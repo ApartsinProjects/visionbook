@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 3: Spatial Filtering &amp; Convolution. Neighborhood operations, the convolution kernel, smoothing, sharpening, derivative filters, edge-preserving filters, borders, separability, and performance." name="description"/>
+<title>Chapter 3: Spatial Filtering &amp; Convolution | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Spatial Filtering &amp; Convolution</a></div>
+<h1>Spatial Filtering &amp; Convolution</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I have personally visited every pixel in this image, nine at a time. Ask me anything, provided it concerns my immediate neighborhood."</p>
+<cite>A Well-Traveled Convolution Kernel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This chapter introduces the single most important operation in the entire book: convolution, the act of replacing each pixel with a weighted combination of its neighbors.</strong> Every filter in this chapter, from a humble blur to a precision edge detector, is one small kernel of numbers slid across the image. The same operation, with the numbers learned from data instead of designed by hand, becomes the convolutional layer at the heart of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> and the U-Net denoiser inside the diffusion models of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. Learn it well here, where the weights are small enough to read.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Everything in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> shared one limitation: each output pixel depended only on the single input pixel at the same position. Point operations can brighten, stretch, and threshold, but they are blind to structure. They cannot tell a noisy speckle from a fine texture, or an edge from a gradient, because telling those apart requires looking at a pixel's surroundings. This chapter widens the aperture from one pixel to a neighborhood, and in doing so unlocks the operations that define classical image processing: smoothing, sharpening, and differentiation.
+</p>
+<p>
+The instrument that does all of this is the kernel: a small grid of weights, typically $3 \times 3$ to $31 \times 31$, that slides across the image and computes a weighted sum at every position. Section 3.1 builds this machinery carefully, distinguishing correlation from true convolution (they differ by a flip that matters more in theory than in daily practice) and implementing both from scratch in NumPy before handing the job to OpenCV and PyTorch. The remaining sections are a tour of what different weights buy you. Section 3.2 covers the smoothing family: the box filter, the Gaussian (the most-used filter in vision), and the median, a nonlinear order-statistic filter that linear theory cannot replicate. Section 3.3 runs the logic in reverse and sharpens, using the unsharp mask trick photographers invented in darkrooms a century before Photoshop. Section 3.4 turns filters into measuring instruments: Sobel, Laplacian, and LoG kernels estimate first and second derivatives, producing the gradient maps that feed the edge and line detectors of <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>.
+</p>
+<p>
+Two closing sections address the tensions the first four create. Smoothing fights noise but destroys edges; Section 3.5 resolves the conflict with the bilateral and guided filters, which adapt their weights to image content and smooth within regions while respecting boundaries. These edge-aware filters run inside virtually every smartphone camera pipeline shipped today. Finally, Section 3.6 confronts the two engineering questions every practitioner hits within an hour of filtering real images: what happens at the image border, where the kernel hangs off the edge, and how to make filtering fast, where one algebraic property (separability) routinely buys a tenfold speedup.
+</p>
+<p>
+A word on why this chapter deserves unusual attention. The convolution kernel is this book's signature recurring character. In Part I it is designed by hand: you will choose the weights and know exactly why each one is there. In <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> the same sliding-window operation returns with learnable weights, and remarkably, the first layers of trained networks rediscover the very filters you build here: oriented edge detectors, blob detectors, and color-opponent kernels. In <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>, stacks of convolutions form the U-Net that turns noise into photographs. Understanding what a $3 \times 3$ kernel can and cannot see is therefore not classical trivia; it is the foundation for reading every architecture diagram in the second half of this book.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should be comfortable with images as NumPy arrays, including dtype pitfalls and vectorized arithmetic, from <a href="../module-00-python-imaging-stack/index.html">Chapter 0: Foundations: The Python Imaging Stack</a>. The discussion of noise origins and image quality metrics leans on the sensor and sampling story of <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1: Digital Image Fundamentals</a>. Histograms, contrast, and thresholding from <a href="../module-02-point-operations-histograms/index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a> appear repeatedly as the downstream consumers of filtered images. Basic linear algebra (dot products, outer products, matrix rank) is assumed throughout and becomes essential in Section 3.6.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">3.1</span>
+<a href="section-3.1.html"><span class="section-title">Convolution &amp; Correlation: The Workhorse Operation</span></a>
+<span class="section-desc">The sliding-window machinery from scratch: correlation, the flip that makes it convolution, kernel galleries, and the same operation in NumPy, OpenCV, and PyTorch.</span>
+</li>
+<li>
+<span class="section-num">3.2</span>
+<a href="section-3.2.html"><span class="section-title">Smoothing: Box, Gaussian &amp; Median Filters</span></a>
+<span class="section-desc">Averaging as noise suppression: the box filter and its artifacts, the Gaussian and its sigma, and the median filter that deletes salt-and-pepper noise outright.</span>
+</li>
+<li>
+<span class="section-num">3.3</span>
+<a href="section-3.3.html"><span class="section-title">Sharpening &amp; Unsharp Masking</span></a>
+<span class="section-desc">Blur, subtract, amplify: the darkroom trick behind every sharpen slider, collapsed into a single kernel, with its halos and noise costs examined.</span>
+</li>
+<li>
+<span class="section-num">3.4</span>
+<a href="section-3.4.html"><span class="section-title">Derivative Filters: Sobel, Laplacian &amp; LoG</span></a>
+<span class="section-desc">Filters as measuring instruments: gradients, magnitudes, and orientations via Sobel and Scharr, second derivatives via the Laplacian, and blob-finding LoG and DoG.</span>
+</li>
+<li>
+<span class="section-num">3.5</span>
+<a href="section-3.5.html"><span class="section-title">Edge-Preserving Smoothing: Bilateral &amp; Guided Filters</span></a>
+<span class="section-desc">Smoothing that respects boundaries: the bilateral filter's two Gaussians, the guided filter's linear model, and the smartphone pipelines built on both.</span>
+</li>
+<li>
+<span class="section-num">3.6</span>
+<a href="section-3.6.html"><span class="section-title">Borders, Separability &amp; Performance</span></a>
+<span class="section-desc">The engineering of filtering: border modes and their artifacts, separable kernels and their tenfold speedups, operation counts, and how production systems make convolution fast.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+Spatial filtering describes every operation in this chapter as a sum over neighborhoods, but there is a second, complementary language for the same ideas. In <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a>, images become sums of waves, and every kernel in this chapter acquires a frequency-domain identity: the Gaussian is revealed as a low-pass filter, sharpening as high-frequency boost, and convolution itself as simple multiplication of spectra. That viewpoint explains in one stroke why box filters ring, why large-kernel convolution is sometimes faster through the FFT, and how Gaussian and Laplacian pyramids compress an image into a stack of scales.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Tomasi, C. and Manduchi, R. "Bilateral Filtering for Gray and Color Images." ICCV (1998). <a href="https://doi.org/10.1109/ICCV.1998.710815" target="_blank" rel="noopener">doi:10.1109/ICCV.1998.710815</a></div>
+<div class="bib-annotation">The paper that named and popularized the bilateral filter taught in Section 3.5; short, readable, and still the cleanest statement of range-versus-domain filtering.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">He, K., Sun, J., and Tang, X. "Guided Image Filtering." IEEE TPAMI (2013). <a href="https://doi.org/10.1109/TPAMI.2012.213" target="_blank" rel="noopener">doi:10.1109/TPAMI.2012.213</a></div>
+<div class="bib-annotation">Introduces the guided filter of Section 3.5: an edge-preserving smoother whose cost is independent of kernel radius, now standard in camera ISPs and matting pipelines.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Marr, D. and Hildreth, E. "Theory of Edge Detection." Proceedings of the Royal Society B (1980). <a href="https://doi.org/10.1098/rspb.1980.0020" target="_blank" rel="noopener">doi:10.1098/rspb.1980.0020</a></div>
+<div class="bib-annotation">The Laplacian-of-Gaussian and zero-crossing theory behind Section 3.4, grounded in a computational account of biological vision.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Perona, P. and Malik, J. "Scale-Space and Edge Detection Using Anisotropic Diffusion." IEEE TPAMI (1990). <a href="https://doi.org/10.1109/34.56205" target="_blank" rel="noopener">doi:10.1109/34.56205</a></div>
+<div class="bib-annotation">The PDE view of edge-preserving smoothing: iterate a diffusion that slows down at edges. Useful contrast to the single-pass bilateral and guided filters of Section 3.5.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Getreuer, P. "A Survey of Gaussian Convolution Algorithms." Image Processing On Line (2013). <a href="https://www.ipol.im/pub/art/2013/87/" target="_blank" rel="noopener">ipol.im/pub/art/2013/87</a></div>
+<div class="bib-annotation">Everything about computing Gaussian blur fast, with reference code: FIR truncation, recursive IIR approximations, and accuracy-versus-speed tradeoffs relevant to Section 3.6.</div>
+</div>
+
+<h3>Recent Research (2022-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Ding, X. et al. "Scaling Up Your Kernels to 31x31: Revisiting Large Kernel Design in CNNs." CVPR (2022). <a href="https://arxiv.org/abs/2203.06717" target="_blank" rel="noopener">arXiv:2203.06717</a></div>
+<div class="bib-annotation">RepLKNet: the paper that restarted the large-kernel conversation, showing hand-tuned depthwise kernels up to 31 pixels wide rival vision transformers.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ding, X. et al. "UniRepLKNet: A Universal Perception Large-Kernel ConvNet for Audio, Video, Point Cloud, Time-Series and Image Recognition." CVPR (2024). <a href="https://arxiv.org/abs/2311.15599" target="_blank" rel="noopener">arXiv:2311.15599</a></div>
+<div class="bib-annotation">Design rules for very large kernels across modalities; a 2024 answer to "how big should a kernel be," sixty years after the question was first asked.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ye, Y. et al. "DiffusionEdge: Diffusion Probabilistic Model for Crisp Edge Detection." AAAI (2024). <a href="https://arxiv.org/abs/2401.02032" target="_blank" rel="noopener">arXiv:2401.02032</a></div>
+<div class="bib-annotation">Edge detection reborn as generation: a diffusion model produces single-pixel-wide edge maps, the modern descendant of the Sobel and LoG operators in Section 3.4.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Yu, F. et al. "Scaling Up to Excellence: Practicing Model Scaling for Photo-Realistic Image Restoration In the Wild." CVPR (2024). <a href="https://arxiv.org/abs/2401.13627" target="_blank" rel="noopener">arXiv:2401.13627</a></div>
+<div class="bib-annotation">SUPIR: generative restoration that synthesizes plausible detail rather than amplifying recorded contrast, the modern counterpoint to the sharpening of Section 3.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, Y. et al. "VMamba: Visual State Space Model." (2024). <a href="https://arxiv.org/abs/2401.10166" target="_blank" rel="noopener">arXiv:2401.10166</a></div>
+<div class="bib-annotation">A linear-time alternative to both convolution and attention; useful perspective on the operation-count analysis of Section 3.6.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 3 of Szeliski covers the same ground as this chapter with full mathematical depth; the book is free online and the standard reference for the field.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Gonzalez, R. and Woods, R. <em>Digital Image Processing</em>, 4th edition. <a href="https://www.imageprocessingplace.com/" target="_blank" rel="noopener">imageprocessingplace.com</a></div>
+<div class="bib-annotation">The classic textbook treatment of spatial filtering, with exhaustive worked examples of every kernel family in this chapter.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Smoothing Images" tutorial and imgproc filtering reference. <a href="https://docs.opencv.org/4.x/d4/d13/tutorial_py_filtering.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The official OpenCV 4.x walkthrough of blur, GaussianBlur, medianBlur, and bilateralFilter used throughout this chapter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">SciPy. <code>scipy.ndimage</code> multidimensional image processing reference. <a href="https://docs.scipy.org/doc/scipy/reference/ndimage.html" target="_blank" rel="noopener">docs.scipy.org</a></div>
+<div class="bib-annotation">Reference implementations of correlate, convolve, and Gaussian filtering with explicit border-mode control, used in Sections 3.1 and 3.6.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch. <code>torch.nn.Conv2d</code> documentation. <a href="https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html" target="_blank" rel="noopener">pytorch.org/docs</a></div>
+<div class="bib-annotation">The learnable version of this chapter's central operation; note the documentation's admission that it actually computes cross-correlation, as explained in Section 3.1.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-02-point-operations-histograms/index.html">&#8592; Chapter 2: Point Operations, Histograms &amp; Thresholding</a>
+<a href="../index.html">Part I</a>
+<a class="next" href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

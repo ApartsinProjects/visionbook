@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 1.1: Image Formation: Optics, Sensors &amp; the ISP Pipeline. How light becomes a NumPy array: lenses, photon shot noise, Bayer color filter arrays, demosaicing, and the camera's image signal processor." name="description"/>
+<title>Section 1.1: Image Formation: Optics, Sensors &amp; the ISP Pipeline | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 1: Digital Image Fundamentals</a></div>
+<h1>Image Formation: Optics, Sensors &amp; the ISP Pipeline</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"People say I have a great eye. Technically I have twelve million of them, and each one counts photons for a living."</p>
+<cite>A Slightly Overexposed Image Sensor</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every image your vision system will ever process is not a recording of the world; it is the output of a long, opinionated pipeline that traded physical accuracy for human-pleasing pictures, one stage at a time.</strong> Light passes through a lens, lands on a sensor that counts photons through a colored mosaic of filters, and then a small embedded computer (the image signal processor, or ISP) invents two thirds of the color values, rebalances the whites, bends the tones, sharpens the edges, and compresses the result. Understanding this pipeline tells you what information survives to your NumPy array, what was destroyed long before your code ran, and which "image bugs" are actually camera decisions.</p>
+</div>
+<p>In <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> we treated the image as a given: a NumPy array that appears when you call <code>cv2.imread</code>. This section asks the question that chapter deliberately postponed: where does that array come from? The answer is a journey in three legs. Optics focuses light from the scene onto a plane. A sensor converts that light into numbers, one photosite at a time, with physics-imposed noise. And an ISP transforms the sensor's raw, greenish, linear measurements into the cheerful JPEG your code eventually loads. Each leg leaves fingerprints in the data that you will keep encountering for the rest of this book.</p>
+
+<h2>1. From Scene to Sensor: The Optics <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>The simplest camera is a box with a hole. The pinhole camera maps each scene point onto the image plane along a straight ray, producing a perfectly sharp but extremely dim image, because almost no light fits through the hole. Real cameras replace the pinhole with a lens, which gathers a wide cone of light from each scene point and refocuses it back to (approximately) a single image point. The price of that brightness is the focusing constraint captured by the thin lens equation:</p>
+$$\frac{1}{f} = \frac{1}{z_o} + \frac{1}{z_i}$$
+<p>where $f$ is the focal length, $z_o$ is the distance from the lens to the object, and $z_i$ is the distance from the lens to the image plane. Only objects at one particular $z_o$ are perfectly in focus for a given $z_i$; everything else is blurred into a small disk (the circle of confusion). The range of depths that look acceptably sharp is the depth of field.</p>
+<p>Two numbers on a lens barrel summarize most of its optical behavior. The focal length $f$ sets the field of view: short focal lengths see wide, long focal lengths see narrow and magnified. The f-number $N = f / D$, where $D$ is the aperture diameter, sets how much light gets in. Small $N$ (a wide aperture like f/1.8) means more light and shallower depth of field; large $N$ (f/11) means less light and deeper focus. There is a hard physical floor here: even a perfect lens blurs a point into a diffraction pattern whose central disk has diameter roughly $2.44 \, \lambda N$ for wavelength $\lambda$. At f/8 and green light ($\lambda \approx 550$ nm) that disk is about 10.7 &#181;m wide, several times larger than the pixels on a modern phone sensor. Past a certain point, more megapixels measure the blur more precisely rather than seeing more detail, a theme we quantify in <a href="section-1.3.html">Section 1.3</a>.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Image Is Already Processed Before It Is Digital</div>
+<p>Defocus, motion blur, lens distortion, vignetting, and chromatic aberration all happen in glass and geometry, before a single number exists. When a vision model underperforms on the corners of the frame, or on fast-moving objects, the root cause is often optical, and no amount of post-processing can fully recover information the optics never delivered. Restoration methods in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> can model and partially invert these degradations, but they are estimating lost data, not retrieving it.</p>
+</div>
+
+<h2>2. The Sensor: Counting Photons <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>At the image plane sits a CMOS sensor: a grid of millions of photosites, each a tiny silicon well that converts incoming photons into electrons via the photoelectric effect. During the exposure time, each well accumulates charge roughly proportional to the light hitting it. At readout, the charge is amplified (the gain is what your camera calls ISO) and digitized by an analog-to-digital converter into a 10, 12, or 14 bit integer. Three properties of this process matter enormously for everything downstream.</p>
+<p>First, the response is linear. Twice the photons means twice the electrons means twice the digital number, right up until the well fills. That fullness threshold is the full well capacity, and hitting it is what clipping means physically: the well simply cannot hold more charge, and every brighter scene value maps to the same maximum number. Clipped highlights are unrecoverable, a fact that drives the dynamic range engineering of <a href="section-1.3.html">Section 1.3</a>.</p>
+<p>Second, light itself is noisy. Photons arrive randomly, following Poisson statistics: a pixel that should receive $n$ photons on average actually receives $n \pm \sqrt{n}$. The signal-to-noise ratio of this photon shot noise is therefore</p>
+$$\mathrm{SNR}_{\text{shot}} = \frac{n}{\sqrt{n}} = \sqrt{n}$$
+<p>which explains, in one line, why low-light images are grainy: fewer photons per pixel means lower $\sqrt{n}$, and no sensor design can change the statistics of the light itself. The simulation below makes this concrete with nothing but a Poisson random generator.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(seed=7)
+
+# A perfectly uniform gray patch imaged at four light levels.
+# The ONLY noise source here is the Poisson arrival of photons.
+for n_photons in [10, 100, 1_000, 10_000]:
+    ideal = np.full((256, 256), n_photons, dtype=np.float64)
+    captured = rng.poisson(ideal)            # photon shot noise
+    snr = captured.mean() / captured.std()
+    print(f"{n_photons:>6} photons/pixel -> SNR = {snr:6.1f}"
+          f"  (theory sqrt(n) = {np.sqrt(n_photons):6.1f})")
+</code></pre>
+<div class="code-caption"><strong>Code 1.1.1:</strong> Photon shot noise from first principles. Even an ideal, noiseless sensor produces grainy images in low light, because the randomness lives in the light, not in the electronics.</div>
+<pre><code class="language-text">    10 photons/pixel -> SNR =    3.2  (theory sqrt(n) =    3.2)
+   100 photons/pixel -> SNR =   10.0  (theory sqrt(n) =   10.0)
+  1000 photons/pixel -> SNR =   31.6  (theory sqrt(n) =   31.6)
+ 10000 photons/pixel -> SNR =  100.0  (theory sqrt(n) =  100.0)
+</code></pre>
+<div class="code-caption"><strong>Output 1.1.1:</strong> Measured SNR tracks the $\sqrt{n}$ law: a hundred times more light buys only ten times cleaner pixels.</div>
+<p>Third, the electronics add their own noise on top: read noise from the amplifier, dark current from thermally generated electrons, and fixed-pattern noise from manufacturing variations between photosites. In bright light, shot noise dominates; in deep shadow, read noise takes over. This is why denoising algorithms, from the classical filters of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> to learned methods, benefit from knowing the noise model: the variance of a raw pixel is approximately a linear function of its brightness, not a constant.</p>
+
+<h2>3. The Color Problem: One Sensor, Three Channels <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Silicon photosites count photons; they do not perceive color. To capture color with a single sensor, manufacturers overlay a color filter array (CFA), almost always the Bayer pattern: a repeating 2&#215;2 tile with one red filter, one blue filter, and two green filters (green is doubled because human luminance sensitivity peaks in green). The consequence is startling when you first meet it: a 12 megapixel camera measures only 12 million color samples in total, one per pixel, not 36 million. At every pixel, two of the three RGB values you find in your array were never measured. They were invented.</p>
+<p>The inventing step is demosaicing: interpolating each missing channel from its neighbors. Simple bilinear interpolation works on smooth regions but produces colored fringing ("zippering") near edges, so production demosaicers use edge-aware methods. The code below builds a Bayer mosaic from a known RGB image and reconstructs it, so you can measure exactly what demosaicing gets wrong and where.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# Synthetic test scene: smooth ramps plus stripes (no input files needed).
+h, w = 256, 384
+yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+rgb = np.dstack([
+    255 * xx / (w - 1),                 # red ramps left to right
+    255 * yy / (h - 1),                 # green ramps top to bottom
+    128 + 64 * np.sin(xx / 6.0),        # blue stripes add sharp detail
+]).astype(np.uint8)
+
+# 1. Sample through an RGGB color filter array: ONE value per photosite.
+mosaic = np.zeros((h, w), dtype=np.uint8)
+mosaic[0::2, 0::2] = rgb[0::2, 0::2, 0]   # R photosites
+mosaic[0::2, 1::2] = rgb[0::2, 1::2, 1]   # G photosites (even rows)
+mosaic[1::2, 0::2] = rgb[1::2, 0::2, 1]   # G photosites (odd rows)
+mosaic[1::2, 1::2] = rgb[1::2, 1::2, 2]   # B photosites
+
+# 2. Demosaic: interpolate the two missing channels at every pixel.
+#    OpenCV names Bayer patterns by the 2x2 tile starting at pixel (1, 1),
+#    so an RGGB mosaic uses the constant COLOR_BayerBG2RGB.
+demosaiced = cv2.cvtColor(mosaic, cv2.COLOR_BayerBG2RGB)
+
+err = np.abs(demosaiced.astype(np.int16) - rgb.astype(np.int16))
+print("mean abs reconstruction error:", round(float(err.mean()), 2))
+print("99th percentile error:", int(np.percentile(err, 99)))
+</code></pre>
+<div class="code-caption"><strong>Code 1.1.2:</strong> Simulating capture through an RGGB Bayer mosaic and reconstructing the full-color image. The mean error is small on the smooth ramps, but the high-percentile error concentrates along the blue stripes, exactly where interpolation has to guess across an edge.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The Bayer pattern is named for Bryce Bayer, the Kodak scientist who patented it in 1976. His colleagues reportedly pronounced it "BY-er", and his one-page idea now sits inside essentially every phone, webcam, and mirrorless camera on Earth. OpenCV's Bayer constants, meanwhile, are named by the 2&#215;2 tile starting at pixel (1,&nbsp;1) rather than (0,&nbsp;0), which is why an RGGB sensor uses <code>COLOR_BayerBG2RGB</code>. Few APIs have caused more off-by-one color bugs.</p>
+</div>
+
+<h2>4. The ISP Pipeline: From Raw Counts to a Viewable Image <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Between the sensor's raw mosaic and the file you load lies the image signal processor, a dedicated chip (or firmware block) that executes a fixed sequence of transformations at billions of pixels per second. Figure 1.1.1 traces the canonical stages. Real ISPs vary the order and fuse stages, but the logical flow is remarkably stable across vendors.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Block diagram of the camera imaging pipeline from scene light through lens, sensor, ISP stages, to JPEG file">
+<defs>
+<marker id="arr111" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+</defs>
+<style>
+.b111 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; rx:8; }
+.i111 { fill:#fdf3e7; stroke:#b86b1f; stroke-width:1.6; }
+.t111 { font:600 14px sans-serif; fill:#14385c; text-anchor:middle; }
+.s111 { font:11.5px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l111 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr111); }
+</style>
+<!-- Row 1: capture -->
+<rect class="b111" x="20" y="40" width="140" height="64" rx="8"/>
+<text class="t111" x="90" y="66">Scene light</text>
+<text class="s111" x="90" y="86">continuous radiance</text>
+<rect class="b111" x="220" y="40" width="140" height="64" rx="8"/>
+<text class="t111" x="290" y="66">Lens</text>
+<text class="s111" x="290" y="86">focus &#183; aperture &#183; blur</text>
+<rect class="b111" x="420" y="40" width="170" height="64" rx="8"/>
+<text class="t111" x="505" y="60">Bayer CFA + sensor</text>
+<text class="s111" x="505" y="78">photon counting,</text>
+<text class="s111" x="505" y="94">shot + read noise</text>
+<rect class="b111" x="650" y="40" width="180" height="64" rx="8"/>
+<text class="t111" x="740" y="66">RAW mosaic</text>
+<text class="s111" x="740" y="86">12 to 14 bit, linear</text>
+<line class="l111" x1="160" y1="72" x2="216" y2="72"/>
+<line class="l111" x1="360" y1="72" x2="416" y2="72"/>
+<line class="l111" x1="590" y1="72" x2="646" y2="72"/>
+<!-- connector down into ISP -->
+<path class="l111" d="M 740 104 L 740 142 L 96 142 L 96 176"/>
+<!-- ISP container -->
+<rect x="20" y="180" width="810" height="120" fill="#fbf8f2" stroke="#b86b1f" stroke-width="1.4" stroke-dasharray="6 4" rx="10"/>
+<text x="62" y="172" font-size="13" font-weight="700" fill="#b86b1f" font-family="sans-serif">ISP</text>
+<rect class="i111" x="36" y="200" width="138" height="60" rx="8"/>
+<text class="t111" x="105" y="224">Black level +</text>
+<text class="t111" x="105" y="242">white balance</text>
+<rect class="i111" x="206" y="200" width="120" height="60" rx="8"/>
+<text class="t111" x="266" y="224">Demosaic</text>
+<text class="s111" x="266" y="244">invent 2/3 of values</text>
+<rect class="i111" x="358" y="200" width="130" height="60" rx="8"/>
+<text class="t111" x="423" y="224">Color matrix</text>
+<text class="s111" x="423" y="244">sensor RGB &#8594; sRGB</text>
+<rect class="i111" x="520" y="200" width="138" height="60" rx="8"/>
+<text class="t111" x="589" y="224">Tone curve +</text>
+<text class="t111" x="589" y="242">gamma</text>
+<rect class="i111" x="690" y="200" width="124" height="60" rx="8"/>
+<text class="t111" x="752" y="224">Denoise +</text>
+<text class="t111" x="752" y="242">sharpen</text>
+<line class="l111" x1="174" y1="230" x2="202" y2="230"/>
+<line class="l111" x1="326" y1="230" x2="354" y2="230"/>
+<line class="l111" x1="488" y1="230" x2="516" y2="230"/>
+<line class="l111" x1="658" y1="230" x2="686" y2="230"/>
+<!-- connector down to output -->
+<path class="l111" d="M 752 260 L 752 282 L 330 282 L 330 330 L 356 330" fill="none"/>
+<rect class="b111" x="360" y="306" width="200" height="50" rx="8"/>
+<text class="t111" x="460" y="328">JPEG / HEIC encode</text>
+<text class="s111" x="460" y="346">8 bit, gamma, compressed</text>
+</svg>
+<figcaption><strong>Figure 1.1.1:</strong> The imaging pipeline. The top row is physics: light, glass, and photon-counting silicon. The dashed box is the ISP, a chain of irreversible processing decisions. The output file is several transformations removed from what the sensor measured.</figcaption>
+</figure>
+<p>Walking through the dashed box in Figure 1.1.1: black level subtraction removes the sensor's electronic pedestal; white balance multiplies the R and B channels by gains so that the scene's illuminant (sunlight, tungsten, LED) renders neutrals as neutral; demosaicing fills in the missing color samples as in Code 1.1.2; the color correction matrix maps the sensor's idiosyncratic spectral sensitivities into a standard color space; the tone curve and gamma encoding compress the sensor's linear 12 to 14 bit range into perceptually spaced 8 bit values (we will treat gamma carefully when we meet point operations in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>); and finally denoising plus sharpening trades texture for cleanliness in a way each vendor tunes to taste. Every one of these stages destroys information: clipping in white balance, interpolation error in demosaicing, quantization in tone mapping, and texture loss in denoising are all permanent.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: rawpy Decodes RAW Files in Three Lines</div>
+<p>Implementing even a minimal ISP yourself (black level, white balance, demosaic, color matrix, gamma) is 150 to 300 lines of careful NumPy. The <strong>rawpy</strong> package wraps LibRaw, the engine behind most open-source RAW converters, and does all of it in one call, with control over every stage:</p>
+<pre><code class="language-python">import rawpy
+
+with rawpy.imread("photo.dng") as raw:
+    rgb = raw.postprocess(use_camera_wb=True,   # apply as-shot white balance
+                          output_bps=16,        # keep 16 bit precision
+                          no_auto_bright=True)  # no surprise exposure changes
+print(rgb.shape, rgb.dtype)   # e.g. (4024, 6048, 3) uint16
+</code></pre>
+<div class="code-caption"><strong>Code 1.1.3:</strong> Full RAW development via rawpy: roughly 200 lines of hand-written ISP replaced by one <code>postprocess</code> call that handles black level, highlight recovery, demosaicing, color matrices, and gamma internally.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Crop Classifier That Changed Its Mind at Noon</div>
+<p><strong>Who:</strong> A machine learning engineer at an agritech startup flying drones over lettuce fields.</p>
+<p><strong>Situation:</strong> A CNN classified per-plant health from drone JPEGs and worked beautifully in the spring pilot.</p>
+<p><strong>Problem:</strong> In summer, the model's health scores for identical plants drifted by the hour. Morning flights flagged 4% of plants; noon flights flagged 19%. The plants had not changed; the predictions had.</p>
+<p><strong>Decision:</strong> The team traced the drift to the camera's auto white balance and auto exposure: as sunlight color and intensity shifted, the ISP silently re-rendered the same vegetation with different green channel statistics. They switched the camera to fixed manual white balance, locked exposure, and recorded RAW alongside JPEG for a calibration subset.</p>
+<p><strong>Result:</strong> Score drift between morning and noon flights fell from 15 percentage points to under 2. The model itself was never retrained.</p>
+<p><strong>Lesson:</strong> When predictions drift and the scene has not changed, suspect the ISP before the model. Auto modes are control loops that change your data distribution underneath you.</p>
+</div>
+
+<h2>5. Why Vision Engineers Should Care <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>It is tempting to shrug: the camera produces an image, the model consumes it, why study the plumbing? Three practical reasons. First, ISPs are tuned for human viewing, not for machine consumption; aggressive sharpening creates halo edges that confuse gradient-based methods, and denoising erases the fine texture that classifiers use to tell surfaces apart. Second, the pipeline is not fixed across devices: the same scene shot on two phones yields measurably different arrays, which is a silent domain shift for any deployed model, and a key reason production teams covered in <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> care about controlling the capture stack on edge devices. Third, several classic "image processing" operations (white balance, gamma, denoising) are things the ISP already did once; doing them again naively compounds errors.</p>
+<p>There is also an opportunity hiding here. Because the RAW mosaic is linear in light, it supports physically meaningful arithmetic: averaging RAW frames genuinely averages photons, and noise behaves predictably. Computational photography exploits this constantly, and a growing line of research feeds RAW data directly to neural networks, skipping the ISP's human-oriented choices altogether.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and Invertible ISPs (2024 to 2026)</div>
+<p>The ISP itself is becoming a learned component. ParamISP (Kim et al., CVPR 2024) trains forward and inverse ISP models conditioned on camera metadata (ISO, exposure, white balance gains), letting researchers convert between RAW and sRGB in both directions for any supported camera, which unlocks RAW-domain training data from ordinary JPEG datasets. A parallel thread asks whether perception models should consume RAW directly: RAW-domain object detection benchmarks and the AIM and Mobile AI challenge series (2024 and 2025 editions) report consistent low-light gains when the network sees linear sensor data instead of tone-mapped sRGB. Further out, event cameras (which report per-pixel brightness changes asynchronously) and quanta image sensors built from single-photon avalanche diodes (SPADs) abandon the frame-based pipeline of Figure 1.1.1 entirely; 2024 to 2026 work on SPAD video reconstruction shows usable imagery at light levels where conventional CMOS produces only noise.</p>
+</div>
+<p>With formation physics in hand, the next question is mathematical: what does it mean to chop a continuous optical image into a finite grid of finite-precision numbers? That is sampling and quantization, the subject of <a href="section-1.2.html">Section 1.2</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.1.1: The Photon Budget <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A security camera halves its exposure time to reduce motion blur. Using the shot noise law, by what factor does the SNR of a mid-gray region drop? The vendor proposes doubling the analog gain (ISO) to compensate for the lost brightness. Explain why this restores the brightness but not the SNR, and identify which noise source gain amplifies along with the signal.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.1.2: Stress-Testing the Demosaicer <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 1.1.2: replace the synthetic scene with a black-and-white checkerboard whose squares are exactly 1 pixel wide, run the mosaic and demosaic round trip, and visualize the per-channel error map. Explain the colored artifacts you see. Then increase the square size to 2, 4, and 8 pixels and plot mean reconstruction error against square size. At what feature size does demosaicing become essentially lossless?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.1.3: ISP Forensics <span class="exercise-type analysis">Analysis</span></div>
+<p>Photograph the same static scene twice with a phone camera: once in normal mode and once with the exposure or white balance manually changed in the camera app. Load both JPEGs as arrays, compute per-channel histograms, and identify which ISP stages most plausibly explain the differences you measure. Which differences could you undo in software, and which involve information loss that cannot be undone?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter Overview</span><span class="nav-num">Chapter 1</span><span class="nav-title">Digital Image Fundamentals</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 1</span><span class="nav-num">Contents</span><span class="nav-title">Digital Image Fundamentals</span></a>
+<a class="next" href="section-1.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 1.2</span><span class="nav-title">Sampling &amp; Quantization</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
