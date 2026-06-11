@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 13.3: Homographies &amp; Panorama Stitching. When two views map point-to-point: planar scenes and rotating cameras, DLT estimation from scratch, homography-versus-fundamental model selection, and a complete panorama pipeline." name="description"/>
+<title>Section 13.3: Homographies &amp; Panorama Stitching | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a></div>
+<h1>Homographies &amp; Panorama Stitching</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My worldview is simple: everything is flat, or I never moved. People call that reductive. I call it nine numbers, and my panoramas look great."</p>
+<cite>A Homography With a Conveniently Flat Worldview</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In two special but enormously common situations, planar scenes and rotating cameras, the point-to-line constraint of epipolar geometry sharpens into a point-to-point map: a homography, and that exactness is why panoramas work.</strong> This section derives when and why the homography holds, estimates it from four matches with the DLT (the same null-space trick as <a href="section-13.2.html">Section 13.2</a>), and assembles the full stitching pipeline: match, fit robustly, warp, blend. Just as important is the boundary of validity: a homography applied outside its two legal cases produces parallax ghosts, and recognizing that failure separates working products from demo-day embarrassments.</p>
+</div>
+
+<p>
+The previous section flagged planar scenes and pure rotation as degeneracies that break fundamental-matrix estimation. This section flips the perspective: those "degenerate" cases are not broken geometry but <em>stronger</em> geometry. When the scene is a plane, or the camera only rotates, the second view is fully determined by the first, point for point, and the map between them is the projective transform you met as a pure warping tool in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>. What Chapter 5 treated as an arbitrary $3 \times 3$ warp now acquires its physics.
+</p>
+
+<h2>1. Two Roads to a Point-to-Point Map <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Why does the general two-view relation stop at point-to-line? Because depth is free: a pixel in the left image could be any point on its ray, and different depths land at different places along the right epipolar line. A homography arises whenever something removes that freedom.
+</p>
+<p>
+<strong>Road one: the scene is a plane.</strong> If every observed point lies on a single 3D plane with unit normal $\mathbf{n}$ at distance $d$ from the left camera, then the ray of each left pixel intersects the plane at exactly one point; depth is no longer free but determined. Pushing that intersection through the right camera's projection gives a closed-form pixel-to-pixel map,
+</p>
+<p>
+$$ H \;=\; K_R \left( R \;-\; \frac{\mathbf{t}\, \mathbf{n}^\top}{d} \right) K_L^{-1}, $$
+</p>
+<p>
+the <strong>plane-induced homography</strong>. Facades, floors, whiteboards, documents, sports fields, and (from a drone at altitude) entire landscapes qualify as planes, which is why this case carries so much industrial weight: every document scanner and every broadcast-sports overlay is this equation at work.
+</p>
+<p>
+<strong>Road two: the camera never translates.</strong> Set $\mathbf{t} = 0$ and the plane drops out of the formula entirely: $H = K_R \, R \, K_L^{-1}$. With no baseline, all viewing rays of both views pass through the same optical center; the two images are two croppings of the same bundle of rays, and <em>any</em> scene, at any depth, maps point-to-point. This is the panorama case: rotate on a tripod (or hand-hold and stay close to pure rotation) and the views stitch exactly, no matter how three-dimensional the world is. The price was paid in <a href="section-13.1.html">Section 13.1</a>: zero baseline means zero depth information. A panorama is geometrically gorgeous and metrically empty.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: H and F Split the World Between Them</div>
+<p>Every image pair you will ever process lives on a spectrum between two models. If the views share an optical center, or the scene is effectively planar (including "far enough away that depth variation is negligible against the distance"), the homography is the correct, <em>exact</em> model with 8 degrees of freedom. The moment there is both real translation and real depth variation, parallax appears, no point-to-point map exists, and the fundamental matrix's point-to-line constraint is the strongest statement geometry can make. The practical model-selection rule from <a href="section-13.2.html">Section 13.2</a> follows: fit both, compare inlier support, and let the data declare which side of the spectrum it is on. Misclassifying the pair in either direction hurts: $F$ on rotational data is fiction, $H$ on parallax data is ghosting.</p>
+</div>
+
+<h2>2. Estimating H: The Direct Linear Transform <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A homography acts on homogeneous points as $\mathbf{x}' \sim H\mathbf{x}$, where $\sim$ means equality up to scale. Cross-multiplying away the unknown scale, each correspondence yields two independent linear equations in the nine entries of $H$, so four matches in general position determine it (eight equations, nine unknowns, one scale). With more matches, the same SVD null-space recipe as the eight-point algorithm applies, and the same Hartley normalization is just as mandatory; the construction is called the <strong>Direct Linear Transform</strong> (DLT). The implementation is fifteen lines:
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def dlt_homography(src, dst):
+    """H mapping src -&gt; dst (each Nx2), via the normalized DLT."""
+    (s, Ts), (d, Td) = normalize_points(src), normalize_points(dst)
+    rows = []
+    for (x, y, _), (u, v, _) in zip(s, d):
+        # two equations per match from x' x (H x) = 0
+        rows.append([-x, -y, -1,  0,  0,  0, u * x, u * y, u])
+        rows.append([ 0,  0,  0, -x, -y, -1, v * x, v * y, v])
+    A = np.asarray(rows)
+    _, _, Vt = np.linalg.svd(A)
+    H = Vt[-1].reshape(3, 3)
+    H = np.linalg.inv(Td) @ H @ Ts      # undo normalization
+    return H / H[2, 2]
+
+H_ours = dlt_homography(ptsL[inl], ptsR[inl])
+H_cv, _ = cv2.findHomography(ptsL[inl], ptsR[inl], 0)  # 0 = plain least squares
+print(np.abs(H_ours - H_cv).max())      # ~1e-6: same answer</code></pre>
+<div class="code-caption">The normalized DLT for homography estimation: two linear equations per correspondence, an SVD null space, and the now-familiar Hartley normalization, reusing <code>normalize_points</code> from the eight-point implementation; the result matches <code>cv2.findHomography</code> to floating-point noise.</div>
+
+<p>
+As with $F$, real matches need a robust wrapper: <code>cv2.findHomography(src, dst, cv2.USAC_MAGSAC, 3.0)</code> runs the DLT on minimal four-point samples inside MAGSAC++, scoring inliers by reprojection distance $\lVert \mathbf{x}' - \pi(H\mathbf{x}) \rVert$, where $\pi$ is the dehomogenization. This is the very call that <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> used as its RANSAC showcase; now you know what the model means physically and when it is the right one to fit.
+</p>
+
+<h2>3. The Panorama Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Stitching two photographs taken from one viewpoint is now a four-stage assembly of parts you already own, summarized in Figure 13.3.1: correspondences from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, a robust homography from this section, a warp from <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, and a blend to hide the seam.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Panorama pipeline: two overlapping input images flow through feature matching, robust homography estimation, perspective warping onto a shared canvas, and seam blending into a final panorama">
+  <g font-family="sans-serif" font-size="13">
+    <!-- input images -->
+    <rect x="20" y="40" width="100" height="70" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5" rx="4"/>
+    <rect x="20" y="130" width="100" height="70" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5" rx="4"/>
+    <text x="70" y="80" text-anchor="middle" fill="#1b4f72">image A</text>
+    <text x="70" y="170" text-anchor="middle" fill="#145a32">image B</text>
+    <!-- stage 1 -->
+    <rect x="170" y="85" width="130" height="70" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="235" y="113" text-anchor="middle" font-weight="bold" fill="#9c4a00">match</text>
+    <text x="235" y="132" text-anchor="middle" fill="#9c4a00">SIFT + ratio test</text>
+    <!-- stage 2 -->
+    <rect x="350" y="85" width="130" height="70" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="415" y="113" text-anchor="middle" font-weight="bold" fill="#9c4a00">fit H</text>
+    <text x="415" y="132" text-anchor="middle" fill="#9c4a00">DLT in MAGSAC++</text>
+    <!-- stage 3 -->
+    <rect x="530" y="85" width="130" height="70" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="595" y="113" text-anchor="middle" font-weight="bold" fill="#9c4a00">warp</text>
+    <text x="595" y="132" text-anchor="middle" fill="#9c4a00">shared canvas</text>
+    <!-- stage 4 / output -->
+    <rect x="700" y="70" width="120" height="100" fill="#eafaf1" stroke="#1e8449" stroke-width="2" rx="6"/>
+    <text x="760" y="110" text-anchor="middle" font-weight="bold" fill="#145a32">blend</text>
+    <text x="760" y="130" text-anchor="middle" fill="#145a32">panorama</text>
+    <!-- arrows -->
+    <g stroke="#5a626c" stroke-width="2">
+      <line x1="120" y1="75" x2="170" y2="108"/>
+      <line x1="120" y1="165" x2="170" y2="132"/>
+      <line x1="300" y1="120" x2="344" y2="120"/>
+      <line x1="480" y1="120" x2="524" y2="120"/>
+      <line x1="660" y1="120" x2="694" y2="120"/>
+    </g>
+    <g fill="#5a626c">
+      <polygon points="344,120 334,115 334,125"/>
+      <polygon points="524,120 514,115 514,125"/>
+      <polygon points="694,120 684,115 684,125"/>
+      <polygon points="170,108 159,106 163,114"/>
+      <polygon points="170,132 163,126 159,134"/>
+    </g>
+    <text x="420" y="225" text-anchor="middle" fill="#5a626c">valid because the camera only rotated: H = K_R R K_L&#8315;&#185; is exact for any scene</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 13.3.1</strong> The panorama pipeline. Overlapping images are matched with the Chapter 10 machinery, a homography is fit robustly, image B is warped into image A's frame on an enlarged canvas, and the overlap is blended. Every stage is a tool already built; the homography's validity rests on the rotation-only capture.</figcaption>
+</figure>
+
+<p>
+The code below stitches two images along Figure 13.3.1's path. The only genuinely new engineering is canvas management: the warped image B may land partly at negative coordinates, so the homography is composed with a translation that shifts everything into view.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+imgA = cv2.imread("pano_left.jpg")    # taken rotating on one spot
+imgB = cv2.imread("pano_right.jpg")
+
+# 1-2. Match and fit H mapping B's pixels into A's frame
+sift = cv2.SIFT_create()
+kA, dA = sift.detectAndCompute(imgA, None)
+kB, dB = sift.detectAndCompute(imgB, None)
+knn = cv2.BFMatcher(cv2.NORM_L2).knnMatch(dB, dA, k=2)
+good = [m for m, n in knn if m.distance &lt; 0.75 * n.distance]
+src = np.float32([kB[m.queryIdx].pt for m in good])
+dst = np.float32([kA[m.trainIdx].pt for m in good])
+H, mask = cv2.findHomography(src, dst, cv2.USAC_MAGSAC, 3.0)
+
+# 3. Canvas: warp B's corners to find the bounding box of the union
+hA, wA = imgA.shape[:2]; hB, wB = imgB.shape[:2]
+cornersB = np.float32([[0, 0], [wB, 0], [wB, hB], [0, hB]]).reshape(-1, 1, 2)
+warped = cv2.perspectiveTransform(cornersB, H)
+allpts = np.vstack([warped.reshape(-1, 2),
+                    [[0, 0], [wA, 0], [wA, hA], [0, hA]]])
+x0, y0 = np.floor(allpts.min(axis=0)).astype(int)
+x1, y1 = np.ceil(allpts.max(axis=0)).astype(int)
+shift = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float64)
+
+# 4. Warp B, paste A, feather the overlap
+pano = cv2.warpPerspective(imgB, shift @ H, (x1 - x0, y1 - y0))
+pano[-y0:hA - y0, -x0:wA - x0] = imgA      # hard paste; feathering below
+cv2.imwrite("panorama.png", pano)
+print(pano.shape, f"{int(mask.sum())} inliers")  # e.g. (1184, 2693, 3) 633 inliers</code></pre>
+<div class="code-caption">A minimal two-image stitcher: the homography from B to A is composed with a translation so the warped result fits a computed canvas, then image A is pasted over its own region; the hard paste leaves a visible seam that the blending discussion below addresses.</div>
+
+<p>
+The hard paste in the last step leaves a visible seam wherever exposure differs between shots, and real stitchers blend instead. The classical answer is <strong>multi-band blending</strong>: decompose both images into the Laplacian pyramids of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, blend low-frequency bands over wide regions (hiding exposure mismatch) and high-frequency bands over narrow ones (keeping edges crisp), then collapse the pyramid. Production stitchers add two more refinements worth knowing by name: <strong>gain compensation</strong>, a least-squares fix of per-image exposure before blending, and <strong>cylindrical or spherical projection</strong> for many-image panoramas, since chaining flat homographies across a wide field of view stretches the end images absurdly; projecting onto a cylinder first keeps the canvas bounded.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.Stitcher Is the Whole Section in Two Lines</div>
+<p>OpenCV ships the entire production pipeline behind one class: <code>stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)</code> then <code>status, pano = stitcher.stitch([img1, img2, img3])</code>. Against the roughly 80 lines of the from-scratch path (plus another 60 for multi-band blending), that is a 70-to-1 reduction, and the class internally runs the full Brown-and-Lowe recipe: pairwise matching with overlap detection, robust homographies, bundle adjustment of rotations across all images, automatic wave correction (straightening the horizon), gain compensation, seam-finding with graph cuts (a cameo from <a href="../module-11-classical-segmentation/index.html">Chapter 11</a>), and multi-band blending. Check <code>status == cv2.Stitcher_OK</code>: the most common failure, <code>ERR_NEED_MORE_IMGS</code>, usually means insufficient overlap (aim for 30 to 50 percent) rather than too few photos.</p>
+</div>
+
+<h2>4. When Panoramas Fail: Parallax <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Every homography failure in the wild is the same failure: the capture violated one of the two roads of subsection 1. Hand-held panoramas are never <em>pure</em> rotation; the camera's optical center translates by a few centimeters between shots. For distant scenery the resulting parallax is a fraction of a pixel and invisible. For a subject two meters away, a 5 cm translation moves near and far objects differently by many pixels, no single homography fits both, and the stitcher produces the characteristic artifacts: ghosted double edges, severed railings, a friend's arm amputated at the seam. The fix hierarchy, in increasing order of effort: rotate about the lens's no-parallax point (tripod panorama heads exist for exactly this), stand farther back, keep seams away from near objects (seam-finding does this automatically), or admit the scene is 3D and graduate to the reconstruction machinery of the rest of this chapter.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Real-Estate Scanner and the Two-Meter Room</div>
+<p><strong>Who:</strong> A proptech company generating 360-degree room views from a phone app, with users sweeping the camera at arm's length.</p>
+<p><strong>Situation:</strong> Their first version stitched the sweep with chained homographies, Stitcher-style. Marketing demos in spacious show apartments looked flawless.</p>
+<p><strong>Problem:</strong> In real listings, small rooms meant near walls and furniture at one to three meters. Arm's-length sweeping rotates the phone about the user's shoulder, not the lens, so the optical center translated through a 60 cm arc: massive parallax. Door frames ghosted, counter edges duplicated, and one memorable kitchen panorama featured a faucet with three spouts. One-star reviews mentioned "melted walls".</p>
+<p><strong>Decision:</strong> The team accepted that the capture violates the homography model and split the product. For outdoor and large-space captures, the homography stitcher stayed. For interiors, they switched to a 3D pipeline: relative pose from the essential matrix (<a href="section-13.2.html">Section 13.2</a>), sparse triangulation, and rendering from a consistent virtual viewpoint, an early step toward the full reconstruction stack of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+<p><strong>Result:</strong> Interior artifact reports dropped by an order of magnitude; processing cost rose 6x, which the company ate as the cost of correctness. The outdoor stitcher, where the planar-or-rotational assumption genuinely holds, never changed.</p>
+<p><strong>Lesson:</strong> A homography is a model with a validity condition, not a general-purpose image glue. Diagnose whether your capture satisfies the condition before shipping the assumption to users who will not hold the camera the way the demo did.</p>
+</div>
+
+<h2>5. Homographies Beyond Panoramas <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The plane-induced road from subsection 1 powers a family of applications that have nothing to do with stitching, and recognizing them as "the same trick" is a mark of fluency. Document and whiteboard rectification fits $H$ from the four detected page corners to an upright rectangle and warps, the perspective correction of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> now with automatically estimated parameters. Sports broadcasting maps the known geometry of the pitch to its image, so graphics can be painted onto the grass and player positions converted to field coordinates. Planar augmented reality tracks a poster or marker with a per-frame homography, and decomposing that homography (via <code>cv2.decomposeHomographyMat</code>, with $K$ known) recovers the camera's pose relative to the plane, the same pose-from-plane idea that rescued the drone mapper in <a href="section-13.2.html">Section 13.2</a>'s practical example. In every case the plane supplies the depth information a single view lacks, which is the entire lesson of this section in one sentence.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Stitching Learns to Handle Parallax</div>
+<p>Research from 2023 to 2026 attacks exactly the failure mode of subsection 4. UDIS++ (ICCV 2023) performs unsupervised deep stitching that warps with a learned thin-plate spline on top of a global homography, absorbing moderate parallax that breaks the classical model, and follow-up work (TRIS, 2024) targets the residual misalignments with learned seam networks. RecDiffusion (CVPR 2024) treats the ragged boundary of a finished panorama as a generative problem, using a diffusion model to "rectangle" the canvas instead of cropping it, a direct bridge to the generative inpainting of <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>. And at the ambitious end, view-synthesis systems sidestep stitching entirely: cast the sweep as a tiny 3D reconstruction and re-render it from one virtual center using the neural and Gaussian-splatting scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>, making "panorama" a special case of novel-view synthesis. The classical homography remains the backbone in all of these; what is learned is the correction around its validity boundary.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.1: Reading the Plane Formula <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from $H = K_R (R - \mathbf{t}\mathbf{n}^\top / d) K_L^{-1}$: (a) verify that setting $\mathbf{t} = 0$ removes all dependence on the plane, and explain geometrically why that must happen; (b) holding the cameras fixed, describe what happens to $H$ as the plane's distance $d \to \infty$, and use the result to explain why distant scenery stitches well even when the photographer walks several meters between shots; (c) explain why two different planes in the same two-view setup induce two <em>different</em> homographies, and what a robust homography fit will report when the scene contains two dominant planes.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.2: Feathered and Multi-Band Blending <span class="exercise-type coding">Coding</span></div>
+<p>Extend this section's stitcher with two blending modes and compare them. (a) Feathering: weight each image by its distance transform (<code>cv2.distanceTransform</code> on the valid-pixel mask) and combine as a weighted average. (b) Multi-band: implement 5-level Laplacian-pyramid blending using the pyramid code of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, with the blend mask smoothed at each level. Photograph a pair with deliberately different exposures (lock one shot against the sky, one against the ground) and show side-by-side crops of the seam region under hard paste, feathering, and multi-band. Which artifacts does each stage remove?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.3.3: The H-versus-F Discriminator <span class="exercise-type analysis">Analysis</span></div>
+<p>Build the model-selection tool this chapter keeps invoking. For a set of image pairs spanning three capture styles (tripod rotation, hand-held of a distant scene, hand-held of a near 3D scene), fit both a homography and a fundamental matrix with the same MAGSAC++ settings, and record inlier counts $n_H$ and $n_F$. Plot the ratio $n_H / n_F$ per pair, grouped by capture style. Propose a threshold for declaring a pair "homography-valid", compare it to the 0.85 ratio used by the drone team in <a href="section-13.2.html">Section 13.2</a>, and report where your three groups separate cleanly and where they overlap. What physical property of the overlap cases explains the ambiguity?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.2.html">&#8592; Section 13.2: Essential &amp; Fundamental Matrices</a>
+<a href="index.html">Chapter 13</a>
+<a class="next" href="section-13.4.html">Section 13.4: Stereo Rectification &amp; Disparity Estimation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

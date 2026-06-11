@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 14: Structure from Motion &amp; Visual SLAM. Feature tracks across many views, incremental SfM, bundle adjustment, real-time visual SLAM with loop closure, and COLMAP-based reconstruction pipelines." name="description"/>
+<title>Chapter 14: Structure from Motion &amp; Visual SLAM | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>Structure from Motion &amp; Visual SLAM</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You call it a camera roll. I call it a crime scene: every photo is a witness statement, and I cross-examine them until the whole afternoon confesses where everything stood."</p>
+<cite>An Overzealous Reconstruction Pipeline</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every photograph is a measurement of the same rigid world, and with enough photographs both the world and every camera that looked at it can be recovered jointly, from pixels alone.</strong> <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> showed that two views determine relative pose and sparse depth. This chapter scales that result from two views to two thousand: structure from motion (SfM) turns an unordered pile of photos into camera poses plus a 3D point cloud, and visual SLAM re-engineers the same mathematics so a robot or headset can do it live, while moving. The output of this chapter, calibrated cameras locked to sparse geometry, is exactly what the neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> consume as input.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Two-view geometry answers a local question: given this pair of images, where was the second camera relative to the first, and where in 3D are the matched points? But nobody photographs a building twice and stops. A real capture is dozens to thousands of images, and a real robot produces thirty frames per second indefinitely. The moment more than two views exist, new questions appear that no pairwise machinery can answer alone. Which images even overlap? How do hundreds of pairwise relative poses, each with its own arbitrary scale, merge into one consistent set of camera positions? And when small errors pile up across a long chain of views, what pulls the reconstruction back into shape? This chapter is the classical answer, and it remains the production answer in 2026.
+</p>
+<p>
+The chapter builds the offline pipeline first. <a href="section-14.1.html">Section 14.1</a> extends the matching machinery of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> from one image pair to a whole collection: geometrically verified match graphs, and feature tracks, the multi-view equivalence classes that say "these seventeen detections, across seventeen photos, are the same physical point." <a href="section-14.2.html">Section 14.2</a> assembles tracks into a reconstruction with incremental SfM: bootstrap from one well-chosen image pair, then repeatedly register the next camera with PnP and triangulate fresh structure, the algorithm running inside COLMAP and most photogrammetry products. <a href="section-14.3.html">Section 14.3</a> introduces the method that makes any of this accurate: bundle adjustment, the joint nonlinear least-squares refinement of every camera and every point at once, made tractable by one of the great sparsity tricks in applied mathematics.
+</p>
+<p>
+Then the camera starts moving. <a href="section-14.4.html">Section 14.4</a> rebuilds SfM under real-time constraints as visual SLAM: keyframes, a tracking thread that localizes every frame in milliseconds, a mapping thread that grows and refines the map, and loop closure, the act of recognizing a previously visited place and snapping accumulated drift out of the trajectory. <a href="section-14.5.html">Section 14.5</a> closes with practice: COLMAP and pycolmap end to end, dense multi-view stereo on top of the sparse model, capture technique that decides success before any algorithm runs, and the 2024-2026 landscape in which learned matchers and feed-forward geometry transformers plug into, and increasingly compete with, the classical pipeline.
+</p>
+<p>
+A thread to watch: this chapter is where Part II's machinery converges. The keypoints, descriptors, and RANSAC of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> become the front end; the calibration of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> and the essential matrices and triangulation of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> become inner loops, executed thousands of times per reconstruction. And the chapter's output outlives the classical era: NeRFs and Gaussian splats in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> and the 3D generation of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> are trained on camera poses that, in nearly every published paper, came out of the pipeline taught here.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter assumes the full detect-describe-match-verify pipeline of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a>, including RANSAC, which runs inside every estimator here. From <a href="../module-12-camera-models-calibration/index.html">Chapter 12: Camera Models &amp; Calibration</a> you need the pinhole model, the intrinsic matrix $K$, homogeneous coordinates, and rotation-translation extrinsics. From <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a> you need the essential matrix, pose recovery, and triangulation; they are called as subroutines on nearly every page. Comfort with nonlinear least squares helps in Section 14.3 but is developed from scratch there.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">14.1</span>
+<a href="section-14.1.html"><span class="section-title">Feature Tracks &amp; Correspondence Across Many Views</span></a>
+<span class="section-desc">From pairwise matches to a geometrically verified match graph, and from the graph to feature tracks: the multi-view correspondences that are the atoms of reconstruction, plus pair selection strategies that keep matching affordable at scale.</span>
+</li>
+<li>
+<span class="section-num">14.2</span>
+<a href="section-14.2.html"><span class="section-title">Incremental Structure from Motion</span></a>
+<span class="section-desc">Growing a reconstruction one camera at a time: choosing the two-view seed, registering new views with PnP and RANSAC, triangulating fresh structure, and the filtering loop that keeps the model healthy.</span>
+</li>
+<li>
+<span class="section-num">14.3</span>
+<a href="section-14.3.html"><span class="section-title">Bundle Adjustment: Polishing the Reconstruction</span></a>
+<span class="section-desc">The joint refinement of all cameras and all points by minimizing total reprojection error: Levenberg-Marquardt, the sparse Jacobian, the Schur complement trick, robust losses, and a working implementation in SciPy.</span>
+</li>
+<li>
+<span class="section-num">14.4</span>
+<a href="section-14.4.html"><span class="section-title">Visual SLAM: Mapping While Moving</span></a>
+<span class="section-desc">Structure from motion under a deadline: tracking, local mapping, and loop-closing threads, keyframes and covisibility, pose-graph optimization that cancels drift, and the monocular-stereo-inertial sensor spectrum.</span>
+</li>
+<li>
+<span class="section-num">14.5</span>
+<a href="section-14.5.html"><span class="section-title">COLMAP &amp; Modern Reconstruction Pipelines</span></a>
+<span class="section-desc">The standard tool end to end: COLMAP and pycolmap in practice, dense multi-view stereo, capture technique that makes or breaks reconstructions, and how learned matchers and feed-forward models like VGGT reshape the pipeline.</span>
+</li>
+</ul>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Rome in a Day</div>
+<p>In 2009, the "Building Rome in a Day" project reconstructed landmark-scale 3D models from roughly 150,000 Flickr photos of Rome in under 24 hours on about 500 cores, with no information beyond the pixels and the occasional lying EXIF tag. It was the moment structure from motion stopped being a lab demo and became internet-scale infrastructure, and its core loop is the same one you will implement in Sections 14.1 through 14.3.</p>
+</div>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+SfM and SLAM treat the world as rigid and motion as something cameras do. <a href="../module-15-motion-flow-tracking/index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a> drops the rigidity assumption and asks what moves inside the frame: dense per-pixel optical flow, sparse Lucas-Kanade tracking (the front end many SLAM systems quietly use), and the Kalman filters that keep track of objects over time. Together, Chapters 14 and 15 cover the two halves of dynamic vision: how the camera moves through the scene, and how the scene moves in front of the camera.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Snavely, N., Seitz, S. M., and Szeliski, R. "Photo Tourism: Exploring Photo Collections in 3D." ACM SIGGRAPH (2006). <a href="https://doi.org/10.1145/1141911.1141964" target="_blank" rel="noopener">doi:10.1145/1141911.1141964</a></div>
+<div class="bib-annotation">The paper that proved SfM works on uncontrolled internet photos: SIFT, pairwise matching, incremental reconstruction, bundle adjustment. The pipeline of Sections 14.1 and 14.2 in its original form, later released as the Bundler toolkit.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Agarwal, S., Snavely, N., Simon, I., Seitz, S. M., and Szeliski, R. "Building Rome in a Day." ICCV (2009). <a href="https://doi.org/10.1109/ICCV.2009.5459148" target="_blank" rel="noopener">doi:10.1109/ICCV.2009.5459148</a></div>
+<div class="bib-annotation">City-scale SfM from 150,000 internet photos: vocabulary-tree pair selection, distributed matching, and large-scale bundle adjustment. The scalability arguments of Section 14.1 come from here.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Sch&#246;nberger, J. L. and Frahm, J.-M. "Structure-from-Motion Revisited." CVPR (2016). <a href="https://openaccess.thecvf.com/content_cvpr_2016/html/Schonberger_Structure-From-Motion_Revisited_CVPR_2016_paper.html" target="_blank" rel="noopener">openaccess.thecvf.com</a></div>
+<div class="bib-annotation">The COLMAP paper: next-best-view selection, robust triangulation, and the filtering-and-retriangulation schedule that made incremental SfM reliable enough to become the field's default tool. Sections 14.2 and 14.5 lean on it heavily.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Triggs, B., McLauchlan, P., Hartley, R., and Fitzgibbon, A. "Bundle Adjustment: A Modern Synthesis." Vision Algorithms: Theory and Practice, Springer LNCS 1883 (2000). <a href="https://doi.org/10.1007/3-540-44480-7_21" target="_blank" rel="noopener">doi:10.1007/3-540-44480-7_21</a></div>
+<div class="bib-annotation">The definitive survey of bundle adjustment: the objective, the sparse normal equations, the Schur complement, gauge freedom, robust kernels. Section 14.3 is a guided tour of its core chapters.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Klein, G. and Murray, D. "Parallel Tracking and Mapping for Small AR Workspaces." ISMAR (2007). <a href="https://doi.org/10.1109/ISMAR.2007.4538852" target="_blank" rel="noopener">doi:10.1109/ISMAR.2007.4538852</a></div>
+<div class="bib-annotation">PTAM: the architectural insight that tracking and mapping should run as parallel threads at different rates, with keyframes in between. Every system in Section 14.4 descends from this design.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Mur-Artal, R., Montiel, J. M. M., and Tard&#243;s, J. D. "ORB-SLAM: A Versatile and Accurate Monocular SLAM System." IEEE Transactions on Robotics 31(5) (2015). <a href="https://arxiv.org/abs/1502.00956" target="_blank" rel="noopener">arXiv:1502.00956</a></div>
+<div class="bib-annotation">The reference feature-based SLAM system: ORB everywhere, covisibility graphs, DBoW2 loop closure, and pose-graph plus bundle-adjustment back end. Its successor ORB-SLAM3 (arXiv:2007.11898) adds visual-inertial fusion and multi-map operation. Section 14.4's architecture walk-through follows it.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">G&#225;lvez-L&#243;pez, D. and Tard&#243;s, J. D. "Bags of Binary Words for Fast Place Recognition in Image Sequences." IEEE Transactions on Robotics 28(5) (2012). <a href="https://doi.org/10.1109/TRO.2012.2197158" target="_blank" rel="noopener">doi:10.1109/TRO.2012.2197158</a></div>
+<div class="bib-annotation">DBoW2: binary bag-of-words place recognition, the loop-closure detector in ORB-SLAM and many production systems, and a preview of the retrieval ideas formalized in Chapter 16.</div>
+</div>
+
+<h3>Recent Research (2024-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Pan, L., B&#225;rath, D., Pollefeys, M., and Sch&#246;nberger, J. L. "Global Structure-from-Motion Revisited." ECCV (2024). <a href="https://arxiv.org/abs/2407.20219" target="_blank" rel="noopener">arXiv:2407.20219</a></div>
+<div class="bib-annotation">GLOMAP: a global SfM system that solves all camera poses at once instead of incrementally, reaching COLMAP-level robustness at order-of-magnitude speedups. The strongest classical challenger to Section 14.2's incremental recipe.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Teed, Z. and Deng, J. "DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras." NeurIPS (2021). <a href="https://arxiv.org/abs/2108.10869" target="_blank" rel="noopener">arXiv:2108.10869</a></div>
+<div class="bib-annotation">The learned SLAM landmark: a recurrent network predicts dense correspondences while a differentiable bundle-adjustment layer enforces geometry. The bridge between Section 14.3's optimizer and deep learning.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Murai, R., Dexheimer, E., and Davison, A. J. "MASt3R-SLAM: Real-Time Dense SLAM with 3D Reconstruction Priors." CVPR (2025). <a href="https://arxiv.org/abs/2412.12392" target="_blank" rel="noopener">arXiv:2412.12392</a></div>
+<div class="bib-annotation">Real-time dense SLAM built on the MASt3R two-view reconstruction prior, requiring no calibration at runtime. Where the feed-forward geometry wave meets Section 14.4's problem statement.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, J., Karaev, N., Rupprecht, C., and Novotny, D. et al. "VGGT: Visual Geometry Grounded Transformer." CVPR (2025). <a href="https://arxiv.org/abs/2503.11651" target="_blank" rel="noopener">arXiv:2503.11651</a></div>
+<div class="bib-annotation">A feed-forward transformer that predicts cameras, depths, and 3D points for up to hundreds of views in a single pass, no matching or bundle adjustment in the loop. Section 14.5 weighs it against the classical pipeline.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Keetha, N., Karhade, J., Jatavallabhula, K. M., et al. "SplaTAM: Splat, Track &amp; Map 3D Gaussians for Dense RGB-D SLAM." CVPR (2024). <a href="https://arxiv.org/abs/2312.02126" target="_blank" rel="noopener">arXiv:2312.02126</a></div>
+<div class="bib-annotation">SLAM with a 3D Gaussian splat as the map representation: tracking and mapping by differentiable rendering. One of the 2024 papers that re-merged SLAM with the neural rendering of Chapter 27.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Hartley, R. and Zisserman, A. <em>Multiple View Geometry in Computer Vision</em>, 2nd edition. Cambridge University Press (2004). <a href="https://www.robots.ox.ac.uk/~vgg/hzbook/" target="_blank" rel="noopener">robots.ox.ac.uk/~vgg/hzbook</a></div>
+<div class="bib-annotation">Part IV covers N-view geometry and the full theory behind this chapter, including the proofs of everything Section 14.3 states about the normal equations.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 11 treats structure from motion and SLAM with an engineer's perspective and a bibliography deep enough to follow any thread; free online.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">COLMAP documentation. <a href="https://colmap.github.io/" target="_blank" rel="noopener">colmap.github.io</a></div>
+<div class="bib-annotation">Installation, CLI reference, camera models, and the database schema for the tool Section 14.5 drives end to end, including the pycolmap Python bindings.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Sarlin, P.-E. et al. "hloc: Hierarchical Localization toolbox." <a href="https://github.com/cvg/Hierarchical-Localization" target="_blank" rel="noopener">github.com/cvg/Hierarchical-Localization</a></div>
+<div class="bib-annotation">The standard recipe for swapping learned features (SuperPoint, LightGlue, NetVLAD retrieval) into a COLMAP reconstruction; Section 14.5's library shortcut for difficult scenes.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Agarwal, S., Mierle, K., et al. "Ceres Solver." <a href="http://ceres-solver.org/" target="_blank" rel="noopener">ceres-solver.org</a></div>
+<div class="bib-annotation">The industrial-strength nonlinear least-squares library behind COLMAP's bundle adjustment: automatic differentiation, Schur-complement solvers, robust loss functions. Section 14.3 explains exactly what it does for you.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-13-two-view-stereo-depth/index.html">&#8592; Chapter 13: Two-View Geometry, Stereo &amp; Depth</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="../module-15-motion-flow-tracking/index.html">Chapter 15: Motion, Optical Flow &amp; Tracking &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

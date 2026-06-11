@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 13.2: Essential &amp; Fundamental Matrices. The epipolar constraint as algebra: E equals t-cross R, the fundamental matrix, the normalized eight-point algorithm from scratch, robust estimation, and recovering camera pose from E." name="description"/>
+<title>Section 13.2: Essential &amp; Fundamental Matrices | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a></div>
+<h1>Essential &amp; Fundamental Matrices</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Nine numbers, rank two, defined up to scale, and the entire relationship between two photographs is my business. I'd say I carry this chapter, but technically I am only seven degrees of freedom."</p>
+<cite>A Quietly Rank-Deficient Fundamental Matrix</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The entire epipolar geometry of <a href="section-13.1.html">Section 13.1</a> compresses into one $3 \times 3$ matrix, and that matrix can be estimated from eight point matches and then unpacked into the relative rotation and translation of the two cameras.</strong> This section does all three jobs. First the derivation: the essential matrix $E = [\mathbf{t}]_\times R$ for calibrated cameras, and its uncalibrated cousin the fundamental matrix $F$. Then estimation: the normalized eight-point algorithm built from scratch, wrapped in the RANSAC discipline of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>. Finally extraction: decomposing $E$ into the four candidate camera motions and using a depth test to pick the real one. These three steps run, in exactly this order, inside every structure-from-motion system you will meet in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+</div>
+
+<p>
+The previous section ended by treating the point-to-line map as a black box. Opening the box requires nothing beyond the pinhole algebra of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> and one well-chosen cross product, and the payoff is large: once the constraint is a matrix equation, estimating it becomes linear algebra, and the camera motion you never measured becomes something you can read out of an SVD.
+</p>
+
+<h2>1. Deriving the Essential Matrix <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Work in normalized camera coordinates: $\hat{\mathbf{x}} = K^{-1} \mathbf{x}$, the pixel coordinates with the intrinsics of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> divided out, so each $\hat{\mathbf{x}}$ is a direction vector from the optical center. Let the left camera sit at the origin and the right camera be displaced by rotation $R$ and translation $\mathbf{t}$, meaning a point $\mathbf{X}_L$ in left-camera coordinates appears in right-camera coordinates as $\mathbf{X}_R = R\,\mathbf{X}_L + \mathbf{t}$.
+</p>
+<p>
+The epipolar constraint says three vectors are coplanar: the left ray direction, the right ray direction, and the baseline. Expressed in the right camera's frame, those are $R\hat{\mathbf{x}}_L$, $\hat{\mathbf{x}}_R$, and $\mathbf{t}$. Coplanarity of three vectors means their scalar triple product vanishes:
+</p>
+<p>
+$$ \hat{\mathbf{x}}_R \cdot \big( \mathbf{t} \times R\,\hat{\mathbf{x}}_L \big) = 0. $$
+</p>
+<p>
+The cross product with $\mathbf{t}$ is a linear map, so write it as the skew-symmetric matrix $[\mathbf{t}]_\times$, where $[\mathbf{t}]_\times \mathbf{v} = \mathbf{t} \times \mathbf{v}$:
+</p>
+<p>
+$$ [\mathbf{t}]_\times = \begin{pmatrix} 0 &amp; -t_z &amp; t_y \\ t_z &amp; 0 &amp; -t_x \\ -t_y &amp; t_x &amp; 0 \end{pmatrix}, \qquad \hat{\mathbf{x}}_R^\top \underbrace{[\mathbf{t}]_\times R}_{E} \, \hat{\mathbf{x}}_L = 0. $$
+</p>
+<p>
+That is the whole derivation. The <strong>essential matrix</strong> $E = [\mathbf{t}]_\times R$ packages the unknown camera motion into one matrix, and the constraint $\hat{\mathbf{x}}_R^\top E \,\hat{\mathbf{x}}_L = 0$ must hold for <em>every</em> correspondence. Its structure mirrors its construction: $E$ has rank 2 (because $[\mathbf{t}]_\times$ does; $\mathbf{t}$ itself is its null vector), its two nonzero singular values are equal, and it has five degrees of freedom: three for rotation, two for the direction of translation. The missing sixth is the length of $\mathbf{t}$: from images alone, a small scene with a small baseline is indistinguishable from a large scene with a large baseline. Two-view geometry is reconstructible only <em>up to scale</em>, a fact that will echo through <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s structure from motion (and that stereo rigs sidestep by measuring their baseline with a ruler, as <a href="section-13.5.html">Section 13.5</a> exploits).
+</p>
+
+<h2>2. The Fundamental Matrix: The Same Idea, Uncalibrated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The essential matrix lives in normalized coordinates, which you can only compute if you know $K$. Substituting $\hat{\mathbf{x}} = K^{-1}\mathbf{x}$ into the constraint gives the pixel-coordinate version,
+</p>
+<p>
+$$ \mathbf{x}_R^\top \underbrace{K_R^{-\top} E \, K_L^{-1}}_{F} \, \mathbf{x}_L = 0, $$
+</p>
+<p>
+defining the <strong>fundamental matrix</strong> $F$. It is the same coplanarity statement wearing pixel units, which is what makes it practical: $F$ can be estimated from raw pixel matches with no calibration whatsoever. The price of generality is structure lost: $F$ keeps rank 2 (the epipoles are its null vectors: $F\mathbf{e}_L = 0$ and $F^\top \mathbf{e}_R = 0$), but its singular values are no longer constrained to be equal, leaving seven degrees of freedom (nine entries, minus one for overall scale, minus one for the rank-2 constraint). The geometric reading of <a href="section-13.1.html">Section 13.1</a> is built in: $\boldsymbol{\ell}_R = F\mathbf{x}_L$ is the right-image epipolar line of $\mathbf{x}_L$, and $\boldsymbol{\ell}_L = F^\top \mathbf{x}_R$ its mate.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Equation Per Match, Linear in the Unknowns</div>
+<p>The constraint $\mathbf{x}_R^\top F \mathbf{x}_L = 0$ is bilinear in the points but <em>linear</em> in the nine entries of $F$. Each correspondence therefore contributes one linear equation in nine unknowns, and since $F$ is only defined up to scale, eight matches suffice to solve for it as a null-space problem. This is the deepest practical fact in the section: a quantity that encodes camera rotation, translation direction, and both intrinsic matrices can be recovered by ordinary linear least squares on point coordinates. Whenever a vision problem can be rearranged so its unknowns enter linearly, an SVD will solve it; you saw the same move in homography fitting in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> and will see it again in triangulation in <a href="section-13.6.html">Section 13.6</a>.</p>
+</div>
+
+<h2>3. The Normalized Eight-Point Algorithm, From Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Expanding $\mathbf{x}_R^\top F \mathbf{x}_L = 0$ for a match $(x, y) \leftrightarrow (x', y')$ (primes for the right image) gives one row of a design matrix $A$:
+</p>
+<p>
+$$ \big(x'x,\; x'y,\; x',\; y'x,\; y'y,\; y',\; x,\; y,\; 1\big) \cdot \mathbf{f} = 0, $$
+</p>
+<p>
+where $\mathbf{f}$ stacks the entries of $F$ row by row. With $n \ge 8$ matches, the least-squares solution is the right singular vector of $A$ with the smallest singular value, after which the rank-2 constraint is enforced by zeroing the smallest singular value of the reshaped $F$. But there is a trap, and it is famous. The columns of $A$ mix products of pixel coordinates (magnitude $\sim 10^5$ for a 1000-pixel image) with raw coordinates ($\sim 10^3$) and ones. The resulting matrix is so badly conditioned that the original eight-point algorithm earned a reputation for uselessness, until Hartley's 1997 paper "In Defense of the Eight-Point Algorithm" showed the fix is one preprocessing step: translate the points of each image to their centroid and scale them so the average distance from the origin is $\sqrt{2}$, solve in normalized coordinates, then transform the result back. The code below implements the whole thing, normalization included.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def normalize_points(pts):
+    """Hartley normalization: centroid to origin, mean distance sqrt(2)."""
+    centroid = pts.mean(axis=0)
+    mean_dist = np.linalg.norm(pts - centroid, axis=1).mean()
+    s = np.sqrt(2.0) / mean_dist
+    T = np.array([[s, 0, -s * centroid[0]],
+                  [0, s, -s * centroid[1]],
+                  [0, 0, 1.0]])
+    pts_h = np.column_stack([pts, np.ones(len(pts))])   # to homogeneous
+    return (T @ pts_h.T).T, T
+
+def eight_point(ptsL, ptsR):
+    """Normalized 8-point algorithm: F such that x_R^T F x_L = 0."""
+    pL, TL = normalize_points(ptsL)
+    pR, TR = normalize_points(ptsR)
+    # one row of A per correspondence, linear in the 9 entries of F
+    A = np.column_stack([
+        pR[:, 0] * pL[:, 0], pR[:, 0] * pL[:, 1], pR[:, 0],
+        pR[:, 1] * pL[:, 0], pR[:, 1] * pL[:, 1], pR[:, 1],
+        pL[:, 0],            pL[:, 1],            np.ones(len(pL))])
+    _, _, Vt = np.linalg.svd(A)
+    F = Vt[-1].reshape(3, 3)            # null-space solution
+    U, S, Vt = np.linalg.svd(F)
+    F = U @ np.diag([S[0], S[1], 0.0]) @ Vt    # enforce rank 2
+    F = TR.T @ F @ TL                   # undo the normalizations
+    return F / F[2, 2]                  # fix the free scale
+
+F_ours = eight_point(ptsL[inl], ptsR[inl])   # inlier matches from Section 13.1
+print(np.round(F_ours / np.linalg.norm(F_ours), 6))
+print("rank:", np.linalg.matrix_rank(F_ours))   # rank: 2</code></pre>
+<div class="code-caption">The normalized eight-point algorithm in 30 lines: Hartley normalization conditions the design matrix, the SVD null space solves the linear system, a second SVD projects onto rank 2, and the similarity transforms are folded back so the returned $F$ operates on raw pixel coordinates.</div>
+
+<p>
+Two implementation notes repay attention. First, the rank-2 projection must come <em>before</em> denormalization conceptually, as written, and skipping it leaves epipolar lines that fail to meet at an epipole. Second, the quality of the result should be checked not by eyeballing matrix entries but by the residuals that matter: the epipolar distances of <a href="section-13.1.html">Section 13.1</a>, evaluated on held-out matches. With normalization, the from-scratch $F$ typically agrees with OpenCV's to within a fraction of a pixel of epipolar distance; without it, errors of tens of pixels are routine on the same data.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Best-Titled Rescue in Vision</div>
+<p>Hartley's paper really is titled "In Defense of the Eight-Point Algorithm", and it reads like a courtroom drama: the defendant (a 1981 algorithm by Longuet-Higgins) stood accused of hopeless noise sensitivity, sophisticated nonlinear methods were the prosecution, and the defense's entire case was "your honor, nobody scaled the coordinates." Few papers have improved so many downstream systems with one similarity transform.</p>
+</div>
+
+<h2>4. Estimation in the Real World: RANSAC and Degeneracies <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Real match sets contain outliers, so the eight-point solver never runs alone: it runs as the model-fitter inside the hypothesize-and-verify loop of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>'s RANSAC, with epipolar distance as the inlier test. Sample seven or eight matches, fit, count inliers, repeat, refit on the winners. OpenCV exposes this whole stack through one call, and its modern USAC backends (notably <code>cv2.USAC_MAGSAC</code>, implementing MAGSAC++) replace the hard inlier threshold with a marginalization over thresholds, which in practice removes the most fragile parameter. For calibrated cameras the better tool is <code>cv2.findEssentialMat</code>, which runs Nist&#233;r's five-point minimal solver inside the same robust loop; fewer points per sample means exponentially fewer iterations at the same outlier rate.
+</p>
+<p>
+Even with robustness, two <strong>degeneracies</strong> produce confident nonsense, and both are everyday occurrences rather than textbook curiosities. If all sampled matches lie on a single 3D plane (a wall, a floor, a building facade filling the frame), the data satisfies a homography, and a one-parameter family of fundamental matrices fits it perfectly; the estimate is arbitrary within that family. If the camera motion is (nearly) pure rotation, there is no baseline, no epipolar geometry exists at all, and whatever $F$ the solver returns is fiction. The practical symptom is identical in both cases: inlier counts look excellent, downstream triangulation explodes. The standard defense, used by COLMAP and ORB-SLAM alike, is to fit <em>both</em> a fundamental matrix and a homography to every pair and compare inlier support; when $H$ explains nearly as many matches as $F$, the pair is treated as planar or rotational, exactly the regime <a href="section-13.3.html">Section 13.3</a> covers.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: findEssentialMat and recoverPose</div>
+<p>The from-scratch stack of this section (normalization, eight-point solve, rank projection, RANSAC loop, decomposition, cheirality test) is about 200 lines. OpenCV compresses it to three: <code>E, mask = cv2.findEssentialMat(ptsL, ptsR, K, method=cv2.USAC_MAGSAC, prob=0.999, threshold=1.0)</code>, then <code>n, R, t, mask = cv2.recoverPose(E, ptsL, ptsR, K)</code>, a roughly 70-to-1 reduction. Internally the library runs the five-point solver on minimal samples (not eight-point, so planar scenes are far less degenerate), MAGSAC++ inlier scoring, the SVD decomposition of subsection 5, and the cheirality vote over all four motion candidates. What it does <em>not</em> do is decide whether your scene was degenerate to begin with; the $H$-versus-$F$ comparison remains your job.</p>
+</div>
+
+<h2>5. From E to Camera Motion: Four Candidates, One Survivor <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The essential matrix was built as $E = [\mathbf{t}]_\times R$, so it should be possible to take it apart again. The SVD does it: writing $E = U \operatorname{diag}(1, 1, 0) V^\top$ and defining the 90-degree rotation $W$ about the $z$-axis, the two candidate rotations are $R_1 = U W V^\top$ and $R_2 = U W^\top V^\top$ (sign-corrected to determinant $+1$), and the translation direction is $\mathbf{t} = \pm \mathbf{u}_3$, the last column of $U$. Two rotations times two translation signs gives <strong>four</strong> candidate motions, and all four reproduce $E$ exactly. Figure 13.2.1 shows what distinguishes them: in only one configuration does the scene sit <em>in front of both cameras</em>.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four candidate camera configurations from decomposing the essential matrix, each showing two cameras and a triangulated point; only in the first is the point in front of both cameras">
+  <!-- panel boxes -->
+  <g font-family="sans-serif" font-size="13">
+    <!-- Panel 1: correct -->
+    <rect x="20" y="30" width="190" height="230" fill="#eafaf1" stroke="#1e8449" stroke-width="2" rx="6"/>
+    <text x="115" y="52" text-anchor="middle" font-weight="bold" fill="#1e8449">(a) R&#8321;, +t</text>
+    <polygon points="60,220 75,196 90,220" fill="#2c3e50"/>
+    <polygon points="140,220 155,196 170,220" fill="#2c3e50"/>
+    <circle cx="115" cy="110" r="6" fill="#c0392b"/>
+    <line x1="75" y1="200" x2="115" y2="110" stroke="#c0392b" stroke-width="1.4"/>
+    <line x1="155" y1="200" x2="115" y2="110" stroke="#c0392b" stroke-width="1.4"/>
+    <text x="115" y="250" text-anchor="middle" fill="#1e8449" font-weight="bold">in front of both &#10003;</text>
+    <!-- Panel 2 -->
+    <rect x="225" y="30" width="190" height="230" fill="#fdf2f0" stroke="#c0392b" stroke-width="1.5" rx="6"/>
+    <text x="320" y="52" text-anchor="middle" font-weight="bold" fill="#5a626c">(b) R&#8321;, &#8722;t</text>
+    <polygon points="265,140 280,116 295,140" fill="#2c3e50" transform="rotate(180 280 128)"/>
+    <polygon points="345,140 360,116 375,140" fill="#2c3e50" transform="rotate(180 360 128)"/>
+    <circle cx="320" cy="225" r="6" fill="#c0392b"/>
+    <line x1="280" y1="136" x2="320" y2="225" stroke="#c0392b" stroke-width="1.4" stroke-dasharray="4,3"/>
+    <line x1="360" y1="136" x2="320" y2="225" stroke="#c0392b" stroke-width="1.4" stroke-dasharray="4,3"/>
+    <text x="320" y="250" text-anchor="middle" fill="#c0392b">behind both &#10007;</text>
+    <!-- Panel 3 -->
+    <rect x="430" y="30" width="190" height="230" fill="#fdf2f0" stroke="#c0392b" stroke-width="1.5" rx="6"/>
+    <text x="525" y="52" text-anchor="middle" font-weight="bold" fill="#5a626c">(c) R&#8322;, +t</text>
+    <polygon points="470,220 485,196 500,220" fill="#2c3e50"/>
+    <polygon points="550,140 565,116 580,140" fill="#2c3e50" transform="rotate(180 565 128)"/>
+    <circle cx="525" cy="170" r="6" fill="#c0392b"/>
+    <line x1="485" y1="200" x2="525" y2="170" stroke="#c0392b" stroke-width="1.4"/>
+    <line x1="565" y1="136" x2="525" y2="170" stroke="#c0392b" stroke-width="1.4" stroke-dasharray="4,3"/>
+    <text x="525" y="250" text-anchor="middle" fill="#c0392b">behind one &#10007;</text>
+    <!-- Panel 4 -->
+    <rect x="635" y="30" width="190" height="230" fill="#fdf2f0" stroke="#c0392b" stroke-width="1.5" rx="6"/>
+    <text x="730" y="52" text-anchor="middle" font-weight="bold" fill="#5a626c">(d) R&#8322;, &#8722;t</text>
+    <polygon points="675,140 690,116 705,140" fill="#2c3e50" transform="rotate(180 690 128)"/>
+    <polygon points="755,220 770,196 785,220" fill="#2c3e50"/>
+    <circle cx="730" cy="170" r="6" fill="#c0392b"/>
+    <line x1="690" y1="136" x2="730" y2="170" stroke="#c0392b" stroke-width="1.4" stroke-dasharray="4,3"/>
+    <line x1="770" y1="200" x2="730" y2="170" stroke="#c0392b" stroke-width="1.4"/>
+    <text x="730" y="250" text-anchor="middle" fill="#c0392b">behind one &#10007;</text>
+  </g>
+  <text x="420" y="300" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle">cheirality test: triangulate matches under each candidate, keep the one with positive depths in both views</text>
+</svg>
+<figcaption><strong>Figure 13.2.1</strong> The four motions hiding in one essential matrix. Decomposing $E$ yields two rotations and two translation signs; all four candidate configurations satisfy the epipolar constraint, but triangulated points (red) land in front of both cameras in exactly one of them (a). The dashed rays mark cameras that would have to see through the back of their own image plane.</figcaption>
+</figure>
+
+<p>
+The disambiguation in Figure 13.2.1 is called the <strong>cheirality test</strong>: triangulate a handful of matches (using <a href="section-13.6.html">Section 13.6</a>'s machinery) under each of the four candidates and count points with positive depth in both cameras. The true motion wins by a landslide; the impostors place points behind at least one camera. <code>cv2.recoverPose</code> performs this vote internally, which is why it asks for the point matches and not just $E$. The recovered $\mathbf{t}$ is, as always, a unit direction: the scale ambiguity of subsection 1 is not an implementation detail but a law.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Drone Mapper That Died on Flat Farmland</div>
+<p><strong>Who:</strong> A two-engineer team at an agritech startup building photogrammetry from fixed-wing drone surveys.</p>
+<p><strong>Situation:</strong> Their pipeline estimated pairwise essential matrices from SIFT matches, chained relative poses, and triangulated crop-field models. Over orchards and farm buildings it worked beautifully.</p>
+<p><strong>Problem:</strong> Over flat wheat fields, reconstructions intermittently shattered: camera poses jumped, triangulated terrain folded into impossible ridges. Inlier ratios looked <em>better</em> on the failing flights than on the successful ones, which confused the team for a week.</p>
+<p><strong>Decision:</strong> A flat field photographed from altitude is one big plane: the planar degeneracy of subsection 4, where a homography explains the matches and the essential-matrix fit is unconstrained along a family of solutions. Following the COLMAP playbook, they added a model-selection step: fit both $H$ and $E$ per pair, and when the homography's inlier count exceeded 85 percent of the essential matrix's, switch to homography-based pose recovery (<code>cv2.decomposeHomographyMat</code>, with plane-normal disambiguation across pairs).</p>
+<p><strong>Result:</strong> Failure rate on flat-terrain flights dropped from roughly one in three to below one in fifty, with no change to the matcher or the flight plan. The "too good" inlier ratios had been the planar tell all along.</p>
+<p><strong>Lesson:</strong> High inlier support means the model fits the data, not that the model is identifiable. Degenerate data fits many models perfectly; production pipelines must test for the degeneracy, not just the fit.</p>
+</div>
+
+<h2>6. E or F? Choosing Your Matrix <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A short decision rule closes the tour. Use the <strong>essential matrix</strong> whenever calibration is available: the five-point solver needs fewer RANSAC samples, the equal-singular-value structure regularizes the fit, and the output decomposes directly into $R$ and $\mathbf{t}$ for the reconstruction work of <a href="section-13.6.html">Section 13.6</a> and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>. Use the <strong>fundamental matrix</strong> when intrinsics are unknown or untrusted: stitching matches across photos from the internet, validating correspondences from an arbitrary camera, or the uncalibrated rectification of <a href="section-13.4.html">Section 13.4</a>. And before either, undistort: both matrices assume the straight-ray pinhole world that <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>'s distortion model restores.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Solvers, Learned and Otherwise</div>
+<p>The estimation problem of this section remains an active 2024-2026 battleground on three fronts. The robust-loop front: MAGSAC++ and the broader USAC framework (both in OpenCV since 4.5) are being joined by learned inlier scorers, descendants of differentiable RANSAC (DSAC), that weight correspondences with a network before a classical solver runs; libraries like PoseLib have become the standard home for fast minimal solvers. The correspondence front: dense matchers such as RoMa (CVPR 2024) and the matching head of MASt3R (ECCV 2024) feed thousands of high-quality matches to exactly the estimators taught here, and the 2023-2025 Image Matching Challenge leaderboards are dominated by such hybrid stacks. The end-to-end front: VGGT (CVPR 2025) skips $E$ and $F$ entirely, regressing camera poses directly from pixels with a transformer, and reporting pose accuracy competitive with optimization pipelines on standard benchmarks. Notably, even these end-to-end systems are <em>evaluated</em> by comparing against poses computed with the classical machinery of this section; the eight-point algorithm has become the measuring stick for its own would-be replacements.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.1: Counting Degrees of Freedom <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Account for every degree of freedom: starting from nine entries, derive why $F$ has seven degrees of freedom and $E$ has five. Then explain (a) why seven matches suffice in principle to estimate $F$ (the seven-point algorithm) and what goes wrong with the linear null-space approach at exactly seven points, and (b) which two constraints distinguish a valid $E$ from a generic rank-2 matrix, and how <code>cv2.findEssentialMat</code>'s five-point solver exploits them.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.2: Normalization Ablation <span class="exercise-type coding">Coding</span></div>
+<p>Take this section's <code>eight_point</code> and produce an un-normalized variant by deleting the two <code>normalize_points</code> calls and the denormalization line. On a real image pair with at least 200 inlier matches, run both variants on 100 random subsets of 20 matches each, and for every fit compute the mean symmetric epipolar distance on the held-out matches. Report the median and the 90th percentile error for each variant, and the condition number of the design matrix $A$ in both cases. How large is Hartley's one-transform improvement on your data?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.2.3: Watching the Cheirality Vote <span class="exercise-type analysis">Analysis</span></div>
+<p>Estimate $E$ for a calibrated image pair, decompose it by hand with the SVD recipe of subsection 5 into all four $(R, \mathbf{t})$ candidates, and triangulate all inlier matches under each candidate using <code>cv2.triangulatePoints</code>. For each candidate report the fraction of points with positive depth in both cameras, and verify the winner matches <code>cv2.recoverPose</code>'s output. Then degrade the geometry: repeat the experiment on a pair with a very short baseline (two frames of a nearly still camera). How decisive is the vote now, and what does that imply for structure-from-motion systems choosing which frame pairs to initialize from?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.1.html">&#8592; Section 13.1: Epipolar Geometry: The Geometry of Two Views</a>
+<a href="index.html">Chapter 13</a>
+<a class="next" href="section-13.3.html">Section 13.3: Homographies &amp; Panorama Stitching &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

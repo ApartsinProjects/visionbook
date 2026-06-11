@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 15: Motion, Optical Flow &amp; Tracking. Brightness constancy, Lucas-Kanade and Horn-Schunck optical flow, background subtraction, mean-shift and correlation-filter tracking, Kalman filters, and multi-object data association." name="description"/>
+<title>Chapter 15: Motion, Optical Flow &amp; Tracking | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Motion, Optical Flow &amp; Tracking</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A photograph tells you where everything is. A video tells you where everything is going, provided you can keep up with thirty deadlines per second."</p>
+<cite>An Overcommitted Motion Vector</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Video is not a stack of unrelated photographs; it is a measurement of motion, and this chapter builds the classical instruments that read it.</strong> Two questions organize everything. First, how does each pixel move from one frame to the next? That is optical flow, and it powers stabilization, frame interpolation, motion segmentation, and the feature tracks that fed <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s reconstructions. Second, how does an object move across hundreds of frames, through occlusions, lighting changes, and lookalike distractors? That is tracking, and it requires not just measurement but memory: a motion model, an uncertainty estimate, and a policy for deciding which detection belongs to which identity. Both questions return, learned end to end, in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>, and the state-estimation machinery built here grows into the world models of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Every chapter so far has treated the image as a frozen instant. <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> came closest to motion: it moved a camera through a static world and recovered geometry from the parallax. This chapter inverts the arrangement. Now the world itself moves, and the question is no longer "where is the camera?" but "what is moving, where is it going, and which thing is it?" Those are genuinely different problems. A pixel that brightens might be an object arriving, a shadow leaving, or a cloud uncovering the sun, and nothing in a single frame can tell you which. Time is a new measurement axis, and like every measurement axis it comes with its own noise, its own aliasing, and its own beautiful, treacherous ambiguities.
+</p>
+<p>
+The first half of the chapter is about pixel motion. Section 15.1 lays the foundations: the distinction between the motion field (the geometric truth) and optical flow (what brightness patterns appear to do), the brightness constancy assumption that links them, and the aperture problem that makes flow locally unknowable in one direction. Section 15.2 turns one unsolvable equation into a solvable system by assuming flow is constant over a small window: the Lucas-Kanade method, whose normal-equations matrix turns out to be exactly the structure tensor of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>. Corners, it emerges, are not just matchable; they are trackable, and the KLT tracker built on this insight has run for four decades. Section 15.3 goes dense: Horn-Schunck's global energy, the smoothness prior that fills in flow where data is silent, and the variational lineage that leads to the modern OpenCV workhorses.
+</p>
+<p>
+The second half is about object motion. Section 15.4 exploits the easiest special case, a static camera, where modeling each pixel's history separates the boring background from the interesting foreground: frame differencing, running Gaussians, and the mixture-of-Gaussians models that survive waving trees and flickering lamps. Section 15.5 follows a single chosen object through the frame: mean-shift climbing a color-histogram likelihood, correlation filters matching templates at Fourier speed, and the drift-versus-adaptation dilemma that haunts every template update. Section 15.6 adds the missing ingredients for multi-object tracking: the Kalman filter, which predicts where each object will be and how sure to be about it, and data association, which decides via the Hungarian algorithm which detection belongs to which track. The SORT family assembled from these pieces still underpins production trackers today.
+</p>
+<p>
+One theme runs through all six sections. Motion estimation is ill-posed: the data never fully determines the answer, so every method is an assumption about constancy plus a prior about smoothness, wrapped around the same least-squares core. Lucas-Kanade assumes local constancy; Horn-Schunck assumes global smoothness; background subtraction assumes temporal stationarity; the Kalman filter assumes dynamic linearity. When the assumption holds, the method works; when it breaks, the failure is diagnosable. Learning that diagnosis is the real skill this chapter teaches, and it transfers intact to the deep methods of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>, which replace the hand-chosen priors with learned ones but inherit every one of the underlying ambiguities.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter leans hard on image gradients and convolution from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a>; the optical flow constraint is built from spatial and temporal derivatives. Pyramids from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a> reappear in pyramidal Lucas-Kanade and coarse-to-fine flow, and Chapter 4's convolution theorem explains why correlation-filter trackers run at hundreds of frames per second. Histograms and back-projection from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a> drive mean-shift tracking, and the morphological cleanup of <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a> turns raw foreground masks into usable blobs. The structure tensor and Shi-Tomasi detector from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a> are reused directly in Section 15.2. Familiarity with <a href="../module-14-sfm-visual-slam/index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a> helps motivate feature tracks but is not required.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">15.1</span>
+<a href="section-15.1.html"><span class="section-title">Motion Fields &amp; the Brightness Constancy Assumption</span></a>
+<span class="section-desc">What motion looks like from inside an image: the motion field versus optical flow, the brightness constancy assumption, the optical flow constraint equation, and the aperture problem.</span>
+</li>
+<li>
+<span class="section-num">15.2</span>
+<a href="section-15.2.html"><span class="section-title">Sparse Flow: Lucas-Kanade &amp; Feature Tracking</span></a>
+<span class="section-desc">Solving the unsolvable by assuming local constancy: least-squares flow in a window, the structure tensor as trackability test, pyramidal coarse-to-fine refinement, and the KLT tracker.</span>
+</li>
+<li>
+<span class="section-num">15.3</span>
+<a href="section-15.3.html"><span class="section-title">Dense Flow: Horn-Schunck to Variational Methods</span></a>
+<span class="section-desc">A flow vector for every pixel: the Horn-Schunck energy, smoothness priors that fill in untextured regions, robust penalties at motion boundaries, and the Farneback and DIS workhorses.</span>
+</li>
+<li>
+<span class="section-num">15.4</span>
+<a href="section-15.4.html"><span class="section-title">Background Subtraction &amp; Change Detection</span></a>
+<span class="section-desc">Static cameras and per-pixel memory: frame differencing, running averages, mixture-of-Gaussians background models, shadow handling, and morphological mask cleanup into object blobs.</span>
+</li>
+<li>
+<span class="section-num">15.5</span>
+<a href="section-15.5.html"><span class="section-title">Object Tracking: Mean-Shift, Correlation Filters &amp; Re-Detection</span></a>
+<span class="section-desc">Following one object through the frame: histogram back-projection and mean-shift, MOSSE and KCF correlation filters at Fourier speed, drift, and re-detection strategies.</span>
+</li>
+<li>
+<span class="section-num">15.6</span>
+<a href="section-15.6.html"><span class="section-title">Kalman Filters &amp; Multi-Object Data Association</span></a>
+<span class="section-desc">Tracking as state estimation: the predict-update cycle, uncertainty propagation, gating, the Hungarian algorithm, and the SORT family of detection-based multi-object trackers.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+With motion, the classical toolkit is nearly complete: Part II has found edges, keypoints, regions, geometry, and now trajectories. What it has not yet done is name things. <a href="../module-16-classical-recognition/index.html">Chapter 16: Classical Recognition Pipelines</a> takes up recognition the pre-deep-learning way: bag-of-visual-words built from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>'s descriptors, HOG templates, deformable part models, and the classifiers that powered a decade of detection. It is the chapter where classical vision reaches for semantics and discovers its limits, which is exactly the cliffhanger that Part III's neural networks resolve.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Horn, B. K. P. and Schunck, B. G. "Determining Optical Flow." Artificial Intelligence 17 (1981). <a href="https://doi.org/10.1016/0004-3702(81)90024-2" target="_blank" rel="noopener">doi:10.1016/0004-3702(81)90024-2</a></div>
+<div class="bib-annotation">The paper that defined dense optical flow as energy minimization: brightness constancy plus a global smoothness prior. Section 15.3 derives and implements its iterative scheme.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lucas, B. D. and Kanade, T. "An Iterative Image Registration Technique with an Application to Stereo Vision." IJCAI (1981). <a href="https://www.ri.cmu.edu/pub_files/pub3/lucas_bruce_d_1981_1/lucas_bruce_d_1981_1.pdf" target="_blank" rel="noopener">ri.cmu.edu (PDF)</a></div>
+<div class="bib-annotation">The other 1981 flow paper: local least squares in a window, with the Newton-style iteration that still runs inside every KLT implementation. The heart of Section 15.2.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Shi, J. and Tomasi, C. "Good Features to Track." CVPR (1994). <a href="https://doi.org/10.1109/CVPR.1994.323794" target="_blank" rel="noopener">doi:10.1109/CVPR.1994.323794</a></div>
+<div class="bib-annotation">Closed the loop between detection and tracking: the points worth tracking are exactly those where the Lucas-Kanade system is well conditioned. Completes the KLT acronym.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Comaniciu, D. and Meer, P. "Mean Shift: A Robust Approach Toward Feature Space Analysis." IEEE TPAMI (2002). <a href="https://doi.org/10.1109/34.1000236" target="_blank" rel="noopener">doi:10.1109/34.1000236</a></div>
+<div class="bib-annotation">The definitive treatment of mean-shift mode seeking, the engine behind Section 15.5's histogram tracker and a clustering tool far beyond tracking.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Bolme, D. S., Beveridge, J. R., Draper, B. A., and Lui, Y. M. "Visual Object Tracking using Adaptive Correlation Filters." CVPR (2010). <a href="https://doi.org/10.1109/CVPR.2010.5539960" target="_blank" rel="noopener">doi:10.1109/CVPR.2010.5539960</a></div>
+<div class="bib-annotation">MOSSE: tracking as template correlation computed in the Fourier domain, at over 600 frames per second on 2010 hardware. The opening move of Section 15.5's correlation-filter story.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kalman, R. E. "A New Approach to Linear Filtering and Prediction Problems." Journal of Basic Engineering (1960). <a href="https://doi.org/10.1115/1.3662552" target="_blank" rel="noopener">doi:10.1115/1.3662552</a></div>
+<div class="bib-annotation">The original Kalman filter paper. Section 15.6's predict-update cycle, uncertainty propagation, and optimal gain all trace to these eleven pages.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zivkovic, Z. "Improved Adaptive Gaussian Mixture Model for Background Subtraction." ICPR (2004). <a href="https://doi.org/10.1109/ICPR.2004.1333992" target="_blank" rel="noopener">doi:10.1109/ICPR.2004.1333992</a></div>
+<div class="bib-annotation">The algorithm behind OpenCV's MOG2 background subtractor: per-pixel Gaussian mixtures with an automatically chosen number of components. Section 15.4's workhorse.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Bewley, A., Ge, Z., Ott, L., Ramos, F., and Upcroft, B. "Simple Online and Realtime Tracking." ICIP (2016). <a href="https://arxiv.org/abs/1602.00763" target="_blank" rel="noopener">arXiv:1602.00763</a></div>
+<div class="bib-annotation">SORT: Kalman prediction plus Hungarian association plus IoU cost, nothing else, and yet competitive with far heavier trackers. Section 15.6 rebuilds it in miniature.</div>
+</div>
+
+<h3>Recent Research (2020-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Teed, Z. and Deng, J. "RAFT: Recurrent All-Pairs Field Transforms for Optical Flow." ECCV (2020). <a href="https://arxiv.org/abs/2003.12039" target="_blank" rel="noopener">arXiv:2003.12039</a></div>
+<div class="bib-annotation">The deep flow architecture that ended the variational era on the benchmarks: all-pairs correlation volumes refined by a recurrent update operator. The bridge from Section 15.3 to Chapter 26.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, Y., Lipson, L., and Deng, J. "SEA-RAFT: Simple, Efficient, Accurate RAFT for Optical Flow." ECCV (2024). <a href="https://arxiv.org/abs/2405.14793" target="_blank" rel="noopener">arXiv:2405.14793</a></div>
+<div class="bib-annotation">RAFT made fast and robust: mixture-of-Laplace loss and architectural simplifications that brought state-of-the-art flow to real-time rates, referenced in Sections 15.1 and 15.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, Y. et al. "ByteTrack: Multi-Object Tracking by Associating Every Detection Box." ECCV (2022). <a href="https://arxiv.org/abs/2110.06864" target="_blank" rel="noopener">arXiv:2110.06864</a></div>
+<div class="bib-annotation">Showed that low-confidence detections are association gold, not garbage: a two-stage matching cascade that fixed most occlusion-induced identity switches. Discussed in Section 15.6.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ravi, N. et al. "SAM 2: Segment Anything in Images and Videos." (2024). <a href="https://arxiv.org/abs/2408.00714" target="_blank" rel="noopener">arXiv:2408.00714</a></div>
+<div class="bib-annotation">Promptable video segmentation with a streaming memory: click an object once and SAM 2 segments and follows it. The modern answer to Section 15.5's single-object tracking problem.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Karaev, N. et al. "CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling Real Videos." (2024). <a href="https://arxiv.org/abs/2410.11831" target="_blank" rel="noopener">arXiv:2410.11831</a></div>
+<div class="bib-annotation">The track-any-point line of work: a transformer that follows thousands of points jointly through occlusions, the direct learned descendant of Section 15.2's KLT tracker.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 9 covers motion estimation and Chapter 7.1 feature tracking, with full derivations and exhaustive references; free online.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Labbe, R. <em>Kalman and Bayesian Filters in Python</em>. <a href="https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python" target="_blank" rel="noopener">github.com/rlabbe</a></div>
+<div class="bib-annotation">A free, executable Jupyter book that builds Kalman filtering from intuition to full multivariate theory; the companion <code>filterpy</code> library is used in Section 15.6's library shortcut.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Optical Flow" tutorial. <a href="https://docs.opencv.org/4.x/d4/dee/tutorial_optical_flow.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The official OpenCV 4.x walkthrough of Lucas-Kanade and Farneback flow, the APIs used throughout this chapter's code, with runnable samples.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-14-sfm-visual-slam/index.html">&#8592; Chapter 14: Structure from Motion &amp; Visual SLAM</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="../module-16-classical-recognition/index.html">Chapter 16: Classical Recognition Pipelines &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 14.1: Feature Tracks &amp; Correspondence Across Many Views. Building geometrically verified match graphs over image collections and stitching pairwise matches into multi-view feature tracks, the atoms of 3D reconstruction." name="description"/>
+<title>Section 14.1: Feature Tracks &amp; Correspondence Across Many Views | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>Feature Tracks &amp; Correspondence Across Many Views</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I have been photographed from forty-three angles and recognized in all of them. My therapist says I should stop calling it surveillance and start calling it a track."</p>
+<cite>A Frequently Observed Corner Point</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Multi-view reconstruction begins by discovering, among millions of keypoints scattered across hundreds of images, which detections are pictures of the same physical point; those equivalence classes, called feature tracks, are the atoms from which structure and motion are built.</strong> This section scales the pairwise matching of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> to whole collections: first a match graph whose edges are geometrically verified image pairs, then a transitive stitching step that chains pairwise matches into tracks spanning many views. Everything downstream, the incremental reconstruction of <a href="section-14.2.html">Section 14.2</a> and the bundle adjustment of <a href="section-14.3.html">Section 14.3</a>, consumes tracks, not matches.</p>
+</div>
+
+<p>
+<a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> ended with a complete two-view toolkit: match keypoints, estimate the essential matrix, recover pose, triangulate. Pointing that toolkit at a folder of two hundred photos raises three questions it cannot answer. Which of the 19,900 possible pairs are worth matching at all? Among the pairs we do match, which matches survive geometric scrutiny? And how do we discover that the corner of a windowsill detected in image 12 is the same corner detected in images 13, 47, and 181, when no single pairwise match connects 12 to 181 directly? The answers are, in order: pair selection, geometric verification, and track building. Together they convert a pile of images into the data structure every reconstruction algorithm actually consumes.
+</p>
+
+<h2>1. From Pairs to a Match Graph <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The organizing object is the <strong>match graph</strong> (also called the scene graph or view graph): one node per image, one edge per image pair that shares verified correspondences, with the matches themselves stored on the edge. For a small collection the construction is brute force: detect and describe keypoints in every image once, then match every pair. The cost structure is worth internalizing immediately. Feature extraction is linear in the number of images $N$, but pairwise matching is quadratic: $\binom{N}{2}$ pairs, each costing a descriptor-space search. At $N = 200$ that is 19,900 matching problems; at $N = 10{,}000$ it is fifty million, which is why Section 5 below is about avoiding exhaustive matching entirely.
+</p>
+<p>
+The listing below builds the verified match graph for a directory of photos with the tools you already own: SIFT detection from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, ratio-test matching, and essential-matrix verification from <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, here with the camera intrinsics $K$ known from a <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> calibration.
+</p>
+
+<pre><code class="language-python">import itertools
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+paths = sorted(Path("scene").glob("*.jpg"))
+sift = cv2.SIFT_create(nfeatures=4000)
+
+feats = []                                   # per-image (keypoints, descriptors)
+for p in paths:
+    img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    feats.append(sift.detectAndCompute(img, None))
+
+K = np.array([[1200.0, 0, 960], [0, 1200.0, 540], [0, 0, 1]])  # from calibration
+bf = cv2.BFMatcher(cv2.NORM_L2)
+
+graph = {}                                   # (i, j) -> list of (kp_idx_i, kp_idx_j)
+for i, j in itertools.combinations(range(len(paths)), 2):
+    knn = bf.knnMatch(feats[i][1], feats[j][1], k=2)
+    good = [m for m, n in knn if m.distance &lt; 0.8 * n.distance]
+    if len(good) &lt; 30:                       # too little evidence: skip the pair
+        continue
+    pi = np.float32([feats[i][0][m.queryIdx].pt for m in good])
+    pj = np.float32([feats[j][0][m.trainIdx].pt for m in good])
+    E, inl = cv2.findEssentialMat(pi, pj, cameraMatrix=K,
+                                  method=cv2.USAC_MAGSAC, threshold=1.5)
+    if E is None or inl is None or inl.sum() &lt; 30:
+        continue                             # no consistent epipolar geometry
+    keep = inl.ravel().astype(bool)
+    graph[(i, j)] = [(good[t].queryIdx, good[t].trainIdx)
+                     for t in np.flatnonzero(keep)]
+
+n_pairs = len(paths) * (len(paths) - 1) // 2
+print(f"{len(graph)} verified edges out of {n_pairs} candidate pairs")
+# 214 verified edges out of 19900 candidate pairs</code></pre>
+<div class="code-caption">Exhaustive construction of a verified match graph: SIFT features extracted once per image, ratio-test matching per pair, and a MAGSAC essential-matrix fit whose inliers become the edge; pairs with fewer than 30 surviving correspondences never enter the graph.</div>
+
+<p>
+Note the shape of the printed result: out of nearly twenty thousand candidate pairs, a couple of hundred carry real geometric signal. A typical photo collection is sparse in exactly this way, because most image pairs simply do not overlap. The match graph makes that sparsity explicit and gives later stages a map of what connects to what: its connected components are the independently reconstructable pieces of the scene, and its edge weights (inlier counts) will drive the seed-pair and next-view choices of <a href="section-14.2.html">Section 14.2</a>.
+</p>
+
+<h2>2. Geometric Verification: Edges You Can Trust <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The ratio test filters ambiguity, but as <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> warned, confidently wrong matches sail through it. The verification step in the listing above is therefore not optional hygiene; it is the difference between a match graph and a rumor mill. Fitting an essential matrix with RANSAC enforces the one constraint that binds all true matches in a pair: they must be consistent with a single rigid camera motion. Surviving inliers are matches that vote for the same epipolar geometry; everything else is discarded before it can poison the graph.
+</p>
+<p>
+One refinement matters in practice. Some image pairs are related by a <strong>homography</strong> rather than general epipolar geometry: pairs that look at a flat wall, or pairs taken from nearly the same position with the camera merely rotated, the panorama case from <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>. For such pairs an essential matrix is poorly determined and triangulation from them is hopeless, because rays from coincident centers never converge. Production systems fit both models, $E$ and $H$, and store which one explains the matches better (COLMAP records exactly this on every edge). A pair whose inliers are mostly explained by $H$ is kept for connectivity but flagged as a poor source of 3D structure, a flag that <a href="section-14.2.html">Section 14.2</a> will read when it chooses its initialization pair.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: An Edge Is a Geometric Claim, Not an Appearance Claim</div>
+<p>Descriptor similarity says "these patches look alike"; a verified edge says "these images saw the same rigid structure from two positions, and here are the correspondences consistent with that motion." Only the second statement supports reconstruction. The entire reliability of multi-view SfM rests on performing this upgrade on every edge before any global reasoning happens, because a single unverified edge between two look-alike facades can weld together parts of the scene that were never near each other.</p>
+</div>
+
+<h2>3. Stitching Matches into Tracks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A pairwise match says keypoint $a$ in image $i$ corresponds to keypoint $b$ in image $j$. Matches are transitive in principle: if $(i,a) \leftrightarrow (j,b)$ and $(j,b) \leftrightarrow (k,c)$, then $(i,a)$, $(j,b)$, $(k,c)$ are all observations of one physical 3D point, even if images $i$ and $k$ were never matched against each other. The maximal sets obtained by closing this relation transitively are the <strong>feature tracks</strong>. Formally, build a graph whose nodes are (image, keypoint) pairs and whose edges are all verified matches; tracks are its connected components. Figure 14.1.1 shows the two layers of the construction side by side.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel: a match graph with five image nodes and verified edges labeled with inlier counts. Right panel: four image frames in a row with one feature track threading through keypoints in each frame.">
+  <text x="190" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">match graph (images)</text>
+  <!-- match graph nodes -->
+  <g font-family="sans-serif" font-size="12" fill="#ffffff" text-anchor="middle">
+    <circle cx="110" cy="90" r="22" fill="#2c3e50"/><text x="110" y="94">I&#8321;</text>
+    <circle cx="270" cy="80" r="22" fill="#2c3e50"/><text x="270" y="84">I&#8322;</text>
+    <circle cx="320" cy="200" r="22" fill="#2c3e50"/><text x="320" y="204">I&#8323;</text>
+    <circle cx="180" cy="265" r="22" fill="#2c3e50"/><text x="180" y="269">I&#8324;</text>
+    <circle cx="70" cy="190" r="22" fill="#2c3e50"/><text x="70" y="194">I&#8325;</text>
+  </g>
+  <!-- edges with inlier counts -->
+  <g stroke="#27ae60" stroke-width="3" fill="none">
+    <line x1="130" y1="83" x2="249" y2="80"/>
+    <line x1="287" y1="96" x2="307" y2="181"/>
+    <line x1="300" y1="212" x2="201" y2="258"/>
+    <line x1="88" y1="177" x2="94" y2="106"/>
+  </g>
+  <line x1="160" y1="252" x2="89" y2="203" stroke="#b9770e" stroke-width="1.6" stroke-dasharray="6,4"/>
+  <g font-family="sans-serif" font-size="11.5" fill="#145a32">
+    <text x="188" y="71">412 inliers</text>
+    <text x="312" y="140">358</text>
+    <text x="262" y="248">240</text>
+    <text x="46" y="142">198</text>
+  </g>
+  <text x="100" y="244" font-family="sans-serif" font-size="11.5" fill="#7d6608">31 (weak)</text>
+  <text x="190" y="312" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">edges = geometrically verified pairs</text>
+
+  <!-- right panel: a track through four frames -->
+  <text x="590" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">one feature track (keypoints)</text>
+  <g fill="#fbfcfc" stroke="#d5dbdb">
+    <rect x="420" y="55" width="80" height="60"/>
+    <rect x="515" y="95" width="80" height="60"/>
+    <rect x="610" y="140" width="80" height="60"/>
+    <rect x="520" y="215" width="80" height="60"/>
+  </g>
+  <g font-family="sans-serif" font-size="11" fill="#5a626c">
+    <text x="426" y="69">I&#8321;</text><text x="521" y="109">I&#8322;</text>
+    <text x="616" y="154">I&#8323;</text><text x="526" y="229">I&#8324;</text>
+  </g>
+  <!-- other keypoints -->
+  <g fill="#aab7c4">
+    <circle cx="440" cy="100" r="3"/><circle cx="480" cy="75" r="3"/>
+    <circle cx="535" cy="140" r="3"/><circle cx="580" cy="110" r="3"/>
+    <circle cx="630" cy="185" r="3"/><circle cx="670" cy="155" r="3"/>
+    <circle cx="545" cy="260" r="3"/><circle cx="585" cy="235" r="3"/>
+  </g>
+  <!-- the track -->
+  <g fill="#c0392b">
+    <circle cx="462" cy="88" r="5.5"/><circle cx="556" cy="124" r="5.5"/>
+    <circle cx="652" cy="170" r="5.5"/><circle cx="560" cy="246" r="5.5"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="2" fill="none">
+    <line x1="462" y1="88" x2="556" y2="124"/>
+    <line x1="556" y1="124" x2="652" y2="170"/>
+    <line x1="652" y1="170" x2="560" y2="246"/>
+  </g>
+  <text x="590" y="302" font-family="sans-serif" font-size="12.5" fill="#922b21" text-anchor="middle">four observations, one 3D point</text>
+  <text x="590" y="320" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">track = connected component of matched keypoints</text>
+</svg>
+<figcaption><strong>Figure 14.1.1</strong> The two graphs of multi-view correspondence. Left: the match graph over images, where each solid edge carries geometrically verified matches and the dashed edge is a weak pair that barely passed verification. Right: zooming into the keypoint level, a single feature track threads one detection per image across four views; the track is the unit that Section 14.2 will triangulate into one 3D point.</figcaption>
+</figure>
+
+<p>
+Computing connected components over a few million (image, keypoint) nodes calls for the classic union-find (disjoint-set) structure: near-constant-time merging with path compression. The implementation below also applies the one consistency filter no track builder should skip: a legitimate physical point can appear at most once per image, so any track containing two keypoints from the same image has merged two different 3D points via a bad match and must be rejected (or split, in more careful systems).
+</p>
+
+<pre><code class="language-python">from collections import defaultdict
+
+class UnionFind:
+    def __init__(self):
+        self.parent = {}
+    def find(self, x):
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]   # path compression
+            x = self.parent[x]
+        return x
+    def union(self, a, b):
+        self.parent[self.find(a)] = self.find(b)
+
+uf = UnionFind()
+for (i, j), pairs in graph.items():          # graph from the previous listing
+    for a, b in pairs:
+        uf.union((i, a), (j, b))             # node = (image index, keypoint index)
+
+components = defaultdict(list)
+for node in list(uf.parent):
+    components[uf.find(node)].append(node)
+
+tracks = []
+for members in components.values():
+    images = [im for im, _ in members]
+    if len(members) &gt;= 3 and len(set(images)) == len(images):
+        tracks.append(sorted(members))       # consistent: one keypoint per image
+
+lengths = np.array([len(t) for t in tracks])
+print(f"{len(tracks)} tracks, mean length {lengths.mean():.1f}, max {lengths.max()}")
+# 23741 tracks, mean length 4.6, max 41</code></pre>
+<div class="code-caption">Track building as union-find over (image, keypoint) nodes: every verified match merges two nodes, connected components become candidate tracks, and the consistency filter drops any component that claims to appear twice in one image, the signature of a transitive mismatch.</div>
+
+<p>
+The track-length histogram this prints is a diagnostic worth a glance on every dataset. Long tracks (a point seen in many views) are gold: they constrain many cameras at once and triangulate accurately. A healthy collection of a few hundred overlapping photos typically yields mean track lengths between 4 and 7. If almost everything has length 2, your pair selection is too sparse or your scene has little revisitation; if a few tracks have implausible lengths spanning unrelated parts of the collection, repeated structure is gluing distinct points together, which brings us to the failure modes.
+</p>
+
+<h2>4. Why Tracks Go Wrong <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Transitivity is the power and the danger of track building. One bad match anywhere in a chain welds two unrelated physical points into a single track, and the error propagates: a track contaminated in images 3 and 4 misleads triangulation in images 5 through 9. The classic culprits are <strong>repeated structure</strong> (identical windows, tiles, lampposts: the same trap flagged in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, now with global consequences) and <strong>self-similar texture</strong> at low resolution. The single-image consistency filter above catches many such merges, because gluing two points usually eventually claims two detections in some image. The rest are caught downstream by geometric residuals: <a href="section-14.2.html">Section 14.2</a> discards track observations with large reprojection error, and the robust losses of <a href="section-14.3.html">Section 14.3</a> mute whatever survives.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Office Block That Folded Onto Itself</div>
+<p><strong>Who:</strong> A two-person reconstruction team at a drone-survey startup delivering facade inspection models for property managers.</p>
+<p><strong>Situation:</strong> A routine 600-photo orbit of a 1970s office block: a grid of several hundred visually identical windows on each face.</p>
+<p><strong>Problem:</strong> The reconstruction came back physically impossible: two opposite building faces fused into one, with cameras from the north orbit placed inside the south facade. The match graph had verified edges between images of <em>different</em> faces, because window-corner descriptors matched across faces and, with hundreds of coplanar repeats, even RANSAC found a self-consistent (and wrong) epipolar geometry.</p>
+<p><strong>Decision:</strong> Three changes: tighten the ratio test from 0.8 to 0.7 for this scene class; require verified pairs to be plausible under the drone's GPS track (no edges between photos taken more than 40 meters apart); and raise the minimum inlier count per edge from 30 to 100 so that only edges with overwhelming evidence survived.</p>
+<p><strong>Result:</strong> The folded geometry disappeared and the model became deliverable. Total verified edges dropped by 22 percent; reconstruction completeness was unaffected because the dropped edges were either wrong or redundant.</p>
+<p><strong>Lesson:</strong> On repetitive architecture the match graph is the attack surface. Cheap priors (GPS, capture order, stricter thresholds) applied at graph construction time prevent failures that no amount of downstream optimization can repair.</p>
+</div>
+
+<h2>5. Pair Selection at Scale <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Exhaustive matching at $N = 10{,}000$ images means $5 \times 10^7$ pairs; at internet scale it is out of the question. The escape is to predict which pairs overlap before matching them, and three families of strategies cover practice. <strong>Sequential matching</strong> exploits capture order: in video or a walking capture, each frame is matched only against its $w$ temporal neighbors (plus occasional long-range checks for revisits), turning the quadratic cost linear. <strong>Retrieval-based matching</strong> treats pair selection as image search: compress every image into a compact global signature, query each image against the rest, and match only the top-$k$ most similar. The classical signature is the bag-of-visual-words vector over quantized descriptors, accelerated by a vocabulary tree; this is precisely the retrieval machinery that <a href="../module-16-classical-recognition/index.html">Chapter 16</a> develops in full, and its modern replacement is a learned global descriptor such as NetVLAD. <strong>Prior-based matching</strong> uses whatever side information exists: GPS tags, capture timestamps, or a previous coarse reconstruction.
+</p>
+<p>
+All of this, extraction, matching, verification, and the bookkeeping database, is a solved engineering problem, and unless you are building a custom pipeline you should not rewrite it.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: pycolmap Builds the Whole Match Graph in Three Calls</div>
+<p>The roughly 45 lines of the two listings above (plus the camera database, GPU batching, and two-model $E$/$H$ verification we did not write) collapse to three lines with COLMAP's Python bindings: <code>pycolmap.extract_features(db, image_dir)</code>, then <code>pycolmap.match_exhaustive(db)</code> (or <code>match_sequential</code> / <code>match_vocabtree</code> / <code>match_spatial</code> for the strategies of this section), and the verified graph lands in a SQLite database that the mapper of <a href="section-14.2.html">Section 14.2</a> reads directly. Internally COLMAP handles GPU SIFT, guided matching, both essential-matrix and homography verification per pair with degeneracy flags, and watermark and duplicate detection: a 15-to-1 reduction in code you write and a far larger reduction in code you would have to debug.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Correspondence Without Detectors</div>
+<p>The pipeline of this section assumes detect-then-match, but the strongest 2024-2026 systems increasingly do not. LightGlue (ICCV 2023) made learned matching fast enough to replace ratio-test matching inside SfM wholesale, and hloc packages it as a drop-in COLMAP front end. Detector-Free SfM (He et al., CVPR 2024) skips keypoint detection entirely, building tracks from dense semi-dense matchers like LoFTR and refining them with a transformer, which roughly doubles registered images on texture-poor benchmarks. MASt3R (ECCV 2024) goes further: a two-view network that outputs matched 3D pointmaps directly, with correspondence as a by-product; its descendants (MASt3R-SfM, 2024) assemble whole reconstructions from these priors. And VGGT (CVPR 2025) drops explicit correspondence altogether, regressing cameras and geometry for hundreds of views in one transformer pass. The representations powering all of these are the learned features of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and the attention machinery of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>; the evaluation framework they are judged by is still the one built here.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.1.1: The Price of Transitivity <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose each pairwise match is independently correct with probability $p = 0.95$ after verification. A track of length $L$ is built from a chain of $L - 1$ matches. What is the probability that a length-10 track contains no wrong link? Now explain why the single-image consistency filter catches many, but not all, contaminated tracks: construct a concrete arrangement of two physical points and four images in which a merged track never visits the same image twice. What downstream signal (think reprojection, Section 14.2) would still expose it?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.1.2: Build and Profile a Track Table <span class="exercise-type coding">Coding</span></div>
+<p>Photograph a textured object or courtyard from 8 to 12 positions with generous overlap. Run the two listings of this section to produce tracks, then report: number of verified edges, number of tracks of length 2 or more (relax the length-3 filter to see the difference), mean and max track length, and a histogram of lengths. Repeat with the ratio test at 0.7 and 0.9 and with the minimum inlier count at 15 and 100. Which knob moves track quality most, and which moves track count most?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.1.3: Repetition Stress Test on the Match Graph <span class="exercise-type analysis">Analysis</span></div>
+<p>Capture or synthesize a scene with strong repetition (a tiled wall, a keyboard photographed from many angles). Build the match graph and inspect the edges connecting images that you know do <em>not</em> overlap. What fraction of candidate edges are spurious, and how many survive verification at thresholds of 1.0, 1.5, and 3.0 pixels? Then measure the rate of tracks rejected by the consistency filter as a function of the ratio-test threshold. Write three sentences relating your findings to why the practical-example team added GPS priors rather than relying on thresholds alone.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 14 Overview</a>
+<a href="index.html">Chapter 14</a>
+<a class="next" href="section-14.2.html">Section 14.2: Incremental Structure from Motion &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

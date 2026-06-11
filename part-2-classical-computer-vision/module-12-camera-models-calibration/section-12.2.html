@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.2: Lens Distortion &amp; Its Correction. Barrel and pincushion distortion, the Brown-Conrady radial and tangential model, undistortion with OpenCV remap, the alpha trade-off, and fisheye models for wide fields of view." name="description"/>
+<title>Section 12.2: Lens Distortion &amp; Its Correction | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Camera Models &amp; Calibration</a></div>
+<h1>Lens Distortion &amp; Its Correction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Of course the building is bowed. I show you more world than a pinhole ever could, and bending it is how I fit it all in. Straight lines are a luxury of the narrow-minded."</p>
+<cite>A Wide-Angle Lens Defending Its Worldview</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Real lenses bend the pinhole model's straight rays, but they bend them in a smooth, symmetric, repeatable way, so a low-order polynomial can describe the bending and a precomputed remap can undo it.</strong> Distortion is the gap between the camera you have and the camera the math of <a href="section-12.1.html">Section 12.1</a> assumes. This section models that gap with the Brown-Conrady radial and tangential terms, corrects it with OpenCV's undistortion machinery, and marks the boundary (around 120 degrees of field of view) beyond which you must switch to a fisheye model. After undistortion, every pinhole formula in this chapter becomes true again, which is the entire point.</p>
+</div>
+
+<p>
+The pinhole of the previous section was an idealization in one important respect: it had no glass. A practical camera needs a lens to gather light, and a lens, being a physical stack of curved elements, does not implement perspective projection exactly. The deviation is called <strong>lens distortion</strong>, and unlike sensor noise it is systematic: the same pixel is displaced by the same amount in every frame. Systematic errors are the good kind, because they can be measured once and corrected forever. This section is about the model that captures them and the correction that removes them; the measuring itself happens in <a href="section-12.3.html">Section 12.3</a>, where the distortion coefficients are estimated jointly with $K$.
+</p>
+
+<h2>1. Why Real Lenses Bend Straight Lines <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+A pinhole projects every straight line in the world to a straight line in the image (project two points of the line; the ray plane through the center intersects the image plane in a line). This straightness is the signature property of perspective projection and the easiest thing for a lens to break. As rays pass through curved glass far from the optical axis, their magnification drifts relative to rays near the axis, and image points slide radially inward or outward from where the pinhole model says they belong. Two classic patterns result, and Figure 12.2.1 shows both next to the ideal:
+</p>
+<ul>
+<li><strong>Barrel distortion</strong>: magnification decreases away from the center, so the image of a square bulges outward like a barrel. Typical of wide-angle and zoom lenses at the short end, action cameras, and webcams.</li>
+<li><strong>Pincushion distortion</strong>: magnification increases away from the center, pinching the square's sides inward. Typical of telephoto lenses.</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three grids: an ideal straight grid, a barrel-distorted grid bulging outward, and a pincushion-distorted grid pinched inward">
+<rect x="0" y="0" width="760" height="320" fill="#ffffff"/>
+<text x="380" y="28" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">What a square grid looks like through three lenses</text>
+<!-- ideal grid -->
+<text x="140" y="60" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#27ae60" font-weight="bold">ideal (pinhole)</text>
+<g stroke="#27ae60" stroke-width="2" fill="none">
+<rect x="60" y="80" width="160" height="160"/>
+<line x1="60" y1="120" x2="220" y2="120"/>
+<line x1="60" y1="160" x2="220" y2="160"/>
+<line x1="60" y1="200" x2="220" y2="200"/>
+<line x1="100" y1="80" x2="100" y2="240"/>
+<line x1="140" y1="80" x2="140" y2="240"/>
+<line x1="180" y1="80" x2="180" y2="240"/>
+</g>
+<text x="140" y="268" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">straight stays straight</text>
+<!-- barrel grid -->
+<text x="380" y="60" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#c0392b" font-weight="bold">barrel (k1 &lt; 0)</text>
+<g stroke="#c0392b" stroke-width="2" fill="none">
+<path d="M310,86 Q380,70 450,86 L456,234 Q380,250 304,234 Z" />
+<path d="M306,122 Q380,108 454,122" />
+<path d="M304,160 Q380,148 456,160" />
+<path d="M306,198 Q380,186 454,198" />
+<path d="M342,82 Q328,160 342,238" />
+<path d="M380,78 Q368,160 380,242" />
+<path d="M418,82 Q432,160 418,238" />
+</g>
+<text x="380" y="268" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">edges bulge outward</text>
+<!-- pincushion grid -->
+<text x="620" y="60" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#2980b9" font-weight="bold">pincushion (k1 &gt; 0)</text>
+<g stroke="#2980b9" stroke-width="2" fill="none">
+<path d="M548,76 Q620,94 692,76 L698,244 Q620,226 542,244 Z" />
+<path d="M550,118 Q620,132 690,118" />
+<path d="M546,160 Q620,172 694,160" />
+<path d="M550,202 Q620,214 690,202" />
+<path d="M580,80 Q594,160 580,240" />
+<path d="M620,84 Q632,160 620,236" />
+<path d="M660,80 Q646,160 660,240" />
+</g>
+<text x="620" y="268" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">edges pinch inward</text>
+<text x="380" y="304" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#888">displacement grows with distance from the image center in both cases</text>
+</svg>
+<figcaption><strong>Figure 12.2.1</strong> Radial distortion in its two flavors. Under barrel distortion (center) magnification falls with radius, so straight scene lines bow away from the image center; under pincushion distortion (right) magnification grows with radius and lines bow toward the center. The displacement is zero at the principal point and grows with the radius, which is why a radial polynomial models it so well.</figcaption>
+</figure>
+
+<p>
+Both patterns share a crucial symmetry: the displacement of a point depends (to first order) only on its <em>distance from the principal point</em>, not on its direction. That radial symmetry is what makes distortion cheap to model. A second, much smaller effect, <strong>tangential distortion</strong>, appears when the lens elements are slightly tilted relative to the sensor, displacing points perpendicular to the radius; it is usually an order of magnitude weaker but costs only two extra coefficients, so the standard model carries it along.
+</p>
+
+<h2>2. The Brown-Conrady Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Distortion is modeled in <strong>normalized image coordinates</strong>: the pixel is first stripped of the intrinsics, $x = (u - c_x)/f_x$, $y = (v - c_y)/f_y$, placing it on the virtual plane at focal distance 1. In these units, with $r^2 = x^2 + y^2$, the distorted position $(x_d, y_d)$ of an ideal point $(x, y)$ is:
+</p>
+<p>
+$$x_d = x\,(1 + k_1 r^2 + k_2 r^4 + k_3 r^6) + 2 p_1 x y + p_2 (r^2 + 2x^2),$$
+$$y_d = y\,(1 + k_1 r^2 + k_2 r^4 + k_3 r^6) + p_1 (r^2 + 2y^2) + 2 p_2 x y.$$
+</p>
+<p>
+The $k$ terms are the radial polynomial (even powers only, by the radial symmetry argument above), and the $p$ terms are tangential. OpenCV stores them in the order $(k_1, k_2, p_1, p_2, k_3)$, the five-element <code>dist</code> vector that rides alongside $K$ through the whole library. Negative $k_1$ produces barrel distortion, positive $k_1$ pincushion, and for most lenses $k_1$ alone explains the bulk of the effect, with $k_2$ trimming the residual at the corners. The model dates to Brown's photogrammetry work in the 1960s and has outlived every camera it was developed on.
+</p>
+
+<p>
+The code below implements the radial part from scratch and pushes a grid of pixel positions through it, so you can see the magnitude and the geometry of the effect with real numbers rather than exaggerated cartoons. The displacement is essentially zero at the center and grows to 183 pixels at the corner, which matches the visual intuition of Figure 12.2.1: distortion is a corner phenomenon.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+k1 = -0.30                          # negative k1: barrel distortion
+fx = fy = 1480.0
+cx, cy = 960.0, 540.0
+
+# A 13 x 9 grid of ideal pixel positions covering a 1920x1080 frame.
+u, v = np.meshgrid(np.linspace(0, 1919, 13), np.linspace(0, 1079, 9))
+
+x = (u - cx) / fx                   # to normalized coordinates: distortion lives here
+y = (v - cy) / fy
+r2 = x**2 + y**2
+factor = 1 + k1 * r2                # radial polynomial, k1 term only
+ud = fx * (x * factor) + cx         # back to pixels
+vd = fy * (y * factor) + cy
+
+shift = np.hypot(ud - u, vd - v)
+print(f"shift at image center: {shift[4, 6]:6.2f} px")
+print(f"shift at frame corner: {shift[0, 0]:6.2f} px")
+# shift at image center:   0.00 px
+# shift at frame corner: 183.01 px</code></pre>
+<div class="code-caption">The radial distortion model applied to a pixel grid with a strong barrel coefficient ($k_1 = -0.30$, typical of an action camera). The center is untouched while the corner pixel is dragged 183 pixels toward the center: distortion budget is spent almost entirely at the periphery.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Distortion Is Modeled Forward, Corrected Backward, and Applied as a Remap</div>
+<p>The Brown-Conrady equations map <em>ideal</em> positions to <em>distorted</em> ones, the direction physics runs. Correction needs the inverse, and the polynomial has no closed-form inverse, so libraries invert it numerically (a few fixed-point iterations per pixel). The expensive inversion is done once, baked into a pair of lookup maps, and then every frame is corrected with the same <code>cv2.remap</code> machinery you met for warping in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>. Undistortion at video rate costs no more than any other warp: one map lookup and one bilinear interpolation per pixel.</p>
+</div>
+
+<h2>3. Undistortion in Practice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Given $K$ and the distortion vector from calibration, OpenCV offers a one-call correction (<code>cv2.undistort</code>) and a two-step version that separates map construction from application. Use the two-step form for video: build the maps once, remap every frame. One genuine decision hides in the process: undistorting bends the image border, so the corrected image has curved edges that no longer fill a rectangle. The <code>alpha</code> parameter of <code>cv2.getOptimalNewCameraMatrix</code> picks your poison. With <code>alpha=0</code> the result is cropped and rescaled so only valid pixels remain (you silently lose field of view at the corners); with <code>alpha=1</code> every original pixel survives but the frame gains black crescents at the borders. The code below takes the middle road explicitly.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+K = np.array([[1538.4, 0., 967.3],
+              [0., 1537.9, 549.9],
+              [0., 0., 1.]])
+dist = np.array([-0.34, 0.15, 0.001, -0.0006, -0.04])   # (k1, k2, p1, p2, k3)
+
+img = cv2.imread("hallway.jpg")          # 1920 x 1080 frame from this camera
+h, w = img.shape[:2]
+
+# alpha=0: keep only valid pixels (lose FOV). alpha=1: keep all pixels (black fringes).
+newK, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0)
+
+# Build the inverse-distortion lookup maps ONCE...
+map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_16SC2)
+# ...then correcting each frame is a single remap (video-rate cheap).
+undist = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+
+x, y, rw, rh = roi                       # valid-pixel rectangle reported by alpha
+undist = undist[y:y + rh, x:x + rw]
+print("undistorted valid region:", (rw, rh), "of", (w, h))
+# undistorted valid region: (1837, 1027) of (1920, 1080)</code></pre>
+<div class="code-caption">Two-step undistortion for video pipelines: <code>initUndistortRectifyMap</code> numerically inverts the Brown-Conrady model into two lookup maps, and <code>remap</code> applies them per frame. With <code>alpha=0</code> the camera effectively loses about 4% of its frame to the correction, the price of straight lines.</div>
+
+<p>
+After this correction, straight scene lines are straight in the image again, and the pure pinhole model of <a href="section-12.1.html">Section 12.1</a> applies to the corrected frame with the new matrix <code>newK</code>. This is the standard contract throughout vision pipelines: undistort early, then let every downstream stage (the line detectors of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>, the stereo matcher of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>) assume a distortion-free camera. Alternatively, when you only care about a sparse set of points (feature matches, marker corners) rather than whole images, <code>cv2.undistortPoints</code> corrects just those coordinates and skips the per-pixel remap entirely, which is both faster and interpolation-free.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.undistortPoints Replaces Your Newton Solver</div>
+<p>Inverting the distortion polynomial yourself means writing a fixed-point or Newton iteration over normalized coordinates, roughly 25 careful lines, plus the bug where it diverges at the corners of wide lenses. OpenCV ships the inversion:</p>
+<pre><code class="language-python">pts = np.array([[[12.0, 8.0]], [[1900.0, 1068.0]]])     # distorted pixel coords
+ideal = cv2.undistortPoints(pts, K, dist, P=K)          # P=K: return pixels, not normals
+print(ideal.reshape(-1, 2))
+# [[ -41.99  -25.96]
+#  [1962.5  1110.9 ]]</code></pre>
+<div class="code-caption">Point-wise undistortion with <code>cv2.undistortPoints</code>: corner pixels of a barrel-distorted frame map outside the original frame once straightened, which is exactly why the alpha crop exists.</div>
+<p>That is a 25-to-1 line reduction, and the library handles the iterative inversion (5 fixed-point iterations by default, with a termination criterion you can override), the tangential terms, and the optional reprojection through any new camera matrix <code>P</code>. It is also the correct way to feed distorted feature coordinates into the geometric solvers of <a href="section-12.4.html">Section 12.4</a> and <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> without paying for a full-frame remap.</p>
+</div>
+
+<h2>4. When the Polynomial Is Not Enough: Fisheye &amp; Wide FOV <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The Brown-Conrady model assumes distortion is a <em>perturbation</em> of perspective projection. Past roughly 120 degrees of field of view that assumption collapses: a perspective image of a 180 degree scene would need an infinitely wide sensor, so wide lenses do not even attempt perspective. A fisheye lens implements a different projection altogether, commonly the equidistant mapping $r = f\theta$, where $\theta$ is the angle of the incoming ray from the optical axis: image radius grows linearly with ray angle rather than with $\tan\theta$. Fitting a perspective-plus-polynomial model to such a lens fails in a characteristic way: calibration converges, the residual looks tolerable in the center, and everything beyond 70% of the image radius is garbage.
+</p>
+<p>
+OpenCV ships a separate four-coefficient model in the <code>cv2.fisheye</code> namespace for exactly this regime, with parallel versions of calibration, projection, and undistortion. The API mirrors the standard one closely enough that switching is mostly a renaming exercise, with one trap: the fisheye functions are stricter about input shapes (points must be <code>(N, 1, 2)</code> or <code>(1, N, 2)</code>, <code>float32</code> or <code>float64</code>).
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# Fisheye intrinsics + 4 distortion coefficients from cv2.fisheye.calibrate.
+K_f = np.array([[612.8, 0., 968.1],
+                [0., 612.4, 542.7],
+                [0., 0., 1.]])
+D = np.array([[0.081], [0.012], [-0.0031], [0.0004]])    # fisheye k1..k4
+
+h, w = 1080, 1920
+# Balance plays the role of alpha: 0 crops to valid pixels, 1 keeps the full circle.
+newK = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+    K_f, D, (w, h), np.eye(3), balance=0.4)
+map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+    K_f, D, np.eye(3), newK, (w, h), cv2.CV_16SC2)
+frame_corrected = cv2.remap(cv2.imread("fisheye.jpg"), map1, map2,
+                            interpolation=cv2.INTER_LINEAR)
+print("perspective focal after rectification:", round(newK[0, 0], 1), "px")
+# perspective focal after rectification: 411.6 px</code></pre>
+<div class="code-caption">Rectifying a 180 degree fisheye frame to perspective with the <code>cv2.fisheye</code> module. The balance parameter trades corner coverage against stretching; the output behaves like a (very wide) pinhole camera, at the cost of severe corner magnification.</div>
+
+<p>
+A rule of thumb for choosing models: below about 100 degrees FOV, the standard model with $k_1, k_2$ suffices; up to about 120 degrees, add $k_3$ or enable the rational model (<code>cv2.CALIB_RATIONAL_MODEL</code>, which adds $k_4..k_6$ in a numerically better-behaved ratio form); beyond that, use <code>cv2.fisheye</code> or a dedicated omnidirectional model. Choosing the wrong family is not a tuning error you can fix with more calibration images, as the next story illustrates.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Orthomosaic That Would Not Stitch</div>
+<p><strong>Who and what.</strong> An agriculture-tech startup flew fixed-wing drones over fields, stitching thousands of nadir photos into orthomosaics that feed per-plant analytics. To cut flight time they swapped the survey camera for a wider 110 degree lens, covering more rows per pass.</p>
+<p><strong>The problem.</strong> After the swap, mosaics developed seam errors of several pixels at field edges, enough to misalign crop rows between passes and corrupt the row-following analytics. Reprojection error from calibration looked acceptable on average, so the team initially blamed GPS drift and burned two weeks tuning the flight controller.</p>
+<p><strong>The decision.</strong> A per-corner residual plot (the diagnostic this chapter teaches in <a href="section-12.5.html">Section 12.5</a>) showed the truth: residuals were tiny in the center and ballooned radially past 80% of the image radius, the signature of a distortion model running out of expressive power. The fix was not more checkerboard images; it was switching from the 5-coefficient standard model to the rational model, and ultimately to the fisheye model for the widest lens.</p>
+<p><strong>The result and the lesson.</strong> Corner residuals dropped by roughly an order of magnitude and the seams closed without touching the GPS. The lesson: average reprojection error hides model-mismatch, which always lives at the corners; and no quantity of data rescues the wrong model family.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Distortion as Just Another Learnable Parameter</div>
+<p>The modern trend is to stop treating distortion as a separate preprocessing stage and fold it into end-to-end geometric learning. GeoCalib (ECCV 2024, <a href="https://arxiv.org/abs/2409.06704" target="_blank" rel="noopener">arXiv:2409.06704</a>) recovers radial distortion together with focal length from a single image, using the bent projections of straight scene structures as supervision, a learned, deformation-aware descendant of the classical "plumb-line" method. Neural rendering stacks go further: Nerfstudio's camera optimizer refines poses and lens parameters jointly while fitting the scene, and COLMAP-free 3D Gaussian Splatting pipelines (2024 to 2025) treat camera model residuals as optimizable variables alongside the scene itself, because at NeRF-level fidelity even a quarter-pixel of uncorrected distortion shows up as floaters and blur. The representations are new; the Brown-Conrady and fisheye parameterizations inside them are exactly the ones in this section, and they feed the 3D pipelines of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.1: Reading the Coefficients <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Explain geometrically why the radial polynomial contains only even powers of $r$. (b) A calibration reports $k_1 = +0.21$: is the lens barrel or pincushion, and which way do the corners of a square move? (c) Distortion is modeled in normalized coordinates, after dividing by $f_x, f_y$. Explain why the same physical lens on the same sensor produces the same $(k_1, k_2)$ regardless of image resolution settings, and name the one intrinsic parameter pair that does change with resolution.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.2: The Plumb-Line Test <span class="exercise-type coding">Coding</span></div>
+<p>Photograph a scene with long straight edges (a door frame, a building) with the widest camera you own. Detect edges and fit lines using the Hough machinery from <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> on (a) the raw image and (b) the image undistorted with your calibration from <a href="section-12.3.html">Section 12.3</a>. For each long edge, fit a straight line to its pixels and report the maximum perpendicular deviation in pixels. By how much does undistortion reduce it? Plot deviation against the edge's distance from the principal point and explain the trend.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.2.3: The Alpha Trade-Off, Quantified <span class="exercise-type analysis">Analysis</span></div>
+<p>Sweep <code>alpha</code> from 0 to 1 in steps of 0.1 in <code>getOptimalNewCameraMatrix</code> for a strongly barrel-distorted calibration. For each setting compute: the retained field of view (use the FOV formula of <a href="section-12.1.html">Section 12.1</a> on the new camera matrix), the fraction of black (invalid) pixels in the output, and the effective resolution at the image center (pixels of output per degree). Plot all three against alpha and write a short recommendation for (a) a photogrammetry pipeline that must not invent pixels and (b) a consumer dashcam app where black borders are unacceptable.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.1.html">&#8592; Section 12.1: The Pinhole Camera &amp; Intrinsic Parameters</a>
+<a href="index.html">Chapter 12</a>
+<a class="next" href="section-12.3.html">Section 12.3: Camera Calibration: Zhang's Method in Practice &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

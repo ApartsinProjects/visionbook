@@ -182,6 +182,18 @@ library (OpenCV, scikit-image, PyTorch, torchvision, timm, ultralytics, Hugging 
 diffusers, etc.). State the line-count reduction explicitly and name what the library
 handles internally.
 
+## QA Audit Pipeline
+
+Two complementary gates, both run before any "done" or publish claim:
+
+1. `C:\Python314\python.exe scripts\audit_book.py`: VisionBook-specific content canaries
+   (file completeness vs toc.html, dash discipline, per-section structure, link integrity).
+2. `scripts\run_audit.cmd`: the book-skills audit-plugin pipeline (150 pluggable checks,
+   P0-P3), the same system that gates the LLMBook. P0 includes the KDP/Kindle blockers
+   (strict XHTML, bare-dollar math, unresolvable font weights). Auto-fix scripts for many
+   check classes live in `E:\Projects\claude-skills\book-skills\scripts\fix\`.
+   Book-specific calibration: skip `OFFTOPIC_NO_LLM_CONTEXT` (it tests LLM-book topicality).
+
 ## Style Rules (non-negotiable)
 
 1. NEVER use em dashes or double dashes anywhere. Use commas, semicolons, colons, parentheses, or separate sentences.

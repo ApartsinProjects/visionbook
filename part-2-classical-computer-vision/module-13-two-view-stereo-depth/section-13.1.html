@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 13.1: Epipolar Geometry: The Geometry of Two Views. Baselines, epipoles, epipolar planes and lines: why a match in the second image must lie on a single line, with OpenCV code to compute and draw epipolar lines." name="description"/>
+<title>Section 13.1: Epipolar Geometry: The Geometry of Two Views | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a></div>
+<h1>Epipolar Geometry: The Geometry of Two Views</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I cannot tell you exactly where your point went in the other photograph. But I can tell you the one line it is hiding on, which narrows things down from a million suspects to about a thousand. You're welcome."</p>
+<cite>A Helpfully Restrictive Epipolar Line</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Two cameras looking at the same scene are not free to disagree arbitrarily: a point seen in one image must appear, in the other image, somewhere on a single specific line, and this one constraint is the foundation of all multi-view geometry.</strong> This section builds that constraint from nothing but the pinhole model of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>. You will learn the vocabulary (baseline, epipole, epipolar plane, epipolar line), see why the constraint collapses correspondence search from two dimensions to one, and compute real epipolar lines on real image pairs with OpenCV. The algebra that encodes the constraint as a matrix is deliberately postponed to <a href="section-13.2.html">Section 13.2</a>; geometry first, equations second.</p>
+</div>
+
+<p>
+<a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> left us with a precise account of what one camera does: it projects each 3D point along a ray through the optical center onto the image plane, and the intrinsic matrix $K$ tells us exactly which pixel that ray hits. It also left us with a loss we could not repair. Every point on a given ray, whether one meter away or one kilometer, lands on the same pixel. Depth is not hidden in a single image; it is absent. This section begins the repair, and the tool is almost embarrassingly simple: take a second photograph from somewhere else.
+</p>
+
+<h2>1. What a Second View Knows <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Consider a point $\mathbf{x}_L$ in the left image. From the left camera's perspective, the 3D point $\mathbf{X}$ that produced it could be anywhere along the viewing ray from the left optical center $\mathbf{C}_L$ through $\mathbf{x}_L$. One image cannot say more. Now ask what the right camera sees. It observes that same ray from the side, and a ray, viewed from anywhere not on it, projects to a line. So whatever depth $\mathbf{X}$ actually has, its image in the right view must fall on the projection of the left ray: a single line in the right image, called the <strong>epipolar line</strong>.
+</p>
+<p>
+This deserves a moment of appreciation. We have not measured anything yet, not matched a single descriptor, and already the geometry has handed us an enormous gift: the correspondence problem of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, which searched a whole 2D image for each match, has become a 1D search along a known line. For a $1000 \times 1000$ image, that is a thousandfold reduction in candidates before any pixel is compared.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Constraint, Not a Solution</div>
+<p>Epipolar geometry never tells you <em>where</em> on the line the match is; finding that still requires comparing pixels, which is the whole business of <a href="section-13.4.html">Section 13.4</a>. What it provides is a hard geometric filter: any candidate match off the line is wrong, full stop, regardless of how similar the pixels look. In practice this filter does double duty. It shrinks the search space for honest matchers, and it exposes dishonest matches: a descriptor pair that violates the epipolar constraint by twenty pixels is an outlier no matter how well the descriptors agree. RANSAC in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> used a homography as its geometric verifier; from this chapter onward, epipolar geometry is the more general verifier of choice.</p>
+</div>
+
+<h2>2. The Epipolar Vocabulary <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The full structure becomes visible when you draw both cameras and one 3D point, as in Figure 13.1.1. Three points define the picture: the two optical centers $\mathbf{C}_L$, $\mathbf{C}_R$, and the scene point $\mathbf{X}$. Together they span a plane, the <strong>epipolar plane</strong>. Everything else is intersections of that plane with the two image planes.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two pinhole cameras observing a 3D point X, with the epipolar plane through both optical centers and X, the baseline joining the centers, epipoles where the baseline pierces each image plane, and epipolar lines where the plane cuts each image plane">
+  <!-- epipolar plane (filled) -->
+  <polygon points="120,310 700,310 410,60" fill="#fdf2e9" stroke="#e67e22" stroke-width="1" stroke-dasharray="5,4" opacity="0.85"/>
+  <!-- 3D point X -->
+  <circle cx="410" cy="60" r="6" fill="#c0392b"/>
+  <text x="410" y="44" font-family="sans-serif" font-size="15" font-weight="bold" fill="#c0392b" text-anchor="middle">X</text>
+  <!-- left camera -->
+  <circle cx="120" cy="310" r="5" fill="#2c3e50"/>
+  <text x="100" y="332" font-family="sans-serif" font-size="14" fill="#2c3e50">C_L</text>
+  <!-- right camera -->
+  <circle cx="700" cy="310" r="5" fill="#2c3e50"/>
+  <text x="700" y="332" font-family="sans-serif" font-size="14" fill="#2c3e50">C_R</text>
+  <!-- baseline -->
+  <line x1="120" y1="310" x2="700" y2="310" stroke="#2c3e50" stroke-width="2"/>
+  <text x="410" y="328" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">baseline</text>
+  <!-- left image plane -->
+  <polygon points="180,160 280,160 300,290 200,290" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5" opacity="0.9"/>
+  <text x="195" y="150" font-family="sans-serif" font-size="13" fill="#2980b9">left image</text>
+  <!-- right image plane -->
+  <polygon points="540,160 640,160 620,290 520,290" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5" opacity="0.9"/>
+  <text x="545" y="150" font-family="sans-serif" font-size="13" fill="#1e8449">right image</text>
+  <!-- left viewing ray -->
+  <line x1="120" y1="310" x2="410" y2="60" stroke="#c0392b" stroke-width="1.8"/>
+  <!-- right viewing ray -->
+  <line x1="700" y1="310" x2="410" y2="60" stroke="#c0392b" stroke-width="1.8"/>
+  <!-- projections of X -->
+  <circle cx="243" cy="204" r="4.5" fill="#2980b9"/>
+  <text x="222" y="196" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2980b9">x_L</text>
+  <circle cx="583" cy="207" r="4.5" fill="#1e8449"/>
+  <text x="592" y="199" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449">x_R</text>
+  <!-- epipoles -->
+  <circle cx="237" cy="310" r="4.5" fill="#8e44ad"/>
+  <text x="232" y="354" font-family="sans-serif" font-size="13" font-weight="bold" fill="#8e44ad">e_L</text>
+  <line x1="237" y1="314" x2="237" y2="342" stroke="#8e44ad" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="572" cy="310" r="4.5" fill="#8e44ad"/>
+  <text x="567" y="354" font-family="sans-serif" font-size="13" font-weight="bold" fill="#8e44ad">e_R</text>
+  <line x1="572" y1="314" x2="572" y2="342" stroke="#8e44ad" stroke-width="1" stroke-dasharray="3,3"/>
+  <!-- epipolar lines on image planes -->
+  <line x1="207" y1="265" x2="265" y2="180" stroke="#8e44ad" stroke-width="2.2"/>
+  <line x1="612" y1="265" x2="556" y2="182" stroke="#8e44ad" stroke-width="2.2"/>
+  <text x="306" y="246" font-family="sans-serif" font-size="12" fill="#8e44ad">epipolar line</text>
+  <text x="438" y="246" font-family="sans-serif" font-size="12" fill="#8e44ad" text-anchor="start">epipolar line</text>
+  <!-- plane label -->
+  <text x="410" y="288" font-family="sans-serif" font-size="13" fill="#e67e22" text-anchor="middle">epipolar plane (C_L, C_R, X)</text>
+</svg>
+<figcaption><strong>Figure 13.1.1</strong> The anatomy of two views. The scene point $\mathbf{X}$ and the two optical centers $\mathbf{C}_L$, $\mathbf{C}_R$ span the epipolar plane (orange). The plane cuts each image plane in an epipolar line (purple); the projections $\mathbf{x}_L$ and $\mathbf{x}_R$ must lie on their respective lines. The baseline joining the centers pierces the image planes at the epipoles $\mathbf{e}_L$ and $\mathbf{e}_R$, through which every epipolar line passes.</figcaption>
+</figure>
+
+<p>
+Working through Figure 13.1.1 gives the complete glossary. The <strong>baseline</strong> is the segment joining the two optical centers; its length, also called the baseline, will set the depth precision of stereo in <a href="section-13.5.html">Section 13.5</a>. The <strong>epipoles</strong> $\mathbf{e}_L$ and $\mathbf{e}_R$ are where the baseline pierces each image plane: the epipole in the left image is literally the photograph of the right camera's center, and vice versa. The epipolar plane intersects each image plane in an <strong>epipolar line</strong>, and since both $\mathbf{x}_L$ and $\mathbf{x}_R$ are images of a point on that plane, each must lie on its line.
+</p>
+<p>
+Now let $\mathbf{X}$ slide to different depths along the left viewing ray. The epipolar plane does not change (the ray lies inside it), so the right epipolar line does not change either; the match $\mathbf{x}_R$ just slides along it. But pick a <em>different</em> pixel $\mathbf{x}_L$, and the plane rotates about the baseline like a page turning on its spine, sweeping out a new pair of epipolar lines. Two consequences follow immediately, and both are worth committing to memory:
+</p>
+<ul>
+<li><strong>Every epipolar line passes through the epipole.</strong> The baseline lies in every epipolar plane, so its piercing points, the epipoles, lie on every epipolar line. The family of epipolar lines is a pencil of lines radiating from the epipole.</li>
+<li><strong>Epipolar lines come in mated pairs.</strong> One plane cuts both images, so each epipolar line in the left image has exactly one partner in the right image, and matches can only happen between partners.</li>
+</ul>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: You Are Photographing Your Other Camera</div>
+<p>The epipole is the image of the other camera's optical center, which means it is a perfectly real image point even when the other camera is far outside the picture frame. In most stereo pairs the epipoles sit comfortably off-image (often kilometers off, in pixel units). Students who first compute an epipole at pixel coordinates $(48000, -3100)$ tend to assume a bug. Usually it is just geometry being literal: that is where the other camera would appear if the sensor were a few meters wide.</p>
+</div>
+
+<h2>3. From Geometry to a Usable Test <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The constraint has a compact verbal form: <em>corresponding points lie on corresponding epipolar lines</em>. To make it computational we need a function that, given a point in one image, produces the epipolar line in the other. <a href="section-13.2.html">Section 13.2</a> will show that this function is linear in homogeneous coordinates: a single $3 \times 3$ matrix $F$, the fundamental matrix, maps a left point to a right line, $\boldsymbol{\ell}_R = F \mathbf{x}_L$, and the constraint becomes the elegant scalar equation $\mathbf{x}_R^\top F \mathbf{x}_L = 0$. For this section we treat $F$ as a black box that OpenCV can estimate from matched keypoints, and concentrate on what the resulting lines look like and how to use them.
+</p>
+<p>
+A line in homogeneous coordinates is a 3-vector $\boldsymbol{\ell} = (a, b, c)^\top$ representing $ax + by + c = 0$, a representation introduced with projective transforms in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>. The perpendicular distance from a pixel $(x, y)$ to that line is
+</p>
+<p>
+$$ d\big((x,y),\, \boldsymbol{\ell}\big) \;=\; \frac{|ax + by + c|}{\sqrt{a^2 + b^2}}, $$
+</p>
+<p>
+and this distance is the workhorse test of two-view geometry: a candidate correspondence is <strong>epipolar-consistent</strong> if each point sits within a pixel or two of its partner's epipolar line. The code below runs the full pipeline on a real pair: detect and match SIFT keypoints exactly as in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, estimate $F$ robustly, then compute and draw the epipolar lines for a handful of inlier matches.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+imgL = cv2.imread("left.jpg", cv2.IMREAD_GRAYSCALE)
+imgR = cv2.imread("right.jpg", cv2.IMREAD_GRAYSCALE)
+
+# 1. Correspondences, exactly as in Chapter 10: SIFT + ratio test
+sift = cv2.SIFT_create()
+kpL, desL = sift.detectAndCompute(imgL, None)
+kpR, desR = sift.detectAndCompute(imgR, None)
+knn = cv2.BFMatcher(cv2.NORM_L2).knnMatch(desL, desR, k=2)
+good = [m for m, n in knn if m.distance &lt; 0.75 * n.distance]
+ptsL = np.float32([kpL[m.queryIdx].pt for m in good])
+ptsR = np.float32([kpR[m.trainIdx].pt for m in good])
+
+# 2. Robust fundamental matrix (MAGSAC++ flavor of RANSAC)
+F, inlier_mask = cv2.findFundamentalMat(ptsL, ptsR,
+                                        cv2.USAC_MAGSAC, 1.0, 0.999)
+inl = inlier_mask.ravel().astype(bool)
+print(f"{inl.sum()} / {len(good)} matches are epipolar-consistent")
+# 487 / 612 matches are epipolar-consistent
+
+# 3. Epipolar lines in the LEFT image for right-image inlier points
+#    (whichImage=2 means the points live in image 2, the right one)
+linesL = cv2.computeCorrespondEpilines(ptsR[inl], 2, F).reshape(-1, 3)
+a, b, c = linesL[0]
+x0, x1 = 0, imgL.shape[1]
+y0, y1 = int(-c / b), int(-(c + a * x1) / b)   # line endpoints at image borders
+vis = cv2.cvtColor(imgL, cv2.COLOR_GRAY2BGR)
+cv2.line(vis, (x0, y0), (x1, y1), (0, 0, 255), 1)
+cv2.circle(vis, tuple(ptsL[inl][0].astype(int)), 5, (0, 255, 0), -1)
+cv2.imwrite("epiline_left.png", vis)</code></pre>
+<div class="code-caption">End-to-end epipolar pipeline on a real image pair: SIFT matches feed a MAGSAC++ fundamental-matrix fit, then <code>cv2.computeCorrespondEpilines</code> turns each right-image point into the $(a, b, c)$ line coefficients of its left-image epipolar line, drawn here through the matching green keypoint.</div>
+
+<p>
+Run this on any pair of photos of a static scene and inspect the output image: the red line should pass through the green point, typically within a pixel. Repeating the drawing for ten matches produces ten lines that all radiate from a common (often off-image) point, the epipole, exactly as the pencil-of-lines picture predicts. When the lines do <em>not</em> converge, or the points sit far off their lines, something upstream is wrong: bad matches that RANSAC failed to reject, a moving object dominating the correspondences, or a degenerate configuration of the kind <a href="section-13.2.html">Section 13.2</a> and <a href="section-13.3.html">Section 13.3</a> dissect.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Two Calls Replace the Whole Construction</div>
+<p>Everything geometric in this section reduces to two OpenCV calls: <code>cv2.findFundamentalMat(ptsL, ptsR, cv2.USAC_MAGSAC, 1.0, 0.999)</code> estimates the epipolar geometry from matches, and <code>cv2.computeCorrespondEpilines(pts, whichImage, F)</code> maps points to partner lines. Building the same from scratch (homogeneous line algebra, the eight-point solver of <a href="section-13.2.html">Section 13.2</a>, a RANSAC loop with epipolar-distance scoring) runs to roughly 150 lines; the library reduces it about 75-to-1 and internally handles point normalization, the rank-2 constraint, MAGSAC++'s threshold-free inlier weighting, and degenerate-sample rejection. You will still write the from-scratch version in the next section, because debugging real systems requires knowing what these two calls assume.</p>
+</div>
+
+<h2>4. Special Configurations Worth Recognizing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Two camera arrangements produce epipolar geometry so distinctive that you should recognize them on sight, because entire system designs are built around each.
+</p>
+<p>
+<strong>Side-by-side cameras (the stereo configuration).</strong> When the two cameras are related by a pure horizontal translation with parallel optical axes, the baseline is parallel to both image planes and never pierces them: the epipoles move to infinity. The pencil of epipolar lines, all forced through a point at horizontal infinity, becomes a family of parallel horizontal lines, and corresponding points share the same row. This is the dream configuration for dense matching, and <a href="section-13.4.html">Section 13.4</a> exists because of it: rectification is nothing but warping an arbitrary pair until its epipolar geometry looks like this.
+</p>
+<p>
+<strong>Forward motion.</strong> When the camera translates along its own optical axis (a car driving forward, a drone descending), the baseline pierces both image planes at the principal point: both epipoles sit in the <em>middle</em> of the image, and epipolar lines radiate outward from the center like spokes. Matches slide outward along the spokes as the camera advances. This radial pattern is the focus of expansion that <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a> revisits with optical flow, and it is the hardest case for stereo matching: near the epipole, the epipolar "line" segment available for matching shrinks to nearly nothing, and depth becomes unobservable along the motion axis.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Warehouse Robot That Matched Every Shelf to Every Other Shelf</div>
+<p><strong>Who:</strong> A robotics team at a logistics company, building visual localization for autonomous tugs in a 40,000-square-meter warehouse.</p>
+<p><strong>Situation:</strong> The tugs localize by matching ORB features between the live camera and a map of reference images. The warehouse is the adversarial case for matching: hundreds of visually identical racking uprights, repeated every 2.7 meters.</p>
+<p><strong>Problem:</strong> Descriptor matching alone produced 30 to 60 percent false correspondences (an upright matched to a different, identical upright), and pose estimates would jump sideways by exactly one rack period several times per shift. Tightening the descriptor ratio test just discarded almost all matches without fixing the period jumps.</p>
+<p><strong>Decision:</strong> Instead of trusting descriptors harder, the team added an epipolar gate. Wheel odometry gave a rough relative pose between the live frame and the reference frame; from it they computed the expected epipolar geometry and discarded any match whose point sat more than 3 pixels from its predicted epipolar line, before running the final pose solver.</p>
+<p><strong>Result:</strong> False-match rate after gating fell below 4 percent, rack-period localization jumps disappeared from the logs, and the matcher could actually loosen its ratio threshold, recovering matches in low-texture aisles. CPU cost of the gate: a dot product and a division per match.</p>
+<p><strong>Lesson:</strong> Appearance says "these two patches look alike"; epipolar geometry says "these two pixels could be the same physical point." In repetitive environments, the second statement is the one you can trust, and it costs almost nothing to check.</p>
+</div>
+
+<h2>5. Where the Constraint Comes From, and Where It Breaks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+It is worth being precise about the assumptions, because every failure of two-view geometry in practice traces back to one of them. The epipolar constraint requires exactly three things: a static scene point (so that both cameras photograph the <em>same</em> $\mathbf{X}$), two distinct optical centers (so that a plane, not a line, is spanned), and cameras that behave like pinholes (so that projection is along straight rays, the assumption <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> spent a whole section repairing with distortion correction; always undistort before doing epipolar geometry).
+</p>
+<p>
+Each assumption fails in an instructive way. A moving object violates the static-scene premise: its matches satisfy a <em>different</em> epipolar geometry (one induced by the object's motion composed with the camera's), which is why points on a passing truck show up as outliers to the road's fundamental matrix, and why motion segmentation can be built from exactly this observation, a thread picked up in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>. Coincident optical centers (a camera rotating on a tripod) collapse the epipolar plane: with no baseline there are no epipoles, no epipolar lines, and no depth, but in exchange the two views become related by a homography, which is precisely the subject of <a href="section-13.3.html">Section 13.3</a>. And uncorrected lens distortion bends the straight rays, turning epipolar lines into epipolar <em>curves</em> that a $3 \times 3$ matrix cannot represent; the symptom is a fundamental-matrix fit whose inliers cluster in the image center while the corners misbehave.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Geometry Without the Geometry Pipeline</div>
+<p>A striking 2024-2026 research line asks whether the explicit pipeline this chapter teaches (match, estimate epipolar geometry, then reconstruct) should be a single learned forward pass instead. DUSt3R (CVPR 2024) feeds two uncalibrated images into a transformer that directly outputs a dense 3D pointmap per image in a shared frame; epipolar geometry is never represented, yet relative pose can be read off the output. Its successor MASt3R (ECCV 2024) adds a matching head and metric scale, and VGGT (CVPR 2025) extends the idea to many views, regressing cameras, depth, and points in one feed-forward pass. Meanwhile, dense learned matchers like RoMa (CVPR 2024) keep the classical estimator but replace sparse keypoints with transformer-predicted correspondences, and epipolar attention layers inside multi-view transformers bake the constraint of this section into the architecture itself, restricting cross-view attention to epipolar lines. The scoreboard in 2026: learned systems win on hard, low-texture, wide-baseline pairs, while the classical pipeline remains unbeaten on calibrated precision, speed per watt, and interpretability, which is why hybrid designs (learned matches, classical solvers) dominate production reconstruction. Understanding this section is what lets you read that scoreboard.</p>
+</div>
+
+<h2>6. What Comes Next <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+This section built the geometry with pictures and one black box: the matrix that maps points to lines. Everything ahead in the chapter unpacks or exploits it. <a href="section-13.2.html">Section 13.2</a> derives that matrix in two flavors (essential for calibrated cameras, fundamental for uncalibrated ones), shows how to estimate it from eight matches, and extracts the relative camera pose hiding inside it. <a href="section-13.4.html">Section 13.4</a> warps image pairs into the side-by-side configuration where epipolar lines are scanlines and matches densely. And <a href="section-13.6.html">Section 13.6</a> intersects the rays the constraint has been guarding all along, turning matched pixels into measured 3D points, the currency in which <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> and the neural 3D methods of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> trade.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.1.1: The Pencil Through the Epipole <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using only the definitions in Figure 13.1.1 (no algebra), argue carefully: (a) why every epipolar line in the left image must pass through the left epipole; (b) why the epipole is the only point in the image with this property; and (c) what happens to the family of epipolar lines as the baseline length shrinks toward zero while everything else stays fixed. For (c), explain what your answer implies about recovering depth from two frames of a nearly stationary camera.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.1.2: Drawing the Pencil <span class="exercise-type coding">Coding</span></div>
+<p>Extend this section's code to draw the 20 epipolar lines with the largest inlier support in <em>both</em> images, each line and its matching point in the same color. Then estimate each epipole as the least-squares intersection of the lines: stack the line vectors $\boldsymbol{\ell}_i^\top$ into a matrix $L$ and take the null-space direction of $L$ via SVD. Report the epipole's pixel coordinates for a stereo-like pair (translation mostly sideways) and for a forward-motion pair (walk two steps toward the scene between shots), and check that the two cases match the predictions of subsection 4.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.1.3: How Much Does the Gate Buy? <span class="exercise-type analysis">Analysis</span></div>
+<p>Design and run an experiment quantifying the epipolar gate's value as a match filter. On three image pairs, generate matches with a deliberately loose ratio test (0.9), then compare three filters: (a) ratio test at 0.7, (b) epipolar gate at 2 pixels using $F$ estimated from the loose matches, (c) both. For each filter report the number of surviving matches and, by visually labeling 50 random survivors per condition, an estimated precision. Where does the epipolar gate help most, and construct one scene (hint: repeated structure on a single plane) where filter (b) passes a family of consistent but wrong matches.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 13 Overview</a>
+<a href="index.html">Chapter 13</a>
+<a class="next" href="section-13.2.html">Section 13.2: Essential &amp; Fundamental Matrices &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.6: RANSAC &amp; Robust Model Fitting. Why least squares breaks on contaminated matches, the hypothesize-and-verify loop, fitting homographies with inlier masks, and the modern MAGSAC++ family." name="description"/>
+<title>Section 10.6: RANSAC &amp; Robust Model Fitting | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>RANSAC &amp; Robust Model Fitting</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Half of my data points could be lying to me. Fortunately, I only need four that tell the truth, and I am prepared to keep drawing straws all night."</p>
+<cite>A Patiently Skeptical Robust Estimator</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When data contains outright lies, do not fit a model to all of it; fit many candidate models to the smallest possible random samples and crown the one that the most data agrees with.</strong> That inversion is RANSAC, the algorithm that closes this chapter's pipeline. Detection (<a href="section-10.1.html">Section 10.1</a>) found repeatable points, description (<a href="section-10.3.html">Sections 10.3</a> and <a href="section-10.4.html">10.4</a>) made them comparable, matching (<a href="section-10.5.html">Section 10.5</a>) produced correspondences that are mostly right, and RANSAC delivers the final product: a geometric model plus a verdict on every single match. Those verified correspondences are what <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> calibrates cameras with, what <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> turns into depth, and what <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> reconstructs cities from.</p>
+</div>
+
+<p>
+In the previous section, every filter judged matches one at a time, and the closing admission was that some confidently wrong matches survive any per-match test. This section brings in the judge that per-match filters cannot replace: geometry. All true correspondences between two views of a rigid scene are bound by a single global model (a homography for planar scenes, a fundamental matrix in general), while false matches scatter without pattern. Fitting that model to contaminated data, and using the fit to separate inliers from outliers, is the problem of robust estimation, and the 1981 algorithm that solves it remains one of the most-used tools in all of computer vision.
+</p>
+
+<h2>1. The Tyranny of the Squared Residual <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Start with the failure. Suppose you have $n$ matched point pairs and want the line (or homography, the logic is identical) that best explains them. The instinct trained by every statistics course is least squares: choose the model parameters that minimize $\sum_i r_i^2$, the sum of squared residuals. Least squares is optimal when residuals are well-behaved Gaussian noise, and the fits of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> leaned on it happily. But a false match is not noise. A correct SIFT match might be off by half a pixel; a false match connecting a roof corner to a fence post is off by four hundred pixels, and the <em>square</em> of its residual is 640,000 times larger than the square of a correct match's. Minimizing the sum, the model abandons a hundred honest points to appease one liar. Statisticians say least squares has a breakdown point of zero: a single sufficiently bad outlier corrupts the fit by an arbitrary amount.
+</p>
+<p>
+Figure 10.6.1 shows the disease and the cure on the simplest possible model. On the left, a handful of outliers drags the least-squares line off the obvious trend; the fit serves nobody, neither the inliers nor the outliers. On the right, the RANSAC fit ignores the outliers entirely, recovering the line the inliers define, with a tolerance band that makes the inlier-or-outlier verdict explicit. Nothing about the picture changes when the model becomes a homography with eight parameters instead of a line with two; only the minimal sample size grows.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two scatter plots of the same contaminated data: least squares fits a line dragged toward an outlier cluster, while RANSAC fits the line through the inliers and flags the outliers">
+  <!-- left: least squares -->
+  <text x="195" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">least squares: everyone votes, liars win</text>
+  <rect x="40" y="45" width="310" height="210" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <g fill="#2980b9">
+    <circle cx="75" cy="222" r="4"/><circle cx="95" cy="209" r="4"/><circle cx="115" cy="203" r="4"/>
+    <circle cx="140" cy="187" r="4"/><circle cx="160" cy="181" r="4"/><circle cx="185" cy="166" r="4"/>
+    <circle cx="205" cy="159" r="4"/><circle cx="230" cy="144" r="4"/><circle cx="250" cy="137" r="4"/>
+    <circle cx="275" cy="122" r="4"/><circle cx="300" cy="113" r="4"/><circle cx="320" cy="101" r="4"/>
+  </g>
+  <g fill="#c0392b">
+    <circle cx="260" cy="235" r="4"/><circle cx="290" cy="225" r="4"/><circle cx="310" cy="240" r="4"/>
+    <circle cx="275" cy="250" r="4"/><circle cx="320" cy="228" r="4"/>
+  </g>
+  <line x1="58" y1="208" x2="338" y2="158" stroke="#c0392b" stroke-width="2.5"/>
+  <text x="120" y="195" font-family="sans-serif" font-size="12" fill="#922b21">LS fit</text>
+  <text x="288" y="268" font-family="sans-serif" font-size="12" fill="#922b21">outlier cluster</text>
+  <text x="195" y="288" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">five liars rotate the whole fit</text>
+
+  <!-- right: RANSAC -->
+  <text x="585" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">RANSAC: the consensus of the honest</text>
+  <rect x="430" y="45" width="310" height="210" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <line x1="455" y1="212" x2="725" y2="82" stroke="#27ae60" stroke-width="1.2" stroke-dasharray="5,4"/>
+  <line x1="455" y1="240" x2="725" y2="110" stroke="#27ae60" stroke-width="1.2" stroke-dasharray="5,4"/>
+  <line x1="455" y1="226" x2="725" y2="96" stroke="#1e8449" stroke-width="2.5"/>
+  <g fill="#27ae60">
+    <circle cx="465" cy="222" r="4"/><circle cx="485" cy="209" r="4"/><circle cx="505" cy="203" r="4"/>
+    <circle cx="530" cy="187" r="4"/><circle cx="550" cy="181" r="4"/><circle cx="575" cy="166" r="4"/>
+    <circle cx="595" cy="159" r="4"/><circle cx="620" cy="144" r="4"/><circle cx="640" cy="137" r="4"/>
+    <circle cx="665" cy="122" r="4"/><circle cx="690" cy="113" r="4"/><circle cx="710" cy="101" r="4"/>
+  </g>
+  <g fill="none" stroke="#aab7c4" stroke-width="1.6">
+    <circle cx="650" cy="235" r="4"/><circle cx="680" cy="225" r="4"/><circle cx="700" cy="240" r="4"/>
+    <circle cx="665" cy="250" r="4"/><circle cx="710" cy="228" r="4"/>
+  </g>
+  <text x="497" y="248" font-family="sans-serif" font-size="12" fill="#145a32">tolerance band &#177;&#964;</text>
+  <text x="655" y="268" font-family="sans-serif" font-size="12" fill="#90a4ae" text-anchor="middle">outliers: identified, ignored</text>
+  <text x="585" y="288" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">the fit comes with a verdict on every point</text>
+</svg>
+<figcaption><strong>Figure 10.6.1</strong> The same contaminated data, fit twice. Left: least squares minimizes squared residuals over all points, so five gross outliers (red) rotate the line away from twelve honest inliers (blue). Right: RANSAC searches for the model with the largest consensus set; points inside the $\pm\tau$ band are declared inliers, the rest are flagged and excluded. The output is not just a better line but a label for every datum.</figcaption>
+</figure>
+
+<p>
+Readers of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> have already met one cure for outliers: the Hough transform, where every edge pixel votes for all the lines through it and real lines emerge as peaks no minority can suppress. RANSAC is the Hough idea run in the opposite direction. Hough discretizes <em>parameter space</em> and lets data vote in it, which works beautifully for two or three parameters and dies of memory starvation at eight (a homography) or twelve (a camera pose). RANSAC never builds a parameter grid; it samples <em>data space</em>, proposing models from tiny subsets and letting the rest of the data vote each proposal up or down. Voting survives; only the ballot box moves.
+</p>
+
+<h2>2. Hypothesize and Verify: The RANSAC Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+RANSAC, for RANdom SAmple Consensus (Fischler and Bolles, 1981), repeats four steps. First, draw a <strong>minimal sample</strong>: the smallest number of data points $s$ that determines the model exactly. Two points define a line; four point pairs define a homography (each pair gives two equations, the homography has eight degrees of freedom, as set up in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>); seven or eight pairs define the fundamental matrix of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>. Second, fit the model to that sample alone. Third, score the hypothesis: count how many of <em>all</em> the data points lie within a tolerance $\tau$ of the model (for a homography, the test is the reprojection error $r_i = \lVert \mathbf{x}'_i - H\mathbf{x}_i \rVert \lt \tau$, with $\tau$ typically 1 to 3 pixels). The points that agree are the hypothesis's <strong>consensus set</strong>. Fourth, if this consensus set is the largest seen so far, keep it. After $N$ trials, refit the model to the entire winning consensus set by least squares, which is now safe because the outliers have been evicted. Figure 10.6.2 lays out the loop.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RANSAC flowchart: sample a minimal subset, fit a model to it, count inliers within the threshold, keep the best model so far, loop back for N trials, then refit on the winning consensus set">
+  <defs>
+    <marker id="arrFwd" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+    <marker id="arrLoop" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b9770e"/>
+    </marker>
+    <marker id="arrDone" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#1e8449"/>
+    </marker>
+  </defs>
+  <!-- four loop boxes -->
+  <g font-family="sans-serif" font-size="12.5" fill="#2c3e50" text-anchor="middle">
+    <rect x="20" y="60" width="165" height="58" rx="6" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="102" y="84">1. draw a random</text><text x="102" y="102">minimal sample (s points)</text>
+    <rect x="215" y="60" width="165" height="58" rx="6" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="297" y="84">2. fit the model</text><text x="297" y="102">to the sample alone</text>
+    <rect x="410" y="60" width="165" height="58" rx="6" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="492" y="84">3. count inliers:</text><text x="492" y="102">residual &lt; &#964; over all data</text>
+    <rect x="605" y="60" width="165" height="58" rx="6" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="687" y="84">4. largest consensus</text><text x="687" y="102">so far? remember it</text>
+  </g>
+  <!-- forward arrows -->
+  <line x1="185" y1="89" x2="211" y2="89" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrFwd)"/>
+  <line x1="380" y1="89" x2="406" y2="89" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrFwd)"/>
+  <line x1="575" y1="89" x2="601" y2="89" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrFwd)"/>
+  <!-- loop-back arrow: box 4 bottom to box 1 bottom -->
+  <polyline points="640,118 640,155 102,155 102,124" fill="none" stroke="#b9770e" stroke-width="2" marker-end="url(#arrLoop)"/>
+  <text x="371" y="148" font-family="sans-serif" font-size="12" fill="#7d6608" text-anchor="middle">not done: next random sample (N trials, adaptive)</text>
+  <!-- exit arrow: box 4 bottom to final box -->
+  <line x1="730" y1="118" x2="730" y2="191" stroke="#1e8449" stroke-width="2" marker-end="url(#arrDone)"/>
+  <text x="724" y="160" font-family="sans-serif" font-size="12" fill="#145a32" text-anchor="end">after N trials</text>
+  <!-- final box -->
+  <rect x="545" y="195" width="235" height="55" rx="6" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="662" y="218" font-family="sans-serif" font-size="12.5" fill="#145a32" text-anchor="middle">5. refit on the full consensus set;</text>
+  <text x="662" y="236" font-family="sans-serif" font-size="12.5" fill="#145a32" text-anchor="middle">return model + inlier mask</text>
+</svg>
+<figcaption><strong>Figure 10.6.2</strong> The hypothesize-and-verify loop. Steps 1 to 4 repeat for $N$ trials (orange loop): a minimal sample proposes a model, the whole dataset votes on it, and the largest consensus survives. The exit path (green) refits by least squares on the winning inliers only, which is safe precisely because the vote already removed the outliers.</figcaption>
+</figure>
+
+<p>
+How many trials are enough? Here RANSAC turns from heuristic into probability exercise. If a fraction $w$ of the data are inliers, a random minimal sample of size $s$ is all-inlier with probability $w^s$, so the probability that $N$ independent samples <em>all</em> contain at least one outlier is $(1 - w^s)^N$. Demanding that at least one clean sample appears with confidence $p$ (conventionally 0.99) and solving gives
+</p>
+<p>
+$$ N \;=\; \frac{\ln(1 - p)}{\ln\!\big(1 - w^{s}\big)}. $$
+</p>
+<p>
+Table 10.6.1 evaluates the formula, and it repays a careful read. Two trends matter. Down each column, trials explode as contamination rises; across each row, they explode as the minimal sample grows. At 50 percent inliers, a line costs 17 trials and a fundamental matrix over a thousand; at 20 percent inliers the eight-point problem needs about 1.8 million. This is why minimal solvers are a cottage industry in geometric vision: shaving the sample size from 8 to 7 (or 5, with calibrated cameras, as <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> makes possible) cuts the exponent itself.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 10.6.1:</strong> <em>Trials $N$ needed for 99 percent confidence of one all-inlier sample.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Inlier fraction $w$</th><th scope="col">Line ($s=2$)</th><th scope="col">Homography ($s=4$)</th><th scope="col">Fundamental matrix ($s=8$)</th></tr>
+</thead>
+<tbody>
+<tr><td>90%</td><td class="winner">3</td><td>5</td><td>9</td></tr>
+<tr><td>50%</td><td>17</td><td>72</td><td>1,177</td></tr>
+<tr><td>20%</td><td>113</td><td>2,877</td><td class="caution">&#8776; 1.8 million</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+In practice nobody knows $w$ in advance, so implementations run <em>adaptively</em>: start pessimistic, and every time a new best consensus set is found, re-estimate $w$ as its fraction of the data and shrink $N$ accordingly. A clean image pair often terminates in dozens of iterations even though the worst-case budget was thousands. The formula is also, deliberately, optimistic: it prices only the chance of drawing one clean sample, not whether that sample's points are well-spread (four nearly collinear points technically determine a homography and practically determine garbage), nor the noise on the inliers themselves. Real implementations add degeneracy checks and local refinement, which is where Section 5's variants come in.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sample Small, Refit Big</div>
+<p>Everything about RANSAC follows from one exponential: the probability of an all-inlier sample is $w^s$, so every extra point in the sample multiplies your required trials by $1/w$. Hypotheses must therefore come from <em>minimal</em> samples, even though models fit to two or four points are individually sloppy. Accuracy is recovered at the end, by least squares on the full consensus set, where it is finally safe. Fitting to few and verifying on all inverts the least-squares instinct of using every datum, and the inversion is the entire trick.</p>
+</div>
+
+<h2>3. RANSAC From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The loop is short enough to write honestly. The code below builds contaminated line data (70 inliers, 30 structureless outliers), fits it both ways, and prints the comparison; the least-squares slope lands at barely two thirds of the truth while RANSAC recovers it almost exactly. The skeleton is the same one OpenCV runs inside <code>cv2.findHomography</code>, just with a line where the homography would be.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+
+# Synthetic data: 70 inliers on y = 0.5x + 10, plus 30 gross outliers
+x_in = rng.uniform(0, 100, 70)
+y_in = 0.5 * x_in + 10 + rng.normal(0, 1.0, 70)     # honest, sigma = 1
+x_out = rng.uniform(0, 100, 30)
+y_out = rng.uniform(0, 100, 30)                     # structureless junk
+x = np.concatenate([x_in, x_out]); y = np.concatenate([y_in, y_out])
+
+def fit_line(xs, ys):
+    """Least squares for y = a*x + b."""
+    A = np.column_stack([xs, np.ones_like(xs)])
+    return np.linalg.lstsq(A, ys, rcond=None)[0]
+
+def ransac_line(x, y, n_trials=200, tau=2.5):
+    best = np.zeros(len(x), bool)
+    for _ in range(n_trials):
+        i, j = rng.choice(len(x), 2, replace=False) # minimal sample: 2 points
+        if x[i] == x[j]:
+            continue                                # degenerate sample: skip
+        a = (y[j] - y[i]) / (x[j] - x[i])
+        b = y[i] - a * x[i]
+        inliers = np.abs(y - (a * x + b)) &lt; tau     # the consensus vote
+        if inliers.sum() &gt; best.sum():
+            best = inliers                          # largest consensus so far
+    return fit_line(x[best], y[best]), best         # safe refit on inliers
+
+a_ls, b_ls = fit_line(x, y)
+(a_r, b_r), inl = ransac_line(x, y)
+print(f"least squares: a={a_ls:.2f}  b={b_ls:.2f}")
+print(f"RANSAC:        a={a_r:.2f}  b={b_r:.2f}  inliers={inl.sum()}")
+# least squares: a=0.33  b=20.84   (dragged far off the true 0.5, 10)
+# RANSAC:        a=0.50  b=10.05  inliers=71</code></pre>
+<div class="code-caption">A complete RANSAC for line fitting in about twenty lines: minimal two-point samples, a degenerate-sample guard, the inlier vote at tolerance $\tau$, and the final least-squares refit run only on the winning consensus set. Thirty percent contamination moves the robust fit by less than a percent.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.measure.ransac Generalizes the Loop</div>
+<p>The from-scratch loop above is about 20 lines and hard-wires the line model. scikit-image ships the loop as a generic engine: <code>from skimage.measure import ransac, LineModelND</code> then <code>model, inliers = ransac(np.column_stack([x, y]), LineModelND, min_samples=2, residual_threshold=2.5, max_trials=200)</code> replaces the whole thing, roughly a 20-to-3 reduction. Internally it handles the adaptive trial count via <code>stop_probability</code>, rejects degenerate samples through <code>is_data_valid</code> and <code>is_model_valid</code> hooks, and accepts any model class exposing <code>estimate</code> and <code>residuals</code>, so the same call fits circles, ellipses, affine maps, or your own model. For homographies and fundamental matrices specifically, OpenCV's <code>cv2.findHomography</code> and <code>cv2.findFundamentalMat</code> bundle the solver, the loop, and the refit into one call, as the next code block shows.</p>
+</div>
+
+<h2>4. Geometric Verification of Real Matches <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Now the payoff for the whole chapter: run the loop on real correspondences. The pipeline below is <a href="section-10.5.html">Section 10.5</a>'s matching recipe with one new call at the end. <code>cv2.findHomography</code> with the <code>cv2.RANSAC</code> flag returns two things, and the second is not a bonus, it is half the product: the $3 \times 3$ homography $H$, and a mask declaring each input match inlier or outlier. The printed attrition tells the story of the chapter in one line: thousands of raw candidates, hundreds of ratio-test survivors, and finally a geometrically consistent core.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img1 = cv2.imread("mural_left.jpg", cv2.IMREAD_GRAYSCALE)
+img2 = cv2.imread("mural_right.jpg", cv2.IMREAD_GRAYSCALE)
+
+sift = cv2.SIFT_create(nfeatures=3000)
+k1, d1 = sift.detectAndCompute(img1, None)
+k2, d2 = sift.detectAndCompute(img2, None)
+pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(d1, d2, k=2)
+good = [m for m, n in pairs if m.distance &lt; 0.75 * n.distance]
+
+src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+H, mask = cv2.findHomography(src, dst, cv2.RANSAC,
+                             ransacReprojThreshold=3.0)   # tau, in pixels
+n_in = int(mask.sum())
+print(f"{len(good)} ratio survivors -&gt; {n_in} geometric inliers "
+      f"({100 * n_in / len(good):.0f}%)")
+# 712 ratio survivors -&gt; 521 geometric inliers (73%)
+
+vis = cv2.drawMatches(img1, k1, img2, k2, good, None,
+                      matchesMask=mask.ravel().tolist(),  # draw inliers only
+                      flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+cv2.imwrite("verified_matches.jpg", vis)</code></pre>
+<div class="code-caption">Geometric verification appended to the standard matching recipe: <code>cv2.findHomography</code> runs the full hypothesize-and-verify loop (4-point samples, 3-pixel reprojection tolerance, adaptive trial count, inlier refit) in one call, and its inlier mask filters <code>drawMatches</code> so the rendered image shows only correspondences the geometry endorses.</div>
+
+<p>
+Two practical warnings keep this honest. First, the homography is the <em>right</em> model only when the scene is planar or the camera rotated about its center, the conditions established in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>; for a translating camera looking at a 3D scene, true matches at different depths obey no shared homography, and the proper model is the fundamental matrix of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> (same function shape: <code>cv2.findFundamentalMat</code>). Fitting the wrong model makes RANSAC silently discard correct matches that disagree with an assumption, not with reality. Second, the inlier count is a trust signal worth gating on: a healthy pair yields hundreds of inliers at a high inlier ratio, while ten inliers out of four hundred candidates means the "model" is four lucky liars, a fit to noise. Production pipelines reject pairs below an inlier floor instead of consuming a garbage homography.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Orthomosaic Stitcher That Learned to Say No</div>
+<p><strong>Who:</strong> Two engineers at an agricultural-tech startup producing stitched field maps (orthomosaics) from drone survey flights.</p>
+<p><strong>Situation:</strong> Each flight returned 400 to 900 overlapping photos of crop fields, stitched overnight into one map that agronomists used to spot irrigation failures.</p>
+<p><strong>Problem:</strong> Wheat looks like wheat. Repetitive crop texture produced confident false matches that the ratio test could not catch, and the least-squares-flavored alignment occasionally swallowed them, warping entire map regions; 18 percent of flights needed manual re-stitching, each costing an hour.</p>
+<p><strong>Decision:</strong> Tighten the ratio test to 0.7, switch verification to MAGSAC++ (<code>cv2.USAC_MAGSAC</code>) at a 2-pixel threshold, and add two gates: an image pair contributes to the mosaic only if it clears 60 inliers <em>and</em> a 35 percent inlier ratio; failing pairs are dropped and their connectivity rerouted through neighbors.</p>
+<p><strong>Result:</strong> Stitch failure rate fell from 18 percent to under 2 percent across the next season, with zero manual rework in most weeks. The dropped-pair log itself became a product feature, flagging flight lines with insufficient overlap for the pilot's next mission.</p>
+<p><strong>Lesson:</strong> RANSAC's inlier mask and count are not diagnostics to print and ignore; they are the API for refusing bad data. A pipeline that can say "this pair is unusable" beats one that always returns an answer.</p>
+</div>
+
+<h2>5. The Modern Family: MSAC, PROSAC, LO-RANSAC &amp; MAGSAC++ <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Vanilla RANSAC has three soft spots, and four decades of refinements target them precisely. <em>Scoring:</em> counting inliers treats a match at $0.1\tau$ and one at $0.99\tau$ identically, so MSAC (Torr and Zisserman) scores each hypothesis by a truncated quadratic loss instead, preferring models whose inliers fit tightly, at zero extra cost. <em>Sampling:</em> drawing samples uniformly wastes trials on bad matches when better information exists; PROSAC (Chum and Matas, 2005) sorts candidates by match quality (the ratio-test score of <a href="section-10.5.html">Section 10.5</a> works) and samples from the best first, often finding the model orders of magnitude sooner. <em>Polish:</em> a model from a minimal sample is noisy even when all its points are inliers, so its consensus set is incomplete; LO-RANSAC (Chum, Matas, and Kittler, 2003) inserts a local-optimization step that refits on the current consensus and re-collects inliers, a small inner loop that markedly stabilizes results.
+</p>
+<p>
+The sharpest pain point is $\tau$ itself: too tight rejects honest matches in blurry images, too loose admits liars, and the right value changes per camera and scene. MAGSAC++ (Barath et al., CVPR 2020) largely removes the dial by marginalizing the score over a range of noise scales, weighting every point by how plausible it is under each, so no single hard threshold decides anything. OpenCV exposes this whole family through the USAC framework: pass <code>cv2.USAC_MAGSAC</code> (or <code>cv2.USAC_PROSAC</code>, <code>cv2.USAC_ACCURATE</code>) wherever <code>cv2.RANSAC</code> goes. Because RANSAC is randomized, its output varies run to run, and the variance is itself a quality measure worth checking; the experiment below repeats the homography fit twenty times under three estimators.
+</p>
+
+<pre><code class="language-python">flags = {"RANSAC      ": cv2.RANSAC,
+         "USAC_DEFAULT": cv2.USAC_DEFAULT,        # LO-RANSAC style pipeline
+         "USAC_MAGSAC ": cv2.USAC_MAGSAC}         # MAGSAC++ scoring
+for name, flag in flags.items():
+    counts = []
+    for _ in range(20):                           # randomized: check spread
+        H, m = cv2.findHomography(src, dst, flag, 3.0)
+        counts.append(int(m.sum()))
+    print(f"{name} inliers: median {int(np.median(counts))}, "
+          f"spread {int(np.ptp(counts))}")
+# RANSAC       inliers: median 518, spread 27
+# USAC_DEFAULT inliers: median 530, spread 11
+# USAC_MAGSAC  inliers: median 537, spread 4</code></pre>
+<div class="code-caption">Twenty repeated fits per estimator on the same matches: the modern USAC variants find slightly larger consensus sets and, more tellingly, vary far less between runs, which is what local optimization and threshold marginalization buy. Run-to-run spread is the cheapest health check a randomized estimator offers.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Born to Make Maps, Still Making Maps</div>
+<p>Fischler and Bolles published RANSAC in 1981 at SRI International, motivated by automated cartography: estimating where a camera was from imperfectly detected landmarks. Forty-five years later its single biggest deployment is COLMAP and the photogrammetry industry, estimating where cameras were from imperfectly matched keypoints, to make maps. CVPR even hosted a "25 Years of RANSAC" workshop in 2006, by which point the algorithm was old enough to rent a car and still a decade short of its NeRF-era second wind.</p>
+</div>
+
+<h2>6. The Pipeline, Complete <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Step back and look at what this chapter assembled. Corners gave us points that can be found again (<a href="section-10.1.html">Section 10.1</a>); scale space made finding them survive zoom and rotation (<a href="section-10.2.html">Section 10.2</a>); SIFT and the binary family turned neighborhoods into comparable vectors (<a href="section-10.3.html">Sections 10.3</a> and <a href="section-10.4.html">10.4</a>); nearest-neighbor search plus the ratio test produced candidate correspondences (<a href="section-10.5.html">Section 10.5</a>); and RANSAC certified them with geometry. Detect, describe, match, verify: four stages, each compensating for the previous one's blind spot. The output, a verified set of correspondences plus the model that binds them, is the raw material for nearly everything in the rest of Part II: calibration targets in <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>, triangulated depth in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, full reconstructions and SLAM maps in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, and the feature tracks that seed the motion estimation of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>.</p>
+<p>
+And RANSAC itself escaped the pipeline long ago. Any fitting problem with gross outliers yields to it: ground-plane estimation in lidar scans, vanishing points from the line segments of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>, loop-closure validation in SLAM, even table-edge detection in document scanners. Whenever you catch yourself distrusting a least-squares fit because some of the data might be lying, the answer is four points and a vote.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Last Classical Holdout</div>
+<p>Deep learning replaced the detector, the descriptor, and the matcher, but the verifier has proven stubborn. MAGSAC++ remains the default robust estimator inside most 2024-2026 reconstruction stacks, and GLOMAP (Pan et al., ECCV 2024), the global structure-from-motion system that revisits COLMAP's design, still RANSAC-verifies every image pair before its global averaging. The differentiable lineage started by DSAC (Brachmann et al., 2017) folds the hypothesize-and-verify loop into training for camera relocalization. The genuinely new challenge is RANSAC-free geometry: DUSt3R (CVPR 2024) and MASt3R (ECCV 2024) regress 3D pointmaps directly from image pairs, and VGGT (CVPR 2025) extends feed-forward geometry to whole image sets, recovering pose without an explicit sampling loop. Yet even these systems are routinely wrapped in robust estimation when metric reliability matters, because a feed-forward network offers no per-correspondence verdict. The vote, it turns out, is hard to retire.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.6.1: The Optimism of the Formula <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Derive the trial-count formula $N = \ln(1-p) / \ln(1 - w^s)$ from the statement "at least one of $N$ samples is all-inlier with probability $p$." Then list three distinct reasons the formula underestimates the trials a real problem needs (consider what an all-inlier sample does <em>not</em> guarantee about the model it produces, the spatial arrangement of sampled points, and the noise on inlier coordinates). Finally, explain why the adaptive version, which shrinks $N$ using the best consensus found so far, is safe even though $w$ is unknown at the start.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.6.2: From Lines to Homographies <span class="exercise-type coding">Coding</span></div>
+<p>Extend this section's from-scratch <code>ransac_line</code> to homographies: draw 4-match minimal samples, solve each with <code>cv2.getPerspectiveTransform</code>, score by reprojection error at $\tau = 3$ pixels, and add the adaptive trial-count update from Section 2. Test it on a real pair (or a synthetic one warped with the tools of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>) and compare your inlier mask against <code>cv2.findHomography</code>'s: what fraction of verdicts agree? Add a degeneracy guard that rejects samples with three nearly collinear points and measure how often it fires.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.6.3: The Threshold and the Dice <span class="exercise-type analysis">Analysis</span></div>
+<p>On one matched image pair, sweep <code>ransacReprojThreshold</code> over 0.5, 1, 2, 3, 5, and 10 pixels, running each setting 50 times. Plot the median inlier count and its run-to-run spread versus threshold, for both <code>cv2.RANSAC</code> and <code>cv2.USAC_MAGSAC</code>. Identify the plateau where the inlier count stabilizes, explain what physical quantity the plateau's onset estimates (think keypoint localization noise from <a href="section-10.2.html">Section 10.2</a>'s sub-pixel refinement), and quantify how much less threshold-sensitive MAGSAC++ is than the vanilla estimator.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.5.html">&#8592; Section 10.5: Descriptor Matching &amp; the Ratio Test</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="../module-11-classical-segmentation/index.html">Chapter 11: Classical Segmentation &amp; Grouping &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
