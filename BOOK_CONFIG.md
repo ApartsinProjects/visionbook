@@ -8,6 +8,7 @@ generic; this file is the only place where content specific to THIS book lives.
 
 - **Title**: Building Vision AI: From Pixels to Generative Models
 - **Subtitle**: A Practitioner's Guide to Image Processing, Classical Computer Vision, Deep Learning, and Generative Vision Models
+- **Authors**: Alexander Apartsin & Yehudit Aperstein
 - **Target Audience**: Software engineers and students with basic Python and linear algebra (vectors, matrices, dot products). No prior computer vision experience required.
 - **Output Format**: HTML chapter files linking to the shared stylesheet `styles/book.css`
 - **Author/Footer line**: `© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a>` (adjust relative depth per file location)
