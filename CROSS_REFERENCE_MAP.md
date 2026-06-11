@@ -28,6 +28,9 @@ arcs to place inline links. Each arc reads "introduced -> deepened -> transforme
 | Thresholding & binarization | Ch 2 | Ch 6 (morphology consumes binary maps) | Ch 24 (per-pixel logits thresholded at inference) |
 | Transfer learning | Ch 21 | Ch 25 (foundation backbones) | Ch 34/35 (fine-tuning generators, LoRA) |
 | Tracking | Ch 15 (Kalman, mean-shift) | Ch 26 (learned MOT) | Ch 36 (object permanence in world models) |
+| World models & simulation | Ch 15 (motion models, Kalman state estimation) | Ch 26 (video understanding), Ch 31 (latent dynamics need VAE latents) | Ch 36.5-36.8 (RSSM/Dreamer, generative simulators, JEPA) |
+| Self-supervision to prediction | Ch 25 (DINO, MAE, contrastive) | Ch 25.6 (foundation models) | Ch 36.7 (JEPA: predict in representation space, decoder-free) |
+| Scores & energies | Ch 30.4 (EBMs, score matching, Langevin) | Ch 33.3 (score SDEs) | Ch 33.5 (flow matching as the modern descendant) |
 
 ## Linking rules
 

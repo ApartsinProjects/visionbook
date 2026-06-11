@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.2: Scale &amp; Rotation Invariance: Scale Space. Gaussian scale space, octaves, scale-normalized blob detection, Difference-of-Gaussians extrema, sub-pixel refinement, and canonical orientation assignment." name="description"/>
+<title>Section 10.2: Scale &amp; Rotation Invariance: Scale Space | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>Scale &amp; Rotation Invariance: Scale Space</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"People keep asking whether I am a small thing nearby or a large thing far away. I stopped answering. I just detect myself at whatever scale shows up."</p>
+<cite>A Serenely Zoom-Proof Keypoint</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A detector that only looks through one window size is blind to the fact that the same object appears at every size, so the fix is to make scale a third search dimension and detect keypoints at the scale where they respond most strongly.</strong> This section builds that machinery: Gaussian scale space as the principled stack of progressively blurred images, the scale-normalized Laplacian as the response worth maximizing, the Difference of Gaussians as its cheap approximation, and extremum detection in the resulting 3D volume. A final step, canonical orientation, dispatches rotation the same way. The output is keypoints stamped with position, scale, and angle: exactly the invariant anchor that <a href="section-10.3.html">Section 10.3</a>'s SIFT descriptor needs.</p>
+</div>
+
+<p>
+<a href="section-10.1.html">Section 10.1</a> closed with an honest confession: every detector in it evaluates a neighborhood of one fixed size, so none of them survives zoom. Photograph a doorway from across the street and its corner fits the structure tensor's window; walk closer and that same corner becomes a smooth, slowly curving boundary that fills half the image and excites nothing. The physical point did not change. The relationship between the point and the window did. This section repairs that relationship.
+</p>
+
+<h2>1. Why Fixed-Size Windows Fail, and What "Scale" Means <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The deep observation, due to scale-space theory (Lindeberg's work in the 1990s formalized it), is that objects in images do not have <em>a</em> size; they have a size <em>relative to the camera</em>, which the photographer chose freely. An algorithm that hopes to recognize structure across photographs therefore may not privilege any single analysis scale. It must examine all of them, and it needs a principled way to generate "the same image, analyzed at coarser and coarser scales" without inventing artifacts along the way.
+</p>
+<p>
+You already own the answer. <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> established that Gaussian smoothing is the unique sensible blur (no new structure created, rotationally symmetric, cascades cleanly), and <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> stacked Gaussian blurs into pyramids. <strong>Gaussian scale space</strong> is the continuous version of that pyramid: the family
+</p>
+<p>
+$$ L(x, y, \sigma) \;=\; G_\sigma * I, $$
+</p>
+<p>
+the image convolved with Gaussians of every standard deviation $\sigma$. The parameter $\sigma$ <em>is</em> the scale: structure much finer than $\sigma$ has been averaged away in $L(\cdot, \cdot, \sigma)$, structure much coarser survives untouched. Detection will now happen inside this 3D volume $(x, y, \sigma)$ rather than on the 2D image, and "the scale of a keypoint" will mean the $\sigma$ at which it is detected.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Invariance by Search, Not by Cleverness</div>
+<p>Scale invariance is not achieved by designing a magically zoom-proof operator. It is achieved by brute honesty: compute the response at every scale, then keep the scale that responds most. When the image is zoomed by a factor $c$, the whole response landscape shifts along the $\sigma$ axis by that same factor, and the per-keypoint maximum shifts with it. The detected scale rides the zoom, which is precisely what invariance means. The same search-then-select pattern handles rotation at the end of this section, and it is worth recognizing as a general design move.</p>
+</div>
+
+<h2>2. Octaves and the Cascade Trick <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A continuous family of blurs must be sampled. The convention, inherited by every implementation from SIFT onward, samples $\sigma$ geometrically: scales come in <strong>octaves</strong> (each octave doubles $\sigma$), and each octave is subdivided into $s$ <strong>intervals</strong> with ratio $k = 2^{1/s}$ between consecutive scales. SIFT defaults to $s = 3$, $\sigma_0 = 1.6$. Two practical refinements keep the cost sane. First, the cascade property from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> (blurring by $\sigma_1$ then $\sigma_2$ equals blurring by $\sqrt{\sigma_1^2 + \sigma_2^2}$) means each level is produced by a small <em>incremental</em> blur of the previous level, never a giant blur of the original. Second, after each octave the image is downsampled by 2 and the process repeats at half resolution: beyond one octave of blur, the extra pixels carry no information, exactly the argument behind <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>'s pyramid. The code below builds one octave from these two rules.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def gaussian_octave(img: np.ndarray, sigma0: float = 1.6,
+                    intervals: int = 3) -&gt; np.ndarray:
+    """One octave of Gaussian scale space: intervals + 3 images."""
+    k = 2.0 ** (1.0 / intervals)
+    levels = [cv2.GaussianBlur(img, (0, 0), sigma0)]
+    for i in range(1, intervals + 3):
+        sigma_prev = sigma0 * k ** (i - 1)
+        # cascade property: the increment that takes sigma_prev to k*sigma_prev
+        sigma_inc = sigma_prev * np.sqrt(k * k - 1.0)
+        levels.append(cv2.GaussianBlur(levels[-1], (0, 0), sigma_inc))
+    return np.stack(levels)               # shape: (intervals + 3, H, W)
+
+img = cv2.imread("street.jpg", cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
+gauss = gaussian_octave(img)
+dog = gauss[1:] - gauss[:-1]              # Difference of Gaussians, see below
+print(gauss.shape, dog.shape)             # (6, H, W) (5, H, W)</code></pre>
+<div class="code-caption">Building one octave of Gaussian scale space with incremental blurs via the cascade property, then differencing adjacent levels to get the five-layer DoG stack; the seemingly odd count of intervals + 3 Gaussian images is explained by the extremum search in Figure 10.2.1.</div>
+
+<p>
+Why $s + 3$ images per octave instead of $s$? The extremum search of Section 4 compares each DoG layer against the layers above and below it, so the top and bottom DoG layers can never host detections. To test a full octave's worth of scales ($s$ layers), you need $s + 2$ DoG layers, hence $s + 3$ Gaussian images. Bookkeeping, but the kind that bites anyone reimplementing SIFT.
+</p>
+
+<h2>3. What to Detect: the Scale-Normalized Laplacian <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Scale space says where to search. It does not yet say what function of the image to maximize there. The structure tensor of <a href="section-10.1.html">Section 10.1</a> could be evaluated per scale (and the multi-scale Harris-Laplace detector does exactly that), but SIFT's lineage uses a different, blob-flavored response: the <strong>Laplacian of Gaussian</strong>, $\nabla^2 L = L_{xx} + L_{yy}$, which you met as an edge-and-blob operator in <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>. A dark blob on a bright background (or vice versa) produces a strong Laplacian response when the Gaussian's width matches the blob's radius; mismatched widths blur the blob away or average it with its surroundings.
+</p>
+<p>
+One subtlety decides everything. Gaussian derivatives shrink as $\sigma$ grows (blurring flattens slopes), so raw Laplacian responses at different scales are not comparable: coarse scales would always lose. Lindeberg's fix is <strong>scale normalization</strong>: multiply by $\sigma^2$, one factor of $\sigma$ per derivative order. The quantity worth comparing across the whole volume is
+</p>
+<p>
+$$ \mathcal{L}(x, y, \sigma) \;=\; \sigma^2 \left| \nabla^2 L(x, y, \sigma) \right|, $$
+</p>
+<p>
+and a keypoint is a local extremum of $\mathcal{L}$ in all three coordinates. For an ideal circular blob of radius $r$, the maximum lands at $\sigma = r / \sqrt{2}$: the detected scale literally measures the blob. This is the theoretical heart of the section; everything after it is approximation and engineering.
+</p>
+<p>
+The engineering: computing $\sigma^2 \nabla^2 L$ at every voxel is expensive, and the <strong>Difference of Gaussians</strong> you built in the code above is an almost-free stand-in. A first-order expansion of the heat equation (which Gaussian blurring solves, as <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> noted) gives
+</p>
+<p>
+$$ D(x, y, \sigma) \;=\; L(x, y, k\sigma) - L(x, y, \sigma) \;\approx\; (k - 1)\,\sigma^2\, \nabla^2 L, $$
+</p>
+<p>
+so subtracting adjacent scale-space levels yields the scale-normalized Laplacian, including the $\sigma^2$ factor, times a constant $(k-1)$ that is identical for every layer and therefore harmless to extremum detection. The blurred images were needed anyway; the detector response costs one subtraction per level.
+</p>
+
+<h2>4. Extrema in Three Dimensions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Detection is now a neighborhood test in the DoG volume: a voxel is a candidate keypoint if it is strictly greater (or strictly smaller) than all 26 neighbors in its $3 \times 3 \times 3$ surroundings: 8 neighbors in its own layer, 9 in the layer above, 9 below. Figure 10.2.1 shows the geometry. The comparison against neighboring <em>scales</em> is what selects the intrinsic scale; the comparison within the layer is ordinary spatial non-maximum suppression, the same hygiene as in <a href="section-10.1.html">Section 10.1</a>.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A stack of Gaussian-blurred images differenced into DoG layers, and a 3x3x3 cube showing the candidate voxel compared against 26 neighbors across three adjacent DoG layers">
+  <!-- Gaussian stack -->
+  <text x="150" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Gaussian levels L(&#183;,&#183;,&#963;)</text>
+  <g stroke="#2980b9" stroke-width="1.5">
+    <polygon points="60,290 200,290 250,260 110,260" fill="#d4e6f1"/>
+    <polygon points="60,240 200,240 250,210 110,210" fill="#aed6f1"/>
+    <polygon points="60,190 200,190 250,160 110,160" fill="#85c1e9"/>
+    <polygon points="60,140 200,140 250,110 110,110" fill="#5dade2"/>
+    <polygon points="60,90 200,90 250,60 110,60" fill="#3498db"/>
+  </g>
+  <text x="38" y="285" font-family="sans-serif" font-size="12" fill="#5a626c">&#963;</text>
+  <text x="30" y="80" font-family="sans-serif" font-size="12" fill="#5a626c">2&#963;</text>
+  <line x1="42" y1="270" x2="42" y2="100" stroke="#5a626c" stroke-width="1.4"/>
+  <polygon points="42,95 37,106 47,106" fill="#5a626c"/>
+  <!-- minus arrows to DoG -->
+  <g stroke="#5a626c" stroke-width="1.6">
+    <line x1="255" y1="250" x2="330" y2="240"/>
+    <line x1="255" y1="200" x2="330" y2="195"/>
+    <line x1="255" y1="150" x2="330" y2="150"/>
+    <line x1="255" y1="100" x2="330" y2="105"/>
+  </g>
+  <text x="292" y="180" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">subtract</text>
+  <text x="292" y="198" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">adjacent</text>
+  <!-- DoG stack -->
+  <text x="430" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">DoG layers D(&#183;,&#183;,&#963;)</text>
+  <g stroke="#1e8449" stroke-width="1.5">
+    <polygon points="340,270 480,270 530,240 390,240" fill="#d5f5e3"/>
+    <polygon points="340,215 480,215 530,185 390,185" fill="#abebc6"/>
+    <polygon points="340,160 480,160 530,130 390,130" fill="#82e0aa"/>
+    <polygon points="340,105 480,105 530,75 390,75" fill="#58d68d"/>
+  </g>
+  <!-- highlight middle voxel -->
+  <circle cx="445" cy="172" r="6" fill="#c0392b"/>
+  <!-- neighbor cube -->
+  <text x="672" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">26-neighbor test</text>
+  <g font-family="sans-serif" font-size="11" fill="#5a626c">
+    <!-- three 3x3 grids -->
+    <g transform="translate(600,55)">
+      <g fill="#d5f5e3" stroke="#1e8449" stroke-width="1">
+        <rect x="0" y="0" width="22" height="22"/><rect x="22" y="0" width="22" height="22"/><rect x="44" y="0" width="22" height="22"/>
+        <rect x="0" y="22" width="22" height="22"/><rect x="22" y="22" width="22" height="22"/><rect x="44" y="22" width="22" height="22"/>
+        <rect x="0" y="44" width="22" height="22"/><rect x="22" y="44" width="22" height="22"/><rect x="44" y="44" width="22" height="22"/>
+      </g>
+      <text x="100" y="38" fill="#5a626c">scale above (9)</text>
+    </g>
+    <g transform="translate(600,135)">
+      <g fill="#d5f5e3" stroke="#1e8449" stroke-width="1">
+        <rect x="0" y="0" width="22" height="22"/><rect x="22" y="0" width="22" height="22"/><rect x="44" y="0" width="22" height="22"/>
+        <rect x="0" y="22" width="22" height="22"/><rect x="44" y="22" width="22" height="22"/>
+        <rect x="0" y="44" width="22" height="22"/><rect x="22" y="44" width="22" height="22"/><rect x="44" y="44" width="22" height="22"/>
+      </g>
+      <rect x="22" y="22" width="22" height="22" fill="#c0392b"/>
+      <text x="100" y="38" fill="#5a626c">same scale (8)</text>
+    </g>
+    <g transform="translate(600,215)">
+      <g fill="#d5f5e3" stroke="#1e8449" stroke-width="1">
+        <rect x="0" y="0" width="22" height="22"/><rect x="22" y="0" width="22" height="22"/><rect x="44" y="0" width="22" height="22"/>
+        <rect x="0" y="22" width="22" height="22"/><rect x="22" y="22" width="22" height="22"/><rect x="44" y="22" width="22" height="22"/>
+        <rect x="0" y="44" width="22" height="22"/><rect x="22" y="44" width="22" height="22"/><rect x="44" y="44" width="22" height="22"/>
+      </g>
+      <text x="100" y="38" fill="#5a626c">scale below (9)</text>
+    </g>
+    <text x="633" y="312" fill="#2c3e50" font-weight="bold" text-anchor="middle">keypoint if extremal vs all 26</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 10.2.1</strong> Scale-space detection in one octave. Left: Gaussian levels from $\sigma$ to $2\sigma$. Center: adjacent levels are subtracted into DoG layers, each approximating the scale-normalized Laplacian at its scale. Right: a voxel (red) becomes a candidate keypoint only if it beats all 26 neighbors across its own and the two adjacent DoG layers.</figcaption>
+</figure>
+
+<p>
+The implementation below runs the test on the <code>dog</code> stack built earlier, using a 3D maximum filter as the vectorized form of the 26-neighbor comparison. Note the contrast threshold: DoG values are tiny on low-contrast structure, which is noise-dominated and unrepeatable, so SIFT discards extrema with $|D| &lt; 0.03$ (on images scaled to $[0,1]$) before doing anything else with them.
+</p>
+
+<pre><code class="language-python">from scipy.ndimage import maximum_filter, minimum_filter
+
+is_max = dog == maximum_filter(dog, size=(3, 3, 3))   # 26-neighbor maxima
+is_min = dog == minimum_filter(dog, size=(3, 3, 3))   # 26-neighbor minima
+extrema = (is_max | is_min) &amp; (np.abs(dog) &gt; 0.03)    # contrast gate
+
+# Only interior layers have neighbors above AND below
+s, y, x = np.where(extrema[1:-1])
+sigma = 1.6 * (2.0 ** ((s + 1) / 3.0))                # layer index -&gt; scale
+print(f"{len(x)} candidates, sigma range {sigma.min():.2f} to {sigma.max():.2f}")
+# 1862 candidates, sigma range 2.02 to 3.20</code></pre>
+<div class="code-caption">Vectorized 26-neighbor extremum detection over the DoG volume using 3D max and min filters, with the low-contrast gate applied immediately; the recovered $\sigma$ per detection converts a layer index into a physical scale in pixels.</div>
+
+<h2>5. Refinement: Sub-Pixel Fitting and Edge Rejection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Raw extrema sit on an integer grid in all three dimensions, and the scale grid is coarse (three samples per octave). SIFT therefore fits a 3D quadratic to the DoG values around each extremum (using finite-difference gradients and Hessian) and solves for the continuous offset $\hat{\mathbf{x}} = -\mathbf{H}^{-1} \nabla D$. The payoff is real: localization error drops well below a pixel, and the interpolated $|D(\hat{\mathbf{x}})|$ gives a better contrast estimate for the gate above. Offsets larger than half a sample mean the true extremum belongs to a neighboring voxel, and the fit is re-run there.
+</p>
+<p>
+One failure mode survives all of this: the DoG operator responds strongly <em>along edges</em>, where localization is poor in exactly the way <a href="section-10.1.html">Section 10.1</a> diagnosed with the aperture problem. The cure is a structure-tensor argument recycled at the descriptor scale: compute the $2 \times 2$ Hessian of the DoG layer at the keypoint, whose eigenvalue ratio plays the same role as the structure tensor's. Rather than eigenvalues, SIFT tests the trace-determinant ratio
+</p>
+<p>
+$$ \frac{(\operatorname{tr} \mathbf{H})^2}{\det \mathbf{H}} \;&lt;\; \frac{(r + 1)^2}{r}, \qquad r = 10, $$
+</p>
+<p>
+which accepts a keypoint only if its principal curvatures differ by less than a factor of 10. The echo of the Harris trick (avoid eigendecomposition, use trace and determinant) is no coincidence; it is the same mathematics serving a second tour of duty.
+</p>
+
+<h2>6. Canonical Orientation: Rotation Handled the Same Way <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Position and scale are now invariantly detected; rotation remains. The strategy repeats the pattern named in the Key Insight: measure everything, select the maximum. Around each keypoint, within a Gaussian window of $1.5\sigma$ at the keypoint's own scale, collect every pixel's gradient orientation into a <strong>36-bin histogram</strong> (10 degrees per bin), weighting each vote by gradient magnitude and the Gaussian. The histogram's peak is the keypoint's <strong>canonical orientation</strong>: the descriptor of <a href="section-10.3.html">Section 10.3</a> will be computed in a coordinate frame rotated to this angle, so the same physical patch yields the same descriptor no matter how the camera was rolled. Figure 10.2.2 sketches the histogram and one important wrinkle.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 36-bin orientation histogram with a dominant peak assigned as canonical orientation and a secondary peak above 80 percent of the maximum spawning a duplicate keypoint">
+  <line x1="70" y1="220" x2="700" y2="220" stroke="#2c3e50" stroke-width="2"/>
+  <line x1="70" y1="220" x2="70" y2="40" stroke="#2c3e50" stroke-width="2"/>
+  <text x="385" y="252" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">gradient orientation (36 bins of 10&#176;)</text>
+  <text x="46" y="130" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle" transform="rotate(-90 46 130)">weighted votes</text>
+  <g fill="#5dade2" stroke="#2980b9" stroke-width="0.8">
+    <rect x="78" y="195" width="14" height="25"/><rect x="95" y="185" width="14" height="35"/>
+    <rect x="112" y="190" width="14" height="30"/><rect x="129" y="170" width="14" height="50"/>
+    <rect x="146" y="150" width="14" height="70"/><rect x="163" y="100" width="14" height="120"/>
+    <rect x="180" y="60" width="14" height="160" fill="#27ae60" stroke="#145a32"/>
+    <rect x="197" y="110" width="14" height="110"/><rect x="214" y="160" width="14" height="60"/>
+    <rect x="231" y="185" width="14" height="35"/><rect x="248" y="195" width="14" height="25"/>
+    <rect x="265" y="200" width="14" height="20"/><rect x="282" y="190" width="14" height="30"/>
+    <rect x="299" y="198" width="14" height="22"/><rect x="316" y="192" width="14" height="28"/>
+    <rect x="333" y="200" width="14" height="20"/><rect x="350" y="196" width="14" height="24"/>
+    <rect x="367" y="188" width="14" height="32"/><rect x="384" y="178" width="14" height="42"/>
+    <rect x="401" y="150" width="14" height="70"/><rect x="418" y="92" width="14" height="128" fill="#f39c12" stroke="#b9770e"/>
+    <rect x="435" y="140" width="14" height="80"/><rect x="452" y="180" width="14" height="40"/>
+    <rect x="469" y="195" width="14" height="25"/><rect x="486" y="200" width="14" height="20"/>
+    <rect x="503" y="192" width="14" height="28"/><rect x="520" y="198" width="14" height="22"/>
+    <rect x="537" y="200" width="14" height="20"/><rect x="554" y="194" width="14" height="26"/>
+    <rect x="571" y="198" width="14" height="22"/><rect x="588" y="190" width="14" height="30"/>
+    <rect x="605" y="196" width="14" height="24"/><rect x="622" y="200" width="14" height="20"/>
+    <rect x="639" y="194" width="14" height="26"/><rect x="656" y="198" width="14" height="22"/>
+    <rect x="673" y="200" width="14" height="20"/>
+  </g>
+  <line x1="70" y1="92" x2="700" y2="92" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="6,4"/>
+  <text x="640" y="84" font-family="sans-serif" font-size="12" fill="#c0392b">80% of peak</text>
+  <text x="187" y="48" font-family="sans-serif" font-size="12" fill="#145a32" font-weight="bold">canonical orientation</text>
+  <text x="425" y="120" font-family="sans-serif" font-size="12" fill="#b9770e" font-weight="bold" text-anchor="start" transform="rotate(-90 433 132)"></text>
+  <text x="470" y="64" font-family="sans-serif" font-size="12" fill="#b9770e" font-weight="bold">second peak &#8805; 80%: duplicate keypoint</text>
+</svg>
+<figcaption><strong>Figure 10.2.2</strong> Orientation assignment. Gradient orientations around the keypoint vote into 36 bins, weighted by magnitude and a Gaussian window. The green peak becomes the canonical orientation. The orange bin clears 80 percent of the peak, so the keypoint is duplicated with a second orientation rather than gambling on one.</figcaption>
+</figure>
+
+<p>
+The wrinkle Figure 10.2.2 highlights: some patches (a checkerboard junction, an X-shaped crossing) genuinely have two strong orientations, and picking one would make the descriptor flip unpredictably between photographs. SIFT's solution is to <em>duplicate</em>: any histogram peak within 80 percent of the maximum spawns its own keypoint with its own orientation. About 15 percent of keypoints get duplicated this way, and Lowe reports the duplicates contribute disproportionately to matching stability. A parabola fit over each peak and its two neighbors refines the angle below the 10-degree bin width.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.SIFT_create Runs This Whole Section</div>
+<p>Everything above (octave construction, DoG, 26-neighbor extrema, quadratic refinement, contrast and edge gates, orientation histograms, duplication) is two lines with OpenCV: <code>sift = cv2.SIFT_create()</code> then <code>kps = sift.detect(gray, None)</code>. A faithful from-scratch version runs several hundred lines, so the reduction is roughly 200-to-1. Each returned <code>cv2.KeyPoint</code> carries the section's outputs as attributes: <code>kp.pt</code> (sub-pixel position), <code>kp.size</code> (diameter, proportional to detected $\sigma$), <code>kp.angle</code> (canonical orientation in degrees), and <code>kp.response</code> (contrast strength, useful for ranking). The constructor exposes the section's thresholds by name: <code>nOctaveLayers=3</code>, <code>contrastThreshold=0.04</code>, <code>edgeThreshold=10</code>, <code>sigma=1.6</code>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Museum Guide That Failed From the Back of the Room</div>
+<p><strong>Who:</strong> A four-person team building a point-your-phone audio guide for a national art museum.</p>
+<p><strong>Situation:</strong> Visitors photograph a painting; the app matches it against a gallery of 2,400 reference images and plays the right commentary. The prototype detected FAST corners at a single scale and matched small patches around them.</p>
+<p><strong>Problem:</strong> Accuracy was 96 percent for visitors standing at arm's length and 41 percent from the back of the room. The reference photos were taken at one distance; visitor photos spanned a 6x range of apparent painting size, and single-scale detection found entirely different corner sets at each distance.</p>
+<p><strong>Decision:</strong> Replace detection with scale-space keypoints (OpenCV SIFT, defaults), keeping the rest of the pipeline. Reference images were re-indexed once, overnight.</p>
+<p><strong>Result:</strong> Back-of-room accuracy rose to 93 percent; arm's-length accuracy held. Median detected scales on far shots were about 2.5x smaller than on near shots of the same paintings, confirming the mechanism: the same physical details were being found, at the scales they actually appeared.</p>
+<p><strong>Lesson:</strong> If users control the camera, scale invariance is not an academic nicety; it is the difference between a demo and a product. Measure your real input's scale range before trusting any fixed-scale detector.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Do Networks Still Need a Scale Space?</div>
+<p>Modern learned detectors split on this section's central question. Some keep the classical answer: XFeat (CVPR 2024) and ALIKED (2023) run explicit multi-scale inference, and DeDoDe (3DV 2024) trains its detector on multi-view consistency so that scale robustness is learned from data rather than built from Gaussians. Others abandon per-keypoint scale search entirely: DUSt3R (CVPR 2024) and MASt3R (ECCV 2024) feed two whole images into a transformer that has seen so many scale combinations in training that invariance emerges as a network property, with no $\sigma$ axis anywhere. The open trade is sample efficiency versus generality: the Gaussian scale space gets invariance from mathematics with zero training data; the transformers get broader robustness (extreme viewpoint, weak texture) at the cost of millions of training pairs and a GPU. Production reconstruction systems in 2026 still overwhelmingly run the classical pyramid, with the learned representations of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a> advancing every year.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.2.1: The Case for $\sigma^2$ <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose extrema were detected on the raw Laplacian $|\nabla^2 L|$ without the $\sigma^2$ normalization. Using the fact that Gaussian blurring with scale $\sigma$ shrinks image derivatives roughly in proportion to $1/\sigma$ per derivative order, predict which scales would win every extremum competition and what would happen to detected keypoint scales when an image is zoomed by 2x. Then explain why the DoG approximation does not need an explicit $\sigma^2$ factor added back.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.2.2: Measuring a Blob With a Detector <span class="exercise-type coding">Coding</span></div>
+<p>Render synthetic images containing single dark discs of radius $r \in \{4, 8, 16, 32\}$ pixels on a white background. Build a dense DoG response over $\sigma$ from 2 to 40 (no octave downsampling needed) and, for each disc, plot $|D|$ at the disc center as a function of $\sigma$. Verify that the peak tracks $\sigma \approx r / \sqrt{2}$ and report the percentage error of the prediction at each radius.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.2.3: Repeatability Under Zoom <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend Exercise 10.1.3 from rotation to scale: downsample an image by factors 1.25, 1.6, 2.0, and 2.5 (use the resampling guidance of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>), detect keypoints with both Shi-Tomasi and SIFT, map detections back to original coordinates, and plot repeatability versus zoom factor for each detector. Additionally, for SIFT only, scatter-plot each matched keypoint's detected scale in the zoomed image against its scale in the original. What slope do you expect, and what slope do you measure?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.1.html">&#8592; Section 10.1: Corner Detection: Harris, Shi-Tomasi &amp; FAST</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.3.html">Section 10.3: SIFT: The Descriptor That Defined a Decade &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

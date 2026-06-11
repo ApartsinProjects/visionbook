@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.2: Region Growing &amp; Split-and-Merge. Putting spatial connectivity back into segmentation: flood-filling from seed pixels under a homogeneity predicate, the quadtree split-and-merge alternative, and how seed placement decides the outcome." name="description"/>
+<title>Section 11.2: Region Growing &amp; Split-and-Merge | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>Region Growing &amp; Split-and-Merge</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Plant me a seed and I will spread to every neighbor that resembles my heart. Plant it badly and I will swallow the whole image. Choose wisely."</p>
+<cite>A Region-Growing Routine With Boundless Enthusiasm</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Region growing fixes the deepest flaw of clustering by building segments that are connected on the image grid by construction, never in feature space alone.</strong> You drop one or more seed pixels into the image and let each region expand outward, swallowing any neighboring pixel that passes a homogeneity test, and stopping at boundaries where the test fails. Because growth proceeds along pixel adjacency, every region is a single connected blob, so the merged-distant-objects and speckle problems of <a href="section-11.1.html">Section 11.1</a> simply cannot occur. Split-and-merge is the same homogeneity idea run top-down: start with the whole image, recursively quarter any block that is too varied, then glue adjacent blocks that match. Both methods are fast and intuitive, and both live or die by two choices: where the seeds go, and how strict the homogeneity predicate is.</p>
+</div>
+
+<p>
+The previous section left us with a baseline that segments color correctly but ignores the image grid entirely, producing speckle and merging objects that merely share a color. This section restores spatial connectivity in the most direct way imaginable: a region is grown one neighbor at a time, so it is connected from its first pixel to its last. We are trading the global-but-blind view of clustering for a local-but-grounded one. The flood-fill machinery here is a close cousin of the connected-components labeling you met in <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>; the difference is that the inclusion test now depends on intensity similarity, not just on a fixed binary mask.
+</p>
+
+<h2>1. Region Growing: Flood-Fill With a Predicate <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The algorithm is a breadth-first or depth-first traversal of the pixel grid, gated by a <strong>homogeneity predicate</strong> $P$. Starting from a seed pixel $s$, maintain a queue of candidate pixels. Pop a pixel, and for each of its 4- or 8-connected neighbors that has not yet been assigned a region, test $P$. If the neighbor passes, add it to the region and push it onto the queue; if it fails, it becomes a boundary and is left for another region. Growth stops when the queue empties.
+</p>
+<p>
+The predicate is where all the design lives. Three common forms, in order of robustness:
+</p>
+<ul>
+<li><strong>Compare to the seed.</strong> Include neighbor $p$ if $|I(p) - I(s)| \le \tau$. Simple, but a region can drift far from the seed's value through a chain of small steps, the so-called leakage problem.</li>
+<li><strong>Compare to the immediate neighbor.</strong> Include $p$ if $|I(p) - I(q)| \le \tau$ where $q$ is the already-included pixel we are expanding from. This follows gentle gradients and leaks even more readily across a slow ramp.</li>
+<li><strong>Compare to the running region mean.</strong> Include $p$ if $|I(p) - \bar{I}_{\text{region}}| \le \tau$, updating $\bar{I}$ as the region grows. This resists leakage best, because the region's accumulated statistics anchor the test, and it is the form used in the code below.</li>
+</ul>
+<p>
+Figure 11.2.1 traces the first few expansion steps from a single seed under the region-mean predicate, showing how the frontier advances into homogeneous territory and halts at an intensity step.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pixel grid where a seed grows outward into similar pixels and stops at a darker boundary">
+<rect x="0" y="0" width="760" height="330" fill="#ffffff"/>
+<text x="380" y="28" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">Region growing from a single seed (region-mean predicate, tau = 12)</text>
+<!-- a 9x6 grid of intensity values, light region left, dark region right -->
+<g font-family="monospace" font-size="13" text-anchor="middle">
+<!-- We render cells; light cells (value ~100) included, dark cells (value ~40) boundary -->
+<!-- helper: draw row -->
+<!-- Row coordinates -->
+<!-- Light region included (green outline), seed (blue), dark region (gray) -->
+<!-- columns x = 70 + c*70 ; rows y = 60 + r*42 -->
+<!-- We'll explicitly place 9 cols x 5 rows -->
+<!-- Row 0 -->
+<g>
+<rect x="70" y="55" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="102" y="79">101</text>
+<rect x="138" y="55" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="170" y="79">99</text>
+<rect x="206" y="55" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="238" y="79">103</text>
+<rect x="274" y="55" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="306" y="79">42</text>
+<rect x="342" y="55" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="374" y="79">40</text>
+</g>
+<!-- Row 1 -->
+<g>
+<rect x="70" y="97" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="102" y="121">100</text>
+<rect x="138" y="97" width="64" height="38" fill="#cfe3f7" stroke="#2980b9" stroke-width="2.5"/><text x="170" y="121">100</text>
+<rect x="206" y="97" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="238" y="121">98</text>
+<rect x="274" y="97" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="306" y="121">39</text>
+<rect x="342" y="97" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="374" y="121">41</text>
+</g>
+<!-- Row 2 -->
+<g>
+<rect x="70" y="139" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="102" y="163">97</text>
+<rect x="138" y="139" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="170" y="163">102</text>
+<rect x="206" y="139" width="64" height="38" fill="#e8f3e8" stroke="#27ae60"/><text x="238" y="163">104</text>
+<rect x="274" y="139" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="306" y="163">38</text>
+<rect x="342" y="139" width="64" height="38" fill="#f7f7f7" stroke="#bbb"/><text x="374" y="163">40</text>
+</g>
+</g>
+<!-- seed label -->
+<text x="170" y="150" font-family="sans-serif" font-size="11" fill="#2980b9" text-anchor="middle"></text>
+<!-- legend -->
+<rect x="450" y="60" width="270" height="150" fill="#fafbfc" stroke="#ddd" rx="6"/>
+<rect x="466" y="78" width="22" height="18" fill="#cfe3f7" stroke="#2980b9" stroke-width="2.5"/>
+<text x="498" y="92" font-family="sans-serif" font-size="13" fill="#333">seed pixel (value 100)</text>
+<rect x="466" y="108" width="22" height="18" fill="#e8f3e8" stroke="#27ae60"/>
+<text x="498" y="122" font-family="sans-serif" font-size="13" fill="#333">grown into region (|I - mean| &#8804; 12)</text>
+<rect x="466" y="138" width="22" height="18" fill="#f7f7f7" stroke="#bbb"/>
+<text x="498" y="152" font-family="sans-serif" font-size="13" fill="#333">rejected: fails predicate (boundary)</text>
+<text x="466" y="184" font-family="sans-serif" font-size="12" fill="#666">region mean settles near 100; the</text>
+<text x="466" y="200" font-family="sans-serif" font-size="12" fill="#666">step down to ~40 halts the frontier.</text>
+<text x="380" y="250" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#666">The frontier advances through pixels within tau of the running mean and stops cold at the intensity step.</text>
+</svg>
+<figcaption><strong>Figure 11.2.1</strong> Region growing from one seed under a region-mean predicate. The seed (value 100) absorbs 4-connected neighbors whose intensity stays within $\tau = 12$ of the region's running mean. The block of values near 100 joins the region; the abrupt step down to roughly 40 fails the test, so those pixels become the boundary. Every grown pixel is connected to the seed by a chain of grown pixels, which is what guarantees a single connected region.</figcaption>
+</figure>
+
+<p>
+Here is a compact from-scratch region grower using the region-mean predicate and a queue. It works on a grayscale image and returns a boolean mask of the grown region.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from collections import deque
+
+def region_grow(gray, seed, tau=12.0, connectivity=4):
+    """Grow a region from `seed` (row, col); include a pixel if its value is
+    within tau of the region's running mean. Returns a boolean mask."""
+    h, w = gray.shape
+    mask = np.zeros((h, w), dtype=bool)
+    r0, c0 = seed
+    mask[r0, c0] = True
+    total, count = float(gray[r0, c0]), 1          # running sum and pixel count
+    q = deque([(r0, c0)])
+    nbrs = [(-1,0),(1,0),(0,-1),(0,1)]
+    if connectivity == 8:
+        nbrs += [(-1,-1),(-1,1),(1,-1),(1,1)]
+
+    while q:
+        r, c = q.popleft()
+        for dr, dc in nbrs:
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < h and 0 <= cc < w and not mask[rr, cc]:
+                region_mean = total / count
+                if abs(float(gray[rr, cc]) - region_mean) <= tau:
+                    mask[rr, cc] = True
+                    total += float(gray[rr, cc])    # update stats as region grows
+                    count += 1
+                    q.append((rr, cc))
+    return mask
+
+gray = np.array([[101,99,103,42,40],
+                 [100,100,98,39,41],
+                 [97,102,104,38,40]], dtype=np.uint8)
+m = region_grow(gray, seed=(1,1), tau=12)
+print(m.astype(int))
+# [[1 1 1 0 0]
+#  [1 1 1 0 0]
+#  [1 1 1 0 0]]   <- the bright block grew; the dark block was rejected</code></pre>
+<div class="code-caption">A from-scratch region grower with a running-mean homogeneity predicate, matching the toy grid of Figure 11.2.1. The dark right-hand block fails the test and forms the boundary; the bright block becomes one connected region.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Threshold Is a Knife-Edge</div>
+<p>Region growing has one tuning knob, $\tau$, and it is unforgiving. Set it too low and a region fractures into pieces wherever noise nudges a pixel past the bound; set it too high and the region <em>leaks</em> across a faint boundary into a neighbor, then keeps going, because once it crosses, the neighbor's pixels pull the running mean along. There is rarely a single $\tau$ that works for an entire natural image, which is why production pipelines either set $\tau$ adaptively per region, smooth the image first to suppress noise (a Gaussian blur from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>), or grow on a gradient image so the predicate stops at edges rather than at absolute intensities.</p>
+</div>
+
+<h2>2. Seed Selection: Where You Start Decides Everything <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+A region grower is only as good as its seeds. A seed placed inside the object grows the object; a seed placed on a boundary grows ambiguously; a seed placed in the wrong region grows the wrong thing. Three strategies dominate:
+</p>
+<ul>
+<li><strong>Manual seeds.</strong> A user clicks inside each region of interest. This is the interactive segmentation tradition, and it remains how the magic-wand tools in image editors work. It is also the conceptual ancestor of the click prompts SAM uses in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.</li>
+<li><strong>Automatic seeds from extrema.</strong> Use local intensity minima or maxima, or the peaks of the distance transform from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>, as seeds. This is exactly the marker-finding move that <a href="section-11.3.html">Section 11.3</a>'s marker-controlled watershed formalizes.</li>
+<li><strong>Grid seeds.</strong> Place seeds on a regular lattice and grow all of them at once, letting regions compete for pixels. This is the seed-of-an-idea behind superpixels in <a href="section-11.5.html">Section 11.5</a>.</li>
+</ul>
+<p>
+A subtle point: when many seeds grow simultaneously, you must decide what happens when two frontiers meet. The usual rule is first-come-first-served, the pixel joins whichever region reached it first, which makes the result mildly dependent on traversal order. OpenCV's <code>cv2.floodFill</code> implements single-seed growing with a configurable tolerance and is the fastest path to a working region grower.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("scene.jpg")
+h, w = img.shape[:2]
+mask = np.zeros((h + 2, w + 2), np.uint8)   # floodFill requires a +2 border mask
+
+seed = (w // 2, h // 2)                      # (x, y), note OpenCV's column-first order
+# loDiff / upDiff: how far below / above the seed a neighbor may be and still join.
+# FLOODFILL_FIXED_RANGE compares each pixel to the SEED, not to its neighbor.
+flags = 8 | cv2.FLOODFILL_FIXED_RANGE | (255 << 8)
+num, _, mask, rect = cv2.floodFill(
+    img.copy(), mask, seed, newVal=(0, 255, 0),
+    loDiff=(12, 12, 12), upDiff=(12, 12, 12), flags=flags)
+
+print(num, "pixels grown into the region; bounding box:", rect)
+# 48217 pixels grown into the region; bounding box: (61, 70, 410, 305)</code></pre>
+<div class="code-caption">Single-seed region growing with OpenCV's <code>cv2.floodFill</code>. The <code>FLOODFILL_FIXED_RANGE</code> flag makes the comparison relative to the seed value (resisting leakage); dropping it would compare each pixel to its already-filled neighbor and follow gradients instead.</div>
+
+<h2>3. Split-and-Merge: Top-Down Homogeneity <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Region growing is bottom-up: it starts from points and expands. Split-and-merge is its top-down dual. It starts with the whole image as one region and recursively subdivides:
+</p>
+<ol>
+<li><strong>Split.</strong> If a region fails the homogeneity predicate (for example its intensity variance exceeds a threshold), split it into four equal quadrants. Recurse on each quadrant. This produces a <strong>quadtree</strong>, in which every leaf is a homogeneous square block.</li>
+<li><strong>Merge.</strong> Sweep the leaf blocks and merge any two adjacent ones whose union still satisfies the predicate. Repeat until no more merges are possible.</li>
+</ol>
+<p>
+The split phase guarantees homogeneity but produces an over-segmented grid of squares with blocky boundaries; the merge phase glues those squares back into natural regions. Figure 11.2.2 shows the quadtree split of a synthetic image with one textured corner.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A square image quartered recursively only where it is non-homogeneous, with the matching quadtree on the right">
+<rect x="0" y="0" width="760" height="360" fill="#ffffff"/>
+<text x="180" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">recursive split</text>
+<text x="580" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">quadtree</text>
+<!-- image: top-left homogeneous, others split -->
+<rect x="60" y="50" width="240" height="240" fill="#fafbfc" stroke="#333" stroke-width="2"/>
+<!-- split into 4 quadrants -->
+<line x1="180" y1="50" x2="180" y2="290" stroke="#333"/>
+<line x1="60" y1="170" x2="300" y2="170" stroke="#333"/>
+<!-- top-left homogeneous (no further split) -->
+<rect x="60" y="50" width="120" height="120" fill="#aed4f0"/>
+<text x="120" y="115" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#225">uniform</text>
+<!-- top-right split further (textured) -->
+<line x1="240" y1="50" x2="240" y2="170" stroke="#777"/>
+<line x1="180" y1="110" x2="300" y2="110" stroke="#777"/>
+<rect x="180" y="50" width="60" height="60" fill="#c98a8a"/>
+<rect x="240" y="50" width="60" height="60" fill="#e0b0b0"/>
+<rect x="180" y="110" width="60" height="60" fill="#d89a9a"/>
+<rect x="240" y="110" width="60" height="60" fill="#c98a8a"/>
+<!-- bottom-left uniform -->
+<rect x="60" y="170" width="120" height="120" fill="#a8c98a"/>
+<text x="120" y="235" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#252">uniform</text>
+<!-- bottom-right uniform -->
+<rect x="180" y="170" width="120" height="120" fill="#cbb88a"/>
+<text x="240" y="235" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#552">uniform</text>
+<!-- quadtree on right -->
+<circle cx="580" cy="70" r="14" fill="#fff" stroke="#333" stroke-width="2"/>
+<text x="580" y="75" text-anchor="middle" font-family="sans-serif" font-size="12">R</text>
+<line x1="570" y1="82" x2="500" y2="130" stroke="#333"/>
+<line x1="577" y1="84" x2="555" y2="130" stroke="#333"/>
+<line x1="583" y1="84" x2="605" y2="130" stroke="#333"/>
+<line x1="590" y1="82" x2="660" y2="130" stroke="#333"/>
+<!-- 4 children -->
+<circle cx="500" cy="144" r="13" fill="#aed4f0" stroke="#333"/><text x="500" y="148" text-anchor="middle" font-family="sans-serif" font-size="10">TL</text>
+<circle cx="555" cy="144" r="13" fill="#fff" stroke="#333"/><text x="555" y="148" text-anchor="middle" font-family="sans-serif" font-size="10">TR</text>
+<circle cx="605" cy="144" r="13" fill="#a8c98a" stroke="#333"/><text x="605" y="148" text-anchor="middle" font-family="sans-serif" font-size="10">BL</text>
+<circle cx="660" cy="144" r="13" fill="#cbb88a" stroke="#333"/><text x="660" y="148" text-anchor="middle" font-family="sans-serif" font-size="10">BR</text>
+<!-- TR splits further -->
+<line x1="548" y1="155" x2="515" y2="205" stroke="#333"/>
+<line x1="552" y1="156" x2="545" y2="205" stroke="#333"/>
+<line x1="558" y1="156" x2="575" y2="205" stroke="#333"/>
+<line x1="562" y1="155" x2="605" y2="205" stroke="#333"/>
+<circle cx="513" cy="216" r="11" fill="#c98a8a" stroke="#333"/>
+<circle cx="545" cy="216" r="11" fill="#e0b0b0" stroke="#333"/>
+<circle cx="577" cy="216" r="11" fill="#d89a9a" stroke="#333"/>
+<circle cx="606" cy="216" r="11" fill="#c98a8a" stroke="#333"/>
+<text x="580" y="270" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">homogeneous quadrants are leaves;</text>
+<text x="580" y="288" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">the varied (TR) corner splits again.</text>
+</svg>
+<figcaption><strong>Figure 11.2.2</strong> Split-and-merge as a quadtree. The image is recursively quartered only where a block fails the homogeneity test. The three uniform quadrants become leaves immediately; the textured top-right quadrant splits a second time. After splitting, a merge pass would glue same-color adjacent leaves back together, removing the blocky boundaries the split introduced.</figcaption>
+</figure>
+
+<p>
+Split-and-merge has a real advantage over region growing: it needs no seeds. The recursive structure visits the whole image, so nothing depends on a lucky starting point. Its disadvantages are equally real: the quadtree's square subdivision imposes blocky, axis-aligned boundaries that the merge step only partly removes, and the merge step's adjacency bookkeeping is fiddly to implement correctly. scikit-image does not ship a single split-and-merge call, but its region adjacency graph tools make the merge phase tractable, and the closely related <code>felzenszwalb</code> segmentation of <a href="section-11.4.html">Section 11.4</a> achieves the same homogeneity-driven merging far more efficiently.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.floodFill and the Region Adjacency Graph</div>
+<p>A correct multi-seed region grower with frontier-collision handling is 60-plus lines; a quadtree split-and-merge with an adjacency-graph merge phase is well over 100. Two library paths shorten this dramatically. For single-region growing, <code>cv2.floodFill</code> is one call (shown above) and runs in optimized C. For the merge phase of split-and-merge, scikit-image's region adjacency graph turns "merge adjacent similar blocks" into a graph operation:</p>
+<pre><code class="language-python">from skimage.future import graph
+from skimage.segmentation import felzenszwalb
+from skimage import data
+
+img = data.astronaut()
+labels = felzenszwalb(img, scale=200, sigma=0.8, min_size=50)  # fast initial regions
+rag = graph.rag_mean_color(img, labels)                        # build adjacency graph
+merged = graph.cut_threshold(labels, rag, thresh=29)           # merge similar neighbors
+print("regions before merge:", labels.max() + 1,
+      " after merge:", merged.max() + 1)
+# regions before merge: 412  after merge: 78</code></pre>
+<div class="code-caption">The merge half of split-and-merge expressed as a region adjacency graph cut in scikit-image, reducing a 100-plus-line hand implementation to three calls.</div>
+<p>That is roughly a 100-to-3 reduction. The library handles the adjacency bookkeeping, the running region statistics, and the iterative threshold-based merging that are the error-prone parts of a hand-rolled version. Note this is the same region-adjacency-graph machinery the superpixel pipelines of <a href="section-11.5.html">Section 11.5</a> reuse.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tracing Cracks in Bridge Inspection Photos</div>
+<p>A civil-engineering startup built a tool to measure crack length in close-up photographs of concrete bridge decks. Cracks are dark, thin, and connected, exactly the structure region growing handles well, but the surface texture of weathered concrete defeated a global threshold: the same gray value was crack here and shadow there. The engineer's pipeline seeded region growing at the darkest local minima after a small Gaussian blur, used a region-mean predicate to follow the crack's own darkness rather than an absolute cutoff, and let connectivity guarantee that each measured region was a single continuous crack rather than a scatter of dark speckles.</p>
+<p>The decision that earned the contract was switching the predicate from seed-relative to region-mean. Seed-relative growing leaked out of the crack wherever a shadow touched it; the region-mean predicate let the region's own accumulated statistics resist the leak, because a wide shadow's brighter pixels pulled the mean away from the crack and tightened the effective bound. The result was crack-length measurements within five percent of a surveyor's manual trace, on a phone-camera image, with no training data. The lesson: when the target is connected and the background is heterogeneous, growing from good seeds beats thresholding the whole frame.</p>
+</div>
+
+<h2>4. The Limits of Greedy Growing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Region growing and split-and-merge share a hidden weakness: both make <em>greedy, local</em> decisions and never reconsider them. Once region growing admits a pixel, it stays admitted, even if it later turns out to be the gateway through which the region leaked into a neighbor. Once split-and-merge merges two blocks, the merge is permanent. Neither method optimizes a global objective, so neither can recover from an early mistake. This is precisely the gap that <a href="section-11.4.html">Section 11.4</a>'s graph-cut formulation closes: by writing the segmentation as the minimum of a global energy, graph cuts find the partition that is best overall, not merely the one that greedy local steps stumbled into.
+</p>
+<p>
+There is also a problem these methods cannot even attempt: <strong>touching objects of the same intensity</strong>. Two cells pressed against each other, or two coins overlapping slightly, present no intensity boundary between them, so region growing floods straight across and returns them as one region. No homogeneity predicate can split them, because by the predicate's own measure they <em>are</em> homogeneous. Separating them requires shape information, specifically the geometry of how the blob narrows at the junction, and that is exactly what the watershed transform of the next section reads off the distance transform. Keep the touching-cells problem in mind; it is the headline motivation for <a href="section-11.3.html">Section 11.3</a>.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Seeds Become Prompts, Predicates Become Networks</div>
+<p>The two ideas of this section, a seed and a homogeneity rule, both survive in the deep era, transformed. The seed became the <strong>prompt</strong>: in Segment Anything (Kirillov et al., ICCV 2023) and SAM 2 (Ravi et al., ICLR 2025) a single click plays the role of the region-growing seed, but instead of a hand-tuned $\tau$ the model has learned what "the same object" means from millions of masks, so it grows semantically rather than by intensity. The homogeneity predicate became a learned <strong>affinity</strong>: methods such as the spatial propagation networks behind some interactive matting tools, and the mask-refinement of EntitySeg-style entity segmentation (Qi et al., 2023), learn pixel-to-pixel similarity from data rather than from an absolute difference threshold. The 2024-2025 trend is interactive and promptable segmentation that keeps the user-in-the-loop spirit of region growing while replacing its brittle parts with learned components. The grammar (seed, grow, stop) is unchanged; the rules became weights.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.2.1: Predicate Comparison <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a 1D intensity profile that ramps smoothly from 50 to 200 over 150 pixels (a gradient with no sharp edge). For a seed at the value-50 end and $\tau = 10$, predict where region growing stops under (a) the seed-relative predicate, (b) the neighbor-relative predicate, and (c) the region-mean predicate. Explain which one leaks all the way to 200 and why, and state the general principle about smooth ramps that this reveals.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.2.2: Robust Seeded Growing <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>region_grow</code> function so it (a) operates on a 3-channel image using CIELAB color distance instead of grayscale difference, and (b) optionally pre-smooths the image with a Gaussian to suppress noise. Run it on a natural image from three different seeds in the same object and overlay the three resulting masks. Quantify how much the mask changes with seed position by reporting the intersection-over-union between the three masks, and discuss what this says about seed sensitivity.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.2.3: Growing vs Cutting on Touching Objects <span class="exercise-type analysis">Analysis</span></div>
+<p>Create or find an image of two overlapping coins of similar brightness on a dark background. Apply your seeded region grower with a seed inside each coin. Show that the two regions either merge into one blob or fight over the overlap, and explain in terms of the missing intensity boundary why no choice of $\tau$ fixes it. Then state, in one sentence each, how the watershed of <a href="section-11.3.html">Section 11.3</a> and the graph cut of <a href="section-11.4.html">Section 11.4</a> would each attack this same image.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.1.html">&#8592; Section 11.1: Segmentation as Clustering</a>
+<a href="index.html">Chapter 11</a>
+<a class="next" href="section-11.3.html">Section 11.3: The Watershed Transform &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

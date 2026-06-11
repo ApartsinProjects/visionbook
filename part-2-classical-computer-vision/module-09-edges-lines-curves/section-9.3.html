@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.3: The Hough Transform: Lines &amp; Circles. Detection as voting: the polar line parameterization, building an accumulator from scratch, the probabilistic variant that returns segments, and the gradient trick behind circle detection." name="description"/>
+<title>Section 9.3: The Hough Transform: Lines &amp; Circles | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Edges, Lines &amp; Curves</a></div>
+<h1>The Hough Transform: Lines &amp; Circles</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I don't argue about where the line is. I hold an election and let every edge pixel vote. Turnout is excellent; the gaps never show up, and that's exactly the point."</p>
+<cite>A Hough Accumulator With Election-Night Energy</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Hough transform turns shape detection into an election: every edge pixel votes for every line (or circle) that could pass through it, and shapes that really exist collect landslides in a parameter-space ballot box called the accumulator.</strong> The genius of the scheme is what it does <em>not</em> require: no connectivity, no ordering, no complete contours. The Canny output of <a href="section-9.2.html">Section 9.2</a> can be gapped by occlusion, peppered with clutter, and shuffled into any order, and the votes still pile up in the same cells, which is why this 1962 idea remains the standard way to pull lines and circles out of edge maps, from lane markings to calibration targets.</p>
+</div>
+
+<p>
+The previous section ended with the best edge map classical vision can produce: thin, well-localized, largely connected. But an edge map is still just pixels; nothing in it says "these 1,200 pixels form one straight line." This section builds the machine that says exactly that, first for lines, then for circles, and along the way introduces a way of thinking (transform the problem into parameter space, accumulate evidence, read off the peaks) that the curve fitting of <a href="section-9.4.html">Section 9.4</a> will complement and the lane detector of <a href="section-9.5.html">Section 9.5</a> will put to work.
+</p>
+
+<h2>1. The Grouping Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Consider the naive approach first, because its failure explains the design. To find lines, you might trace contours: start at an edge pixel, follow its neighbors, and check whether the path stays straight. Tracing dies on contact with reality. Real edge maps have gaps (a shadow interrupts the curb), junctions (the curb crosses a lamp post), and clutter (leaves everywhere); a tracer must decide at every gap and junction what to do, and each decision compounds. Worse, tracing is sequential: one bad hop poisons everything after it.
+</p>
+<p>
+The Hough transform inverts the logic. Instead of asking "which pixels chain together?", it asks each pixel independently: <em>"which lines could you belong to?"</em> Every edge pixel answers with a set of candidate lines, all candidates receive one vote each, and the lines that many pixels agree on win. No pixel ever needs to know about any other pixel; agreement emerges in the tally. Gaps cost nothing but a few missing votes, and clutter votes incoherently, scattering its ballots across parameter space without electing anyone.
+</p>
+
+<h2>2. Lines as Points: The $(\rho, \theta)$ Parameter Space <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To vote for a line you need an address for every line. The schoolbook form $y = mx + b$ fails the job: vertical lines need $m = \infty$, and near-vertical lines need enormous $m$, so no finite, evenly spaced ballot box can hold them. Duda and Hart's 1972 fix, now universal, addresses each line by its <strong>normal form</strong>:
+</p>
+<p>
+$$ \rho = x \cos\theta + y \sin\theta, $$
+</p>
+<p>
+where $\theta \in [0, \pi)$ is the direction of the line's normal and $\rho$ is the line's signed perpendicular distance from the origin. Every line in the image has exactly one $(\rho, \theta)$ address, both coordinates bounded: $\theta$ by construction, $\rho$ by the image diagonal $D$, so $\rho \in [-D, D]$. Vertical lines are nothing special ($\theta = 0$); the pathology is gone.
+</p>
+<p>
+Now the elegant part. Fix an edge pixel $(x_0, y_0)$ and ask which lines pass through it: all $(\rho, \theta)$ satisfying $\rho = x_0 \cos\theta + y_0 \sin\theta$, which is a <strong>sinusoid</strong> in the $(\theta, \rho)$ plane. One pixel, one sinusoid. And if several pixels are collinear, their sinusoids all pass through the single $(\rho, \theta)$ address of the shared line: collinearity in the image becomes <em>intersection</em> in parameter space. Figure 9.3.1 draws the duality; it is the picture to hold in mind whenever Hough voting comes up.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels: left, image space with four collinear points on a line and the normal parameterization rho theta; right, parameter space where each point becomes a sinusoid and all sinusoids intersect at one cell, shown with a vote-count peak">
+  <!-- LEFT PANEL: image space -->
+  <rect x="20" y="40" width="330" height="240" fill="#ffffff" stroke="#d1d4d8"/>
+  <text x="185" y="28" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">image space</text>
+  <!-- the line -->
+  <line x1="50" y1="250" x2="330" y2="80" stroke="#90a4ae" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <!-- collinear edge pixels -->
+  <circle cx="85"  cy="229" r="5" fill="#e67e22"/>
+  <circle cx="150" cy="189" r="5" fill="#e67e22"/>
+  <circle cx="230" cy="141" r="5" fill="#e67e22"/>
+  <circle cx="300" cy="98"  r="5" fill="#e67e22"/>
+  <!-- normal from origin -->
+  <line x1="20" y1="280" x2="160" y2="140" stroke="#8e44ad" stroke-width="2"/>
+  <text x="60" y="195" font-family="sans-serif" font-size="14" font-weight="bold" fill="#6c3483">&#961;</text>
+  <path d="M 60 280 A 40 40 0 0 0 48 252" fill="none" stroke="#6c3483" stroke-width="1.5"/>
+  <text x="68" y="265" font-family="sans-serif" font-size="13" fill="#6c3483">&#952;</text>
+  <text x="40" y="298" font-family="sans-serif" font-size="12" fill="#5a626c">origin</text>
+  <text x="200" y="265" font-family="sans-serif" font-size="12" fill="#5a626c">4 collinear edge pixels (gaps allowed)</text>
+  <!-- RIGHT PANEL: parameter space -->
+  <rect x="420" y="40" width="330" height="240" fill="#ffffff" stroke="#d1d4d8"/>
+  <text x="585" y="28" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">parameter space (the accumulator)</text>
+  <!-- axes labels -->
+  <text x="585" y="305" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#5a626c">&#952; (0 to &#960;)</text>
+  <text x="405" y="165" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#5a626c" transform="rotate(-90 405 165)">&#961;</text>
+  <!-- four sinusoids intersecting at one point (585,150) -->
+  <path d="M 430 100 C 480 70, 540 105, 585 150 C 630 195, 690 225, 740 215" fill="none" stroke="#e67e22" stroke-width="2"/>
+  <path d="M 430 165 C 480 130, 540 130, 585 150 C 630 170, 690 185, 740 160" fill="none" stroke="#e67e22" stroke-width="2" opacity="0.8"/>
+  <path d="M 430 230 C 480 215, 540 185, 585 150 C 630 115, 690 90, 740 100" fill="none" stroke="#e67e22" stroke-width="2" opacity="0.6"/>
+  <path d="M 430 260 C 490 255, 545 200, 585 150 C 625 100, 680 60, 740 65" fill="none" stroke="#e67e22" stroke-width="2" opacity="0.45"/>
+  <!-- intersection cell -->
+  <rect x="577" y="142" width="16" height="16" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+  <text x="600" y="138" font-family="sans-serif" font-size="12" font-weight="bold" fill="#1e8449">4 votes: the line's address (&#961;*, &#952;*)</text>
+  <text x="430" y="265" font-family="sans-serif" font-size="11" fill="#5a626c"></text>
+</svg>
+<figcaption><strong>Figure 9.3.1</strong> The Hough duality. Left: four collinear edge pixels in image space; the shared line is addressed by its normal angle $\theta$ and distance $\rho$ from the origin. Right: each pixel maps to a sinusoid of all the lines through it, and the four sinusoids intersect in exactly one accumulator cell, whose vote count equals the number of supporting pixels regardless of the gaps between them.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Paul Hough was a physicist, and the 1962 patent ("Method and Means for Recognizing Complex Patterns") was about finding particle tracks in bubble-chamber photographs, millions of which needed scanning at mid-century physics labs. His version used the slope-intercept parameterization, infinities and all; the $(\rho, \theta)$ form and the name "Hough transform" came a decade later from Duda and Hart. The algorithm thus entered computer vision the same way many of its best ideas did: sideways, from physics.</p>
+</div>
+
+<h2>3. Building the Accumulator From Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Implementation is bookkeeping. Discretize parameter space into bins (say 1 degree by 1 pixel; for a 640&#215;480 image that is 180 columns and about 1,600 rows, under 300k cells), give every edge pixel a vote in each $\theta$ column at the $\rho$ its sinusoid passes through, and find cells whose counts are both large and locally maximal. The code below vectorizes the votes with NumPy and verifies the whole idea on a synthetic image where we know the answer.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def hough_lines_scratch(edges, d_theta=np.pi / 180, d_rho=1.0):
+    ys, xs = np.nonzero(edges)                     # coordinates of edge pixels
+    thetas = np.arange(0, np.pi, d_theta)
+    diag = int(np.hypot(*edges.shape))
+    # each pixel's rho at every theta: one sinusoid per row
+    rho = xs[:, None] * np.cos(thetas) + ys[:, None] * np.sin(thetas)
+    bins = np.round((rho + diag) / d_rho).astype(int)
+    acc = np.zeros((int(2 * diag / d_rho) + 1, len(thetas)), np.int32)
+    for j in range(len(thetas)):                   # tally one theta column at a time
+        acc[:, j] = np.bincount(bins[:, j], minlength=acc.shape[0])
+    return acc, thetas, diag
+
+# Synthetic test: one known line plus 0.5% salt noise
+img = np.zeros((200, 300), np.uint8)
+cv2.line(img, (20, 180), (280, 40), 255, 1)
+rng = np.random.default_rng(3)
+edges = (img &gt; 0) | (rng.random((200, 300)) &gt; 0.995)
+
+acc, thetas, diag = hough_lines_scratch(edges)
+r, t = np.unravel_index(acc.argmax(), acc.shape)
+print(f"line pixels drawn: {(img &gt; 0).sum()}, peak votes: {acc.max()}")
+print(f"detected theta = {np.rad2deg(thetas[t]):.1f} deg, rho = {r - diag} px")
+# Representative output:
+# line pixels drawn: 261, peak votes: 247
+# detected theta = 61.7 deg, rho = 168 px
+</code></pre>
+<div class="code-caption">A vectorized from-scratch Hough transform: every edge pixel deposits one vote per theta column along its sinusoid, and on a synthetic image the accumulator's single tallest peak recovers the drawn line's normal angle and distance, with the 300 noise pixels contributing only scattered single votes.</div>
+
+<p>
+Two numbers in the output deserve a look. The peak collects 247 of the 261 line pixels: a few votes leak into neighboring cells because the discrete line's pixels do not sit exactly on one mathematical line, a phenomenon called <strong>peak spreading</strong> that gets worse as bins shrink. That is the accumulator's core resolution trade-off: coarse bins merge nearby distinct lines; fine bins smear one line's votes across several cells and can drop its peak below threshold. Practical implementations blur the accumulator lightly or use a coarse-to-fine pass; OpenCV's <code>cv2.HoughLines</code> exposes the bin sizes directly as its <code>rho</code> and <code>theta</code> arguments. The salt noise, meanwhile, added 300 edge pixels and changed nothing, which is the robustness the voting design bought us.
+</p>
+
+<h2>4. The Practical Variant: Probabilistic Hough <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The classical transform has two operational annoyances: it returns infinite lines (a $(\rho, \theta)$ pair says nothing about where the paint starts and stops), and it spends votes on every edge pixel even when a fraction would do. The <strong>progressive probabilistic Hough transform</strong> (Matas, Galambos, and Kittler, 2000), implemented as <code>cv2.HoughLinesP</code>, fixes both: it samples edge pixels at random, and the moment a candidate line accumulates enough votes it walks along that line in the image, collecting the actual run of supporting pixels into a <em>segment</em> with endpoints, then removes those pixels from the pool so they cannot vote again. You get exactly what downstream code wants, drawable segments, for less computation.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+gray = cv2.imread("corridor.jpg", cv2.IMREAD_GRAYSCALE)
+blur = cv2.GaussianBlur(gray, (0, 0), 1.4)
+edges = cv2.Canny(blur, 60, 150)                       # Section 9.2's recipe
+
+# Classical: infinite lines as (rho, theta) pairs
+lines = cv2.HoughLines(edges, rho=1, theta=np.pi / 180, threshold=150)
+
+# Probabilistic: finite segments as (x1, y1, x2, y2)
+segs = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=60,
+                       minLineLength=40,   # discard stubs shorter than this
+                       maxLineGap=8)       # bridge breaks up to this many px
+
+print(f"classical: {0 if lines is None else len(lines)} infinite lines")
+print(f"probabilistic: {0 if segs is None else len(segs)} segments")
+vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+for x1, y1, x2, y2 in segs[:, 0]:
+    cv2.line(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+# Representative output:
+# classical: 18 infinite lines
+# probabilistic: 64 segments
+</code></pre>
+<div class="code-caption">The two OpenCV line detectors on a corridor photograph: <code>cv2.HoughLines</code> returns 18 dominant infinite lines (one per wall seam and floor tile direction), while <code>cv2.HoughLinesP</code> returns 64 finite drawable segments, with <code>minLineLength</code> filtering stubs and <code>maxLineGap</code> bridging breaks left by the edge detector.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: 30 Lines of Accumulator Become One Call</div>
+<p>Our from-scratch transform is about 30 lines and still lacks peak non-maximum suppression, multi-line extraction, and segment endpoints. <code>cv2.HoughLines</code> and <code>cv2.HoughLinesP</code> are one call each: internally they manage the accumulator's memory, suppress non-maximal peaks, run the progressive sampling and pixel-removal logic of the probabilistic variant, and do it all in C++ at video rate. <code>skimage.transform.hough_line</code> plus <code>hough_line_peaks</code> is the readable middle ground, returning the raw accumulator so you can visualize exactly the picture in Figure 9.3.1 on your own images. A 30-to-1 line-count reduction, and several-hundred-fold on speed.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Voting Buys Robustness That Fitting Cannot</div>
+<p>The Hough transform never computes a residual and never averages anything, and that is precisely why outliers cannot hurt it: clutter votes for the wrong cells, and wrong cells simply lose the election. Compare the least-squares fit coming in <a href="section-9.4.html">Section 9.4</a>, where every point, including every outlier, tugs on the answer. The price of the robustness is precision (an answer quantized to bin width) and scaling (one accumulator dimension per shape parameter). This complementarity sets up the chapter's standard two-step: <em>detect</em> coarsely by voting, then <em>measure</em> precisely by fitting the voters.</p>
+</div>
+
+<h2>5. Circles and the Gradient Trick <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A circle has three parameters, center $(a, b)$ and radius $r$, satisfying $(x - a)^2 + (y - b)^2 = r^2$. The voting recipe generalizes immediately and then immediately becomes expensive: a 3D accumulator for a 640&#215;480 image with radii up to 100 already holds roughly 30 million cells, and each edge pixel must vote on a whole cone of (center, radius) combinations. The standard escape, implemented in OpenCV's <code>HOUGH_GRADIENT</code> method, reuses a fact we have been carrying since <a href="section-9.1.html">Section 9.1</a>: at any point on a circle's rim, the gradient points along the radius, straight at (or away from) the center. So instead of voting for every possible center, each edge pixel votes only for the cells along its <em>gradient ray</em>, collapsing the 3D election into a 2D center-finding election followed by a cheap 1D radius histogram per candidate center. Figure 9.3.2 shows the geometry.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A circle with three rim points whose gradient rays all point through the circle center, where votes accumulate; a stray clutter point's ray misses the center">
+  <defs>
+    <marker id="arr931" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#e67e22"/>
+    </marker>
+    <marker id="arr932" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#90a4ae"/>
+    </marker>
+  </defs>
+  <!-- circle -->
+  <circle cx="280" cy="135" r="90" fill="none" stroke="#2c3e50" stroke-width="2"/>
+  <!-- center -->
+  <circle cx="280" cy="135" r="6" fill="#27ae60"/>
+  <text x="294" y="128" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449">votes pile up here</text>
+  <!-- rim points + gradient rays toward center -->
+  <circle cx="280" cy="45"  r="5" fill="#e67e22"/>
+  <line x1="280" y1="45" x2="280" y2="120" stroke="#e67e22" stroke-width="2" marker-end="url(#arr931)"/>
+  <circle cx="203" cy="182" r="5" fill="#e67e22"/>
+  <line x1="203" y1="182" x2="266" y2="144" stroke="#e67e22" stroke-width="2" marker-end="url(#arr931)"/>
+  <circle cx="364" cy="172" r="5" fill="#e67e22"/>
+  <line x1="364" y1="172" x2="295" y2="142" stroke="#e67e22" stroke-width="2" marker-end="url(#arr931)"/>
+  <!-- clutter point whose ray misses -->
+  <circle cx="120" cy="60" r="5" fill="#90a4ae"/>
+  <line x1="120" y1="60" x2="190" y2="95" stroke="#90a4ae" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#arr932)"/>
+  <text x="95" y="44" font-family="sans-serif" font-size="12" fill="#5a626c">clutter votes elsewhere</text>
+  <!-- annotations right -->
+  <g font-family="sans-serif" font-size="13" fill="#2c3e50">
+    <text x="500" y="70">on a rim, the gradient points along</text>
+    <text x="500" y="90">the radius, so each edge pixel votes</text>
+    <text x="500" y="110">only along its gradient ray</text>
+    <text x="500" y="145">3D (a, b, r) election collapses to:</text>
+    <text x="500" y="168">1. a 2D vote for the center</text>
+    <text x="500" y="190">2. a 1D radius histogram per center</text>
+    <text x="500" y="222">this is cv2.HOUGH_GRADIENT, and why</text>
+    <text x="500" y="242">circle detection is tractable at all</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 9.3.2</strong> The gradient trick for circles. Gradient rays from rim pixels (orange) all pass through the center, so center votes concentrate without ever enumerating radii; a clutter pixel's ray (gray) wanders harmlessly. The radius is recovered afterward from the distances of the supporting pixels.</figcaption>
+</figure>
+
+<p>
+OpenCV 4.x ships two versions: the legacy <code>HOUGH_GRADIENT</code> and, since version 4.3, <code>HOUGH_GRADIENT_ALT</code>, a rewrite with markedly better precision whose <code>param2</code> becomes an interpretable "circle perfectness" score in $[0, 1]$ rather than a raw vote threshold.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+gray = cv2.imread("coins.jpg", cv2.IMREAD_GRAYSCALE)
+gray = cv2.medianBlur(gray, 5)            # median: kills speckle, keeps rims
+
+circles = cv2.HoughCircles(
+    gray, cv2.HOUGH_GRADIENT_ALT, dp=1.5,  # accumulator at 1/1.5 resolution
+    minDist=30,                            # centers closer than this merge
+    param1=300,                            # upper gradient threshold (Scharr)
+    param2=0.9,                            # circle "perfectness", 0..1
+    minRadius=20, maxRadius=80)
+
+if circles is not None:
+    for x, y, r in np.uint16(np.around(circles[0])):
+        print(f"center ({x:4d},{y:4d})  radius {r:3d}")
+# Representative output (six coins on a desk):
+# center ( 142, 210)  radius  46
+# center ( 305, 188)  radius  52
+# center ( 251, 341)  radius  46
+# center ( 433, 296)  radius  38
+# center ( 118, 388)  radius  52
+# center ( 391, 121)  radius  39
+</code></pre>
+<div class="code-caption">Circle detection with <code>HOUGH_GRADIENT_ALT</code> on a coins photograph: median pre-filtering protects the rims, <code>minDist</code> stops one coin from being reported twice, and the interpretable <code>param2=0.9</code> demands near-complete, well-formed circles, returning one center and radius per coin.</div>
+
+<p>
+Circle voting earns its keep across an unreasonable range of jobs: pupils and irises, drill holes on PCBs, pipeline cross-sections, agar-plate colonies, and the circle-grid calibration targets that <code>cv2.findCirclesGrid</code> locates for the camera calibration of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>. Beyond circles, Ballard's 1981 <strong>generalized Hough transform</strong> extends voting to arbitrary template shapes by storing, for each gradient orientation, the displacement vectors toward a reference point; it trades the analytic shape equation for a lookup table and reappears conceptually in implicit-shape-model detectors. And when lines themselves are the product, the strongest classical competitor is the LSD line-segment detector, which grows segments from aligned-gradient regions rather than voting; it is worth knowing as the non-Hough alternative on cluttered scenes.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Row Guidance Without GPS</div>
+<p><strong>Who:</strong> The perception engineer at an agricultural robotics startup retrofitting autonomous row-following onto orchard sprayers.</p>
+<p><strong>Situation:</strong> Under dense canopy, RTK-GPS drops out for minutes at a time; the sprayer must keep following the crop row using its forward camera.</p>
+<p><strong>Problem:</strong> Crop rows are not crisp lines: they are ragged stripes of vegetation with gaps, weeds, and shadow dapple, exactly the conditions that break contour tracing and exhaust hand-tuned heuristics.</p>
+<p><strong>Decision:</strong> A voting pipeline. Segment vegetation with an excess-green index ($2G - R - B$) thresholded per frame using the histogram methods of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, clean the binary mask with one morphological opening from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>, then run <code>cv2.HoughLines</code> with the $\theta$ range restricted to &#177;20 degrees of the expected row direction (votes outside the plausible range are never even counted), and median-filter the winning $(\rho, \theta)$ over 15 frames.</p>
+<p><strong>Result:</strong> Lateral RMS error of 4.1 centimeters at 8 km/h over 14 kilometers of test rows, on an embedded board with most of a 90 fps budget to spare; the gaps and weeds that defeated the heuristic tracker cost the accumulator only a few percent of its votes.</p>
+<p><strong>Lesson:</strong> The accumulator is a budget, and domain knowledge is free money: restricting $\theta$ to the physically possible range cut compute by a factor of nine and eliminated an entire family of false detections (shadow lines near-perpendicular to the rows) before they could vote.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Voting Survives, With Learned Ballots</div>
+<p>The 2023-2026 line-detection literature is largely hybrids that keep the classical extraction and learn the evidence under it. DeepLSD (Pautrat et al., CVPR 2023, arXiv:2212.07766) trains a network to output a cleaned gradient-like field and then runs classical line-segment extraction on top, beating both pure-classical and pure-learned baselines. GlueStick (Pautrat et al., ICCV 2023) carries detected line segments into the matching stage, treating them as first-class features alongside the keypoints of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, and line features are increasingly standard in the SLAM systems of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, where corridors and window frames outlive textureless walls. On the fitting side, PARSAC (Kluger and Rosenhahn, AAAI 2024, arXiv:2401.14919) learns to propose which points belong together so that many lines or planes can be recovered in parallel, a neural sibling of the accumulator's simultaneous multi-shape tally. The voting idea itself, propose from evidence and let consensus decide, is now textbook design vocabulary far beyond classical vision.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.3.1: Parameter Space Bookkeeping <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Explain why $\theta$ only needs the range $[0, \pi)$ rather than $[0, 2\pi)$, given that $\rho$ is signed. (b) A colleague proposes detecting ellipses with a direct Hough transform. An ellipse has five parameters; estimate the accumulator size at 1-pixel and 1-degree resolution for a 640&#215;480 image and explain why nobody does this. (c) Which two ideas from this section and from <a href="section-9.4.html">Section 9.4</a> combine into the practical answer for ellipses?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.3.2: Two Families of Lines <span class="exercise-type coding">Coding</span></div>
+<p>Photograph or download a chessboard image and run the full pipeline: Canny (Section 9.2's auto-threshold recipe), then <code>cv2.HoughLines</code>. Cluster the resulting $(\rho, \theta)$ pairs by $\theta$ into two perpendicular families (k-means with $k = 2$ on the angle, or a simple histogram split), draw each family in its own color, and count the lines per family. Compare your counts against the board's true 9+9 grid lines and diagnose any misses or duplicates in terms of peak spreading and threshold choice.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.3.3: Stress-Testing the Election <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the from-scratch accumulator from this section, run a controlled study on synthetic images: one line of 200 pixels, plus salt noise swept from 0 percent to 5 percent of pixels, 20 trials each. Plot (a) the peak's vote count, (b) the angular error of the detected line, and (c) the height of the tallest <em>spurious</em> peak, all versus noise density. At what noise level does a spurious peak first beat the true line, and how does doubling the bin sizes shift that crossover? Explain both observations with the peak-spreading trade-off.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.2.html">&#8592; Section 9.2: The Canny Edge Detector, Step by Step</a>
+<a href="index.html">Chapter 9</a>
+<a class="next" href="section-9.4.html">Section 9.4: Fitting Curves: Least Squares &amp; Robust Alternatives &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

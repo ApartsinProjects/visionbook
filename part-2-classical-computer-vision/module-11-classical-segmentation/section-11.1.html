@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.1: Segmentation as Clustering: K-Means &amp; Mean-Shift. Treating pixels as points in a color or color-plus-position feature space, K-Means with a chosen k, Mean-Shift mode-seeking, and the speckle that comes from ignoring spatial connectivity." name="description"/>
+<title>Section 11.1: Segmentation as Clustering: K-Means &amp; Mean-Shift | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>Segmentation as Clustering: K-Means &amp; Mean-Shift</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I sorted your pixels into five tidy groups. You wanted a cat, a sofa, and some sky? I gave you five shades of beige. We clearly value different things."</p>
+<cite>A Color-Quantizing K-Means Instance With Strong Opinions About k</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The simplest way to segment an image is to forget it is an image at all: treat each pixel as an independent point in a feature space, cluster the points, and paint each pixel with its cluster label.</strong> This reduces segmentation to a problem that statistics solved decades ago. K-Means partitions the points into a number of groups you specify in advance; Mean-Shift discovers the number of groups itself by climbing the density of the feature space toward its peaks. Both are fast, training-free, and surprisingly effective for color-homogeneous scenes, and both share one revealing flaw: because they ignore which pixels are next to which, they happily assign two pixels on opposite sides of the image to the same region, producing the characteristic salt-and-pepper speckle that the rest of this chapter exists to repair.</p>
+</div>
+
+<p>
+In the previous chapter we hunted for sparse keypoints, the rare pixels distinctive enough to match across views. This section inverts the goal. We want a label for <em>every</em> pixel, and we want pixels that look alike to share a label. The cleanest framing of that wish is clustering: define a feature vector for each pixel, drop all of those vectors into a space, and group the ones that fall close together. Segmentation then becomes a side effect of clustering, the cluster index assigned back to the pixel's location is its segment. This view connects directly to the histograms and thresholds of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>: a threshold is a one-dimensional, two-cluster special case of exactly this idea.
+</p>
+
+<h2>1. Pixels as Points in a Feature Space <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+A grayscale image of $H \times W$ pixels can be unrolled into $HW$ points on the intensity line $[0, 255]$. A color image becomes $HW$ points in a three-dimensional color cube. The choice of <em>which</em> features to use is the single most consequential decision in clustering-based segmentation, more consequential than the clustering algorithm itself. Three common choices, in increasing richness:
+</p>
+<ul>
+<li><strong>Color only</strong>, a 3-vector $(R, G, B)$ or, better, $(L, a, b)$ in a perceptually uniform space. Pixels are grouped purely by appearance; two regions of identical color anywhere in the image merge.</li>
+<li><strong>Color plus position</strong>, a 5-vector $(L, a, b, x, y)$. Adding the spatial coordinates, scaled by a weight, biases the clustering toward compact, spatially coherent blobs. This is the feature that makes superpixels work in <a href="section-11.5.html">Section 11.5</a>.</li>
+<li><strong>Color plus texture</strong>, where each pixel carries a vector of filter-bank responses (Gabor energies, the local binary patterns hinted at in <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>). This separates regions that share a mean color but differ in pattern, like grass from a green wall.</li>
+</ul>
+
+<p>
+Why prefer CIELAB over raw RGB? Because clustering measures distance, and in RGB the Euclidean distance between two colors does not match how different they look to a human eye. CIELAB was designed so that equal Euclidean steps correspond to roughly equal perceived color changes, which means a K-Means boundary drawn at constant distance in Lab lands where a person would also draw it. Converting is one OpenCV call, and it routinely improves the segmentation for free. Figure 11.1.1 shows the same image as a cloud of points in feature space, the geometry that every clustering method below operates on.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An image on the left maps to a cloud of points in a feature space on the right, where three dense clusters are circled">
+<rect x="0" y="0" width="760" height="380" fill="#ffffff"/>
+<!-- left: schematic image -->
+<text x="150" y="34" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">image (pixels in a grid)</text>
+<rect x="50" y="50" width="200" height="200" fill="#fafbfc" stroke="#999"/>
+<!-- sky -->
+<rect x="50" y="50" width="200" height="80" fill="#aed4f0"/>
+<!-- field -->
+<rect x="50" y="130" width="200" height="120" fill="#a8c98a"/>
+<!-- object -->
+<circle cx="150" cy="170" r="34" fill="#c98a8a"/>
+<text x="150" y="270" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">3 visually distinct regions</text>
+<!-- arrow -->
+<line x1="262" y1="150" x2="330" y2="150" stroke="#333" stroke-width="2.5"/>
+<polygon points="330,150 318,144 318,156" fill="#333"/>
+<text x="296" y="140" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">unroll</text>
+<!-- right: feature-space scatter -->
+<text x="560" y="34" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">feature space (color cloud)</text>
+<rect x="380" y="50" width="340" height="280" fill="#fafbfc" stroke="#cccccc"/>
+<text x="550" y="350" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#333">feature axis 1 (e.g. a*)</text>
+<text x="368" y="190" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#333" transform="rotate(-90 368 190)">feature axis 2 (e.g. L*)</text>
+<!-- cluster blue (sky) -->
+<g fill="#aed4f0"><circle cx="470" cy="95" r="4"/><circle cx="485" cy="105" r="4"/><circle cx="460" cy="110" r="4"/><circle cx="478" cy="90" r="4"/><circle cx="492" cy="100" r="4"/><circle cx="465" cy="100" r="4"/></g>
+<ellipse cx="476" cy="100" rx="34" ry="26" fill="none" stroke="#2980b9" stroke-width="2" stroke-dasharray="5,4"/>
+<!-- cluster green (field) -->
+<g fill="#a8c98a"><circle cx="600" cy="220" r="4"/><circle cx="615" cy="230" r="4"/><circle cx="590" cy="235" r="4"/><circle cx="620" cy="215" r="4"/><circle cx="605" cy="245" r="4"/><circle cx="630" cy="232" r="4"/><circle cx="595" cy="210" r="4"/></g>
+<ellipse cx="610" cy="228" rx="38" ry="28" fill="none" stroke="#27ae60" stroke-width="2" stroke-dasharray="5,4"/>
+<!-- cluster red (object) -->
+<g fill="#c98a8a"><circle cx="540" cy="160" r="4"/><circle cx="555" cy="170" r="4"/><circle cx="530" cy="172" r="4"/><circle cx="548" cy="155" r="4"/></g>
+<ellipse cx="543" cy="165" rx="26" ry="22" fill="none" stroke="#c0392b" stroke-width="2" stroke-dasharray="5,4"/>
+</svg>
+<figcaption><strong>Figure 11.1.1</strong> Segmentation as clustering. Every pixel becomes a point in a feature space (here a 2D slice of CIELAB). Visually distinct regions form dense clouds; a clustering algorithm finds those clouds, and the cluster label is painted back onto each pixel's grid location. Notice that the feature space discards spatial layout entirely: two sky pixels at opposite corners land on top of each other.</figcaption>
+</figure>
+
+<h2>2. K-Means: Partition Into k Groups <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+K-Means is the workhorse. Given $n$ points and a target count $k$, it seeks $k$ centers (centroids) $\mu_1, \dots, \mu_k$ that minimize the total squared distance from each point to its nearest center:
+</p>
+<p>
+$$J = \sum_{i=1}^{n} \min_{j \in \{1,\dots,k\}} \lVert x_i - \mu_j \rVert^2$$
+</p>
+<p>
+This objective is non-convex, so K-Means does not solve it exactly. Instead it runs Lloyd's algorithm, an alternation that is guaranteed to decrease $J$ at every step until it stops moving:
+</p>
+<ol>
+<li><strong>Assign</strong>: give each point to its nearest centroid.</li>
+<li><strong>Update</strong>: move each centroid to the mean of the points assigned to it.</li>
+<li>Repeat until assignments stop changing.</li>
+</ol>
+<p>
+The catch is that Lloyd's algorithm converges to a local minimum that depends on where the centroids start. Poor initialization gives poor segmentations. The standard fix is k-means++, which seeds centers spread out across the data rather than at random; OpenCV and scikit-learn both default to it. Here is K-Means color segmentation written against OpenCV's <code>cv2.kmeans</code>, which expects the feature matrix as <code>float32</code>.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("scene.jpg")                       # uint8 BGR, shape (H, W, 3)
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)          # perceptually uniform space
+
+# Reshape (H, W, 3) -> (H*W, 3) and cast to float32 as cv2.kmeans requires.
+features = lab.reshape(-1, 3).astype(np.float32)
+
+K = 5
+criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+# attempts=10: run Lloyd 10 times from different seeds, keep the lowest-energy run.
+compactness, labels, centers = cv2.kmeans(
+    features, K, None, criteria, attempts=10, flags=cv2.KMEANS_PP_CENTERS)
+
+centers = centers.astype(np.uint8)                  # one mean color per cluster
+quantized = centers[labels.flatten()]               # recolor each pixel by its center
+segmented = quantized.reshape(lab.shape)
+segmented = cv2.cvtColor(segmented, cv2.COLOR_LAB2BGR)
+
+print("compactness (total within-cluster SSD):", round(compactness, 1))
+print("cluster centers (Lab):\n", centers)
+# compactness (total within-cluster SSD): 18342105.0
+# cluster centers (Lab):
+#  [[201  126  142] [ 78 121 131] [148 118 168] [122 130 110] [ 49 128 128]]</code></pre>
+<div class="code-caption">K-Means color segmentation in CIELAB with OpenCV. The <code>labels</code> array assigns every pixel to one of K clusters; recoloring each pixel with its cluster center produces the familiar posterized segmentation. The returned compactness is the value of the objective $J$, useful for comparing runs.</div>
+
+<p>
+The output is a clean partition into five color regions. But notice what it cannot tell you: it found five <em>colors</em>, not five <em>objects</em>. If the cat and the sofa share a beige, they merge; if the sky shades from pale to deep blue, it may split. And because each pixel was clustered in isolation, single stray pixels of an off-color get their own label scattered across the image. K-Means also demands that you commit to $k$ before you look. Choosing it badly is the most common failure, which the next callout addresses.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: K-Means Has No Idea Where Pixels Are</div>
+<p>The objective $J$ contains no term for spatial location unless you put one there. Two pixels that are visually identical but a thousand pixels apart contribute to the same centroid and receive the same label. This is why pure color K-Means produces a label image full of speckle and disconnected fragments: the algorithm is literally blind to the image grid. Adding scaled $(x, y)$ to the feature vector is the cheapest way to inject spatial coherence, and it is exactly the move SLIC formalizes in <a href="section-11.5.html">Section 11.5</a>. Everything else in this chapter is a richer answer to the same missing-spatial-structure problem.</p>
+</div>
+
+<h2>3. Choosing k: The Elbow and the Silhouette <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+K-Means cannot pick $k$ for you, but two diagnostics narrow the choice. The <strong>elbow method</strong> plots the objective $J$ (within-cluster sum of squares) against $k$. Adding clusters always lowers $J$, but the curve bends sharply at the "natural" number of clusters and flattens afterward; you pick $k$ at the bend. The <strong>silhouette score</strong> is more principled: for each point it compares the mean distance to its own cluster against the mean distance to the nearest other cluster, giving a value in $[-1, 1]$, and you pick the $k$ that maximizes the average.
+</p>
+
+<pre><code class="language-python">from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import numpy as np
+
+# Subsample 5000 pixels: silhouette on a full image is O(n^2) and far too slow.
+rng = np.random.default_rng(0)
+sample = features[rng.choice(len(features), 5000, replace=False)]
+
+for k in range(2, 8):
+    km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(sample)
+    sil = silhouette_score(sample, km.labels_)
+    print(f"k={k}  inertia={km.inertia_:11.0f}  silhouette={sil:.3f}")
+# k=2  inertia=  742103104  silhouette=0.512
+# k=3  inertia=  391204480  silhouette=0.547   <- best silhouette
+# k=4  inertia=  268339712  silhouette=0.498
+# k=5  inertia=  201118368  silhouette=0.441
+# k=6  inertia=  168442096  silhouette=0.402
+# k=7  inertia=  148209760  silhouette=0.388</code></pre>
+<div class="code-caption">Selecting k with the inertia (elbow) and silhouette diagnostics on a 5000-pixel subsample. Here the silhouette peaks at k=3, matching the three visually distinct regions of Figure 11.1.1; the inertia curve also bends most sharply between k=3 and k=4.</div>
+
+<p>
+Both diagnostics agree on three clusters for this scene, which is reassuring but not a guarantee. In a cluttered natural image neither metric gives a clean answer, because "the right number of regions" is genuinely ambiguous. That ambiguity is the strongest argument for the next method, which refuses to be told $k$ at all.
+</p>
+
+<h2>4. Mean-Shift: Let the Density Decide <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Mean-Shift abandons the idea of a fixed cluster count. It views the feature points as samples from an underlying probability density and seeks that density's <em>modes</em>, its local peaks. Every point climbs uphill toward the nearest peak, and points that arrive at the same peak form one cluster. The number of clusters is whatever number of peaks the data happens to have, given one parameter: the <strong>bandwidth</strong> $h$, the radius of the window that defines "local".
+</p>
+<p>
+The climb is elegant. From a point $x$, compute the mean of all points within radius $h$, weighted by a kernel, then shift $x$ to that mean. Repeat. The shift vector,
+</p>
+<p>
+$$m(x) = \frac{\sum_{i} x_i \, g\!\left(\lVert \frac{x - x_i}{h} \rVert^2\right)}{\sum_{i} g\!\left(\lVert \frac{x - x_i}{h} \rVert^2\right)} - x,$$
+</p>
+<p>
+always points up the density gradient, so iterating it provably converges to a mode. Figure 11.1.2 traces three points shifting toward the two peaks of a 1D density. A small bandwidth finds many narrow modes (oversegmentation); a large bandwidth merges everything into a few broad modes (undersegmentation). Unlike $k$ in K-Means, bandwidth has a physical meaning, a color-distance scale, which makes it easier to set by intuition.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A bimodal density curve with three starting points shifting along arrows toward the two peaks">
+<rect x="0" y="0" width="760" height="360" fill="#ffffff"/>
+<text x="380" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">Mean-Shift climbs the feature density toward its modes</text>
+<!-- axes -->
+<line x1="70" y1="300" x2="710" y2="300" stroke="#333" stroke-width="1.5"/>
+<line x1="70" y1="300" x2="70" y2="60" stroke="#333" stroke-width="1.5"/>
+<text x="390" y="338" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#333">feature value</text>
+<text x="48" y="180" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#333" transform="rotate(-90 48 180)">density</text>
+<!-- bimodal density curve -->
+<path d="M70,295 C160,290 200,110 260,110 C320,110 340,250 390,250 C440,250 470,80 540,80 C610,80 650,290 710,295"
+      fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+<!-- mode markers -->
+<line x1="260" y1="110" x2="260" y2="300" stroke="#bbb" stroke-dasharray="4,4"/>
+<line x1="540" y1="80" x2="540" y2="300" stroke="#bbb" stroke-dasharray="4,4"/>
+<text x="260" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8e44ad">mode 1</text>
+<text x="540" y="98" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8e44ad">mode 2</text>
+<!-- starting points + shift arrows toward modes -->
+<circle cx="150" cy="300" r="6" fill="#c0392b"/>
+<line x1="160" y1="300" x2="248" y2="300" stroke="#c0392b" stroke-width="2"/>
+<polygon points="248,300 236,294 236,306" fill="#c0392b"/>
+<text x="150" y="290" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#c0392b">start A</text>
+<circle cx="430" cy="300" r="6" fill="#c0392b"/>
+<line x1="424" y1="300" x2="312" y2="300" stroke="#c0392b" stroke-width="2"/>
+<polygon points="312,300 324,294 324,306" fill="#c0392b"/>
+<text x="430" y="290" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#c0392b">start B</text>
+<circle cx="620" cy="300" r="6" fill="#27ae60"/>
+<line x1="612" y1="300" x2="552" y2="300" stroke="#27ae60" stroke-width="2"/>
+<polygon points="552,300 564,294 564,306" fill="#27ae60"/>
+<text x="620" y="290" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#27ae60">start C</text>
+</svg>
+<figcaption><strong>Figure 11.1.2</strong> Mean-Shift as mode-seeking. Starting points A and B climb the density gradient to mode 1; point C climbs to mode 2. Each iteration shifts a point to the weighted mean of its neighbors within bandwidth $h$, which always moves it uphill. Points landing on the same mode form one cluster, so the number of clusters is discovered, not specified.</figcaption>
+</figure>
+
+<p>
+OpenCV ships a specialized image version, <code>cv2.pyrMeanShiftFiltering</code>, that runs Mean-Shift jointly over color (the range parameter <code>sr</code>) and position (the spatial parameter <code>sp</code>), which is precisely the color-plus-position feature of Section 1. It produces a posterized, edge-preserving image; a connected-components pass then turns the flattened colors into labeled regions.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("scene.jpg")
+# sp = spatial window radius (pixels), sr = color window radius (Lab/BGR units).
+# Larger sr merges more colors; larger sp merges over larger spatial extents.
+shifted = cv2.pyrMeanShiftFiltering(img, sp=21, sr=40, maxLevel=1)
+
+# After Mean-Shift the image is piecewise-flat; label the flat regions.
+gray = cv2.cvtColor(shifted, cv2.COLOR_BGR2GRAY)
+n_labels, labels = cv2.connectedComponents(
+    (cv2.Canny(gray, 1, 1) == 0).astype(np.uint8))   # regions = areas with no internal edge
+print("Mean-Shift produced", n_labels, "connected regions (no k specified)")
+# Mean-Shift produced 37 connected regions (no k specified)</code></pre>
+<div class="code-caption">Joint spatial-range Mean-Shift filtering with OpenCV, followed by connected-components labeling. No cluster count is supplied: the bandwidths <code>sp</code> and <code>sr</code> implicitly determine how many modes (and therefore how many regions) emerge.</div>
+
+<p>
+Mean-Shift's gift, automatic cluster count, comes at a cost: it is far slower than K-Means, roughly quadratic in the number of points in a naive implementation, which is why the OpenCV version operates on an image pyramid and why you subsample for the scikit-learn <code>MeanShift</code> estimator. That same mode-seeking iteration reappears as a tracker in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>, where the "density" is a color histogram and the mode being chased is a moving object.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: scikit-learn's KMeans and MeanShift</div>
+<p>A hand-written Lloyd's iteration with k-means++ seeding and a convergence test is roughly 40 lines and easy to get subtly wrong (empty clusters, integer overflow in the distance computation, a missing best-of-N-restarts loop). scikit-learn collapses both algorithms to a few lines and adds production niceties:</p>
+<pre><code class="language-python">from sklearn.cluster import KMeans, MeanShift, estimate_bandwidth
+
+# K-Means: parallelized, k-means++ by default, 10 restarts.
+km = KMeans(n_clusters=5, n_init=10).fit(features)
+
+# Mean-Shift: bandwidth auto-estimated from a quantile of pairwise distances.
+bw = estimate_bandwidth(sample, quantile=0.1, n_samples=500)
+ms = MeanShift(bandwidth=bw, bin_seeding=True).fit(sample)
+print("Mean-Shift found", len(set(ms.labels_)), "clusters automatically")</code></pre>
+<div class="code-caption">Both clustering algorithms in a handful of lines via scikit-learn, with automatic bandwidth estimation for Mean-Shift.</div>
+<p>That is a 40-to-3 line reduction for K-Means alone. The library handles k-means++ initialization, the best-of-<code>n_init</code> restart loop, empty-cluster reassignment, multithreading, and (with <code>MiniBatchKMeans</code>) a streaming variant for images too large to fit a full distance matrix. <code>estimate_bandwidth</code> removes the worst guesswork from Mean-Shift by reading a bandwidth off the data's own distance distribution.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting Inventory Colors at a Paint Retailer</div>
+<p>A regional paint retailer wanted to auto-tag product photos by dominant color so its website filter ("show me the sage greens") would actually work. The team's first instinct was a deep classifier, but the catalog had 9,000 SKUs and no labeled training set. An engineer reached instead for K-Means with $k = 5$ in CIELAB, run on a center crop of each photo, and took the largest cluster's center as the dominant color. The result was a 9,000-image pipeline that ran overnight on a single laptop with no GPU and no labels.</p>
+<p>The decision that mattered was the color space. Their RGB prototype mislabeled warm grays as beige and cool grays as blue because RGB distances do not track perception; switching the three lines to CIELAB fixed roughly 600 mislabels at a stroke. The lesson: for color-homogeneous product shots, classical clustering in the right space beat a model they could not afford to train, and the only real engineering was choosing features, not algorithms. They later added a tiny learned classifier only for the genuinely hard cases (multicolor patterns), exactly the classical-then-learned escalation this chapter recommends.</p>
+</div>
+
+<h2>5. Why Clustering Is Not Enough <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Step back and the limitation is structural, not a tuning problem. Clustering segments the <em>feature space</em>, but a segmentation lives in the <em>image grid</em>, and the map between them is lossy in exactly the wrong direction. Two failures follow inevitably:
+</p>
+<ul>
+<li><strong>Speckle and fragmentation.</strong> Because labels are assigned per pixel with no smoothness term, sensor noise scatters single off-color pixels into the wrong cluster, leaving a label image peppered with one-pixel islands. A morphological opening from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> cleans the worst of it, but that is a patch, not a cure.</li>
+<li><strong>Merged distinct objects.</strong> Two physically separate objects of the same color receive the same label and become one region, because the feature space cannot represent "these are far apart on the grid." No threshold on color distance can separate them.</li>
+</ul>
+<p>
+Both failures trace to the same root: clustering threw away spatial connectivity in Section 1 and never got it back. The remaining sections of this chapter are progressively richer ways to restore it. <a href="section-11.2.html">Section 11.2</a> grows regions that are connected by construction. <a href="section-11.3.html">Section 11.3</a> floods a surface so that basins respect topography. <a href="section-11.4.html">Section 11.4</a> writes spatial smoothness directly into an energy function. Keep the speckle of pure K-Means in mind as the baseline each method improves on.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Clustering Returns in the Deep Era</div>
+<p>Clustering never left; it moved up a layer. STEGO (Hamilton et al., ICLR 2022) performs <em>unsupervised</em> semantic segmentation by clustering the patch features of a self-supervised <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">DINO</a> backbone, exactly K-Means' "cluster the feature space" idea but with learned features that finally track semantics instead of color. CutLER (Wang et al., CVPR 2023) discovers object masks with normalized cuts on self-supervised features and no labels at all. On the foundation-model side, SAM and its 2024 successor SAM 2 (Ravi et al., ICLR 2025) make grouping promptable: a single click replaces the seed of region growing, and the model returns a coherent mask. The arc is clean: classical methods clustered hand-chosen features and got color regions; modern methods cluster learned features and get objects. The algorithm barely changed; the feature space did. We follow that thread end to end in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.1: Feature Space, Drawn <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a 100x100 image that is exactly half red (top) and half blue (bottom). (a) Sketch its pixels in 3D RGB feature space. How many clusters does K-Means need to segment it perfectly, and where do the centroids sit? (b) Now suppose a thin white diagonal line crosses both halves. Describe what happens to the line's pixels under pure color K-Means with $k = 2$, and explain why adding the white as a third cluster still leaves the line spatially fragmented. (c) State, in one sentence, the feature you would add to keep the line as a single connected region.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.2: Position-Weighted K-Means <span class="exercise-type coding">Coding</span></div>
+<p>Build the 5-dimensional feature $(L, a, b, w\cdot x, w\cdot y)$ for a natural image and run <code>cv2.kmeans</code> on it for $w \in \{0, 0.5, 2, 8\}$. Display the four label images side by side. Quantify spatial coherence by counting connected components per label (use <code>cv2.connectedComponents</code>) and plot component count versus $w$. Explain why large $w$ drives the result toward the regular tiling you will meet again as superpixels in <a href="section-11.5.html">Section 11.5</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.1.3: Bandwidth Sweep <span class="exercise-type analysis">Analysis</span></div>
+<p>Run <code>cv2.pyrMeanShiftFiltering</code> on one image across a grid of <code>sr</code> (color radius) and <code>sp</code> (spatial radius) values. For each setting, record the number of connected regions and the wall-clock time. Produce two heatmaps (region count, runtime) over the <code>(sp, sr)</code> grid and write a short paragraph relating bandwidth to the over/undersegmentation trade. Which corner of the grid would you choose for a real-time application, and what do you sacrifice?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 11 Overview</a>
+<a href="index.html">Chapter 11</a>
+<a class="next" href="section-11.2.html">Section 11.2: Region Growing &amp; Split-and-Merge &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

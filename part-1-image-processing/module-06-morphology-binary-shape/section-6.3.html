@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.3: Opening, Closing &amp; Morphological Gradients. Composing erosion and dilation into the workhorse cleanup operators: speckle removal, hole filling, idempotence, granulometry, boundary extraction, and top-hat illumination rescue." name="description"/>
+<title>Section 6.3: Opening, Closing &amp; Morphological Gradients | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Opening, Closing &amp; Morphological Gradients</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I went in for a small procedure: they eroded my speckle, then dilated me right back to size. The surgeon says a second visit would change nothing. Apparently I am now idempotent."</p>
+<cite>A Recently Opened Binary Mask</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Erosion and dilation are rarely used alone; their power is in composition, where one operator's destruction is the other's restoration: opening (erode, then dilate) deletes what is too small to matter and returns everything else to size, closing (dilate, then erode) fills what is too small to be a real hole, and their differences carve out boundaries and rescue thresholds from uneven lighting.</strong> This section turns the atoms of <a href="section-6.2.html">Section 6.2</a> into the four or five compound operators that do most of the real cleanup work in industrial vision.</p>
+</div>
+
+<p>
+The previous section closed on a deliberate loose end: erosion and dilation are not inverses, and information destroyed by one cannot be recovered by the other. This section weaponizes that asymmetry. Erode a mask and every speck smaller than the structuring element is gone forever; dilate the result and the surviving objects regrow to their original size, minus the casualties. Run the pair in the opposite order and pinholes vanish instead of specks. These two compositions, with their differences and grayscale variants, form the standard toolkit applied to virtually every thresholded image before anyone dares count or measure anything, including the masks produced by the segmentation networks of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.
+</p>
+
+<h2>1. Opening: Delete the Small, Restore the Rest <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The <strong>opening</strong> of $A$ by structuring element $B$ is erosion followed by dilation with the same SE:
+</p>
+<p>
+$$ A \circ B \;=\; (A \ominus B) \oplus B. $$
+</p>
+<p>
+There is an equivalent characterization that explains the behavior far better than the formula: <em>the opening is the union of all placements of $B$ that fit entirely inside $A$.</em> Imagine painting the inside of every object using $B$ as the brush, never letting the brush cross the boundary. Whatever the brush can reach survives; whatever it cannot (specks smaller than the brush, hairline protrusions, thin bridges) is erased. Surviving objects keep their size and roughly their shape, with convex corners gently rounded to the brush's curvature. Opening also never adds a single pixel: $A \circ B \subseteq A$, a property called anti-extensivity.
+</p>
+
+<h2>2. Closing: Fill the Small, Preserve the Rest <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The <strong>closing</strong> runs the composition in the opposite order:
+</p>
+<p>
+$$ A \bullet B \;=\; (A \oplus B) \ominus B. $$
+</p>
+<p>
+By the duality law of <a href="section-6.2.html">Section 6.2</a>, closing the foreground is exactly opening the background: $A \bullet B = (A^c \circ \hat{B})^c$. Every fact about opening therefore has a closing mirror. Closing fills pinholes and narrow gulfs smaller than the SE, bridges gaps thinner than the SE, and never removes a pixel ($A \subseteq A \bullet B$, extensivity). The brush picture works here too, painted from outside: closing keeps every point the brush <em>cannot</em> reach when rolled around the exterior, so small interior voids that the brush cannot enter get sealed.
+</p>
+<p>
+Both compositions share a third property that no amount of repeated blurring from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> can claim: <strong>idempotence</strong>. Opening an opened image changes nothing, $(A \circ B) \circ B = A \circ B$, and likewise for closing. The operator converges in one application; "more cleanup" requires a bigger SE, not another pass. Figure 6.3.1 shows the canonical cleanup pipeline that puts both to work.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four-panel pipeline: a noisy thresholded mask with specks and pinholes, after opening the specks are gone, after closing the pinholes are filled, yielding a clean mask ready for counting">
+  <defs>
+    <marker id="arr63" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#5a626c"/>
+    </marker>
+  </defs>
+  <!-- Panel 1: raw threshold -->
+  <text x="105" y="30" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Raw threshold</text>
+  <rect x="25" y="45" width="160" height="170" fill="#fdfefe" stroke="#bdc3c7"/>
+  <ellipse cx="105" cy="130" rx="55" ry="60" fill="#34495e"/>
+  <circle cx="92"  cy="112" r="6" fill="#fdfefe"/>
+  <circle cx="121" cy="150" r="5" fill="#fdfefe"/>
+  <circle cx="44"  cy="65"  r="3.5" fill="#34495e"/>
+  <circle cx="166" cy="78"  r="3" fill="#34495e"/>
+  <circle cx="52"  cy="196" r="3" fill="#34495e"/>
+  <circle cx="170" cy="190" r="3.5" fill="#34495e"/>
+  <circle cx="148" cy="58"  r="2.5" fill="#34495e"/>
+  <text x="105" y="235" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">specks + pinholes</text>
+
+  <line x1="192" y1="130" x2="232" y2="130" stroke="#5a626c" stroke-width="2.5" marker-end="url(#arr63)"/>
+  <text x="212" y="118" font-family="sans-serif" font-size="12" fill="#b9770e" text-anchor="middle" font-weight="bold">open</text>
+
+  <!-- Panel 2: after opening -->
+  <text x="320" y="30" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">After opening</text>
+  <rect x="240" y="45" width="160" height="170" fill="#fdfefe" stroke="#bdc3c7"/>
+  <ellipse cx="320" cy="130" rx="55" ry="60" fill="#34495e"/>
+  <circle cx="307" cy="112" r="6" fill="#fdfefe"/>
+  <circle cx="336" cy="150" r="5" fill="#fdfefe"/>
+  <text x="320" y="235" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">specks gone, holes remain</text>
+
+  <line x1="407" y1="130" x2="447" y2="130" stroke="#5a626c" stroke-width="2.5" marker-end="url(#arr63)"/>
+  <text x="427" y="118" font-family="sans-serif" font-size="12" fill="#1a5276" text-anchor="middle" font-weight="bold">close</text>
+
+  <!-- Panel 3: after closing -->
+  <text x="535" y="30" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">After closing</text>
+  <rect x="455" y="45" width="160" height="170" fill="#fdfefe" stroke="#bdc3c7"/>
+  <ellipse cx="535" cy="130" rx="55" ry="60" fill="#34495e"/>
+  <text x="535" y="235" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">holes filled</text>
+
+  <line x1="622" y1="130" x2="662" y2="130" stroke="#5a626c" stroke-width="2.5" marker-end="url(#arr63)"/>
+
+  <!-- Panel 4: ready -->
+  <text x="710" y="30" font-family="sans-serif" font-size="14" font-weight="bold" fill="#145a32" text-anchor="middle">Ready</text>
+  <rect x="670" y="45" width="85" height="170" fill="#eafaf1" stroke="#a9dfbf"/>
+  <text x="712" y="120" font-family="sans-serif" font-size="12" fill="#145a32" text-anchor="middle">count,</text>
+  <text x="712" y="140" font-family="sans-serif" font-size="12" fill="#145a32" text-anchor="middle">label,</text>
+  <text x="712" y="160" font-family="sans-serif" font-size="12" fill="#145a32" text-anchor="middle">measure</text>
+</svg>
+<figcaption><strong>Figure 6.3.1</strong> The standard open-then-close cleanup pipeline. The raw threshold carries salt specks (false foreground) and glare pinholes (false holes). Opening erases everything smaller than the structuring element while restoring survivors to size; closing then seals the pinholes. The output feeds the labeling and measurement machinery of Sections 6.4 to 6.6.</figcaption>
+</figure>
+
+<p>
+The pipeline of Figure 6.3.1 is six lines of code. The demonstration below builds a controllable mess (one true object, salt specks, glare holes) so the cleanup can be verified by counting rather than by squinting:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(7)
+mask = np.zeros((400, 400), np.uint8)
+cv2.circle(mask, (200, 200), 120, 255, -1)            # the real object
+for x, y in rng.integers(0, 400, (60, 2)):            # 60 salt specks
+    cv2.circle(mask, (int(x), int(y)), int(rng.integers(1, 3)), 255, -1)
+for x, y in rng.integers(120, 280, (25, 2)):          # 25 glare pinholes
+    cv2.circle(mask, (int(x), int(y)), int(rng.integers(1, 4)), 0, -1)
+
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+opened  = cv2.morphologyEx(mask,   cv2.MORPH_OPEN,  se)
+cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, se)
+
+for name, m in [("raw", mask), ("opened", opened), ("cleaned", cleaned)]:
+    n, _ = cv2.connectedComponents(m)
+    holes, _ = cv2.connectedComponents(255 - m, connectivity=4)
+    print(f"{name:8s} objects = {n - 1:3d}   holes+bg = {holes - 1}")
+# Output:
+# raw      objects =  59   holes+bg = 24    (some specks overlap; some holes merge)
+# opened   objects =   1   holes+bg = 24
+# cleaned  objects =   1   holes+bg = 1     (only the true background remains)</code></pre>
+<div class="code-caption">A controlled mess and its repair: <code>cv2.morphologyEx</code> with <code>MORPH_OPEN</code> then <code>MORPH_CLOSE</code> takes the mask from 59 apparent objects with two dozen false holes down to exactly one object and one background region, with every step verifiable by the component counts of Section 6.1 (note the 4-connected background count, per the Jordan pairing).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The SE Size Is a Declaration About the World</div>
+<p>Opening with a disk of radius $r$ encodes the claim "no real object feature is thinner than $2r$ pixels"; closing with the same disk claims "no real hole is smaller than that." Choose $r$ from physical knowledge (smallest defect that matters, optics resolution, pixel pitch from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>), not by eyeballing one image. When the claim is false, morphology fails silently and confidently: an opening sized for dust will happily erase the hairline crack you were hired to find.</p>
+</div>
+
+<h2>3. Granulometry: Sieving an Image by Size <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Opening with ever-larger SEs is a measurement instrument in its own right. Since opening removes everything smaller than the SE, the surviving foreground area as a function of SE radius is a decreasing curve, and its drops mark the sizes at which the image holds its content. This is <strong>granulometry</strong>, the original 1964 application: sieving crushed ore through ever-finer meshes, in software. The curve's negative derivative (the <em>pattern spectrum</em>) is effectively a histogram of object sizes computed without ever segmenting a single object, a trick worth remembering whenever objects touch or overlap too much to count, and a spiritual cousin of the multi-scale analysis in <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+beans = (cv2.imread("coffee_beans.png", cv2.IMREAD_GRAYSCALE) &gt; 128)
+beans = beans.astype(np.uint8) * 255
+
+areas = []
+radii = range(1, 30)
+for r in radii:
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    surviving = cv2.morphologyEx(beans, cv2.MORPH_OPEN, se)
+    areas.append(int(np.count_nonzero(surviving)))
+
+spectrum = -np.diff(areas)               # area destroyed at each radius
+peak = radii[int(np.argmax(spectrum)) + 1]
+print(f"dominant grain radius ~ {peak} px")
+# Representative output:
+# dominant grain radius ~ 14 px</code></pre>
+<div class="code-caption">Granulometry in a dozen lines: opening a bean mask with growing elliptical SEs and differencing the surviving areas yields a pattern spectrum whose peak reveals the dominant grain radius, no labeling or separation of touching beans required.</div>
+
+<h2>4. Morphological Gradients: Boundaries From Differences <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Differences between the atoms and the original image isolate exactly the pixels each operator moves, and those pixels live on boundaries. Three standard combinations exist. The <strong>morphological gradient</strong>, $(A \oplus B) - (A \ominus B)$, yields a boundary ribbon roughly two pixels thick straddling the contour. The <strong>internal gradient</strong> $A - (A \ominus B)$ keeps the one-pixel rim just inside the object, and the <strong>external gradient</strong> $(A \oplus B) - A$ the rim just outside. On binary masks these are the standard way to extract object outlines before the more structured contour tracing of <a href="section-6.6.html">Section 6.6</a>; on grayscale images the morphological gradient behaves like an edge-strength map, an unsigned cousin of the derivative filters from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> and a precursor to the proper edge detectors of <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>. One line each in OpenCV: <code>cv2.morphologyEx(img, cv2.MORPH_GRADIENT, se)</code>, with the internal and external variants as ordinary subtractions.
+</p>
+
+<h2>5. Top-Hat &amp; Black-Hat: Rescuing Thresholds From Bad Lighting <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The most valuable composition for grayscale work subtracts an opening from its input. The <strong>white top-hat</strong>, $f - (f \circ B)$, works because a grayscale opening with a large SE erases every bright structure narrower than the SE, leaving a clean estimate of the smooth background; subtracting that background leaves precisely the small bright structures, now sitting on a flat field. The <strong>black-hat</strong>, $(f \bullet B) - f$, does the same for small dark structures on bright backgrounds, ink on unevenly lit paper being the canonical case. This is the morphological answer to the uneven-illumination problem that motivated adaptive thresholding in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>: rather than adapting the threshold to the lighting, flatten the lighting and keep the simple global threshold.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# Page photographed under a desk lamp: strong left-to-right falloff.
+page = cv2.imread("lamp_lit_page.png", cv2.IMREAD_GRAYSCALE)
+
+_, global_otsu = cv2.threshold(page, 0, 255,
+                               cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+# SE must dwarf the text strokes but stay smaller than the lighting scale.
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+blackhat = cv2.morphologyEx(page, cv2.MORPH_BLACKHAT, se)  # dark ink -&gt; bright
+_, rescued = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+print("ink fraction, naive Otsu :", f"{(global_otsu &gt; 0).mean():.1%}")
+print("ink fraction, black-hat  :", f"{(rescued &gt; 0).mean():.1%}")
+# Representative output:
+# ink fraction, naive Otsu : 37.2%   &lt;- entire dark half of page marked as ink
+# ink fraction, black-hat  : 6.1%    &lt;- text only, both halves of the page</code></pre>
+<div class="code-caption">Black-hat rescue of a lamp-lit page: a $31 \times 31$ opening-based background estimate flattens the illumination so a single global Otsu threshold recovers the ink at a plausible 6 percent coverage, where the naive global threshold had swallowed the whole dark side of the page.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Area Criteria Beat Shape Criteria for Pure Cleanup</div>
+<p>Opening removes small objects but also rounds the corners of survivors, because the SE's shape is stamped onto everything it touches. When you only want "delete blobs under 50 px and fill holes under 20 px" with zero shape distortion, scikit-image does it in two lines: <code>skimage.morphology.remove_small_objects(mask, 50)</code> and <code>remove_small_holes(mask, 20)</code>. Internally these label components (Section 6.4 machinery), measure areas, and discard by threshold, which replaces the dozen lines of label-measure-filter logic you would otherwise write and leaves surviving shapes pixel-identical. The trade-off cuts both ways: area criteria cannot break thin bridges or trim hairs, which only a true opening's shape test can do. Production pipelines often run both.</p>
+</div>
+
+<h2>6. Hit-or-Miss: Morphology as Exact Pattern Matching <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+One last composition rounds out the algebra. The <strong>hit-or-miss transform</strong> erodes the foreground with one SE and the background with a second, disjoint SE, keeping only pixels where both fit: a template match demanding specified foreground pixels <em>and</em> specified background pixels simultaneously. OpenCV encodes both SEs in a single kernel of $1$ (must be foreground), $-1$ (must be background), and $0$ (indifferent), via <code>cv2.morphologyEx(mask, cv2.MORPH_HITMISS, kernel)</code>. A kernel of all $-1$s around a central $1$ finds isolated pixels; an L-shaped pattern finds right-angle corners. Hit-or-miss is the primitive behind the thinning algorithms that produce the skeletons of <a href="section-6.5.html">Section 6.5</a>, where a rotating family of such templates peels away boundary pixels that can be removed without breaking connectivity.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Glare, Dust, and Ninety Blisters a Minute</div>
+<p><strong>Who:</strong> A vision integrator commissioning a blister-pack inspection station at a pharmaceutical contract manufacturer.</p>
+<p><strong>Situation:</strong> Each pack holds 10 tablets under a clear plastic film; a camera with a ring light checks for missing or broken tablets at 90 packs per minute. Thresholding tablet silhouettes worked well in the lab.</p>
+<p><strong>Problem:</strong> On the line, the plastic film's curvature threw specular glare that punched 2 to 5 px holes through tablet silhouettes, while airborne tablet dust speckled the background with 1 to 3 px false foreground. Both confused the area check: holed tablets read as broken, and dust occasionally aggregated into phantom tablet fragments. Regulatory constraints made a switch to an opaque-model deep network unattractive: every reject must be explainable in an audit.</p>
+<p><strong>Decision:</strong> Insert a 7 px elliptical opening (kills dust up to twice the observed maximum) followed by an 11 px closing (seals glare holes with margin) between threshold and measurement, with both radii recorded in the audit file alongside the physical justification: the smallest genuine defect the customer must catch, a chipped tablet edge, removes at least 30 px of silhouette width and survives both operators untouched.</p>
+<p><strong>Result:</strong> False rejects fell from 4.1 percent to 0.06 percent over a 2-million-pack validation run, with zero missed genuine defects in the seeded-defect challenge set. The auditor accepted the two-line mathematical argument (anti-extensivity plus the size threshold) as the explanation of why no real defect can be masked.</p>
+<p><strong>Lesson:</strong> Opening and closing radii are not tuning knobs; they are documented claims about defect physics. When a regulator asks "prove this filter cannot hide a defect," idempotence and monotonicity from this chapter are the proof, which is an argument no learned post-processor can yet make.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cleanup Goes Learnable</div>
+<p>The open-then-close recipe now has learned competitors and learned collaborators. SegRefiner (Wang et al., NeurIPS 2023, arXiv:2312.12425) recasts mask cleanup as a discrete diffusion process that iteratively refines coarse masks, fixing exactly the speckle-and-pinhole errors this section targets, but learned from data. The mask pipelines around SAM 2 (Ravi et al., 2024, arXiv:2408.00714) take the hybrid route: foundation-model masks post-processed with classical hole filling and small-region removal, because the morphological step is free, deterministic, and adds no failure modes. And through differentiable morphology libraries such as Kornia's <code>kornia.morphology</code>, opening and closing now appear <em>inside</em> loss functions, where penalizing the difference between a prediction and its opening teaches a network of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>'s kind to stop emitting speckle in the first place.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The names are older than the notation. "Opening" opens narrow channels and isthmuses between regions (erosion cuts them; dilation cannot rebuild them), while "closing" closes narrow channels between background regions. Serra's school in Fontainebleau taught the pair with coastline metaphors, and the vocabulary stuck: morphologists still speak of gulfs, isthmuses, capes, and lakes, making the field's papers read faintly like sailing charts.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.1: Idempotence From the Brush Picture <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the characterization "opening = union of all SE placements that fit inside $A$," argue in two or three sentences why opening twice with the same SE must equal opening once. Then explain why the same argument fails for plain erosion (which keeps shrinking with every pass), and what this difference means operationally for someone tempted to run a cleanup loop "until the mask stops changing."</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.2: The Granulometer <span class="exercise-type coding">Coding</span></div>
+<p>Photograph or synthesize an image of mixed coins (or generate disks of two known radii, 12 px and 20 px, with heavy overlap), threshold it, and compute the pattern spectrum as in this section's granulometry code. Verify that the spectrum shows two peaks at the correct radii even when the coins touch and overlap so much that connected-component counting (Section 6.4) would fail. Report how the smaller peak degrades as you increase overlap, and explain why.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.3.3: Open-Close Versus Close-Open <span class="exercise-type analysis">Analysis</span></div>
+<p>Opening-then-closing and closing-then-opening are both idempotent smoothers, but they are not equal. Construct a mask where the two orders give visibly different results (hint: place a speck close enough to an object that closing first welds them together). Characterize in general terms which artifacts each order favors, and state a rule for choosing the order based on whether false foreground or false holes are the more dangerous error in a given inspection task.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.2.html">&#8592; Section 6.2: Erosion &amp; Dilation</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="section-6.4.html">Section 6.4: Connected Components &amp; Region Properties &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

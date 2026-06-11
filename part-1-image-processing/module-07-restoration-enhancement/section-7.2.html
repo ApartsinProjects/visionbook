@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.2: Classical Denoising: From Gaussian to Non-Local Means. Denoising as the art of choosing whom to average: local Gaussian and median filtering, edge-aware bilateral filtering, patch-based non-local means, and BM3D, benchmarked with PSNR." name="description"/>
+<title>Section 7.2: Classical Denoising: From Gaussian to Non-Local Means | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Classical Denoising: From Gaussian to Non-Local Means</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Why should I average my neighbors just because they live next door? Somewhere across this image are patches that actually understand me."</p>
+<cite>A Non-Local Means Filter With High Standards</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Denoising is the art of averaging the right pixels: every classical denoiser is a different answer to the single question "which pixels can be trusted to share a value?"</strong> The ladder climbs from spatial proximity (Gaussian), through robust proximity (median) and similarity-gated proximity (bilateral), to patch self-similarity anywhere in the image (non-local means and BM3D). Each rung encodes a sharper prior about what natural images look like, and the top rung held the state of the art for a full decade until neural networks learned to climb past it.</p>
+</div>
+<p>
+<a href="section-7.1.html">Section 7.1</a> built the damage: we can now synthesize noise with known statistics and score any attempted cure with the PSNR and SSIM metrics from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>. This section attempts the cure itself. We start from the humble filters of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, reread them as denoisers, and then make the conceptual leap that defined classical denoising's final and best decade: the realization that a pixel's most trustworthy relatives usually do not live next door.
+</p>
+<h2>1. Averaging and Its Discontents <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+All denoising rests on one statistical fact. If you average $N$ independent measurements of the same underlying value, each corrupted by noise of standard deviation $\sigma$, the average has noise $\sigma / \sqrt{N}$. Average a hundred honest copies of a pixel and the noise drops tenfold. The entire difficulty of denoising hides inside the phrase "of the same underlying value": the clean image is exactly what we do not have, so we never know for certain which pixels share a value. Every algorithm in this section is a strategy for guessing.
+</p>
+<p>
+Guess too generously and you average pixels that do not belong together: an edge pixel gets blended with the other side of the edge, and noise reduction becomes blur. Guess too cautiously and you average too few samples, leaving noise behind. This is the denoiser's version of the bias-variance tradeoff: aggressive averaging trades variance (noise) for bias (lost structure). The history of classical denoising is the history of finding more pixels to average without inviting the wrong ones, and you can read the whole section as a progression of increasingly clever invitation lists.
+</p>
+<h2>2. The Local Family, Reread as Denoisers <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+<a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> introduced the Gaussian, median, and bilateral filters as general smoothing tools. Viewed as denoisers, each is an invitation policy. The <strong>Gaussian filter</strong> invites every pixel within a spatial radius, weighted by distance: its prior says images are smooth everywhere, which is false at every edge, and the result is the familiar tradeoff of clean flat regions bought with smeared boundaries. The <strong>median filter</strong> invites the same neighbors but takes a vote instead of an average, which makes it nearly immune to the impulse noise of Table 7.1.1: a dead pixel is an outlier, and medians ignore outliers. The <strong>bilateral filter</strong> adds a second gate: a neighbor is invited only if it is both spatially close and tonally similar, so averaging stops at edges. Code 7.2.1 runs all three against the same Gaussian-noised test image so we have concrete numbers to argue about.
+</p>
+<pre><code class="language-python">import numpy as np
+from skimage import data, img_as_float
+from skimage.filters import gaussian, median
+from skimage.morphology import disk
+from skimage.restoration import denoise_bilateral
+from skimage.metrics import peak_signal_noise_ratio as psnr
+
+rng = np.random.default_rng(seed=7)
+clean = img_as_float(data.camera())                    # 512x512 grayscale
+noisy = np.clip(clean + rng.normal(0, 0.10, clean.shape), 0, 1)
+
+results = {
+    'noisy':     noisy,
+    'gaussian':  gaussian(noisy, sigma=1.2),
+    'median':    median(noisy, footprint=disk(2)),
+    'bilateral': denoise_bilateral(noisy, sigma_color=0.15, sigma_spatial=3),
+}
+for name, img in results.items():
+    print(f"{name:9s} PSNR = {psnr(clean, img):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.1:</strong> The local denoising family on $\sigma = 0.1$ Gaussian noise. Each filter's parameters were chosen by a quick sweep; in real work you would tune them against the noise estimate from Code 7.1.3.</div>
+<pre class="code-output">noisy     PSNR = 20.2 dB
+gaussian  PSNR = 26.5 dB
+median    PSNR = 25.6 dB
+bilateral PSNR = 26.9 dB
+</pre>
+<div class="code-caption"><strong>Output 7.2.1a:</strong> A typical run (exact values shift by a few tenths of a dB with the seed). All three filters buy 5 to 7 dB, but inspect the images and the cost is visible: the Gaussian result is uniformly soft, the median result has flattened fine texture into plateaus, and the bilateral result is crisp at strong edges yet waxy in gently textured regions.</div>
+<p>
+The bilateral filter's waxiness is worth understanding because it motivates everything that follows. The tonal gate works well at high-contrast edges, where "similar intensity" reliably means "same side of the edge." But in low-contrast texture, noise itself decides who looks similar: the filter averages pixels whose intensities happen to match by chance, producing the smooth, plasticky patches that photographers call the watercolor effect. The deeper problem is that a single noisy pixel value is a terrible identity card. Two pixels from the same structure can differ wildly because of noise; two pixels from different structures can match by accident. We need a richer description of who a pixel is.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Every Denoiser Is a Prior in Disguise</div>
+<p>Each filter's invitation policy is an assumption about natural images stated in code. Gaussian: images are smooth. Median: images are locally constant with occasional outliers. Bilateral: images are piecewise smooth with sharp boundaries. Non-local means, coming next: images repeat themselves. BM3D: images repeat themselves and are sparse in a transform domain. When a denoiser fails on your data, the productive question is never "which filter is best" but "which of these beliefs is true of my images." The same question, with "belief" replaced by "training distribution," is how you will debug learned denoisers in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a> and beyond.</p>
+</div>
+<h2>3. Non-Local Means: Averaging by Resemblance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The 2005 insight of Buades, Coll, and Morel reads obvious in hindsight, as the best insights do. Natural images are massively self-similar: a brick wall contains hundreds of nearly identical bricks, a face has two matching eyebrows and acres of similar skin, a sky repeats itself almost everywhere. Each repetition is an independent noisy measurement of nearly the same content. So instead of identifying a pixel by its single noisy value, identify it by the small <em>patch</em> around it, and average it with every pixel in the image whose surrounding patch looks alike, regardless of where that pixel lives. The estimate for pixel $p$ becomes
+</p>
+$$
+\hat f(p) = \frac{1}{Z(p)} \sum_{q} w(p, q) \, g(q),
+\qquad
+w(p, q) = \exp\!\left( -\frac{\lVert P(p) - P(q) \rVert_2^2}{h^2} \right),
+$$
+<p>
+where $P(p)$ is the patch of pixels centered on $p$, $Z(p) = \sum_q w(p,q)$ normalizes the weights, and $h$ controls how strict the resemblance test is. Patches that match closely get weight near one; patches that differ get exponentially suppressed. Figure 7.2.1 contrasts this with the local policy of Section 2: the bilateral filter asks "who is nearby and similar in value," while non-local means (NLM) asks "who, anywhere, is living the same life."
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of local averaging within a disk versus non-local means averaging over similar patches found anywhere in the image">
+<style>
+.panel { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.4; }
+.dark { fill: #cbd5e1; }
+.ttl { font-family: Verdana, Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.sub2 { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #4b5563; text-anchor: middle; }
+.pixel { fill: #2563eb; }
+.refp { fill: none; stroke: #2563eb; stroke-width: 2.2; }
+.goodp { fill: none; stroke: #059669; stroke-width: 2; }
+.badp { fill: none; stroke: #dc2626; stroke-width: 2; stroke-dasharray: 4 3; }
+.wlbl { font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-size: 12px; text-anchor: middle; }
+.glink { stroke: #059669; stroke-width: 1.6; fill: none; marker-end: url(#ag); }
+.blink { stroke: #dc2626; stroke-width: 1.6; fill: none; stroke-dasharray: 4 3; marker-end: url(#ar); }
+.diskr { fill: rgba(37, 99, 235, 0.12); stroke: #2563eb; stroke-width: 1.5; stroke-dasharray: 5 4; }
+</style>
+<defs>
+<marker id="ag" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#059669"/></marker>
+<marker id="ar" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#dc2626"/></marker>
+</defs>
+<!-- Left panel: local -->
+<text class="ttl" x="200" y="24">Local averaging (Chapter 3)</text>
+<rect class="panel" x="60" y="40" width="280" height="220" rx="6"/>
+<polygon class="dark" points="60,260 340,150 340,260"/>
+<circle class="diskr" cx="200" cy="170" r="46"/>
+<rect class="pixel" x="196" y="166" width="8" height="8"/>
+<text class="sub2" x="200" y="290">everyone within the disk is invited,</text>
+<text class="sub2" x="200" y="306">including pixels across the edge</text>
+<!-- Right panel: non-local -->
+<text class="ttl" x="660" y="24">Non-local averaging (this section)</text>
+<rect class="panel" x="480" y="40" width="360" height="220" rx="6"/>
+<polygon class="dark" points="480,260 840,150 840,260"/>
+<!-- reference patch -->
+<rect class="refp" x="592" y="100" width="30" height="30"/>
+<rect class="pixel" x="603" y="111" width="8" height="8"/>
+<!-- good candidates on same texture -->
+<rect class="goodp" x="514" y="64" width="30" height="30"/>
+<rect class="goodp" x="724" y="84" width="30" height="30"/>
+<rect class="goodp" x="780" y="130" width="30" height="30"/>
+<!-- bad candidate across edge -->
+<rect class="badp" x="640" y="206" width="30" height="30"/>
+<!-- links with weights -->
+<path class="glink" d="M 544 82 C 566 86, 580 96, 592 106"/>
+<text class="wlbl" x="556" y="68" fill="#059669">w = 0.9</text>
+<path class="glink" d="M 724 102 C 690 106, 660 110, 624 113"/>
+<text class="wlbl" x="690" y="84" fill="#059669">w = 0.8</text>
+<path class="glink" d="M 780 148 C 730 150, 660 135, 624 122"/>
+<text class="wlbl" x="762" y="178" fill="#059669">w = 0.7</text>
+<path class="blink" d="M 652 204 C 640 175, 630 150, 615 132"/>
+<text class="wlbl" x="688" y="190" fill="#dc2626">w &#8776; 0</text>
+<text class="sub2" x="660" y="290">patches that resemble the reference are invited from anywhere;</text>
+<text class="sub2" x="660" y="306">the look-alike across the edge is rejected by its patch, not its address</text>
+</svg>
+<figcaption><strong>Figure 7.2.1:</strong> Two invitation policies. Left: a local filter averages everything inside a spatial disk, so pixels across the edge (gray region) contaminate the estimate. Right: non-local means identifies the blue pixel by its surrounding patch and averages it with patches that match (green, high weight $w$) wherever they sit, while a nearby but structurally different patch (red, dashed) receives weight near zero.</figcaption>
+</figure>
+<p>
+Code 7.2.2 is a deliberately naive implementation, four nested loops and no tricks, because the algorithm fits in fifteen readable lines and reading it teaches more than any description. Run it on a small crop; the full image would take minutes, which is itself a lesson about why the optimized library versions exist.
+</p>
+<pre><code class="language-python">def nlm_gray(img, patch=7, window=8, h=0.12):
+    """Educational non-local means for float grayscale images.
+    Searches a (2*window+1)^2 neighborhood; O(N * window^2 * patch^2)."""
+    half = patch // 2
+    pad = half + window
+    p = np.pad(img, pad, mode='reflect')
+    out = np.empty_like(img)
+    for i in range(img.shape[0]):
+        for j in range(img.shape[1]):
+            ci, cj = i + pad, j + pad
+            ref = p[ci-half:ci+half+1, cj-half:cj+half+1]
+            wsum, acc = 0.0, 0.0
+            for di in range(-window, window + 1):
+                for dj in range(-window, window + 1):
+                    cand = p[ci+di-half:ci+di+half+1,
+                             cj+dj-half:cj+dj+half+1]
+                    d2 = np.mean((ref - cand) ** 2)     # patch distance
+                    w = np.exp(-d2 / h ** 2)            # resemblance weight
+                    wsum += w
+                    acc  += w * p[ci + di, cj + dj]
+            out[i, j] = acc / wsum
+    return out
+
+crop, ncrop = clean[120:184, 200:264], noisy[120:184, 200:264]
+restored = nlm_gray(ncrop)
+print(f"noisy crop PSNR = {psnr(crop, ncrop):.1f} dB, "
+      f"NLM crop PSNR = {psnr(crop, restored):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.2:</strong> Non-local means from scratch, run on a 64x64 crop. In practice the search "window" is restricted exactly as here (a 17x17 region rather than the whole image), which loses little quality because self-similar patches cluster spatially, and turns an unusable algorithm into a merely slow one.</div>
+<p>
+Two parameters do the steering. The patch size (7x7 is the classic default) sets how much context defines a pixel's identity: too small and noise corrupts the identity card, too large and rare structures find no matches. The bandwidth $h$ sets the strictness of the resemblance test and should scale with the noise level: a common refinement subtracts the expected noise contribution from the patch distance before weighting, $w = \exp(-\max(d^2 - 2\sigma^2, 0)/h^2)$, so that two identical patches corrupted by noise still count as identical. The exercises ask you to implement that version, and feeding it the $\sigma$ estimated by Code 7.1.3 closes the loop with the previous section.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>cv2.fastNlMeansDenoising</code> and <code>skimage.restoration.denoise_nl_means</code></div>
+<p>Both major libraries ship heavily optimized NLM. The thirty-odd lines of Code 7.2.2 collapse to one call each:</p>
+<pre><code class="language-python">import cv2
+from skimage.restoration import denoise_nl_means, estimate_sigma
+
+# OpenCV: uint8 in, strength h in 8-bit gray levels (about the noise sigma)
+den_cv = cv2.fastNlMeansDenoising((noisy * 255).astype(np.uint8), None,
+                                  h=25, templateWindowSize=7,
+                                  searchWindowSize=21)
+
+# scikit-image: float in, noise-aware weighting via sigma=
+sigma_est = estimate_sigma(noisy)
+den_sk = denoise_nl_means(noisy, h=0.8 * sigma_est, sigma=sigma_est,
+                          patch_size=7, patch_distance=11, fast_mode=True)
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.3:</strong> Production non-local means in one line per library; <code>fastNlMeansDenoisingColored</code> handles color, and OpenCV adds a multi-frame variant for video.</div>
+<p>Roughly 30 lines become 1, and the speedup is around three orders of magnitude. Internally the libraries handle the integral-image trick that computes all patch distances at a fixed offset in O(1) per pixel, the noise-compensated weighting, multithreading, and color images (where patch distance is measured across channels jointly). Use Code 7.2.2 to understand the algorithm; never ship it.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Squint at the NLM formula and you are looking at an attention mechanism, fourteen years early: compare a query patch against key patches everywhere, softmax-like exponential weights, then a weighted average of values. When <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> introduces self-attention in Vision Transformers, the formula will feel familiar. The 2018 "Non-local Neural Networks" paper by Wang et al. made the connection explicit and cited Buades directly. Denoising folklore became deep learning's favorite primitive.</p>
+</div>
+<h2>4. BM3D: Self-Similarity Meets Sparsity <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Non-local means uses similar patches timidly: it only averages their center pixels. BM3D (block-matching and 3D filtering, Dabov et al. 2007) commits fully. It <em>groups</em> similar patches into a 3D stack, applies a 3D transform to the whole stack (a 2D DCT or wavelet across each patch, plus a 1D transform along the stack), and then denoises all the patches jointly by shrinking small transform coefficients toward zero. The logic combines both great classical priors at once. Self-similarity says the stacked patches are nearly identical, so the 1D transform along the stack compresses them into a few strong coefficients. Transform-domain sparsity, the idea behind the wavelet shrinkage you met in <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, says clean structure concentrates in few large coefficients while noise spreads evenly across all of them. Kill the small coefficients and you kill mostly noise; the patches then "collaborate," because structure shared across the group survives shrinkage even where any single patch is too noisy to reveal it.
+</p>
+<p>
+The full algorithm runs this pipeline twice: a first pass with hard thresholding produces a rough estimate, and a second pass uses that estimate to build Wiener shrinkage weights (the same Wiener logic that <a href="section-7.3.html">Section 7.3</a> derives for deblurring) for a refined result. Patches overlap, so each pixel receives many estimates that are averaged with weights. None of this is pleasant to implement, and unlike NLM there is no fifteen-line educational version worth your time; the reference implementation from the original authors is the sensible route, shown in Code 7.2.4.
+</p>
+<pre><code class="language-python">import bm3d                      # pip install bm3d  (Tampere reference impl.)
+
+den_bm3d = bm3d.bm3d(noisy, sigma_psd=0.10,
+                     stage_arg=bm3d.BM3DStages.ALL_STAGES)
+print(f"BM3D PSNR = {psnr(clean, den_bm3d):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.4:</strong> BM3D via the authors' reference package. <code>sigma_psd</code> is the noise standard deviation in the image's value range, which you can estimate with Code 7.1.3; <code>ALL_STAGES</code> runs both the hard-threshold pass and the Wiener refinement pass.</div>
+<pre class="code-output">BM3D PSNR = 29.4 dB
+</pre>
+<div class="code-caption"><strong>Output 7.2.4a:</strong> On this standard test image and noise level, BM3D beats the best local filter from Output 7.2.1a by roughly 2.5 dB, a gap large enough to see immediately: texture survives that every other classical method erases.</div>
+<p>
+From 2007 until deep denoisers matured in the late 2010s, BM3D was the number to beat, and it aged remarkably well: it needs no training data, adapts to any noise level through a single parameter, and remains the standard "classical baseline" row in every denoising paper's results table. When a learned method beats BM3D by half a decibel, that half decibel is the headline.
+</p>
+<h2>5. The Bake-Off, and What the Numbers Hide <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Code 7.2.5 races the contenders on equal terms, measuring both quality and time, because in production the second number often decides. The ranking it produces is the canonical one: quality rises in the order Gaussian, median, bilateral, NLM, BM3D, and runtime rises in nearly the same order. You pay for trust.
+</p>
+<pre><code class="language-python">import time
+
+def bench(name, fn):
+    t0 = time.perf_counter()
+    out = fn()
+    ms = (time.perf_counter() - t0) * 1000
+    print(f"{name:10s} {psnr(clean, out):5.1f} dB   {ms:8.0f} ms")
+
+bench('gaussian',  lambda: gaussian(noisy, sigma=1.2))
+bench('bilateral', lambda: denoise_bilateral(noisy, sigma_color=0.15,
+                                             sigma_spatial=3))
+bench('nl-means',  lambda: denoise_nl_means(noisy, h=0.8 * sigma_est,
+                                            sigma=sigma_est, patch_size=7,
+                                            patch_distance=11, fast_mode=True))
+bench('bm3d',      lambda: bm3d.bm3d(noisy, sigma_psd=0.10))
+</code></pre>
+<div class="code-caption"><strong>Code 7.2.5:</strong> Quality and wall-clock for the four main contenders on the 512x512 test image. Absolute times depend on your machine; the relative ladder (each rung roughly an order of magnitude slower) is stable.</div>
+<pre class="code-output">gaussian    26.5 dB         6 ms
+bilateral   26.9 dB       310 ms
+nl-means    28.3 dB       900 ms
+bm3d        29.4 dB      4600 ms
+</pre>
+<div class="code-caption"><strong>Output 7.2.5a:</strong> A typical run. Three extra decibels cost three orders of magnitude in compute, which is why video pipelines still run bilateral or hardware NLM variants while offline photo editors can afford BM3D-class methods.</div>
+<p>
+Now the caveats, because this tidy benchmark hides three traps. First, everything above assumes additive Gaussian noise of known strength; on the Poisson-dominated low-light images of <a href="section-7.1.html">Section 7.1</a>, run the Anscombe sandwich around any of these methods or the dark regions will be under-denoised. Second, PSNR rewards smoothness, as Section 7.1 warned: the bilateral filter's waxy patches score better than they look, and BM3D's occasional low-contrast artifacts (ghostly repeated structure in flat areas, the price of aggressive patch grouping) score worse than they look. Always look. Third, real camera noise after the ISP's own processing is spatially correlated and channel-dependent, violating every independence assumption in this section; this is the gap that learned denoisers, trained on real sensor data, exploit to win.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Microscope That Could Not Afford More Light</div>
+<p><strong>Who:</strong> An image-analysis engineer at a live-cell microscopy startup.</p>
+<p><strong>Situation:</strong> Fluorescence imaging of living cells is photon-starved by design: more excitation light yields cleaner images but kills or alters the cells (phototoxicity). The product needed clean-looking video at one-tenth the normal light dose.</p>
+<p><strong>Problem:</strong> The pipeline's Gaussian denoiser, tuned until the noise vanished, also erased the thin filament structures the biologists were paying to see. Tuned to preserve filaments, it left the background crawling. No setting of one knob satisfied both.</p>
+<p><strong>Decision:</strong> Cellular images are extremely self-similar: hundreds of near-identical filament segments, vesicles, and membrane patches per frame. The engineer applied a variance-stabilizing transform (the noise was Poisson-dominated, exactly as in Section 7.1) followed by non-local means, with $h$ tied to the per-frame noise estimate.</p>
+<p><strong>Result:</strong> Filaments survived because each segment was averaged with its many look-alikes rather than with empty background. The downstream segmentation stage, which had been the original complaint, went from unusable to production-quality with no other changes.</p>
+<p><strong>Lesson:</strong> Match the prior to the content. Self-similar imagery (biology, textiles, aerials, architecture) is where patch-based methods earn their compute bill, and stabilizing the noise first is what lets a single $h$ work across the whole frame.</p>
+</div>
+<h2>6. From Hand-Written Priors to Learned Ones <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+This section's ladder, smoothness to robustness to edge-awareness to self-similarity to sparsity, is a sequence of priors that researchers wrote by hand, one insight per decade. The next move in the story was to stop writing them. A denoising network sees millions of (clean, noisy) pairs, generated with exactly the pipelines of <a href="section-7.1.html">Section 7.1</a>, and learns whatever prior the data supports, including the awkward correlated, signal-dependent noise that breaks the classical assumptions. DnCNN demonstrated the approach decisively in 2017, beating BM3D with a plain convolutional network that predicts the noise residual. The conceptual continuity runs deeper than the benchmark tables: denoising autoencoders in <a href="../../part-4-generative-vision-models/module-31-autoencoders-vaes/index.html">Chapter 31</a> turn "remove the noise" into a way of learning representations, and diffusion models in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> turn iterated denoising into image generation itself. The skill you built in this section, reasoning about what a denoiser believes and where that belief fails, transfers intact; only the source of the belief changes.</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: One Model, Every Degradation</div>
+<p>Classical denoisers handle one noise model at a time; the 2024 to 2026 frontier is collapsing the whole restoration toolbox into single networks. <strong>Restormer</strong> (Zamir et al., CVPR 2022) set the transformer template for restoration, and <strong>PromptIR</strong> (Potlapalli et al., NeurIPS 2023) made one network switch behavior across noise, rain, and haze using learned prompts. <strong>AdaIR</strong> (Cui et al., ICLR 2025) pushes the all-in-one idea further by mining frequency bands to identify which degradation it is looking at, an automated version of this chapter's "diagnose before you cure" discipline. Meanwhile <strong>DiffBIR</strong> (Lin et al., ECCV 2024) bolts a diffusion prior onto restoration for severe damage. The self-supervised line that began with Noise2Noise and Noise2Void keeps advancing for domains like microscopy where clean ground truth cannot exist, which is worth remembering: the field's hardest denoising problems are still constrained by exactly the ground-truth question that Section 7.1's synthetic pipelines were built to dodge.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.1: Choose the Prior <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each image, name the denoiser from this section you would try first and the prior that justifies it, in one sentence each: (a) a flat-shaded cartoon frame with crisp outlines; (b) a night-time street photo dominated by shot noise; (c) a scanned 1960s document with scattered black specks; (d) an aerial photograph of a vineyard (rows upon rows of nearly identical vines); (e) a portrait whose skin must not turn waxy.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.2: Noise-Compensated Weights <span class="exercise-type coding">Coding</span></div>
+<p>Modify Code 7.2.2 to use the noise-compensated weight $w = \exp(-\max(d^2 - 2\sigma^2, 0)/h^2)$, feeding it the $\sigma$ estimated by <code>estimate_sigma</code> from Code 7.1.3. Sweep $h$ over a grid for $\sigma \in \{0.05, 0.10, 0.20\}$ and plot PSNR against $h/\sigma$. You should find the best ratio is roughly constant across noise levels; report it. This is why libraries expose $h$ as a multiple of $\sigma$.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.2.3: Method Noise <span class="exercise-type analysis">Analysis</span></div>
+<p>Buades proposed judging a denoiser by its <em>method noise</em>: the difference $g - \hat f$ between the noisy input and the denoised output, which is everything the method removed. For the Gaussian, bilateral, and NLM results of this section, display the method noise as an image. An ideal denoiser removes pure noise, so its method noise should look structureless. Identify which image structures each method stole (edges? texture? corners?), and explain each theft in terms of the method's prior.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-7.1.html"><span class="nav-label">Section 7.1: Noise Models &amp; Degradation Pipelines</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="section-7.3.html"><span class="nav-label">Section 7.3: Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

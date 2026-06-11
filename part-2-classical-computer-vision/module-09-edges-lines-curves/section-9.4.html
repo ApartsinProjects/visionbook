@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.4: Fitting Curves: Least Squares &amp; Robust Alternatives. Ordinary versus total least squares for lines, why a single outlier ruins a squared-loss fit, M-estimators with cv2.fitLine, RANSAC with its iteration budget, and direct ellipse fitting." name="description"/>
+<title>Section 9.4: Fitting Curves: Least Squares &amp; Robust Alternatives | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Edges, Lines &amp; Curves</a></div>
+<h1>Fitting Curves: Least Squares &amp; Robust Alternatives</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I fit two hundred points beautifully. Then one outlier walked in, and now I'm somewhere I can't explain, and the inliers won't return my calls."</p>
+<cite>A Least-Squares Fit With Regrets</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Detection tells you a line exists; fitting tells you exactly which line, to a fraction of a pixel, and the entire craft of fitting in vision is managing a single tension: the squared loss that is statistically optimal for honest Gaussian noise is unboundedly gullible toward outliers.</strong> This section builds the toolkit in escalating order of paranoia: total least squares for the geometry, M-estimators that cap how loudly any point may complain, and RANSAC, which abandons loss-shaping altogether and instead searches for the largest consensus of points that agree on one model. RANSAC is the algorithm to internalize: met here on lines, it returns for match filtering in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, fundamental matrices in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, and pose estimation in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+</div>
+
+<p>
+The Hough transform of <a href="section-9.3.html">Section 9.3</a> ended with an answer quantized to its bin width: a line known to within a degree and a pixel. For drawing on a debug image, fine; for steering a vehicle in <a href="section-9.5.html">Section 9.5</a> or measuring a machined part, not fine. The standard two-step is to let voting <em>detect</em> (and, crucially, collect the supporting pixels) and then let fitting <em>measure</em>, estimating continuous parameters from those supporters at subpixel precision. This section is about doing the second step without being betrayed by the points that should never have been in the set.
+</p>
+
+<h2>1. Least Squares, Two Ways <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Given points $(x_i, y_i)$ believed to lie on a line, <strong>ordinary least squares</strong> (OLS) fits $y = mx + b$ by minimizing the squared <em>vertical</em> residuals $\sum_i (y_i - m x_i - b)^2$. That asymmetry, vertical distance rather than distance to the line, is inherited from statistics, where $x$ is an error-free covariate and all the uncertainty lives in $y$. Image geometry obeys no such convention: an edge pixel is noisy in every direction, and a lane line is as likely to be vertical as horizontal. For near-vertical point sets, tiny $x$-noise translates into wild apparent slopes, and OLS systematically <em>flattens</em> the estimate; in the limit of an exactly vertical line, it cannot represent the answer at all, the same pathology that doomed slope-intercept in <a href="section-9.3.html">Section 9.3</a>.
+</p>
+<p>
+The geometric fix is <strong>total least squares</strong> (TLS): minimize squared <em>perpendicular</em> distances to the line, the distances that Figure 9.4.1 contrasts with OLS's vertical ones. TLS has a closed form worth knowing by heart. The best line passes through the centroid $\bar{p}$, and writing the unit normal as $\mathbf{n}$, the objective $\sum_i \big( (p_i - \bar{p}) \cdot \mathbf{n} \big)^2 = \mathbf{n}^\top S \, \mathbf{n}$ is a quadratic form in the $2 \times 2$ scatter matrix $S = \sum_i (p_i - \bar{p})(p_i - \bar{p})^\top$. The minimizing $\mathbf{n}$ is the eigenvector of $S$ with the <em>smallest</em> eigenvalue; equivalently the line's direction is the largest-eigenvalue eigenvector. Readers who know PCA will recognize it exactly: the TLS line is the first principal component, anchored at the centroid.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels comparing ordinary least squares with vertical residual segments against total least squares with perpendicular residual segments on the same steep point set">
+  <!-- LEFT: OLS -->
+  <rect x="20" y="40" width="350" height="220" fill="#ffffff" stroke="#d1d4d8"/>
+  <text x="195" y="28" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">ordinary least squares: vertical residuals</text>
+  <!-- steep true line -->
+  <line x1="150" y1="250" x2="240" y2="55" stroke="#2c3e50" stroke-width="2"/>
+  <!-- points off the line -->
+  <circle cx="142" cy="225" r="5" fill="#e67e22"/>
+  <circle cx="200" cy="160" r="5" fill="#e67e22"/>
+  <circle cx="196" cy="120" r="5" fill="#e67e22"/>
+  <circle cx="248" cy="80"  r="5" fill="#e67e22"/>
+  <!-- vertical residuals: long because line is steep -->
+  <line x1="142" y1="225" x2="142" y2="267" stroke="#c0392b" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="200" y1="160" x2="200" y2="141" stroke="#c0392b" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="196" y1="120" x2="196" y2="150" stroke="#c0392b" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="248" y1="80"  x2="248" y2="38"  stroke="#c0392b" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="40" y="285" font-family="sans-serif" font-size="12" fill="#a93226">steep line &#8658; huge vertical residuals &#8658; slope gets flattened</text>
+  <!-- RIGHT: TLS -->
+  <rect x="410" y="40" width="350" height="220" fill="#ffffff" stroke="#d1d4d8"/>
+  <text x="585" y="28" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">total least squares: perpendicular residuals</text>
+  <line x1="540" y1="250" x2="630" y2="55" stroke="#2c3e50" stroke-width="2"/>
+  <circle cx="532" cy="225" r="5" fill="#e67e22"/>
+  <circle cx="590" cy="160" r="5" fill="#e67e22"/>
+  <circle cx="586" cy="120" r="5" fill="#e67e22"/>
+  <circle cx="638" cy="80"  r="5" fill="#e67e22"/>
+  <!-- perpendicular residuals: short -->
+  <line x1="532" y1="225" x2="547" y2="232" stroke="#1e8449" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="590" y1="160" x2="581" y2="156" stroke="#1e8449" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="586" y1="120" x2="598" y2="126" stroke="#1e8449" stroke-width="2" stroke-dasharray="4,3"/>
+  <line x1="638" y1="80"  x2="628" y2="76"  stroke="#1e8449" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="430" y="285" font-family="sans-serif" font-size="12" fill="#1e8449">distance measured to the line itself: direction-neutral, PCA solves it</text>
+</svg>
+<figcaption><strong>Figure 9.4.1</strong> The same steep point set under two residual definitions. OLS (left) measures vertically, so a steep line accrues enormous residuals and the minimizer tilts toward horizontal; TLS (right) measures perpendicular to the line, treats all orientations equally, and reduces to the first principal component through the centroid.</figcaption>
+</figure>
+
+<p>
+The code makes the difference concrete on a nearly vertical point set with the same isotropic noise in both coordinates:
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(7)
+true_angle = 88.0                                  # nearly vertical line
+d = np.deg2rad(true_angle)
+t = rng.uniform(-50, 50, 300)
+pts = np.c_[t * np.cos(d), t * np.sin(d)] + rng.normal(0, 1.0, (300, 2))
+
+# OLS: regress y on x (vertical residuals)
+m, b = np.polyfit(pts[:, 0], pts[:, 1], 1)
+
+# TLS: principal axis of the centered scatter matrix
+c = pts - pts.mean(axis=0)
+eigval, eigvec = np.linalg.eigh(c.T @ c)
+vx, vy = eigvec[:, -1]                             # largest-eigenvalue direction
+
+print(f"true slope {np.tan(d):8.2f}  angle {true_angle:.1f} deg")
+print(f"OLS  slope {m:8.2f}  angle {np.degrees(np.arctan(m)):.1f} deg")
+print(f"TLS  slope {vy / vx:8.2f}  angle {np.degrees(np.arctan2(vy, vx)) % 180:.1f} deg")
+# Representative output:
+# true slope    28.64  angle 88.0 deg
+# OLS  slope    14.31  angle 86.0 deg
+# TLS  slope    28.49  angle 88.0 deg
+</code></pre>
+<div class="code-caption">OLS versus TLS on a nearly vertical point cloud with identical noise in both axes: the vertical-residual fit halves the slope (the textbook attenuation bias), while the eigenvector fit recovers the true direction; only the residual definition differs between them.</div>
+
+<p>
+For curves beyond lines the same least-squares machinery extends to anything <em>linear in its parameters</em>: a parabola $x = a y^2 + b y + c$ (the lane-friendly orientation that <a href="section-9.5.html">Section 9.5</a> will use) builds a design matrix from powers of $y$ and solves the normal equations, which is precisely what <code>np.polyfit</code> does internally, along with scaling tricks that keep the system well conditioned.
+</p>
+
+<h2>2. The Fragility of the Square <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Why square residuals in the first place? Because under independent Gaussian noise, as modeled in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>, the least-squares solution is the maximum-likelihood estimate: squaring is not arbitrary, it is the log of the Gaussian density. But the optimality is a contract with an assumption, and image data violates it routinely. The pixels feeding your line fit are not "true line plus Gaussian jitter"; some of them are a glare blob, a leaf, a second structure that wandered into the gate. For such points the Gaussian model assigns probabilities like $10^{-50}$, and the squared loss, dutifully maximizing likelihood, will move the line however far it must to make the absurd point less absurd. Influence grows <em>linearly and without bound</em> in the residual: a point 100 pixels off pulls 100 times harder than a point 1 pixel off. In the robust-statistics vocabulary, least squares has a <strong>breakdown point of zero</strong>: a single sufficiently bad point produces an arbitrarily bad fit.
+</p>
+
+<h2>3. M-Estimators: Capping the Complaint <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The first family of fixes keeps the optimization framing but swaps the loss $\rho(r)$. The <strong>Huber loss</strong> is quadratic for $|r| \le \delta$ and linear beyond, so distant points pull with constant rather than growing force; the <strong>Tukey biweight</strong> goes further and flattens entirely, so far-enough outliers exert <em>zero</em> influence. Estimators of this family are called <strong>M-estimators</strong>, and they are solved by <strong>iteratively reweighted least squares</strong> (IRLS): fit, compute residuals, downweight points with large residuals, refit, repeat until the weights settle. OpenCV packages the whole loop as <code>cv2.fitLine</code>, where the <code>distType</code> argument names the loss:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(0)
+# 60 honest points on y = 0.5 x + 10, sigma = 1 px
+x = rng.uniform(0, 100, 60)
+inliers = np.c_[x, 0.5 * x + 10 + rng.normal(0, 1.0, 60)]
+# a glare blob: 6 bad points far below the line (about 9% contamination)
+outliers = np.tile([150.0, -120.0], (6, 1)) + rng.normal(0, 2.0, (6, 2))
+pts = np.vstack([inliers, outliers]).astype(np.float32)
+
+for name, dist in [("L2 (plain TLS)", cv2.DIST_L2),
+                   ("Huber", cv2.DIST_HUBER),
+                   ("Welsch", cv2.DIST_WELSCH)]:
+    vx, vy, x0, y0 = cv2.fitLine(pts, dist, 0, 0.01, 0.01).ravel()
+    print(f"{name:15s} slope {vy / vx:+.3f}")
+# Representative output (true slope +0.500):
+# L2 (plain TLS)  slope +0.214
+# Huber           slope +0.487
+# Welsch          slope +0.499
+</code></pre>
+<div class="code-caption">One glare blob, three losses: with 9 percent contamination the squared loss surrenders more than half the true slope, Huber's linear tails recover most of it, and the redescending Welsch loss (a Tukey-style cousin) ignores the blob entirely, all through the same <code>cv2.fitLine</code> call with a different <code>distType</code>.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: IRLS Without Writing the Loop</div>
+<p>A hand-rolled IRLS (fit, residuals, weights, refit, convergence test) is 25 honest lines and two subtle bugs waiting to happen (weight floor, convergence criterion). <code>cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01)</code> is one line: OpenCV runs the reweighting internally, exposes six loss functions (<code>DIST_L2</code>, <code>DIST_L1</code>, <code>DIST_L12</code>, <code>DIST_FAIR</code>, <code>DIST_WELSCH</code>, <code>DIST_HUBER</code>), and returns the line as a unit direction plus a point, which is the orientation-neutral representation TLS taught us to prefer. A 25-to-1 reduction, plus the numerical maturity of code that has run in production for two decades.</p>
+</div>
+
+<p>
+M-estimators have a ceiling, though. IRLS starts from the plain least-squares fit, and the redescending losses that ignore outliers also ignore <em>anything far from the current fit</em>. If contamination is heavy enough that the starting fit lands closer to the outliers than the truth, the reweighting converges confidently to the wrong structure. In practice M-estimation is excellent up to roughly 10 to 20 percent contamination with a decent initialization. Edge maps routinely do worse: in <a href="section-9.5.html">Section 9.5</a>'s lane images, on a bad frame <em>most</em> thresholded pixels can belong to shadows and asphalt texture rather than paint. For that regime you need the second family.
+</p>
+
+<h2>4. RANSAC: Fit the Many, Ignore the Few <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+<strong>RANSAC</strong> (Random Sample Consensus, Fischler and Bolles, 1981) abandons the idea of weighing all points and instead hunts for the largest subset that agrees on one model. The loop is almost embarrassingly simple. Repeat $N$ times: draw the <em>minimal</em> sample that determines the model (2 points for a line, 3 for a circle, 4 correspondences for the homographies of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>); fit the model to the sample exactly; count the <strong>inliers</strong>, points within a tolerance $\tau$ of the model. Keep the hypothesis with the most inliers, then refit precisely (TLS or an M-estimator) on its consensus set. Outliers cannot sabotage hypotheses they are not sampled into, and a hypothesis built from two honest points collects the whole honest population as supporters.
+</p>
+<p>
+The number of iterations is not folklore; it is arithmetic. If the inlier fraction is $w$ and the minimal sample has $s$ points, one draw is all-inlier with probability $w^s$, so the number of iterations needed to see at least one clean draw with confidence $p$ is
+</p>
+<p>
+$$ N \;=\; \frac{\ln(1 - p)}{\ln(1 - w^s)}. $$
+</p>
+<p>
+For a line ($s = 2$) with half the points outliers ($w = 0.5$) and $p = 0.99$, $N = 17$: seventeen tries to fit a line through 50 percent garbage, which is why RANSAC feels like cheating the first time it works. The formula's sting is the exponent: for a fundamental matrix with $s = 8$ at $w = 0.5$, $N \approx 1{,}177$, and at $w = 0.3$ it explodes past 70,000, the reason <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> cares so much about minimal solvers and inlier-rate boosters. Figure 9.4.2 shows the consensus logic that makes the whole thing tick.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A point cloud with an inlier band along a diagonal line and several outliers; a RANSAC hypothesis line from two sampled points captures the inlier band within its tolerance corridor, while a contaminated least squares line tilts toward the outliers">
+  <rect x="20" y="40" width="500" height="230" fill="#ffffff" stroke="#d1d4d8"/>
+  <!-- tolerance corridor around true line -->
+  <polygon points="50,235 440,85 440,115 50,265" fill="#e8f6ee" opacity="0.8"/>
+  <!-- RANSAC line -->
+  <line x1="50" y1="250" x2="440" y2="100" stroke="#27ae60" stroke-width="2.5"/>
+  <!-- LS line dragged toward outliers -->
+  <line x1="50" y1="215" x2="440" y2="175" stroke="#c0392b" stroke-width="2.5" stroke-dasharray="7,5"/>
+  <!-- inlier points along the diagonal -->
+  <g fill="#e67e22">
+    <circle cx="75"  cy="238" r="4"/><circle cx="110" cy="228" r="4"/>
+    <circle cx="140" cy="212" r="4"/><circle cx="175" cy="202" r="4"/>
+    <circle cx="205" cy="186" r="4"/><circle cx="240" cy="177" r="4"/>
+    <circle cx="270" cy="160" r="4"/><circle cx="305" cy="151" r="4"/>
+    <circle cx="335" cy="134" r="4"/><circle cx="370" cy="125" r="4"/>
+    <circle cx="400" cy="110" r="4"/>
+  </g>
+  <!-- two sampled points highlighted -->
+  <circle cx="140" cy="212" r="8" fill="none" stroke="#1e8449" stroke-width="2.5"/>
+  <circle cx="370" cy="125" r="8" fill="none" stroke="#1e8449" stroke-width="2.5"/>
+  <!-- outliers below -->
+  <g fill="#90a4ae">
+    <circle cx="320" cy="245" r="4"/><circle cx="350" cy="252" r="4"/>
+    <circle cx="385" cy="240" r="4"/><circle cx="410" cy="250" r="4"/>
+    <circle cx="120" cy="80"  r="4"/>
+  </g>
+  <!-- legend -->
+  <g font-family="sans-serif" font-size="13" fill="#2c3e50">
+    <line x1="560" y1="78" x2="600" y2="78" stroke="#27ae60" stroke-width="2.5"/>
+    <text x="610" y="83">RANSAC winner</text>
+    <line x1="560" y1="110" x2="600" y2="110" stroke="#c0392b" stroke-width="2.5" stroke-dasharray="7,5"/>
+    <text x="610" y="115">least squares</text>
+    <circle cx="580" cy="142" r="4" fill="#e67e22"/>
+    <text x="610" y="147">inliers (11)</text>
+    <circle cx="580" cy="174" r="4" fill="#90a4ae"/>
+    <text x="610" y="179">outliers (5)</text>
+    <circle cx="580" cy="206" r="8" fill="none" stroke="#1e8449" stroke-width="2.5"/>
+    <text x="610" y="211">minimal sample</text>
+    <rect x="566" y="230" width="28" height="14" fill="#e8f6ee"/>
+    <text x="610" y="242">tolerance band &#964;</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 9.4.2</strong> One winning RANSAC hypothesis. Two sampled points (circled) define a line whose tolerance corridor (green band) captures all 11 inliers, so this hypothesis scores 11 votes; the dashed least-squares line, fit to all 16 points, is dragged toward the outlier cluster and scores fewer. Consensus, not residual size, picks the winner.</figcaption>
+</figure>
+
+<pre><code class="language-python">import numpy as np
+
+def ransac_line(pts, n_iter=100, tol=2.0, seed=0):
+    rng = np.random.default_rng(seed)
+    best_inl = None
+    for _ in range(n_iter):
+        i, j = rng.choice(len(pts), size=2, replace=False)   # minimal sample
+        p, q = pts[i], pts[j]
+        d = q - p
+        n = np.array([-d[1], d[0]]) / (np.hypot(*d) + 1e-12) # unit normal
+        resid = np.abs((pts - p) @ n)                        # point-line dist
+        inl = resid &lt; tol
+        if best_inl is None or inl.sum() &gt; best_inl.sum():
+            best_inl = inl
+    # final polish: TLS on the consensus set only
+    sel = pts[best_inl]
+    c = sel - sel.mean(axis=0)
+    _, eigvec = np.linalg.eigh(c.T @ c)
+    return eigvec[:, -1], sel.mean(axis=0), best_inl
+
+# same contaminated data as the cv2.fitLine demo above
+direction, centroid, inl = ransac_line(pts)
+print(f"inliers found: {inl.sum()}/{len(pts)}, "
+      f"slope {direction[1] / direction[0]:+.3f}")
+# Representative output:
+# inliers found: 60/66, slope +0.501
+</code></pre>
+<div class="code-caption">RANSAC for a 2D line in 20 lines: minimal two-point hypotheses, perpendicular-distance inlier tests, consensus maximization, and a final total-least-squares polish restricted to the 60-point consensus set, recovering the true slope to three decimals despite the glare blob.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Philosophies of Robustness, One Standard Recipe</div>
+<p>M-estimators and RANSAC answer the outlier problem from opposite ends. M-estimators keep everyone in the room but cap the volume of any one voice (reshape the loss); RANSAC decides who is in the room at all (binary membership by consensus), which is why it survives contamination levels that break every loss function. The costs mirror each other: M-estimators need a good start and modest contamination; RANSAC needs a tolerance $\tau$ and enough iterations, and its answer has sampling randomness. The production recipe used across this book is therefore a pipeline: RANSAC to select the inliers, then a least-squares or M-estimator fit on the selected set to measure precisely. Detection robustness and measurement precision are different jobs; assign each to the tool built for it.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Twenty-Five Microns or Scrap</div>
+<p><strong>Who:</strong> A quality engineer at an automotive supplier, responsible for the vision cell that gauges bores on machined brake components.</p>
+<p><strong>Situation:</strong> A backlit camera images each bore; edge points are extracted along radial profiles at subpixel precision (the parabola-peak trick from <a href="section-9.1.html">Section 9.1</a>) and a circle is fit to report the diameter against a tolerance of &#177;25 microns, which at the cell's optics is about a third of a pixel.</p>
+<p><strong>Problem:</strong> Chamfer reflections and occasional swarf produced clusters of false edge points; the least-squares circle fit absorbed them, biasing diameters by up to two pixels on affected parts. The cell was failing good parts and, worse, passing two marginal ones a shift.</p>
+<p><strong>Decision:</strong> Replace the single fit with the two-step recipe: RANSAC over three-point circle hypotheses (the minimal sample for a circle) with $\tau$ set to 3 times the known edge-point noise, then a final least-squares circle on the consensus set only. Iteration budget from the formula at $w = 0.7$, $p = 0.999$: 18 draws, trivial at line rate.</p>
+<p><strong>Result:</strong> Diameter repeatability improved from 0.6 pixels to 0.08 pixels (about 6 microns); the gauge passed its repeatability study, false rejects fell by roughly 80 percent, and the false-accept incidents stopped appearing in audit.</p>
+<p><strong>Lesson:</strong> Subpixel metrology is won or lost at the membership decision, not the fit. The fit was never the problem; the roster was. RANSAC fixed the roster, and ordinary least squares, given an honest roster, was already a superb measuring instrument.</p>
+</div>
+
+<h2>5. Fitting Ellipses Directly <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+One conic deserves special mention because it appears whenever circles are photographed: perspective turns circles into ellipses, so pupils, drilled holes, plates, and the calibration dots of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> all reach the fitter as ellipse data. The general conic $a x^2 + b x y + c y^2 + d x + e y + f = 0$ is linear in its six coefficients, but a naive least-squares solve happily returns hyperbolas and parabolas when the data is noisy or covers only an arc. Fitzgibbon, Pilu, and Fisher's 1999 method imposes the constraint $4ac - b^2 = 1$, which forces ellipse-ness <em>algebraically</em>, and the constrained problem collapses to a small generalized eigenvalue system: a closed-form, always-an-ellipse fit. That is the algorithm inside OpenCV:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+mask = cv2.imread("pupil_mask.png", cv2.IMREAD_GRAYSCALE)  # binary blob
+contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_NONE)
+cnt = max(contours, key=cv2.contourArea)        # largest blob's boundary
+
+(cx, cy), (minor, major), angle = cv2.fitEllipse(cnt)  # needs &gt;= 5 points
+print(f"center ({cx:.1f}, {cy:.1f}), axes {minor:.1f} x {major:.1f} px, "
+      f"tilt {angle:.1f} deg")
+# Representative output:
+# center (212.4, 156.8), axes 38.2 x 51.6 px, tilt 14.3 deg
+</code></pre>
+<div class="code-caption">Direct ellipse fitting on a pupil segmentation: the largest contour's boundary points feed <code>cv2.fitEllipse</code>, which runs the Fitzgibbon constrained eigen-solution and returns center, axes, and tilt in one call, guaranteed to be an ellipse even when the contour covers only part of the rim.</div>
+
+<p>
+The same robustness caveats apply at this level too: <code>cv2.fitEllipse</code> is a least-squares method, so eyelash occlusions or specular bites on the contour call for the RANSAC wrapper (five points is the minimal ellipse sample) or for <code>skimage.measure.EllipseModel</code> inside <code>skimage.measure.ransac</code>, which composes exactly the two-step recipe this section has been building.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: RANSAC at 45, Still Being Upgraded</div>
+<p>Robust fitting remains an active engineering frontier because every multi-view system in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> lives or dies by it. MAGSAC++ (Barath et al., CVPR 2020) removed RANSAC's most user-hostile knob, the inlier threshold $\tau$, by marginalizing over noise scales, and ships in OpenCV 4.x as part of the USAC framework: passing <code>cv2.USAC_MAGSAC</code> to <code>cv2.findHomography</code> upgrades the estimator with one constant. PARSAC (Kluger and Rosenhahn, AAAI 2024, arXiv:2401.14919) attacks the multi-model setting, several lines or planes at once, with a network that proposes which points belong together, fitting all models in parallel at real-time rates. The broader 2024-2026 pattern is hybridization: learned components propose samples, score consensus, or predict inlier probabilities, while the geometric solvers and the consensus logic of 1981 remain the load-bearing skeleton. Sampling consensus has aged the way Canny has: not replaced, but given better evidence to vote with.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.1: Breakdown Arithmetic <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) The mean of $n$ numbers has breakdown point 0 while the median survives until half the data is bad; explain in one paragraph how this pair maps onto least squares versus RANSAC. (b) After RANSAC selects a consensus set, the recipe refits with least squares on the inliers; explain why this final fit is now safe, and name the circumstance (think tolerance $\tau$ versus true noise level) under which it still is not. (c) Why does RANSAC fit each hypothesis to a <em>minimal</em> sample rather than, say, ten points?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.2: RANSAC Circles Versus Hough Circles <span class="exercise-type coding">Coding</span></div>
+<p>Generate a synthetic image containing one circle's edge points (200 points, $\sigma = 1$ px) plus 200 uniformly scattered clutter points. Implement RANSAC circle fitting (three-point hypotheses; the circumcenter formula gives the exact circle) and compare against <code>cv2.HoughCircles</code> on a rendering of the same points: report center and radius errors for both, then sweep the clutter count from 0 to 1,000 and plot both methods' errors. Where does each method break first, and how does that match the voting-versus-fitting trade-off from <a href="section-9.3.html">Section 9.3</a>?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.4.3: The Iteration Budget, Felt <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the formula $N = \ln(1-p) / \ln(1 - w^s)$ with $p = 0.99$, tabulate $N$ for $s \in \{2, 3, 4, 8\}$ and $w \in \{0.8, 0.5, 0.3, 0.1\}$. Then verify one cell empirically: run your line RANSAC 1,000 times at $w = 0.3$ with the tabulated $N$ and report how often it finds the true structure. Finally, explain why the $s = 8$, $w = 0.3$ cell (roughly 70,000 iterations) motivates two strategies you will meet again in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>: minimal solvers with smaller $s$, and match-quality filtering that raises $w$ before RANSAC ever runs.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.3.html">&#8592; Section 9.3: The Hough Transform: Lines &amp; Circles</a>
+<a href="index.html">Chapter 9</a>
+<a class="next" href="section-9.5.html">Section 9.5: Worked Example: Lane-Marking Detection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

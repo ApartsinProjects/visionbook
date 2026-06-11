@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.2: Performance: Vectorization, OpenCV Optimizations &amp; GPU Arrays. The performance ladder for imaging code: honest timing, NumPy vectorization and lookup tables, OpenCV threading and SIMD, Numba JIT loops, and CuPy GPU arrays with the transfer toll." name="description"/>
+<title>Section 8.2: Performance: Vectorization, OpenCV Optimizations &amp; GPU Arrays | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Tools of the Trade: The Image Processing Stack</a></div>
+<h1>Performance: Vectorization, OpenCV Optimizations &amp; GPU Arrays</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"They profiled me and discovered I spend 94 percent of my life inside two lines of Python. I prefer to think of it as having a rich inner loop."</p>
+<cite>A Thoroughly Profiled Imaging Pipeline</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Making imaging code fast is not about writing cleverer Python; it is about moving the inner loop out of Python entirely, into NumPy's C loops, OpenCV's SIMD kernels, Numba's compiled output, or a GPU, in that order of effort.</strong> The interpreter costs roughly a microsecond per pixel visited; compiled code costs roughly a nanosecond. Everything in this section is a strategy for crossing that thousandfold gap, and the first rule is to measure before touching anything.</p>
+</div>
+<p>
+The previous section (<a href="section-8.1.html">Section 8.1</a>) chose the libraries; this one makes them fast. The need is real: a single 4K frame holds 8.3 million pixels, and a 30 fps pipeline gives you 33 milliseconds to do everything <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> through <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> taught. This section climbs the performance ladder one rung at a time, measuring at every step, and ends at the rung where Part III of this book lives permanently: the GPU.
+</p>
+<h2>1. Measure First: Honest Timing <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Optimization without measurement is superstition. Before rewriting anything, establish a number with a harness that handles the three classic timing traps: one-time costs (thread-pool spin-up, JIT compilation, lazy library initialization) that inflate the first call, run-to-run noise from the operating system, and, for GPUs, asynchronous execution that makes naive stopwatch timing measure only the kernel <em>launch</em>. Code 8.2.1 is the small harness used for every number in this section.
+</p>
+<pre><code class="language-python">import time
+import numpy as np
+
+def bench(fn, *args, repeats=7, warmup=2):
+    """Median-of-repeats timing with warm-up runs."""
+    for _ in range(warmup):       # absorb one-time costs: thread pools,
+        fn(*args)                 # JIT compilation, lazy initialization
+    times = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(*args)
+        times.append(time.perf_counter() - t0)
+    return float(np.median(times))   # median resists OS scheduling spikes
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.1:</strong> A minimal honest-timing harness: warm-up runs absorb first-call costs, and the median of several repeats resists background-process noise. For GPU code, pair it with an explicit device synchronization (Section 5 below).</div>
+<p>
+Two habits complete the discipline. First, time the <em>stages</em> of a pipeline separately, not just the whole; the slow part is almost never where intuition points. Second, record the image size and dtype next to every number, because a result measured on a 512&times;512 uint8 thumbnail says little about a 4K float32 frame: the larger image may not fit in cache, and memory traffic, not arithmetic, usually dominates.
+</p>
+<h2>2. The Vectorization Ladder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The single most common performance bug in imaging code is a per-pixel Python loop. Code 8.2.2 implements the same gamma correction (the point operation from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, $I' = 255\,(I/255)^{\gamma}$) four ways, from a raw double loop to OpenCV's SIMD lookup table.
+</p>
+<pre><code class="language-python">import numpy as np, cv2
+
+img = np.random.default_rng(0).integers(0, 256, (1080, 1920), dtype=np.uint8)
+GAMMA = 0.5
+
+def gamma_loop(im):                       # tier 0: pure Python, ~2 M iterations
+    out = np.empty_like(im)
+    for r in range(im.shape[0]):
+        for c in range(im.shape[1]):
+            out[r, c] = round(255 * (im[r, c] / 255) ** GAMMA)
+    return out
+
+def gamma_vec(im):                        # tier 1: one whole-array expression
+    return (255 * (im / 255.0) ** GAMMA + 0.5).astype(np.uint8)
+
+TABLE = np.array([round(255 * (v / 255) ** GAMMA) for v in range(256)],
+                 dtype=np.uint8)          # uint8 input has only 256 cases
+
+def gamma_lut_np(im):                     # tier 2: precomputed lookup table
+    return TABLE[im]
+
+def gamma_lut_cv(im):                     # tier 3: OpenCV's SIMD-dispatched LUT
+    return cv2.LUT(im, TABLE)
+
+for f in (gamma_loop, gamma_vec, gamma_lut_np, gamma_lut_cv):
+    print(f"{f.__name__:13s}: {bench(f, img) * 1000:8.1f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.2:</strong> One gamma correction, four tiers of the ladder. The lookup-table tiers exploit a structural fact: a per-pixel function of a uint8 image can take at most 256 distinct values, so all 2 million pixels reduce to 256 computations plus indexing.</div>
+<pre class="code-output">gamma_loop   :   2410.3 ms
+gamma_vec    :     46.2 ms
+gamma_lut_np :      4.8 ms
+gamma_lut_cv :      1.2 ms
+</pre>
+<div class="code-caption"><strong>Output 8.2.2a:</strong> Representative single-machine numbers for a 1920&times;1080 frame (yours will differ; the ratios will not, much). The span from top to bottom is a factor of about 2,000.</div>
+<p>
+The ladder generalizes far beyond gamma. Whole-array arithmetic, boolean masking (<code>img[img &gt; t] = 255</code>), broadcasting, and fancy indexing cover most of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>; <code>np.pad</code> plus slicing reproduce the border modes of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>; and the array model that makes all of it possible was the subject of <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>. Two refinements buy further factors: prefer <code>float32</code> to <code>float64</code> when precision allows (half the memory traffic, and OpenCV's float paths are float32-first), and avoid accidental copies; an expression like <code>a + b + c</code> allocates a full temporary per operator, which <code>np.add(a, b, out=buf)</code> avoids in tight real-time loops. Figure 8.2.1 places all the tiers of this section on one chart.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Horizontal bar chart of relative throughput for six implementation tiers, on a logarithmic scale">
+<style>
+.bt { font-family: Verdana, Arial, sans-serif; font-size: 13px; fill: #1f2937; }
+.bl { font-family: Verdana, Arial, sans-serif; font-size: 12px; font-weight: bold; fill: #1f2937; }
+.bn { font-family: Verdana, Arial, sans-serif; font-size: 12px; font-weight: bold; fill: #f9fafb; text-anchor: end; }
+.ttl { font-family: Verdana, Arial, sans-serif; font-size: 15px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.note { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #6b7280; }
+.axis { stroke: #9ca3af; stroke-width: 1; }
+</style>
+<text class="ttl" x="470" y="28">Throughput relative to a pure-Python pixel loop (log scale)</text>
+<line class="axis" x1="220" y1="46" x2="220" y2="356"/>
+<!-- bars: width = 60 + 170*log10(speedup) -->
+<text class="bl" x="210" y="70" text-anchor="end">Pure Python loop</text>
+<rect x="220" y="52" width="60" height="28" fill="#9ca3af" rx="4"/>
+<text class="bt" x="290" y="70">1&#215;</text>
+<text class="bl" x="210" y="118" text-anchor="end">NumPy arithmetic</text>
+<rect x="220" y="100" width="349" height="28" fill="#93c5fd" rx="4"/>
+<text class="bn" x="561" y="118">~50&#215;</text>
+<text class="bl" x="210" y="166" text-anchor="end">NumPy LUT</text>
+<rect x="220" y="148" width="519" height="28" fill="#60a5fa" rx="4"/>
+<text class="bn" x="731" y="166">~500&#215;</text>
+<text class="bl" x="210" y="214" text-anchor="end">Numba @njit loop</text>
+<rect x="220" y="196" width="600" height="28" fill="#3b82f6" rx="4"/>
+<text class="bn" x="812" y="214">~1,500&#215;</text>
+<text class="bl" x="210" y="262" text-anchor="end">OpenCV (SIMD + threads)</text>
+<rect x="220" y="244" width="621" height="28" fill="#2563eb" rx="4"/>
+<text class="bn" x="833" y="262">~2,000&#215;</text>
+<text class="bl" x="210" y="310" text-anchor="end">CuPy GPU array</text>
+<rect x="220" y="292" width="689" height="28" fill="#1d4ed8" rx="4"/>
+<text class="bn" x="901" y="310">~5,000&#215;*</text>
+<text class="note" x="220" y="348">* once the data is resident on the device; host-to-device transfers excluded (see Section 5)</text>
+<text class="note" x="220" y="396">Representative orders of magnitude for simple per-pixel and small-kernel operations on 2 to 8 MP images.</text>
+<text class="note" x="220" y="380">Bars are logarithmic: each step rightward is roughly a factor of ten.</text>
+</svg>
+<figcaption><strong>Figure 8.2.1:</strong> The performance ladder. Each rung removes the Python interpreter from a larger share of the work: NumPy moves the loop to C, the LUT collapses the computation itself, Numba and OpenCV add compilation, SIMD, and threads, and the GPU adds thousands of cores, with a transfer toll at the door.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: You Are Probably Memory-Bound, Not Compute-Bound</div>
+<p>For most Part I operations the processor is starved, not busy. A 3&times;3 box filter does 9 multiply-adds per pixel but must move every pixel through the memory hierarchy at least twice; on a modern CPU the arithmetic finishes long before the next cache line arrives. This is why the float32-over-float64 switch helps (half the bytes), why chaining ten small NumPy operations is slower than one fused expression (each pass re-streams the whole image), and why a GPU's advantage on these workloads is mostly its memory bandwidth (hundreds of GB/s versus tens). When you optimize, count bytes moved before you count FLOPs.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Local Statistics Without the Loop</div>
+<p>A from-scratch local standard deviation map (the texture measure used for adaptive thresholding in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>) is a roughly 25-line windowed double loop with border bookkeeping. The identity $\operatorname{Var}[x] = \mathbb{E}[x^2] - \mathbb{E}[x]^2$ turns it into three calls to a box filter from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>:</p>
+<pre><code class="language-python">from scipy import ndimage
+
+f  = img.astype(np.float32)
+m  = ndimage.uniform_filter(f, size=7)        # E[x]  over each 7x7 window
+m2 = ndimage.uniform_filter(f * f, size=7)    # E[x^2]
+sigma = np.sqrt(np.maximum(m2 - m * m, 0.0))  # clamp tiny negatives (round-off)
+</code></pre>
+<p>About 25 lines become 3, and the library supplies separable filtering (two 1D passes instead of a 2D window), correct border handling, and compiled C inner loops. The same trick computes local means for Niblack/Sauvola-style thresholds and local contrast for enhancement.</p>
+</div>
+<h2>3. OpenCV's Hidden Gears <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+OpenCV is fast by default, but it pays to know which gears are turning. Builds dispatch at runtime to the widest SIMD instruction set the CPU offers (SSE4, AVX2, AVX-512, NEON), many functions parallelize across a thread pool, and <code>cv2.useOptimized()</code> reports whether the optimized dispatch is active. Algorithmic gears matter even more: <code>cv2.GaussianBlur</code> runs as two separable 1D passes, turning the $O(k^2)$ per-pixel cost derived in <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> into $O(2k)$, and <code>cv2.filter2D</code> silently switches to the FFT route from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> when the kernel is large enough for the $O(N \log N)$ transform to win. Code 8.2.3 inspects and exercises these gears, reusing the harness from Code 8.2.1.
+</p>
+<pre><code class="language-python">import cv2, numpy as np
+
+img = np.random.default_rng(1).integers(0, 256, (2160, 3840), dtype=np.uint8)
+print("optimized:", cv2.useOptimized(), "| threads:", cv2.getNumThreads())
+
+blur = lambda im: cv2.GaussianBlur(im, (31, 31), 5.0)
+t_par = bench(blur, img)                  # default: all cores
+
+n = cv2.getNumThreads()
+cv2.setNumThreads(1)                      # serial baseline for comparison
+t_ser = bench(blur, img)
+cv2.setNumThreads(n)                      # restore the pool
+
+print(f"31x31 Gaussian, {n} threads: {t_par*1000:6.1f} ms")
+print(f"31x31 Gaussian, 1 thread : {t_ser*1000:6.1f} ms")
+
+if cv2.ocl.haveOpenCL():                  # Transparent API: same calls, GPU/iGPU
+    u = cv2.UMat(img)                     # upload once to the OpenCL device
+    t_gpu = bench(lambda im: cv2.GaussianBlur(im, (31, 31), 5.0), u)
+    print(f"31x31 Gaussian, UMat     : {t_gpu*1000:6.1f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.3:</strong> Three OpenCV gears on a 4K frame: the thread pool (toggled with <code>setNumThreads</code>), and the Transparent API, where wrapping an array in <code>cv2.UMat</code> routes the very same function calls through OpenCL to a GPU or integrated GPU. <code>result.get()</code> brings a UMat back to NumPy.</div>
+<pre class="code-output">optimized: True | threads: 8
+31x31 Gaussian, 8 threads:    7.9 ms
+31x31 Gaussian, 1 thread :   31.6 ms
+31x31 Gaussian, UMat     :    3.2 ms
+</pre>
+<div class="code-caption"><strong>Output 8.2.3a:</strong> Representative numbers: threading buys about 4&times; on an 8-core laptop (memory bandwidth caps the scaling), and the Transparent API roughly doubles that again on an integrated GPU, without changing a single function call.</div>
+<p>
+One caution: the pip wheels of <code>opencv-python</code> ship without CUDA, so the <code>cv2.cuda</code> module is empty unless you build OpenCV yourself or use a vendor build. For NVIDIA GPU work from Python, the CuPy route in Section 5 is usually the shorter path.
+</p>
+<h2>4. Numba: When the Loop Must Stay <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Some algorithms resist whole-array form because each output depends on a previously computed output: scanline accumulations, region growing, dithering with error diffusion (<a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>), adaptive recursions. For these, <a href="https://numba.pydata.org/" target="_blank" rel="noopener">Numba</a> compiles the Python loop itself to machine code. Code 8.2.4 shows the pattern on a per-row exponential moving average, a data-dependent scan NumPy cannot vectorize directly.
+</p>
+<pre><code class="language-python">from numba import njit, prange
+import numpy as np
+
+@njit(parallel=True, cache=True)
+def row_ema(im, alpha):
+    """Per-row exponential moving average: out[c] depends on out[c-1],
+    so the scan cannot be a single whole-array expression."""
+    out = np.empty(im.shape, dtype=np.float32)
+    for r in prange(im.shape[0]):         # rows are independent: parallel
+        out[r, 0] = im[r, 0]
+        for c in range(1, im.shape[1]):   # columns are sequential: a scan
+            out[r, c] = alpha * im[r, c] + (1.0 - alpha) * out[r, c - 1]
+    return out
+
+smooth = row_ema(img.astype(np.float32), 0.1)   # first call compiles (~0.5 s)
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.4:</strong> A Numba-compiled scan: <code>@njit</code> compiles the function to machine code on first call (cached to disk with <code>cache=True</code>), and <code>prange</code> parallelizes the independent outer loop across cores. Loop bodies must stick to NumPy arrays and scalars; no Python objects.</div>
+<p>
+Typical results land within a small factor of hand-written C, which puts Numba on the same rung as OpenCV in Figure 8.2.1, for code OpenCV never implemented. The costs are a first-call compilation pause, a restricted Python subset inside compiled functions, and one more dependency to manage; the benefit is keeping algorithm-shaped code readable instead of contorting it into array algebra.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 70-Millisecond Inspection Line</div>
+<p><strong>Who:</strong> A vision engineer at a systems integrator building print-quality inspection for a packaging line.</p>
+<p><strong>Situation:</strong> 4K frames at 30 fps; the pipeline ran flat-field correction, Gaussian smoothing, thresholding, and connected components (the <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a> toolkit) in 70 ms per frame, more than twice the 33 ms budget.</p>
+<p><strong>Problem:</strong> The team assumed the morphology was the bottleneck and began prototyping a GPU port, a multi-week detour.</p>
+<p><strong>Decision:</strong> The engineer first instrumented each stage with a harness like Code 8.2.1. The profile said otherwise: 41 ms went to a hand-written Python loop performing flat-field correction pixel by pixel, and another 12 ms to an accidental float64 round trip. The fix was one vectorized float32 expression (<code>(f - dark) / (flat - dark)</code> on whole arrays) and one dtype audit.</p>
+<p><strong>Result:</strong> 11 ms per frame on the existing CPU. The GPU port was cancelled.</p>
+<p><strong>Lesson:</strong> Profile per stage before architecting. The slow part is usually ten lines, and the cheapest accelerator is the loop you delete.</p>
+</div>
+<h2>5. GPU Arrays and the Transfer Toll <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+<a href="https://cupy.dev/" target="_blank" rel="noopener">CuPy</a> reimplements the NumPy API on NVIDIA GPUs: <code>cp.asarray</code> ships an array to device memory, the familiar operations run as CUDA kernels, and <code>cupyx.scipy.ndimage</code> mirrors the SciPy filters used throughout Part I. The catch is the toll booth: data must cross the PCIe bus in both directions, and kernels launch asynchronously, so honest timing needs the library's own benchmark utility. Code 8.2.5 shows the workflow.
+</p>
+<pre><code class="language-python">import cupy as cp
+from cupyx.scipy import ndimage as cundi
+from cupyx.profiler import benchmark
+
+g = cp.asarray(img)                        # host -&gt; device, one PCIe transfer
+print(benchmark(cundi.gaussian_filter, (g, 5.0), n_repeat=50))
+
+result = cp.asnumpy(cundi.gaussian_filter(g, 5.0))   # device -&gt; host
+</code></pre>
+<div class="code-caption"><strong>Code 8.2.5:</strong> The CuPy round trip. <code>cupyx.profiler.benchmark</code> synchronizes the device around each repeat, so it reports real kernel time rather than launch time; a plain <code>perf_counter</code> stopwatch around an unsynchronized call can under-report by orders of magnitude.</div>
+<pre class="code-output">gaussian_filter: CPU:   142.1 us  +/- 9.3   GPU-0:  618.4 us  +/- 12.0
+</pre>
+<div class="code-caption"><strong>Output 8.2.5a:</strong> Representative benchmark line: 0.6 ms on the GPU for a blur that took several milliseconds per 4K frame on the CPU. The transfer itself (8.3 MB of uint8 each way, roughly 0.7 ms per direction at PCIe 3.0 rates) costs more than the kernel.</div>
+<p>
+That last observation is the whole strategy. A single operation rarely justifies the round trip; a resident pipeline does. Ship the frame once, run the entire chain (correction, filtering, thresholding, even the non-local means denoiser from <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>, which is exactly the kind of arithmetic-heavy kernel GPUs love) on device arrays, and bring back only the result, which is often just a mask or a measurement. Amdahl's law quantifies the ceiling: accelerating a fraction $p$ of total runtime by a factor $s$ yields overall speedup
+</p>
+<p>
+$$S = \frac{1}{(1 - p) + p / s},$$
+</p>
+<p>
+so a pipeline that is only 70 percent GPU-eligible caps below $1/0.3 \approx 3.3\times$ no matter how fast the kernels get. The unaccelerated remainder, often disk I/O and JPEG decode from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, then becomes the next profiling target. When the pipeline's destination is a neural network anyway, the natural move is to adopt PyTorch tensors as the resident format from the start; <a href="../../part-3-deep-learning-for-vision/module-18-neural-networks-pytorch/index.html">Chapter 18</a> makes that move, and <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> pushes it to the edge.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compiled and Batched Image Processing (2024-2026)</div>
+<p>The acceleration story is consolidating around compilers and batching. <strong>PyTorch 2.x's <code>torch.compile</code></strong> (the TorchInductor backend, maturing through 2024-2025) fuses chains of tensor operations into single generated kernels, attacking exactly the temporary-array traffic this section warned about, and <strong>Triton</strong>, the Python-embedded kernel language it emits, has become the standard way to hand-write a custom GPU kernel without CUDA C++. <strong>NVIDIA CV-CUDA</strong> (open-sourced 2023, with steady releases through 2025) provides batched GPU implementations of classical pre- and post-processing (resize, warp, color conversion, morphology) for inference services that process thousands of images per second, and <strong>cuCIM</strong> (RAPIDS) keeps a scikit-image-compatible API on GPUs for gigapixel biomedical work. Tying the ecosystem together, the <strong>DLPack</strong> interchange protocol lets NumPy, CuPy, PyTorch, and JAX hand each other arrays without copies, so a pipeline can cross library borders at zero transfer cost. The practical reading: learn the array model once; the compilers are coming to you.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.1: Place the Operation on the Ladder <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each operation, name the highest ladder rung it can reach and justify the answer: (a) per-pixel gamma correction of a uint8 image; (b) per-pixel gamma of a float32 image (careful: how many distinct inputs now?); (c) a 3&times;3 median filter; (d) Floyd-Steinberg error-diffusion dithering; (e) Otsu threshold selection followed by binarization. Which of these are LUT-able, which vectorize, and which need Numba?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.2: The Kernel-Size Crossover <span class="exercise-type coding">Coding</span></div>
+<p>Using the harness from Code 8.2.1, benchmark <code>cv2.GaussianBlur</code>, <code>scipy.ndimage.gaussian_filter</code>, and <code>skimage.filters.gaussian</code> on a 4K float32 image for kernel sizes 3 to 101. Plot time versus kernel size for each. Identify the slope changes and explain them using separability (<a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>) and the FFT route (<a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>). Repeat the OpenCV run with <code>cv2.setNumThreads(1)</code> and quantify the threading gain as a function of kernel size.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.2.3: The GPU Break-Even Point <span class="exercise-type analysis">Analysis</span></div>
+<p>With CuPy (or a cloud GPU notebook), measure (a) host-to-device and device-to-host transfer time for a 4K uint8 frame, and (b) GPU versus CPU time for one Gaussian blur. Derive the number $k$ of chained filter operations at which the GPU pipeline (transfer + $k$ kernels + transfer) beats the CPU pipeline ($k$ CPU filters). How does $k$ change for 512&times;512 thumbnails? Reconcile your finding with Amdahl's law as stated in Section 5.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-8.1.html"><span class="nav-label">Section 8.1: Library Landscape: OpenCV, scikit-image, Pillow &amp; SciPy ndimage</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span></a>
+<a class="next" href="section-8.3.html"><span class="nav-label">Section 8.3: Test Images, Datasets &amp; Quality Metrics Tooling</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

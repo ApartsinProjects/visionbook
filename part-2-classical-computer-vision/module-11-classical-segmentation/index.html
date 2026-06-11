@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 11: Classical Segmentation &amp; Grouping. Carving an image into meaningful regions with clustering (K-Means, Mean-Shift), region growing, the watershed transform, graph cuts and GrabCut, and superpixels (SLIC)." name="description"/>
+<title>Chapter 11: Classical Segmentation &amp; Grouping | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>Classical Segmentation &amp; Grouping</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me an image and I will divide it into regions. Whether those regions mean anything is, regrettably, your problem and not mine."</p>
+<cite>An Unsupervised Clustering Algorithm With No Concept of Objects</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Segmentation answers the question every recognition system must eventually face: which pixels belong together?</strong> The previous chapter found sparse, distinctive anchor points for geometry. This chapter goes the other way and asks for dense groupings: partition the entire image into coherent regions that a downstream stage can label, measure, or edit. The classical toolkit assembled here, clustering in feature space, growing regions from seeds, flooding a topographic surface, cutting a graph at its weakest links, and oversegmenting into superpixels, is not a museum exhibit. Watershed still separates touching cells in microscopy, GrabCut still powers one-click background removal, and SLIC superpixels still preprocess pixels for networks that would otherwise drown in them. These algorithms also teach the vocabulary, region, boundary, affinity, energy, that the deep segmentation models of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> later inherit wholesale.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+<a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> solved the correspondence problem: find the same physical point in two photographs. That gave us sparse, precise anchors. But a great deal of vision needs the opposite kind of information, dense and regional rather than sparse and pointwise. A robot picking parts off a conveyor needs to know which pixels are the part and which are the belt. A radiologist's assistant needs the tumor outlined, not three keypoints near it. A photo editor needs the foreground separated from the background so it can be relit or replaced. Each of these is a segmentation problem: a partition of the image grid into regions, ideally regions that correspond to something a human would call an object, a surface, or a material.
+</p>
+<p>
+The difficulty is that "meaningful" is not a property the pixels carry. A pixel is a triple of numbers; it does not know it belongs to a cat. Classical segmentation therefore proceeds by proxy: it groups pixels that are similar in some measurable way (color, brightness, texture, spatial proximity) and hopes that similarity tracks meaning closely enough to be useful. This is both the strength and the limitation of the classical approach. When the proxy is good, the methods are fast, deterministic, and need no training data; when the proxy fails, no amount of clever optimization recovers the missing semantics. The chapter is, in a sense, an extended study of how far you can get on similarity alone, and where you must hand off to the learned models of Part III.
+</p>
+<p>
+The five sections move from the most assumption-free method to the most structured. Section 11.1 treats segmentation as clustering: throw every pixel into a feature space and let K-Means or Mean-Shift find the clusters, with no notion of spatial connectivity at all. Section 11.2 adds spatial structure back, growing regions from seed pixels and merging or splitting them with a homogeneity test. Section 11.3 introduces the watershed transform, the elegant idea of reading an image as a landscape and flooding it from below, which solves the touching-objects problem that clustering cannot. Section 11.4 reframes the whole problem as a graph: pixels are nodes, similarities are edge weights, and a segmentation is a cut, an idea that yields both the globally optimal binary segmentation of graph cuts and the interactive magic of GrabCut. Section 11.5 closes with superpixels, which deliberately oversegment into hundreds of small, regular, edge-respecting regions that serve as a compact substrate for everything downstream.
+</p>
+<p>
+A thread runs through all five sections: the tension between local evidence and global consistency. A pixel's own color is local evidence; whether it joins its neighbor is a question about consistency across the image. Clustering ignores spatial consistency entirely and pays for it with speckle. Region growing enforces local consistency greedily and pays for it with seed sensitivity. Graph cuts optimize a global energy and pay for it in compute. Reading the chapter as a sequence of answers to "how much global structure can I afford?" makes the design choices legible. The same trade reappears, with the unary and pairwise terms now learned, when <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> bolts a Conditional Random Field onto a fully convolutional network, and when promptable models like SAM let a user click instead of seed.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter builds directly on the color spaces and intensity statistics of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a>, whose histograms and thresholds are the simplest segmentations of all. The watershed and region-growing sections lean on the morphological operators (erosion, dilation, the distance transform, connected components) from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a>, and on the gradients and edge maps of <a href="../module-09-edges-lines-curves/index.html">Chapter 9: Edges, Lines &amp; Curves</a>. A reader comfortable with NumPy arrays, basic linear algebra, and the idea of a feature vector will follow the clustering material without trouble; the graph-cut section assumes nothing about max-flow beyond what Section 11.4 develops from scratch.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">11.1</span>
+<a href="section-11.1.html"><span class="section-title">Segmentation as Clustering: K-Means &amp; Mean-Shift</span></a>
+<span class="section-desc">Treating each pixel as a point in a color or color-plus-position feature space: K-Means with its chosen k, Mean-Shift with its data-driven mode count, and the speckle that comes from ignoring spatial connectivity.</span>
+</li>
+<li>
+<span class="section-num">11.2</span>
+<a href="section-11.2.html"><span class="section-title">Region Growing &amp; Split-and-Merge</span></a>
+<span class="section-desc">Putting spatial connectivity back in: flood-filling from seed pixels under a homogeneity predicate, the quadtree split-and-merge alternative, and how seed placement decides everything.</span>
+</li>
+<li>
+<span class="section-num">11.3</span>
+<a href="section-11.3.html"><span class="section-title">The Watershed Transform</span></a>
+<span class="section-desc">Reading an image as a topographic surface and flooding it from below: catchment basins, the oversegmentation problem, and marker-controlled watershed that separates touching objects classical clustering cannot.</span>
+</li>
+<li>
+<span class="section-num">11.4</span>
+<a href="section-11.4.html"><span class="section-title">Graph-Based Segmentation: Graph Cuts &amp; GrabCut</span></a>
+<span class="section-desc">Pixels as graph nodes and similarities as edge weights: the min-cut/max-flow energy, the Felzenszwalb-Huttenlocher efficient graph segmentation, and GrabCut's iterative foreground extraction from a single box.</span>
+</li>
+<li>
+<span class="section-num">11.5</span>
+<a href="section-11.5.html"><span class="section-title">Superpixels: SLIC &amp; Friends</span></a>
+<span class="section-desc">Oversegmenting into hundreds of small, regular, edge-respecting regions: SLIC's local k-means, compactness versus boundary adherence, and why superpixels are the preferred substrate for graphs, CRFs, and even neural pipelines.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+Segmentation carved the image into regions; the next chapters ask where those regions sit in three dimensions. <a href="../module-12-camera-models-calibration/index.html">Chapter 12: Camera Models &amp; Calibration</a> opens the geometric arc of Part II by formalizing how a 3D world projects onto the 2D grid we have been segmenting, and how calibration recovers the precise mapping. The grouping instinct developed here does not disappear: it returns, learned end to end, in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24: Segmentation</a>, where fully convolutional networks predict per-pixel labels and promptable models like SAM turn a click into a mask. And the masks themselves become controllers in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35: Controllable Generation &amp; Image Editing</a>, where a region selected here decides what a diffusion model is allowed to repaint.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Comaniciu, D. and Meer, P. "Mean Shift: A Robust Approach Toward Feature Space Analysis." IEEE TPAMI (2002). <a href="https://doi.org/10.1109/34.1000236" target="_blank" rel="noopener">doi:10.1109/34.1000236</a></div>
+<div class="bib-annotation">The reference treatment of Mean-Shift for image segmentation and tracking: the kernel density view, the mode-seeking iteration, and the joint spatial-range filtering that Section 11.1 builds on.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Vincent, L. and Soille, P. "Watersheds in Digital Spaces: An Efficient Algorithm Based on Immersion Simulations." IEEE TPAMI (1991). <a href="https://doi.org/10.1109/34.87344" target="_blank" rel="noopener">doi:10.1109/34.87344</a></div>
+<div class="bib-annotation">The immersion-flooding algorithm that made watershed practical, and the algorithm OpenCV's <code>cv2.watershed</code> descends from. The heart of Section 11.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Boykov, Y. and Jolly, M.-P. "Interactive Graph Cuts for Optimal Boundary &amp; Region Segmentation of Objects in N-D Images." ICCV (2001). <a href="https://doi.org/10.1109/ICCV.2001.937505" target="_blank" rel="noopener">doi:10.1109/ICCV.2001.937505</a></div>
+<div class="bib-annotation">The paper that recast binary segmentation as min-cut/max-flow with user-supplied hard constraints. Section 11.4's energy function comes straight from here.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Rother, C., Kolmogorov, V., and Blake, A. "GrabCut: Interactive Foreground Extraction Using Iterated Graph Cuts." ACM SIGGRAPH (2004). <a href="https://doi.org/10.1145/1015706.1015720" target="_blank" rel="noopener">doi:10.1145/1015706.1015720</a></div>
+<div class="bib-annotation">GrabCut: Gaussian mixture color models plus iterated graph cuts, initialized from a single bounding box. The algorithm behind one-click background removal and Section 11.4's centerpiece.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Felzenszwalb, P. and Huttenlocher, D. "Efficient Graph-Based Image Segmentation." IJCV (2004). <a href="https://doi.org/10.1023/B:VISI.0000022288.19776.77" target="_blank" rel="noopener">doi:10.1023/B:VISI.0000022288.19776.77</a></div>
+<div class="bib-annotation">A near-linear-time region merging algorithm with an adaptive boundary predicate, available as <code>skimage.segmentation.felzenszwalb</code>. Section 11.4's fast unsupervised alternative to graph cuts.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Achanta, R. et al. "SLIC Superpixels Compared to State-of-the-Art Superpixel Methods." IEEE TPAMI (2012). <a href="https://doi.org/10.1109/TPAMI.2012.120" target="_blank" rel="noopener">doi:10.1109/TPAMI.2012.120</a></div>
+<div class="bib-annotation">SLIC: localized k-means in a five-dimensional color-plus-position space. The most-used superpixel method and the entirety of Section 11.5's core.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Shi, J. and Malik, J. "Normalized Cuts and Image Segmentation." IEEE TPAMI (2000). <a href="https://doi.org/10.1109/34.868688" target="_blank" rel="noopener">doi:10.1109/34.868688</a></div>
+<div class="bib-annotation">The normalized-cut criterion that fixed graph cuts' bias toward tiny segments and launched the spectral-clustering view of segmentation referenced in Section 11.4.</div>
+</div>
+
+<h3>Recent Research (2023-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Kirillov, A. et al. "Segment Anything." ICCV (2023). <a href="https://arxiv.org/abs/2304.02643" target="_blank" rel="noopener">arXiv:2304.02643</a></div>
+<div class="bib-annotation">SAM: the promptable foundation model whose click-to-mask interaction is the learned descendant of this chapter's interactive segmentation. The bridge from classical to <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ravi, N. et al. "SAM 2: Segment Anything in Images and Videos." ICLR (2025). <a href="https://arxiv.org/abs/2408.00714" target="_blank" rel="noopener">arXiv:2408.00714</a></div>
+<div class="bib-annotation">The video extension of SAM with a streaming memory, showing the modern frontier of the grouping problem this chapter introduces.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Stutz, D., Hermans, A., and Leibe, B. "Superpixels: An Evaluation of the State-of-the-Art." CVIU (2018). <a href="https://arxiv.org/abs/1612.01601" target="_blank" rel="noopener">arXiv:1612.01601</a></div>
+<div class="bib-annotation">A thorough, still-cited benchmark of 28 superpixel algorithms on boundary recall and undersegmentation error, the empirical backdrop for Section 11.5's claims.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 7 (Segmentation) covers clustering, watershed, graph cuts, and normalized cuts with full mathematical depth and a generous reference list; free online.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Gonzalez, R. and Woods, R. <em>Digital Image Processing</em>, 4th edition (2018). <a href="https://www.imageprocessingplace.com/" target="_blank" rel="noopener">imageprocessingplace.com</a></div>
+<div class="bib-annotation">Chapter 10 gives the classical, textbook account of thresholding, region growing, split-and-merge, and watershed that underpins Sections 11.2 and 11.3.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">scikit-image. <code>skimage.segmentation</code> module documentation. <a href="https://scikit-image.org/docs/stable/api/skimage.segmentation.html" target="_blank" rel="noopener">scikit-image.org</a></div>
+<div class="bib-annotation">SLIC, Felzenszwalb, quickshift, watershed, random walker, and Chan-Vese in one consistent API, with worked gallery examples used throughout this chapter's code.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Image Segmentation with Watershed Algorithm" and "GrabCut" tutorials. <a href="https://docs.opencv.org/4.x/d3/db4/tutorial_py_watershed.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The official OpenCV 4.x walkthroughs of <code>cv2.watershed</code>, <code>cv2.grabCut</code>, and <code>cv2.kmeans</code> that match Sections 11.1, 11.3, and 11.4 line for line.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">scikit-learn. <code>sklearn.cluster</code> (KMeans, MeanShift) documentation. <a href="https://scikit-learn.org/stable/modules/clustering.html" target="_blank" rel="noopener">scikit-learn.org</a></div>
+<div class="bib-annotation">The clustering reference for Section 11.1: k-means++ initialization, MiniBatchKMeans for large images, and the bandwidth estimation used by MeanShift.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-10-keypoints-descriptors-matching/index.html">&#8592; Chapter 10: Keypoints, Descriptors &amp; Matching</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="section-11.1.html">Section 11.1: Segmentation as Clustering &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

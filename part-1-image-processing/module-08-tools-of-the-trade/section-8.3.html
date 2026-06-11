@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 8.3: Test Images, Datasets &amp; Quality Metrics Tooling. Standard test images and synthetic targets, benchmark datasets for denoising, super-resolution and deblurring, and the PSNR, SSIM and LPIPS metric toolboxes with their default-parameter pitfalls." name="description"/>
+<title>Section 8.3: Test Images, Datasets &amp; Quality Metrics Tooling | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Tools of the Trade: The Image Processing Stack</a></div>
+<h1>Test Images, Datasets &amp; Quality Metrics Tooling</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Forty-seven years of being blurred, sharpened, compressed, and denoised, and they finally let me retire. My one request: let the astronaut take it from here. She is used to noise."</p>
+<cite>A Graciously Retired Test Image</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An image processing claim is only as good as the data it was tested on and the metric that scored it, and both are standardized for exactly that reason.</strong> Shared test images make results comparable across papers and decades; benchmark datasets make them comparable across methods; and metric toolboxes make the numbers themselves reproducible, provided you pin down the parameters that the defaults quietly choose for you. This section is the inventory of all three.</p>
+</div>
+<p>
+The previous section (<a href="section-8.2.html">Section 8.2</a>) made pipelines fast; this one makes their evaluation trustworthy. Every experiment in Part I needed three ingredients we mostly took for granted: an input image, a degraded-versus-clean pair, and a number that says how well a method did. Here we treat each ingredient as infrastructure: where the standard images live, which datasets benchmark the restoration tasks of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>, and how to compute the quality metrics introduced in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> so that a reviewer, or your own CI pipeline, gets the same number you did.
+</p>
+<h2>1. The Standard Test Images <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+A handful of photographs have been blurred and denoised millions of times because everyone agreed to use the same ones. The historical home is the <a href="https://sipi.usc.edu/database/" target="_blank" rel="noopener">USC-SIPI database</a> (maintained since 1977), source of the mandrill, the peppers, and the house; the <a href="http://r0k.us/graphics/kodak/" target="_blank" rel="noopener">Kodak suite</a> adds 24 film scans that remain the default smoke test for compression and denoising. For code, the most convenient gallery ships inside scikit-image itself: <code>skimage.data</code> bundles the classic cameraman, an astronaut portrait, coins on a textured background, text, and more, each one load-by-function-call. Code 8.3.1 inventories it.
+</p>
+<pre><code class="language-python">from skimage import data
+
+for name in ["camera", "astronaut", "coins", "text", "checkerboard",
+             "page", "moon", "shepp_logan_phantom"]:
+    img = getattr(data, name)()          # each image is a function call
+    print(f"{name:20s} {img.shape!s:16s} {img.dtype}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.1:</strong> The built-in test gallery: <code>skimage.data</code> downloads nothing for the core images and returns plain NumPy arrays, which makes it the fastest way to get a real photograph into a unit test.</div>
+<pre class="code-output">camera               (512, 512)       uint8
+astronaut            (512, 512, 3)    uint8
+coins                (303, 384)       uint8
+text                 (172, 448)       uint8
+checkerboard         (200, 200)       uint8
+page                 (191, 384)       uint8
+moon                 (512, 512)       uint8
+shepp_logan_phantom  (400, 400)       float64
+</pre>
+<div class="code-caption"><strong>Output 8.3.1a:</strong> Eight ready-made test subjects covering portraits, textures, documents, low contrast, and a synthetic CT phantom; note the mixed dtypes, exactly the trap <a href="section-8.1.html">Section 8.1</a> warned about.</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most famous test image of all, the 1972 "Lena" crop, is conspicuously absent from modern libraries. After decades of debate about using a Playboy centerfold as the field's default benchmark, journals began declining it (Nature journals in 2018), and IEEE stopped accepting new papers containing it as of April 2024. The community's drop-in replacement in scikit-image is <code>data.astronaut()</code>: NASA's portrait of Eileen Collins, the first woman to command a Space Shuttle mission. The epigraph above is her predecessor's gracious handover.</p>
+</div>
+<p>
+Synthetic targets complement the photographs because their ground truth is mathematical. The Shepp-Logan phantom (printed by Code 8.3.1) has known ellipse boundaries, which is why CT reconstruction papers have used it since 1974. Checkerboards and ramps expose interpolation and quantization artifacts from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>. The most instructive of all is the zone plate, $I(r) = \tfrac{1}{2}\left(1 + \cos(\alpha r^2)\right)$, whose local frequency grows linearly with radius: a single image that sweeps every spatial frequency, so aliasing from poor resampling (<a href="../module-05-geometric-transformations/index.html">Chapter 5</a>) and the band behavior of filters (<a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>) appear as visible rings exactly where theory predicts. Code 8.3.2 builds one, then manufactures the (clean, noisy) pair every denoising experiment needs.
+</p>
+<pre><code class="language-python">import numpy as np
+
+def zone_plate(n=512, alpha=0.4):
+    """Radial chirp: local frequency grows linearly with radius."""
+    y, x = np.mgrid[-n // 2:n // 2, -n // 2:n // 2].astype(np.float64)
+    r2 = (x**2 + y**2) / n                # normalized squared radius
+    return 0.5 * (1.0 + np.cos(alpha * r2))
+
+clean = zone_plate()                      # float64 in [0, 1], exact ground truth
+rng = np.random.default_rng(7)
+noisy = np.clip(clean + rng.normal(0.0, 25 / 255, clean.shape), 0.0, 1.0)
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.2:</strong> A zone plate plus calibrated Gaussian noise (the sigma = 25 convention, expressed on a [0, 1] scale) yields a synthetic restoration benchmark with perfect ground truth: the exact setup behind the denoising numbers of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>.</div>
+<h2>2. Benchmark Datasets for Restoration <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+When a method must be compared against published results, single images give way to standard datasets. Table 8.3.1 lists the ones that dominate the literature for the tasks of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>; the names recur in virtually every paper you will read after this part of the book.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 8.3.1:</strong> <em>Standard benchmark datasets for Part I restoration tasks.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Dataset</th><th scope="col">Task</th><th scope="col">Contents</th><th scope="col">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/resources.html" target="_blank" rel="noopener">BSDS500</a> / BSD68</td><td>Denoising (synthetic)</td><td>500 natural photos; 68-image gray test split</td><td>Noise added at sigma 15/25/50; the classic protocol</td></tr>
+<tr><td>Set12 / <a href="http://r0k.us/graphics/kodak/" target="_blank" rel="noopener">Kodak24</a></td><td>Denoising (synthetic)</td><td>12 gray classics; 24 color film scans</td><td>Small, fast, in every results table</td></tr>
+<tr><td><a href="https://www.eecs.yorku.ca/~kamel/sidd/" target="_blank" rel="noopener">SIDD</a></td><td>Denoising (real)</td><td>~30k smartphone pairs, 10 scenes, 5 phones</td><td>Real sensor noise; exposes methods tuned on Gaussian assumptions</td></tr>
+<tr><td><a href="https://data.vision.ee.ethz.ch/cvl/DIV2K/" target="_blank" rel="noopener">DIV2K</a></td><td>Super-resolution</td><td>800 train + 100 val images at 2K</td><td>The training set behind nearly every modern SR model</td></tr>
+<tr><td>Set5 / Set14 / Urban100</td><td>Super-resolution (eval)</td><td>5, 14, and 100 test images</td><td>Urban100's repeated facades punish bad upscalers</td></tr>
+<tr><td><a href="https://seungjunnah.github.io/Datasets/gopro" target="_blank" rel="noopener">GoPro</a></td><td>Deblurring</td><td>3,214 blur/sharp pairs from 240 fps video</td><td>Blur synthesized by averaging real frames</td></tr>
+<tr><td>LOL</td><td>Low-light enhancement</td><td>485 train + 15 test paired exposures</td><td>The standard paired benchmark for the Chapter 7 enhancement task</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+Two hygiene rules attach to every row. First, respect the published splits: DIV2K's validation images, for example, appear inside other datasets' test sets, and accidental train-test contamination has invalidated more than one results table. Second, record the exact degradation recipe (noise sigma and dtype scale, downsampling kernel for SR, JPEG quality) alongside your scores; "PSNR 31.2 on BSD68" is meaningless without "sigma = 25, grayscale, values in [0, 255]". A quick histogram audit of any downloaded dataset, with the tools from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, catches the most common surprises: 16-bit files masquerading as 8-bit, and already-compressed "clean" references.
+</p>
+<h2>3. Metric Tooling: PSNR, SSIM &amp; the Default-Parameter Trap <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+<a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> defined the two workhorse full-reference metrics: peak signal-to-noise ratio,
+$$\mathrm{PSNR} = 10 \log_{10} \frac{L^2}{\mathrm{MSE}},$$
+with $L$ the dynamic range, and the structural similarity index
+$$\mathrm{SSIM}(x, y) = \frac{(2\mu_x \mu_y + C_1)(2\sigma_{xy} + C_2)}{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)},$$
+computed over local windows and averaged. The tooling lives in <code>skimage.metrics</code>, and it hides a reproducibility trap: the original SSIM publication specifies an 11&times;11 Gaussian-weighted window with $\sigma = 1.5$ and population statistics, while scikit-image defaults to a 7&times;7 uniform window with sample statistics. Both are legitimate SSIMs; they are just different numbers. Code 8.3.3 computes both and makes the second trap, <code>data_range</code>, explicit.
+</p>
+<pre><code class="language-python">from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+# Floats demand an explicit range; guessing it is the classic silent bug.
+psnr = peak_signal_noise_ratio(clean, noisy, data_range=1.0)
+
+ssim_default = structural_similarity(clean, noisy, data_range=1.0)
+
+ssim_paper = structural_similarity(      # the Wang et al. (2004) protocol
+    clean, noisy, data_range=1.0,
+    gaussian_weights=True, sigma=1.5,    # 11x11 Gaussian window
+    use_sample_covariance=False)         # population (1/N) statistics
+
+print(f"PSNR              : {psnr:.2f} dB")
+print(f"SSIM (defaults)   : {ssim_default:.4f}")
+print(f"SSIM (paper flags): {ssim_paper:.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.3:</strong> The same image pair, two SSIM protocols. The three flags in <code>ssim_paper</code> reproduce the original publication's implementation; papers and MATLAB references almost always mean this variant. Report which one you used.</div>
+<pre class="code-output">PSNR              : 20.17 dB
+SSIM (defaults)   : 0.4664
+SSIM (paper flags): 0.3923
+</pre>
+<div class="code-caption"><strong>Output 8.3.3a:</strong> The two protocols differ by 0.07 on this pair, far larger than the margins by which methods beat each other in results tables. Protocol disagreement masquerades as algorithmic improvement.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Metric Is Code, Not Math</div>
+<p>The SSIM formula is unambiguous; an SSIM <em>number</em> also depends on window shape, statistics convention, data range, channel handling, and any resizing done before scoring. The same is true of PSNR (range and dtype), LPIPS (which backbone network), and later FID (which feature extractor and sample count, as <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> will stress). Treat every reported metric as a function with parameters, state them when you publish, and pin them in code when you compare. The honest minimum is one sentence: library, version, and flags.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 0.02 SSIM That Did Not Exist</div>
+<p><strong>Who:</strong> An ML engineer at an imaging startup benchmarking a new denoiser for a customer pitch.</p>
+<p><strong>Situation:</strong> The pitch claimed the model beat the published BM3D baseline by 0.02 SSIM on BSD68 at sigma 25.</p>
+<p><strong>Problem:</strong> A prospective customer's team re-ran the comparison and got the opposite ordering. Both sides accused the other of a broken pipeline.</p>
+<p><strong>Decision:</strong> A joint debugging call traced the gap to tooling, not models: the startup scored with scikit-image defaults (uniform 7&times;7 window) on float images in [0, 1], while the baseline numbers came from the original Gaussian-window protocol on [0, 255] integers, and one side was also accidentally scoring after a resize. They re-scored everything with one pinned script: paper flags, explicit <code>data_range</code>, no resizing.</p>
+<p><strong>Result:</strong> The real margin was 0.004 SSIM, within noise across the 68 images. The pitch was rewritten around speed, where the model's advantage was genuine and reproducible.</p>
+<p><strong>Lesson:</strong> Before comparing two methods, prove you can reproduce the baseline's published number first. If you cannot, your harness, not the method, is the variable.</p>
+</div>
+<h2>4. Beyond Pixels: Perceptual and No-Reference Metrics <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+PSNR and SSIM compare pixels and local statistics, and they famously prefer over-smoothed results that humans dislike. LPIPS (Zhang et al., 2018) scores the distance between deep network features of the two images instead, and correlates far better with human judgments on restoration outputs. When no clean reference exists at all (real-world enhancement, in-the-wild quality monitoring), no-reference metrics such as NIQE, BRISQUE, and the learned MUSIQ and CLIP-IQA estimate quality from the image alone. Figure 8.3.1 organizes the families into the decision you actually face.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Decision tree: choice of image quality metric family based on whether a reference image exists or whole image sets are compared">
+<style>
+.q { fill: #1f2937; }
+.qt { font-family: Verdana, Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #f9fafb; text-anchor: middle; }
+.fam { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; }
+.fam2 { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+.fam3 { fill: #fef3c7; stroke: #d97706; stroke-width: 2; }
+.ft { font-family: Verdana, Arial, sans-serif; font-size: 13px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.fs { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #4b5563; text-anchor: middle; }
+.edge { stroke: #6b7280; stroke-width: 1.8; fill: none; marker-end: url(#ah83); }
+.el { font-family: Verdana, Arial, sans-serif; font-size: 11px; font-weight: bold; fill: #374151; text-anchor: middle; }
+</style>
+<defs>
+<marker id="ah83" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+<path d="M0,0 L6,3 L0,6 z" fill="#6b7280"/>
+</marker>
+</defs>
+<rect class="q" x="320" y="20" width="300" height="56" rx="10"/>
+<text class="qt" x="470" y="44">What are you comparing</text>
+<text class="qt" x="470" y="63">against?</text>
+<path class="edge" d="M380,76 L170,140"/>
+<path class="edge" d="M470,76 L470,140"/>
+<path class="edge" d="M560,76 L770,140"/>
+<text class="el" x="225" y="105">pristine reference</text>
+<text class="el" x="470" y="115">no reference</text>
+<text class="el" x="730" y="105">two image sets</text>
+<rect class="fam" x="30" y="140" width="280" height="240" rx="10"/>
+<text class="ft" x="170" y="168">Full-reference</text>
+<text class="fs" x="170" y="196">Pixel-faithful:</text>
+<text class="fs" x="170" y="212">MSE, PSNR</text>
+<text class="fs" x="170" y="240">Structural:</text>
+<text class="fs" x="170" y="256">SSIM, MS-SSIM</text>
+<text class="fs" x="170" y="284">Learned perceptual:</text>
+<text class="fs" x="170" y="300">LPIPS, DISTS</text>
+<text class="fs" x="170" y="336">Use for: restoration,</text>
+<text class="fs" x="170" y="352">compression, codecs</text>
+<rect class="fam2" x="330" y="140" width="280" height="240" rx="10"/>
+<text class="ft" x="470" y="168">No-reference (blind)</text>
+<text class="fs" x="470" y="196">Natural-statistics:</text>
+<text class="fs" x="470" y="212">NIQE, BRISQUE</text>
+<text class="fs" x="470" y="240">Learned:</text>
+<text class="fs" x="470" y="256">MUSIQ, CLIP-IQA, TOPIQ</text>
+<text class="fs" x="470" y="284">LLM-based (2024+):</text>
+<text class="fs" x="470" y="300">Q-Align</text>
+<text class="fs" x="470" y="336">Use for: in-the-wild quality,</text>
+<text class="fs" x="470" y="352">enhancement without truth</text>
+<rect class="fam3" x="630" y="140" width="280" height="240" rx="10"/>
+<text class="ft" x="770" y="168">Distributional</text>
+<text class="fs" x="770" y="196">Feature statistics:</text>
+<text class="fs" x="770" y="212">FID, KID</text>
+<text class="fs" x="770" y="240">Text alignment:</text>
+<text class="fs" x="770" y="256">CLIPScore</text>
+<text class="fs" x="770" y="284">Covered in depth in</text>
+<text class="fs" x="770" y="300">Chapter 37 (Part IV)</text>
+<text class="fs" x="770" y="336">Use for: generative models,</text>
+<text class="fs" x="770" y="352">dataset-vs-dataset checks</text>
+<text class="fs" x="470" y="412">All three families are one pip install away via pyiqa (full- and no-reference) and torchmetrics (FID, KID).</text>
+</svg>
+<figcaption><strong>Figure 8.3.1:</strong> Choosing a quality metric family. With a pristine reference, pick the row matching your question (fidelity, structure, or perception); without one, blind metrics estimate quality from natural-image statistics or learned models; and comparing whole collections of images is a distributional problem, the Chapter 37 story that begins with the histogram statistics of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>.</figcaption>
+</figure>
+<p>
+In practice you rarely implement any of these. The <a href="https://github.com/chaofengc/IQA-PyTorch" target="_blank" rel="noopener">pyiqa</a> toolbox wraps more than forty metrics, classical and learned, behind one interface, as Code 8.3.4 shows.
+</p>
+<pre><code class="language-python">import pyiqa, torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+metrics = {name: pyiqa.create_metric(name, device=device)
+           for name in ["psnr", "ssim", "lpips", "niqe"]}
+
+# Tensors in NCHW, float, [0, 1]; pyiqa also accepts file paths directly.
+ref = torch.from_numpy(clean).float()[None, None]
+deg = torch.from_numpy(noisy).float()[None, None]
+
+for name, m in metrics.items():
+    score = m(deg, ref) if not m.metric_mode == "NR" else m(deg)
+    print(f"{name:6s}: {float(score):8.4f}   (lower is better: {m.lower_better})")
+</code></pre>
+<div class="code-caption"><strong>Code 8.3.4:</strong> One interface, forty-plus metrics: pyiqa exposes each metric's direction via <code>lower_better</code> and its reference requirement via <code>metric_mode</code>, which prevents the two most common scripting mistakes in evaluation harnesses.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SSIM in One Call</div>
+<p>A faithful from-scratch SSIM is roughly 60 lines: Gaussian window construction, five local-statistics convolutions, the stability constants $C_1, C_2$, edge handling, and channel averaging. <code>skimage.metrics.structural_similarity</code> with the three protocol flags from Code 8.3.3 is 1 line, and the library additionally handles multichannel inputs, returns the full similarity map via <code>full=True</code> for spatial debugging, and stays numerically stable for constant patches where naive implementations divide by zero. 60 lines to 1, and the one line is the one reviewers can check.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Quality Assessment Meets Multimodal Models (2024-2026)</div>
+<p>The newest no-reference metrics are language models. <strong>Q-Bench</strong> (ICLR 2024) benchmarked how well multimodal LLMs perceive low-level quality attributes, and <strong>Q-Align</strong> (ICML 2024) turned that ability into a state-of-the-art scorer by teaching an LLM to emit discrete quality levels the way human raters do. <strong>DepictQA</strong> (ECCV 2024) goes further and outputs reasoned, comparative quality <em>descriptions</em> rather than a single scalar, and <strong>CLIP-IQA</strong> showed that even a frozen CLIP model scores quality zero-shot from prompt pairs like "good photo" versus "bad photo". On the full-reference side, <strong>TOPIQ</strong> (IEEE TIP 2023) propagates semantic attention down to local distortions. Most of these ship in pyiqa already, so the practical frontier is one <code>create_metric</code> string away; the open question, pursued across 2025-2026 work, is keeping learned judges honest when the images being judged come from generative models, a problem <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> takes up in earnest.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.1: Match the Metric to the Job <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, choose a metric family from Figure 8.3.1 and one concrete metric, and justify the choice: (a) regression-testing a JPEG encoder against golden outputs; (b) ranking three denoisers for a medical imaging customer who fears hallucinated detail; (c) monitoring the quality of user-uploaded photos in production, where no reference exists; (d) deciding whether a synthetic training set "looks like" the real one. Which scenario is the trap where the obvious metric rewards the wrong behavior?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.2: A Reproducible Benchmark Harness <span class="exercise-type coding">Coding</span></div>
+<p>Build a small benchmark: download the Kodak suite, add Gaussian noise at sigma 15, 25, and 50 (on a documented scale), and score <code>cv2.fastNlMeansDenoisingColored</code> and the bilateral filter from <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> with PSNR, both SSIM protocols from Code 8.3.3, and LPIPS. Emit one CSV row per (image, sigma, method, metric, value) and a header comment recording library versions and all metric flags. Verify a colleague (or a fresh environment) reproduces your numbers to four decimals.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 8.3.3: When Metrics Disagree <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct two degradations of the same Kodak image with equal PSNR (tune their strengths until PSNRs match within 0.05 dB): a Gaussian blur and additive noise. Score both with SSIM and LPIPS. Which degradation does each metric prefer, and what does that reveal about what each one measures? Relate your finding to the over-smoothing bias discussed in Section 4 and to the frequency content removed by each degradation (<a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>).</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-8.2.html"><span class="nav-label">Section 8.2: Performance: Vectorization, OpenCV Optimizations &amp; GPU Arrays</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 8</span></a>
+<a class="next" href="section-8.4.html"><span class="nav-label">Section 8.4: Curated References &amp; Further Reading</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

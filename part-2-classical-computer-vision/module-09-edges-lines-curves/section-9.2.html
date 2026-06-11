@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.2: The Canny Edge Detector, Step by Step. Canny's three optimality criteria, Gaussian smoothing and gradients, non-maximum suppression, double thresholding with hysteresis, a from-scratch implementation, and tuning cv2.Canny." name="description"/>
+<title>Section 9.2: The Canny Edge Detector, Step by Step | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Edges, Lines &amp; Curves</a></div>
+<h1>The Canny Edge Detector, Step by Step</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I accept strong edges on the spot. Weak edges need a strong edge to vouch for them. It's not paranoia; it's hysteresis."</p>
+<cite>A Canny Detector With Trust Issues</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Canny detector closes the gradient-to-edge gap of <a href="section-9.1.html">Section 9.1</a> with two ideas that decide with context instead of pixel by pixel: non-maximum suppression thins gradient ribbons to one-pixel crests, and hysteresis lets confident edges rescue their faint continuations.</strong> What makes it remarkable is its pedigree: rather than tinkering toward a heuristic, John Canny in 1986 wrote down what an optimal edge detector should achieve (find real edges, place them accurately, mark each once), derived the operator that best satisfies the criteria, and arrived at a four-stage pipeline so well balanced that it remains the default edge detector in every vision library four decades later, and lately the favorite conditioning signal of the diffusion models in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>.</p>
+</div>
+
+<p>
+The previous section ended with a measured indictment: a thresholded gradient map keeps thick ribbons instead of curves and shatters real contours no matter where the threshold sits. This section builds the machine that fixes both defects. We will walk the four stages in order, implement the whole detector from scratch in NumPy, verify it against OpenCV's, and finish with the one-line call and its tuning knobs.
+</p>
+
+<h2>1. What Should an Edge Detector Optimize? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Canny's contribution begins before any code, with three criteria for judging any edge detector applied to a noisy step edge:
+</p>
+<p>
+<strong>Good detection.</strong> Maximize the probability of marking real edges and minimize the probability of marking noise. <strong>Good localization.</strong> Marked points should sit as close as possible to the true edge position. <strong>Single response.</strong> One edge should produce one mark, not a cluster.
+</p>
+<p>
+The criteria fight each other. Detection improves with more smoothing (noise dies faster than the step does), but localization worsens, because smoothing smears the step's position; this is the $\sigma$ trade-off that <a href="section-9.1.html">Section 9.1</a> flagged. Canny formalized the trade-off, solved for the 1D operator maximizing a product of the criteria, and found the optimum is approximated within about 20 percent by something we already own: <strong>the first derivative of a Gaussian</strong>, exactly the "smooth, then differentiate" composite of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. The deep reassurance of the result is that the standard practice was not just convenient; it is close to provably the best a linear filter can do. What the optimal filter cannot do alone is satisfy criterion three and produce thin, connected curves; that requires the two nonlinear stages that make Canny's pipeline famous. Figure 9.2.1 lays out all four stages.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline flowchart of the Canny detector: input image to Gaussian smoothing, to gradient magnitude and orientation, to non-maximum suppression, to double threshold with hysteresis, to the final edge map">
+  <defs>
+    <marker id="arr921" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#5a626c"/>
+    </marker>
+  </defs>
+  <!-- Boxes -->
+  <rect x="20"  y="60" width="120" height="70" rx="8" fill="#eef3f8" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="80" y="90" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">1. Gaussian</text>
+  <text x="80" y="108" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">smoothing</text>
+  <rect x="180" y="60" width="120" height="70" rx="8" fill="#eef3f8" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="240" y="84" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">2. Gradient</text>
+  <text x="240" y="102" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#2c3e50">magnitude +</text>
+  <text x="240" y="118" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#2c3e50">orientation</text>
+  <rect x="340" y="60" width="130" height="70" rx="8" fill="#fdf2e5" stroke="#e67e22" stroke-width="1.5"/>
+  <text x="405" y="84" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#a04000">3. Non-maximum</text>
+  <text x="405" y="102" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#a04000">suppression</text>
+  <text x="405" y="118" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#a04000">ribbons &#8594; 1-px crests</text>
+  <rect x="510" y="60" width="130" height="70" rx="8" fill="#f3ecf8" stroke="#8e44ad" stroke-width="1.5"/>
+  <text x="575" y="84" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#6c3483">4. Hysteresis</text>
+  <text x="575" y="102" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6c3483">two thresholds;</text>
+  <text x="575" y="118" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6c3483">strong recruits weak</text>
+  <rect x="680" y="60" width="80" height="70" rx="8" fill="#e8f6ee" stroke="#27ae60" stroke-width="1.5"/>
+  <text x="720" y="90" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449">edge</text>
+  <text x="720" y="108" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449">map</text>
+  <!-- Arrows -->
+  <line x1="140" y1="95" x2="172" y2="95" stroke="#5a626c" stroke-width="2" marker-end="url(#arr921)"/>
+  <line x1="300" y1="95" x2="332" y2="95" stroke="#5a626c" stroke-width="2" marker-end="url(#arr921)"/>
+  <line x1="470" y1="95" x2="502" y2="95" stroke="#5a626c" stroke-width="2" marker-end="url(#arr921)"/>
+  <line x1="640" y1="95" x2="672" y2="95" stroke="#5a626c" stroke-width="2" marker-end="url(#arr921)"/>
+  <!-- Stage character labels -->
+  <text x="160" y="170" font-family="sans-serif" font-size="12" fill="#5a626c">stages 1-2: linear filtering (Chapter 3 machinery), near-optimal by Canny's criteria</text>
+  <text x="160" y="192" font-family="sans-serif" font-size="12" fill="#5a626c">stages 3-4: nonlinear decisions that use thinness and continuity, the two facts</text>
+  <text x="160" y="210" font-family="sans-serif" font-size="12" fill="#5a626c">about edges that no per-pixel threshold can express</text>
+</svg>
+<figcaption><strong>Figure 9.2.1</strong> The four-stage Canny pipeline. The first two stages are the smoothed-gradient machinery of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>; the last two are nonlinear decision stages, and they are where the thick-ribbon and broken-contour defects of <a href="section-9.1.html">Section 9.1</a> get repaired.</figcaption>
+</figure>
+
+<h2>2. Stages 1 and 2: Smooth, Then Measure <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Nothing new is needed here, only a deliberate choice. Convolve with a Gaussian of scale $\sigma$, then apply Sobel kernels to get $I_x$, $I_y$, and from them magnitude and orientation. The single decision is $\sigma$, and it should be made consciously: $\sigma \approx 1$ to $1.4$ preserves fine texture edges; $\sigma \approx 2$ to $3$ is a sensible default for natural photographs; larger values are for finding only the dominant contours. One practical warning that surprises many users: <code>cv2.Canny</code> performs <em>no</em> internal Gaussian smoothing; it runs Sobel directly on whatever you pass it. Smoothing is your job (or use <code>skimage.feature.canny</code>, which takes an explicit <code>sigma</code> argument). Feeding a raw noisy image to <code>cv2.Canny</code> and wondering about speckle is among the most common edge-detection bugs in production code, a sibling of the denoise-first discipline from <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>.
+</p>
+
+<h2>3. Stage 3: Non-Maximum Suppression <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Stage 3 attacks the thick ribbons. The insight is geometric: crossing an edge perpendicularly, gradient magnitude rises, peaks at the true boundary, and falls. The ribbon exists because we kept the whole rise and fall; the boundary is just the crest. So at every pixel, look one step in the gradient direction and one step against it, and <strong>keep the pixel only if its magnitude is at least as large as both neighbors</strong>. The result is called non-maximum suppression (NMS): everything that is not a local maximum along the gradient direction is deleted, collapsing each ribbon to a one-pixel crest line exactly perpendicular to the local gradient, the geometry established in Figure 9.1.2 of <a href="section-9.1.html">Section 9.1</a>.
+</p>
+<p>
+On a discrete grid "one step in the gradient direction" needs care: a gradient at 37 degrees points between pixels. The classical implementation quantizes orientation into four bins (0, 45, 90, 135 degrees), each selecting one of the four neighbor pairs in the 3&#215;3 neighborhood; finer implementations interpolate magnitude between the two pixels straddling the true direction. Figure 9.2.2 shows the quantized version that our from-scratch code implements.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 3 by 3 pixel neighborhood with a gradient arrow through the center pixel and the two neighbors along the gradient direction highlighted, plus the four quantized direction bins">
+  <defs>
+    <marker id="arr922" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#e67e22"/>
+    </marker>
+  </defs>
+  <!-- 3x3 grid -->
+  <g>
+    <rect x="60"  y="40" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+    <rect x="120" y="40" width="60" height="60" fill="#fdf2e5" stroke="#90a4ae"/>
+    <rect x="180" y="40" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+    <rect x="60"  y="100" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+    <rect x="120" y="100" width="60" height="60" fill="#eef3f8" stroke="#2c3e50" stroke-width="2"/>
+    <rect x="180" y="100" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+    <rect x="60"  y="160" width="60" height="60" fill="#fdf2e5" stroke="#90a4ae"/>
+    <rect x="120" y="160" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+    <rect x="180" y="160" width="60" height="60" fill="#ffffff" stroke="#90a4ae"/>
+  </g>
+  <text x="150" y="135" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">p</text>
+  <!-- Gradient arrow through center, roughly NE direction (up-right) -->
+  <line x1="92" y1="206" x2="206" y2="56" stroke="#e67e22" stroke-width="2.5" marker-end="url(#arr922)"/>
+  <text x="212" y="44" font-family="sans-serif" font-size="13" font-weight="bold" fill="#a04000">&#8711;I</text>
+  <text x="48" y="252" font-family="sans-serif" font-size="12" fill="#5a626c">keep p only if mag(p) &#8805; both shaded neighbors</text>
+  <!-- Right panel: quantization bins -->
+  <text x="420" y="50" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">orientation quantized to 4 bins:</text>
+  <g font-family="sans-serif" font-size="13" fill="#2c3e50">
+    <text x="420" y="86">bin 0&#176; (gradient &#8596; horizontal): compare left / right</text>
+    <text x="420" y="118">bin 45&#176;: compare upper-right / lower-left</text>
+    <text x="420" y="150">bin 90&#176; (gradient &#8597; vertical): compare up / down</text>
+    <text x="420" y="182">bin 135&#176;: compare upper-left / lower-right</text>
+  </g>
+  <text x="420" y="222" font-family="sans-serif" font-size="12" fill="#5a626c">each bin spans 45&#176;; ties are kept (&#8805;, not &gt;) so flat crests</text>
+  <text x="420" y="240" font-family="sans-serif" font-size="12" fill="#5a626c">survive and the contour stays connected</text>
+</svg>
+<figcaption><strong>Figure 9.2.2</strong> Non-maximum suppression in a 3&#215;3 neighborhood. The gradient at the center pixel p points up-right (bin 45 degrees), so p is compared against its upper-right and lower-left neighbors (shaded); p survives only as a local maximum along the gradient line, which thins every gradient ribbon to a one-pixel crest.</figcaption>
+</figure>
+
+<h2>4. Stage 4: Double Threshold and Hysteresis <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Stage 4 attacks the broken contours, and it does so by refusing to use one threshold. Pick two, $T_{\text{high}}$ and $T_{\text{low}}$ (Canny suggested a ratio between 2:1 and 3:1). Pixels above $T_{\text{high}}$ are <strong>strong</strong>: accepted unconditionally. Pixels below $T_{\text{low}}$ are rejected unconditionally. The pixels in between are <strong>weak</strong>: accepted if and only if they connect, directly or through a chain of other weak pixels, to some strong pixel. Implementation is a flood fill seeded at the strong pixels and allowed to spread only through weak ones; readers of <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> will recognize this as morphological reconstruction of the weak map from strong markers.
+</p>
+<p>
+Why this works is worth saying plainly. A real contour whose contrast dips for a stretch produces weak pixels precisely along the dip, sandwiched between strong segments, so the flood fill recovers it whole. An isolated noise response has the same magnitude as that dip but no strong sponsor anywhere nearby, so it dies. The decision uses geometry that no per-pixel threshold can see: <em>membership in a connected structure</em>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Hysteresis Is a Prior About the World, Not a Trick</div>
+<p>Double thresholding encodes a physical belief: boundaries in the world are continuous curves, so edge evidence should be judged by the company it keeps. A weak gradient adjoining a confident contour is probably that contour continuing; the same weak gradient alone in flat sky is probably noise. This is the chapter's first instance of a pattern that defines the rest of the book: when per-pixel evidence is ambiguous, resolve it with structure. The Hough transform of <a href="section-9.3.html">Section 9.3</a> (pixels voting for shared geometry) and the RANSAC consensus of <a href="section-9.4.html">Section 9.4</a> are the same idea at ever larger scales.</p>
+</div>
+
+<h2>5. The Whole Detector From Scratch <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Forty lines of NumPy implement everything above. The code keeps each stage visibly separate so you can instrument any of them, and then checks itself against OpenCV's implementation.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+from collections import deque
+
+def canny_from_scratch(gray, sigma=1.4, low=40, high=90):
+    # Stage 1: Gaussian smoothing (sigma chosen by the caller, deliberately)
+    img = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), sigma)
+
+    # Stage 2: gradient magnitude and orientation
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    ang = np.rad2deg(np.arctan2(gy, gx)) % 180.0      # fold to [0, 180)
+
+    # Stage 3: non-maximum suppression with 4-bin orientation quantization
+    q = (((ang + 22.5) // 45).astype(int)) % 4         # 0,45,90,135 deg bins
+    offs = [(0, 1), (-1, 1), (-1, 0), (-1, -1)]        # neighbor along gradient
+    H, W = mag.shape
+    nms = np.zeros_like(mag)
+    for y in range(1, H - 1):
+        for x in range(1, W - 1):
+            dy, dx = offs[q[y, x]]
+            m = mag[y, x]
+            if m &gt;= mag[y + dy, x + dx] and m &gt;= mag[y - dy, x - dx]:
+                nms[y, x] = m                          # crest pixels survive
+
+    # Stage 4: double threshold + hysteresis (flood fill from strong seeds)
+    strong = nms &gt;= high
+    weak = (nms &gt;= low) &amp; ~strong
+    edges = strong.copy()
+    queue = deque(zip(*np.nonzero(strong)))
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                yy, xx = y + dy, x + dx
+                if 0 &lt;= yy &lt; H and 0 &lt;= xx &lt; W and weak[yy, xx] and not edges[yy, xx]:
+                    edges[yy, xx] = True               # strong recruits weak
+                    queue.append((yy, xx))
+    return edges
+
+gray = cv2.imread("street.jpg", cv2.IMREAD_GRAYSCALE)
+mine = canny_from_scratch(gray, sigma=1.4, low=40, high=90)
+ref = cv2.Canny(cv2.GaussianBlur(gray, (0, 0), 1.4), 40, 90) &gt; 0
+
+print(f"edge pixels (ours): {mine.mean():.2%}   (OpenCV): {ref.mean():.2%}")
+print(f"pixelwise agreement: {(mine == ref).mean():.1%}")
+# Representative output:
+# edge pixels (ours): 3.08%   (OpenCV): 3.21%
+# pixelwise agreement: 99.3%
+</code></pre>
+<div class="code-caption">The full Canny pipeline in four labeled stages, validated against <code>cv2.Canny</code> on the same pre-blurred input: agreement above 99 percent of pixels, with the residual disagreement concentrated on borderline weak pixels where OpenCV's interpolated NMS and our 4-bin quantization make different calls.</div>
+
+<p>
+The Python loops make this implementation a teaching instrument, not a production one: it runs in seconds where OpenCV takes about a millisecond. But every line corresponds to a sentence in this section, and instrumenting it (dump the <code>nms</code> array, count how many weak pixels hysteresis rescued) is the fastest way to make the pipeline's behavior concrete. On a typical street photograph, roughly a third of the final edge pixels arrive via rescue rather than direct strong acceptance, which is the broken-contour defect of <a href="section-9.1.html">Section 9.1</a> being repaired in bulk.
+</p>
+
+<h2>6. The One-Liner and Its Knobs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+In production you call the library, and the craft moves into choosing arguments. The most durable trick is deriving the thresholds from image statistics, in the spirit of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>'s histogram methods, so that one configuration survives across exposures and scenes:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+gray = cv2.imread("street.jpg", cv2.IMREAD_GRAYSCALE)
+blur = cv2.GaussianBlur(gray, (0, 0), 1.4)     # cv2.Canny does NOT smooth
+
+# Auto-thresholds from the median: robust to exposure changes
+v = float(np.median(blur))
+low, high = int(max(0, 0.66 * v)), int(min(255, 1.33 * v))
+
+edges = cv2.Canny(blur, low, high,
+                  apertureSize=3,      # Sobel kernel size: 3, 5, or 7
+                  L2gradient=True)     # true Euclidean magnitude, not |gx|+|gy|
+
+print(f"median {v:.0f} -&gt; thresholds ({low}, {high}); "
+      f"edge pixels: {(edges &gt; 0).mean():.2%}")
+# Representative output:
+# median 118 -&gt; thresholds (77, 156); edge pixels: 2.64%
+</code></pre>
+<div class="code-caption">The production pattern: explicit pre-blur (because <code>cv2.Canny</code> applies Sobel directly with no internal smoothing), median-derived hysteresis thresholds that track exposure automatically, and <code>L2gradient=True</code> for an isotropic magnitude worth its small extra cost.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: 40 Lines Become One</div>
+<p>Our from-scratch detector is about 40 lines plus a validation harness; <code>cv2.Canny(blur, low, high)</code> is one line, and <code>skimage.feature.canny(gray, sigma=1.4)</code> is one line that also folds in the Gaussian stage and uses sub-bin interpolated NMS for slightly cleaner crests. Internally the libraries handle the parts our version simplified: interpolation between neighbors instead of 4-bin quantization, border policies, a scan-line hysteresis that avoids Python-level queues, and SIMD-parallelized gradient kernels, which is how they run three orders of magnitude faster. Write the from-scratch version once to own the concepts; ship the library call.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Document Scanner That Stopped Missing Pages</div>
+<p><strong>Who:</strong> Two engineers on the mobile team of an expense-management app, responsible for the "scan receipt" feature.</p>
+<p><strong>Situation:</strong> The feature finds the document quadrilateral in the camera frame (Canny, then contour extraction, then a four-corner polygon fit) and warps it flat for OCR, the classic pipeline.</p>
+<p><strong>Problem:</strong> Detection was tuned on office lighting with fixed thresholds (50, 150). In the field, dim restaurants and glary taxi seats pushed the gradient distribution far from the tuning conditions: the page-found rate measured 78 percent on a 12,000-image sample of real user captures, and support tickets said "the blue box never appears."</p>
+<p><strong>Decision:</strong> Three changes, all from this section: downscale to 480 pixels wide (less noise, faster, and document edges survive), explicit Gaussian pre-blur at $\sigma = 1.5$, and median-based auto-thresholds per frame instead of constants; plus a light dilation from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> to close hairline gaps before contour extraction.</p>
+<p><strong>Result:</strong> Page-found rate rose to 96 percent on the same evaluation set; 95th-percentile latency was 28 milliseconds on a mid-range phone; the team deleted two per-market threshold overrides from the config system.</p>
+<p><strong>Lesson:</strong> Canny's thresholds are statistics, not constants. Any deployment that meets uncontrolled lighting should derive them from each frame's own histogram, which costs one median and removes an entire class of field failures.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The detector the whole field uses was a master's thesis: John Canny worked it out at MIT in 1983, and the journal paper appeared in 1986. Canny then largely left edges behind for robot motion planning and computational geometry. The thesis-project-turned-eternal-default is a recurring pattern in vision; you will meet another one when SIFT appears in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Canny's Second Career as a Control Signal</div>
+<p>Edge detection research continues (DiffusionEdge, AAAI 2024, generates single-pixel crisp edge maps with a diffusion model; RankED, CVPR 2024, tackles the pixel imbalance and annotator ambiguity with ranking losses; SCESAME, WACV 2024 workshops, derives zero-shot edges by ensembling Segment Anything outputs), but the headline 2024-2026 story is who consumes Canny maps now. ControlNet (Zhang et al., ICCV 2023, arXiv:2302.05543) made the Canny edge map one of the standard conditioning signals for text-to-image diffusion: draw or extract a contour map, and the generator must respect its geometry while inventing everything else. The Canny condition remains among the most-downloaded control adapters for Stable Diffusion and its successors, meaning a 1986 algorithm sits in the hot path of 2026's generative pipelines, a story <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a> completes. The learned first-layer filters of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> tell the complementary story: networks rediscover Canny's stages 1 and 2 on their own.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.1: Order Matters <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain what would go wrong if the pipeline's stages were reordered: (a) thresholding before non-maximum suppression, and (b) NMS after hysteresis instead of before. Then consider setting $T_{\text{low}} = T_{\text{high}}$: which of Section 9.1's two defects returns, and why does the ratio between the thresholds (rather than either absolute value) control the detector's tolerance for contrast dips along a contour?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.2: Measure the Rescue Rate <span class="exercise-type coding">Coding</span></div>
+<p>Instrument the from-scratch implementation to report, for each image, the number of strong pixels, the number of weak pixels, and the number of weak pixels that hysteresis ultimately rescued. Run it over ten varied photographs at threshold ratios 2:1 and 3:1 and report the rescue fraction for each. Then replace the queue-based flood fill with <code>cv2.connectedComponents</code> on the union map (keep components that contain at least one strong pixel) and verify the outputs are identical while measuring the speedup.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.2.3: The Sigma Sweep <span class="exercise-type analysis">Analysis</span></div>
+<p>Using <code>skimage.feature.canny</code>, sweep $\sigma \in \{0.5, 1, 2, 4, 8\}$ on one detailed photograph. For each result, report the edge-pixel fraction and the number of connected components, and visually identify which real structures appear and disappear. Plot both metrics against $\sigma$ and annotate the plot with the detection-versus-localization trade-off from Canny's criteria: which $\sigma$ would you choose for (a) a texture-analysis task and (b) finding the silhouette of a single large object, and why?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.1.html">&#8592; Section 9.1: What Is an Edge? Gradients Revisited</a>
+<a href="index.html">Chapter 9</a>
+<a class="next" href="section-9.3.html">Section 9.3: The Hough Transform: Lines &amp; Circles &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

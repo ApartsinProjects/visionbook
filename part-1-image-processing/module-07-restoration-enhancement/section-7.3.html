@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.3: Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy. Point spread functions, why naive inverse filtering explodes, the Wiener filter's frequency-wise compromise, and Richardson-Lucy iteration for photon-limited images." name="description"/>
+<title>Section 7.3: Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"You want me to divide by my smallest frequencies? That is how a whisper of noise becomes a scream, and I will be telling everyone it was your idea."</p>
+<cite>A Cautiously Regularized Wiener Filter</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Deconvolution is division in the frequency domain, and the entire craft lies in refusing to divide where the divisor is tiny.</strong> Blur multiplies each spatial frequency of the image by a known factor; undoing it means dividing each frequency back out. But blur crushes high frequencies toward zero while noise does not, and the naive quotient amplifies that noise without bound. The Wiener filter and Richardson-Lucy iteration are the two classical answers: one a closed-form frequency-by-frequency compromise, the other a patient iterative bargain with photon statistics.</p>
+</div>
+<p>
+<a href="section-7.2.html">Section 7.2</a> fought the additive term in the degradation model $g = h \ast f + n$. This section fights the convolution. Blur is in some ways a kinder enemy than noise: it is deterministic, it destroys no pixels outright, and if you know the kernel $h$ exactly, the damage is in principle reversible. The phrase "in principle" is where three decades of engineering live, because the reversal is the most spectacularly ill-posed operation in this chapter, and noise, even a whisper of it, is what makes it so.
+</p>
+<h2>1. A Gallery of Point Spread Functions <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+The blur kernel $h$ has a physical name, the <em>point spread function</em>: it is literally the image that a single point of light produces after passing through your optics. <a href="section-7.1.html">Section 7.1</a> placed it in the degradation pipeline; here we meet the three shapes that cover most of practice. A defocused lens spreads a point into a filled <strong>disk</strong> (the aperture's shape, which is why out-of-focus highlights look like little polygons matching the iris blades). Camera shake or subject motion during the exposure drags the point along a path, in the simplest case a straight <strong>line</strong> whose length and angle encode the motion. And the combined small imperfections of atmosphere, diffraction, and lens design aggregate into something well approximated by the <strong>Gaussian</strong> kernel of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. Code 7.3.1 builds the motion case, which we will use as the running example.
+</p>
+<pre><code class="language-python">import numpy as np
+from scipy.signal import fftconvolve
+from skimage import data, img_as_float
+from skimage.metrics import peak_signal_noise_ratio as psnr
+
+def motion_psf(length=15, angle_deg=30, size=31):
+    """Line PSF: a 1-pixel-wide segment of given length and angle,
+    normalized to sum to 1 (blur must conserve brightness)."""
+    psf = np.zeros((size, size))
+    c = size // 2
+    a = np.deg2rad(angle_deg)
+    for t in np.linspace(-length / 2, length / 2, 4 * length):
+        i = int(round(c + t * np.sin(a)))
+        j = int(round(c + t * np.cos(a)))
+        psf[i, j] = 1.0
+    return psf / psf.sum()
+
+rng = np.random.default_rng(seed=7)
+clean = img_as_float(data.camera())
+psf = motion_psf()
+blurred = fftconvolve(clean, psf, mode='same')
+noisy_blurred = np.clip(blurred + rng.normal(0, 0.005, clean.shape), 0, 1)
+print(f"blurred PSNR vs clean: {psnr(clean, noisy_blurred):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.1:</strong> Synthesizing motion blur with a line-shaped PSF, plus a deliberately faint amount of sensor noise ($\sigma = 0.005$, invisible to the eye). Keep that tiny noise in mind; it is about to matter enormously.</div>
+<p>
+In real systems you obtain the PSF rather than assume it: astronomers read it off stars (genuine point sources), microscopists image sub-resolution fluorescent beads, and lens labs photograph backlit pinholes or slanted edges. When none of that is possible, the PSF must be estimated from the blurred image itself, the "blind" problem we defer to Section 5. For now, assume $h$ is known and exact.
+</p>
+<h2>2. The Inverse Filter Catastrophe <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The convolution theorem from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> turns the degradation model into per-frequency multiplication: $G(u,v) = H(u,v)\,F(u,v) + N(u,v)$, where capital letters are Fourier transforms. Solving for the unknown image looks like one line of algebra:
+</p>
+$$
+\hat F(u, v) = \frac{G(u, v)}{H(u, v)} = F(u, v) + \frac{N(u, v)}{H(u, v)}.
+$$
+<p>
+The first term is exactly what we want, the true image, fully recovered. The second term is the catastrophe. A blur kernel is an averaging operation, so $H$ falls toward zero at high frequencies, and a line-shaped motion PSF is worse: its transform is a sinc-like pattern that crosses zero repeatedly <em>throughout</em> the frequency plane. At every such frequency we are dividing the noise, which is flat and indifferent, by a number arbitrarily close to zero. Figure 7.3.1 sketches the disaster and the remedy to come.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Schematic plot of blur transfer function magnitude falling to zero crossings, a flat noise floor, the exploding inverse filter gain, and the bounded Wiener gain">
+<style>
+.axis { stroke: #1f2937; stroke-width: 1.6; fill: none; marker-end: url(#ahx); }
+.curveH { stroke: #2563eb; stroke-width: 2.4; fill: none; }
+.curveN { stroke: #6b7280; stroke-width: 1.8; fill: none; stroke-dasharray: 6 4; }
+.curveInv { stroke: #dc2626; stroke-width: 2.2; fill: none; }
+.curveW { stroke: #059669; stroke-width: 2.4; fill: none; }
+.lab { font-family: Verdana, Arial, sans-serif; font-size: 12.5px; fill: #1f2937; }
+.danger { fill: rgba(220, 38, 38, 0.10); }
+.legline { stroke-width: 2.4; }
+</style>
+<defs>
+<marker id="ahx" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#1f2937"/></marker>
+</defs>
+<!-- axes -->
+<line class="axis" x1="70" y1="300" x2="880" y2="300"/>
+<line class="axis" x1="70" y1="300" x2="70" y2="40"/>
+<text class="lab" x="845" y="322">frequency u</text>
+<text class="lab" x="20" y="60">gain</text>
+<!-- danger zones near H zeros -->
+<rect class="danger" x="340" y="40" width="70" height="260"/>
+<rect class="danger" x="560" y="40" width="70" height="260"/>
+<rect class="danger" x="760" y="40" width="70" height="260"/>
+<!-- |H(u)|: decaying sinc-like with zeros at 375, 595, 795 -->
+<path class="curveH" d="M 70 80 C 160 85, 250 130, 340 240 C 360 270, 390 285, 410 250 C 460 180, 510 200, 560 270 C 580 292, 610 292, 630 268 C 680 220, 720 250, 760 288 C 780 297, 810 297, 830 290"/>
+<!-- |N(u)|: flat noise floor -->
+<line class="curveN" x1="70" y1="262" x2="860" y2="262"/>
+<!-- inverse gain 1/H: spikes at zeros -->
+<path class="curveInv" d="M 70 296 C 200 294, 300 285, 340 230 L 362 50 L 380 50 L 400 235 C 440 268, 510 262, 555 215 L 580 52 L 605 52 L 628 230 C 670 262, 720 248, 758 200 L 778 55 L 800 55 L 822 240"/>
+<!-- Wiener gain: follows 1/H at low freq, rolls off, never spikes -->
+<path class="curveW" d="M 70 290 C 180 286, 260 270, 320 235 C 345 222, 365 222, 385 232 C 430 252, 480 244, 525 240 C 560 240, 580 252, 610 262 C 660 274, 720 276, 780 286 C 810 290, 840 292, 860 294"/>
+<!-- labels -->
+<text class="lab" x="120" y="70" fill="#2563eb">|H(u)|  blur transfer (falls, crosses zero)</text>
+<text class="lab" x="640" y="250" fill="#6b7280">noise floor |N(u)|</text>
+<text class="lab" x="395" y="46" fill="#dc2626">inverse gain 1/|H| (explodes at every zero)</text>
+<text class="lab" x="300" y="330" fill="#b91c1c">shaded: |H| below the noise floor, division amplifies noise</text>
+<text class="lab" x="96" y="252" fill="#059669">Wiener gain (tracks 1/|H| while safe, then rolls off to zero)</text>
+</svg>
+<figcaption><strong>Figure 7.3.1:</strong> Why naive deconvolution fails and how Wiener fixes it. The blur transfer function $|H(u)|$ (blue) decays and repeatedly crosses zero for motion blur. Wherever it dips below the noise floor (shaded bands), the inverse gain $1/|H|$ (red) explodes and multiplies pure noise. The Wiener gain (green) follows the inverse where the signal dominates and rolls smoothly to zero where noise does, surrendering exactly the frequencies that cannot be saved.</figcaption>
+</figure>
+<p>
+Code 7.3.2 commits the naive inversion so you can watch it fail. The noise we added is half a percent of the intensity range, far below visibility, yet the output is unrecognizable static. This is not an implementation bug; it is the textbook definition of an ill-posed inverse problem, and the single most important demonstration in this chapter.
+</p>
+<pre><code class="language-python">def fft_of_psf(psf, shape):
+    """Zero-pad the PSF to image size, center it, return its 2D FFT."""
+    padded = np.zeros(shape)
+    k = psf.shape[0]
+    padded[:k, :k] = psf
+    # roll so the PSF center sits at (0, 0), as the FFT convention expects
+    padded = np.roll(padded, (-(k // 2), -(k // 2)), axis=(0, 1))
+    return np.fft.fft2(padded)
+
+H = fft_of_psf(psf, clean.shape)
+G = np.fft.fft2(noisy_blurred)
+
+F_naive = G / H                          # the one-line "solution"
+restored_naive = np.real(np.fft.ifft2(F_naive))
+print(f"inverse filter PSNR: {psnr(clean, np.clip(restored_naive, 0, 1)):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.2:</strong> Naive inverse filtering of the faintly noisy motion blur from Code 7.3.1. Note the PSF centering roll; forgetting it shifts the restored image by half the kernel size, a classic deconvolution bug.</div>
+<pre class="code-output">inverse filter PSNR: 5.8 dB
+</pre>
+<div class="code-caption"><strong>Output 7.3.2a:</strong> A typical run. The blurred input scored about 24 dB against the clean image; "restoring" it scored under 6 dB, worse than replacing the image with gray. Invisible noise, amplified at the zero crossings of $H$, has buried the picture completely.</div>
+<h2>3. The Wiener Filter: Divide Only Where It Pays <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The fix is to stop demanding exact inversion and ask instead for the linear filter that minimizes the expected squared error of the restoration, given the statistics of signal and noise. Norbert Wiener solved that problem in general; for our model the answer replaces $1/H$ with
+</p>
+$$
+W(u, v) = \frac{H^*(u, v)}{|H(u, v)|^2 + K(u, v)},
+\qquad
+K(u, v) = \frac{S_n(u, v)}{S_f(u, v)},
+$$
+<p>
+where $H^*$ is the complex conjugate and $K$ is the noise-to-signal power ratio at each frequency. Read it as a negotiation. Where the blurred signal towers over the noise ($|H|^2 \gg K$), the filter behaves like the exact inverse $1/H$. Where blur has crushed the signal below the noise floor ($|H|^2 \ll K$), the denominator is dominated by $K$ and the gain glides to zero: those frequencies are abandoned rather than amplified, which is precisely the green curve of Figure 7.3.1. In practice nobody knows the true power spectra, so $K$ is collapsed to a single constant and tuned, which makes it this method's one honest knob. Code 7.3.3 implements the whole thing in six lines and sweeps the knob.
+</p>
+<pre><code class="language-python">def wiener_deconv(g, H, K):
+    """Wiener deconvolution with a constant noise-to-signal ratio K."""
+    G = np.fft.fft2(g)
+    W = np.conj(H) / (np.abs(H) ** 2 + K)
+    return np.clip(np.real(np.fft.ifft2(W * G)), 0, 1)
+
+for K in [1e-1, 1e-2, 1e-3, 1e-4]:
+    out = wiener_deconv(noisy_blurred, H, K)
+    print(f"K = {K:.0e}   PSNR = {psnr(clean, out):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.3:</strong> Wiener deconvolution from scratch. The constant $K$ stands in for the unknown noise-to-signal ratio; sweeping it shows the regularization tradeoff directly.</div>
+<pre class="code-output">K = 1e-01   PSNR = 24.8 dB
+K = 1e-02   PSNR = 26.7 dB
+K = 1e-03   PSNR = 28.4 dB
+K = 1e-04   PSNR = 26.0 dB
+</pre>
+<div class="code-caption"><strong>Output 7.3.3a:</strong> A typical run (values shift with seed and PSF). Too much regularization ($K = 10^{-1}$) barely deblurs; too little ($K = 10^{-4}$) lets noise back in, with faint ripples echoing the PSF's zero crossings; the sweet spot recovers several decibels over the blurred input. Compare this curve to the catastrophic Output 7.3.2a, which is the $K \to 0$ limit.</div>
+<p>
+The visual signature of Wiener restoration is worth knowing: crisp recovered edges accompanied by faint <em>ringing</em>, ripples parallel to strong edges at the frequencies the filter gave up on. Ringing is not a bug but a receipt, the visible cost of the frequencies that were surrendered to noise. Heavier-handed priors (total variation deconvolution, which penalizes gradient magnitude, is the classic upgrade) trade ringing for staircase flatness; every deconvolution method leaves a fingerprint.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>skimage.restoration.wiener</code> and <code>unsupervised_wiener</code></div>
+<p>scikit-image ships both the classical filter and a variant that estimates the regularization automatically from the data, removing the manual $K$ sweep:</p>
+<pre><code class="language-python">from skimage.restoration import wiener, unsupervised_wiener
+
+restored_w = wiener(noisy_blurred, psf, balance=0.01)
+restored_u, _ = unsupervised_wiener(noisy_blurred, psf)   # tunes itself
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.4:</strong> Library Wiener deconvolution; <code>unsupervised_wiener</code> uses a Gibbs sampler to estimate the regularization, trading compute for one less knob.</div>
+<p>About 25 lines of FFT bookkeeping (padding, centering, conjugates, clipping, the $K$ sweep) become 1 or 2. Internally the library also applies edge tapering to suppress the boundary artifacts that circular convolution otherwise wraps around the frame, a detail our from-scratch version quietly ignores and real images quietly punish.</p>
+</div>
+<h2>4. Richardson-Lucy: Deconvolution for Photon Counters <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+The Wiener filter assumes additive Gaussian noise, but <a href="section-7.1.html">Section 7.1</a> taught that photon-limited images, astronomy, fluorescence microscopy, low-dose X-ray, obey Poisson statistics, where the noise scales with the signal. Richardson (1972) and Lucy (1974), working independently, derived the maximum-likelihood estimate for exactly that case. The result is not a closed form but a beautifully simple fixed-point iteration:
+</p>
+$$
+f^{(k+1)} = f^{(k)} \cdot \left( h^{\dagger} \ast \frac{g}{h \ast f^{(k)}} \right),
+$$
+<p>
+where $h^{\dagger}$ is the PSF flipped in both axes. The loop reads like a conversation. Blur your current guess ($h \ast f^{(k)}$) and compare it to what the camera actually saw, as a ratio: 1 where the guess explains the data, above 1 where the guess is too dim, below 1 where too bright. Smear that ratio backward through the optics ($h^{\dagger} \ast$) so each source pixel hears about the mismatches it could have caused, then scale the guess multiplicatively. The multiplicative update has two elegant consequences: a nonnegative guess stays nonnegative forever (no negative light, a constraint Wiener cheerfully violates), and total flux is conserved, which is why astronomers trust it for photometry. Code 7.3.5 is the entire algorithm.
+</p>
+<pre><code class="language-python">def richardson_lucy_scratch(g, psf, n_iter=30):
+    """Richardson-Lucy deconvolution, the whole algorithm."""
+    f = np.full(g.shape, 0.5)                 # flat, positive initial guess
+    psf_flipped = psf[::-1, ::-1]
+    for _ in range(n_iter):
+        estimate = fftconvolve(f, psf, mode='same')
+        ratio = g / (estimate + 1e-12)        # observed vs predicted
+        f = f * fftconvolve(ratio, psf_flipped, mode='same')
+    return np.clip(f, 0, 1)
+
+for n in [5, 15, 30, 80]:
+    out = richardson_lucy_scratch(noisy_blurred, psf, n_iter=n)
+    print(f"{n:3d} iterations   PSNR = {psnr(clean, out):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.3.5:</strong> Richardson-Lucy in eight lines. The <code>1e-12</code> guards division where the prediction is zero; the iteration-count sweep exposes the algorithm's central tradeoff.</div>
+<pre class="code-output">  5 iterations   PSNR = 25.9 dB
+ 15 iterations   PSNR = 27.8 dB
+ 30 iterations   PSNR = 28.3 dB
+ 80 iterations   PSNR = 26.9 dB
+</pre>
+<div class="code-caption"><strong>Output 7.3.5a:</strong> A typical run showing <em>semi-convergence</em>: quality rises, peaks, then degrades as further iterations begin fitting the noise. The rising phase restores genuine structure; past the peak, the maximum-likelihood machinery starts explaining individual noisy photons with speckle artifacts.</div>
+<p>
+Semi-convergence is the Richardson-Lucy version of the Wiener knob: the iteration count <em>is</em> the regularization. Stop early and you accept residual blur; run long and you amplify noise, just more gracefully than the inverse filter did. Production variants add explicit damping or a total-variation penalty inside the loop so the iteration can run to convergence safely. The library one-liner, <code>skimage.restoration.richardson_lucy(noisy_blurred, psf, num_iter=30)</code>, implements the same loop with the same semantics, and is the version to use outside teaching.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>When the Hubble Space Telescope reached orbit in 1990 with its famously mis-ground mirror, its PSF was not a neat point but a 15-arcsecond halo of spherical aberration. The silver lining: a space telescope photographs point sources for a living, so the PSF was known exquisitely well, turning a hardware disaster into the best-posed deconvolution problem in history. Richardson-Lucy and friends extracted publishable science for three years until the 1993 repair mission, and NASA workshops from that era turned deconvolution from an astronomical niche into standard imaging practice. The lesson generalizes: knowing $h$ precisely is worth more than any algorithmic cleverness.</p>
+</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The PSF Is Data. Go Measure It</div>
+<p>Every method in this section assumed $h$ was known, and every practical success story of classical deconvolution (Hubble, microscopy, industrial inspection) earned that assumption by <em>measuring</em> the PSF: stars, beads, pinholes, calibration targets, encoder logs. Deconvolving with a slightly wrong PSF fails much faster than deconvolving with a slightly wrong $K$ or iteration count; the exercises quantify how fast. When your deblurring disappoints, spend your next hour improving the PSF estimate, not swapping algorithms. The cheapest decibels are always in $h$.</p>
+</div>
+<h2>5. Blind Deconvolution and the Real World <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+When the PSF cannot be measured, it must be estimated from the blurred image itself, jointly with the image: the <em>blind</em> deconvolution problem, which is doubly ill-posed (a sharp image with wide blur and a blurry image with narrow blur explain the data equally well; so does the original photo of an intrinsically blurry scene). Classical practice tames it with structure. For straight-line motion blur, the PSF has only two parameters, and the blur's periodic zero crossings (Figure 7.3.1) leave measurable notches in the image's power spectrum from which length and angle can be read, a trick built on the cepstrum. For defocus, the disk radius is a one-parameter search scored by how natural the deconvolution result looks. General blind methods alternate between updating the image given the PSF and the PSF given the image, each step a constrained Richardson-Lucy-like update; they work, fragilely, and they are the part of this section that deep learning improved first and most.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Conveyor Belt That Outran Its Camera</div>
+<p><strong>Who:</strong> A machine-vision engineer at a bottling plant integrator.</p>
+<p><strong>Situation:</strong> A label-inspection camera photographed bottles on a conveyor moving at fixed speed. A production-line upgrade doubled the belt speed, and suddenly every label image carried 12 pixels of horizontal motion blur. OCR accuracy on lot codes collapsed from 99.6 to 81 percent.</p>
+<p><strong>Problem:</strong> The "proper" fixes were rejected: a faster shutter needed lighting the plant would not buy, and retraining the OCR on blurry images needed months of data collection. The team had weeks.</p>
+<p><strong>Decision:</strong> The blur here is the dream case: pure horizontal motion whose length is exactly computable from belt speed (from the PLC encoder) times exposure time (from the camera config). The engineer generated the line PSF analytically per Code 7.3.1 and inserted a Wiener deconvolution (Code 7.3.4, with edge tapering) before OCR, tuning $K$ once on a saved set of blurred lot codes.</p>
+<p><strong>Result:</strong> OCR recovered to 99.2 percent. Total compute cost: one FFT round trip per image, about 4 ms, invisible in the line's cycle time.</p>
+<p><strong>Lesson:</strong> Deconvolution with a <em>known</em> PSF is cheap, fast, and nearly magical; deconvolution with a guessed PSF is a research project. When the physics hands you $h$ (encoders, shutter timings, optics specs), take it.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Deblurring After the Classical Era</div>
+<p>Learned deblurring now dominates benchmarks: <strong>NAFNet</strong> (Chen et al., ECCV 2022) showed a stripped-down network without activation functions setting records on the GoPro motion-blur benchmark, and <strong>Restormer</strong> (CVPR 2022) remains the standard transformer baseline. The diffusion wave reframed deblurring as posterior sampling: <strong>HI-Diff</strong> (Chen et al., NeurIPS 2023) couples a compact latent diffusion prior to a regression backbone, while blind restorers like <strong>DiffBIR</strong> (ECCV 2024) and <strong>SUPIR</strong> (CVPR 2024) treat blur as just one ingredient of compound degradation, inverting it with a generative prior strong enough to invent plausible detail. That strength is the new caveat: a Wiener filter can only redistribute the evidence in the photons, but a diffusion deblurrer can manufacture a sharp face that was never there, which is why forensic and scientific users still reach for the methods of this section, and why <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> revisits deconvolution as a guided-sampling problem. Meanwhile your phone quietly runs learned deblurring on every shot; features like Google Photos' Unblur put a consumer button on this entire section.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.1: Limits of the Compromise <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Show from the Wiener formula that $K \to 0$ recovers the inverse filter and large $K$ approaches a scaled matched filter (gain proportional to $H^*$). (b) Explain why no setting of $K$ can recover a frequency at which $H(u,v) = 0$ exactly, and what that implies about the maximum information any deconvolution method can extract. (c) Motion blur of length $L$ has spectral zeros spaced $1/L$ apart; what does this predict about deblurring long versus short exposures?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.2: Map the Semi-Convergence <span class="exercise-type coding">Coding</span></div>
+<p>Using Code 7.3.5, run Richardson-Lucy for 200 iterations on the motion-blurred image at three noise levels ($\sigma \in \{0.001, 0.005, 0.02\}$), recording PSNR every 5 iterations. Plot the three curves on one chart. Where does each peak? Fit the relationship between noise level and optimal iteration count, and explain it: why should noisier data demand earlier stopping?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.3.3: How Wrong Can the PSF Be? <span class="exercise-type analysis">Analysis</span></div>
+<p>Blur an image with a 15-pixel, 30-degree motion PSF. Now deconvolve (Wiener, best $K$) with deliberately wrong PSFs: every combination of length $\{11, 13, 15, 17, 19\}$ and angle $\{20, 25, 30, 35, 40\}$ degrees. Render the 5x5 PSNR grid as a heatmap. Which parameter is the restoration more sensitive to, and by how much? Reconcile your finding with the Key Insight callout: how accurately must a blind method estimate each parameter before deconvolution helps rather than harms?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-7.2.html"><span class="nav-label">Section 7.2: Classical Denoising: From Gaussian to Non-Local Means</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="section-7.4.html"><span class="nav-label">Section 7.4: Inpainting: Filling the Holes</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

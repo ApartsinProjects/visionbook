@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.1: Corner Detection: Harris, Shi-Tomasi &amp; FAST. Why corners are the findable points: the structure tensor, eigenvalue analysis, the Harris response, Shi-Tomasi's refinement, and the FAST segment test." name="description"/>
+<title>Section 10.1: Corner Detection: Harris, Shi-Tomasi &amp; FAST | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>Corner Detection: Harris, Shi-Tomasi &amp; FAST</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Flat regions tell you nothing. Edges only commit in one direction. Me? I am interesting from every angle, and I have the eigenvalues to prove it."</p>
+<cite>A Structurally Confident Corner Detector</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A point is worth detecting only if you can find it again, and the points you can find again are the ones where the image changes in two independent directions at once: corners.</strong> This section turns that intuition into mathematics. The structure tensor summarizes how a small window of pixels changes under shifts; its two eigenvalues classify every pixel as flat, edge, or corner; and three famous detectors (Harris, Shi-Tomasi, FAST) are three ways of reading that classification at different points on the accuracy-versus-speed curve. Everything later in this chapter, and the stereo, reconstruction, and tracking chapters that consume its output, starts from the corners detected here.</p>
+</div>
+
+<p>
+<a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> celebrated edges as the most informative pixels in a single image. The moment a second image enters the picture, the celebration sours. This chapter's opening problem is correspondence: pick a point in image one, find the same physical point in image two. For that job, edges have a fatal flaw, and the first task of this section is to understand the flaw precisely, because the cure is the definition of a corner.
+</p>
+
+<h2>1. The Correspondence Problem and the Aperture Problem <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Imagine sliding a small window over a photograph and asking, at each location, a simple question: if I nudge this window a few pixels in any direction, does the patch of pixels inside it change? Three qualitatively different answers exist. Over a blank wall, the patch looks identical no matter where you nudge it; a matcher trying to localize that patch in another image would find thousands of equally good positions. Along an edge, the patch changes when you cross the edge but stays the same when you slide along it; the matcher can pin down one coordinate but not the other. Only at a corner, where two edges meet or texture varies in two directions, does every nudge change the patch. A corner is localizable in both dimensions, and that is the whole reason this chapter hunts for corners rather than edges.
+</p>
+<p>
+The edge case has a classical name: the <strong>aperture problem</strong>. Seen through a small aperture, a moving edge appears to move only perpendicular to itself; its motion along its own direction is invisible. The same ambiguity that ruins edge matching here will return in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a> as the central obstacle of optical flow, and the detectors built in this section are exactly the points where optical flow is well posed. Figure 10.1.1 makes the three-way distinction visual.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three image patches: flat region where shifts change nothing, edge where only perpendicular shifts change the patch, corner where every shift changes the patch">
+  <!-- Flat panel -->
+  <text x="140" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Flat</text>
+  <rect x="65" y="45" width="150" height="150" fill="#d6dbdf" stroke="#90a4ae"/>
+  <rect x="115" y="95" width="50" height="50" fill="none" stroke="#e74c3c" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <g stroke="#5a626c" stroke-width="1.6">
+    <line x1="140" y1="120" x2="140" y2="100"/><line x1="140" y1="120" x2="140" y2="140"/>
+    <line x1="140" y1="120" x2="120" y2="120"/><line x1="140" y1="120" x2="160" y2="120"/>
+  </g>
+  <text x="140" y="222" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">every shift looks the same:</text>
+  <text x="140" y="240" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">unmatchable</text>
+
+  <!-- Edge panel -->
+  <text x="390" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Edge</text>
+  <rect x="315" y="45" width="75" height="150" fill="#aab7c4" stroke="#90a4ae"/>
+  <rect x="390" y="45" width="75" height="150" fill="#eaf2f8" stroke="#90a4ae"/>
+  <rect x="365" y="95" width="50" height="50" fill="none" stroke="#e74c3c" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <g stroke="#27ae60" stroke-width="2.4">
+    <line x1="390" y1="120" x2="362" y2="120"/><line x1="390" y1="120" x2="418" y2="120"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="1.6" stroke-dasharray="3,3">
+    <line x1="390" y1="120" x2="390" y2="96"/><line x1="390" y1="120" x2="390" y2="144"/>
+  </g>
+  <text x="390" y="222" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">change across, sameness along:</text>
+  <text x="390" y="240" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">localizable in one direction only</text>
+
+  <!-- Corner panel -->
+  <text x="640" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Corner</text>
+  <rect x="565" y="45" width="150" height="150" fill="#eaf2f8" stroke="#90a4ae"/>
+  <path d="M 565 45 L 640 45 L 640 120 L 565 120 Z" fill="#aab7c4"/>
+  <rect x="615" y="95" width="50" height="50" fill="none" stroke="#e74c3c" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <g stroke="#27ae60" stroke-width="2.4">
+    <line x1="640" y1="120" x2="640" y2="96"/><line x1="640" y1="120" x2="640" y2="144"/>
+    <line x1="640" y1="120" x2="616" y2="120"/><line x1="640" y1="120" x2="664" y2="120"/>
+  </g>
+  <text x="640" y="222" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">every shift changes the patch:</text>
+  <text x="640" y="240" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">localizable in both directions</text>
+</svg>
+<figcaption><strong>Figure 10.1.1</strong> The three answers to "does shifting the window change the patch?". Flat regions change under no shift, edges change only perpendicular to themselves (the aperture problem), and corners change under every shift, which is what makes them findable again in a second image.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Detect Where Matching Is Well Posed</div>
+<p>Corner detection is not about corners as a shape; it is about selecting the pixels where the correspondence problem has a unique answer. A detector is judged by <em>repeatability</em>: photographed again from a new viewpoint, under new lighting, does it fire at the same physical points? Repeatability, not visual salience, is the metric every detector in this chapter is engineered for.</p>
+</div>
+
+<h2>2. The Structure Tensor: Measuring Change in All Directions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To turn the sliding-window thought experiment into an algorithm, write it down. Let $I(x, y)$ be a grayscale image and consider shifting a window $W$ by a small offset $(u, v)$. The summed squared difference between the original and shifted patch is
+</p>
+<p>
+$$ E(u, v) \;=\; \sum_{(x,y) \in W} w(x, y)\, \big[ I(x+u,\, y+v) - I(x, y) \big]^2, $$
+</p>
+<p>
+where $w$ is a weighting window (Gaussian in practice, so that pixels near the center count more). For small shifts, the first-order Taylor expansion $I(x+u, y+v) \approx I + u\, I_x + v\, I_y$ replaces the image difference with the image gradients $I_x$ and $I_y$, the same quantities the Sobel operator of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> computes. Substituting and collecting terms gives a quadratic form
+</p>
+<p>
+$$ E(u, v) \;\approx\; \begin{bmatrix} u &amp; v \end{bmatrix} M \begin{bmatrix} u \\ v \end{bmatrix}, \qquad M \;=\; \sum_{(x,y) \in W} w(x,y) \begin{bmatrix} I_x^2 &amp; I_x I_y \\ I_x I_y &amp; I_y^2 \end{bmatrix}. $$
+</p>
+<p>
+The $2 \times 2$ matrix $M$ is the <strong>structure tensor</strong> (also called the second-moment matrix), and it compresses everything the window knows about local geometry into three numbers. Because $M$ is symmetric, it has two non-negative eigenvalues $\lambda_1 \geq \lambda_2$ with orthogonal eigenvectors, and the quadratic form means exactly this: shifting the window by one pixel along the first eigenvector changes the patch by $\lambda_1$; along the second, by $\lambda_2$. The eigenvalues are the answers to the sliding-window question, measured in the two most informative directions.
+</p>
+<p>
+The classification follows immediately, and Figure 10.1.2 draws it. If both eigenvalues are small, no shift changes anything: flat. If one is large and the other small, the patch changes only across one direction: edge. If both are large, every shift changes the patch: corner. Note the pleasant continuity with <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>: an edge detector looks for one large gradient direction; a corner detector demands two.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The eigenvalue plane of the structure tensor: flat region near the origin, edge regions along each axis, corner region where both eigenvalues are large">
+  <!-- axes -->
+  <line x1="120" y1="280" x2="700" y2="280" stroke="#2c3e50" stroke-width="2"/>
+  <line x1="120" y1="280" x2="120" y2="30" stroke="#2c3e50" stroke-width="2"/>
+  <polygon points="700,280 688,274 688,286" fill="#2c3e50"/>
+  <polygon points="120,30 114,42 126,42" fill="#2c3e50"/>
+  <text x="690" y="308" font-family="sans-serif" font-size="15" fill="#2c3e50" font-style="italic">&#955;&#8321;</text>
+  <text x="92" y="42" font-family="sans-serif" font-size="15" fill="#2c3e50" font-style="italic">&#955;&#8322;</text>
+  <!-- flat region -->
+  <rect x="120" y="200" width="170" height="80" fill="#d6dbdf" opacity="0.75"/>
+  <text x="205" y="245" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">FLAT</text>
+  <text x="205" y="264" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">&#955;&#8321;, &#955;&#8322; both small</text>
+  <!-- edge region along lambda1 axis -->
+  <rect x="290" y="200" width="380" height="80" fill="#f5b7b1" opacity="0.7"/>
+  <text x="480" y="245" font-family="sans-serif" font-size="14" font-weight="bold" fill="#922b21" text-anchor="middle">EDGE</text>
+  <text x="480" y="264" font-family="sans-serif" font-size="12" fill="#7b241c" text-anchor="middle">&#955;&#8321; &#8811; &#955;&#8322;</text>
+  <!-- edge region along lambda2 axis -->
+  <rect x="120" y="40" width="170" height="160" fill="#f5b7b1" opacity="0.7"/>
+  <text x="205" y="115" font-family="sans-serif" font-size="14" font-weight="bold" fill="#922b21" text-anchor="middle">EDGE</text>
+  <text x="205" y="134" font-family="sans-serif" font-size="12" fill="#7b241c" text-anchor="middle">&#955;&#8322; &#8811; &#955;&#8321;</text>
+  <!-- corner region -->
+  <rect x="290" y="40" width="380" height="160" fill="#a9dfbf" opacity="0.8"/>
+  <text x="480" y="110" font-family="sans-serif" font-size="16" font-weight="bold" fill="#145a32" text-anchor="middle">CORNER</text>
+  <text x="480" y="132" font-family="sans-serif" font-size="12" fill="#1e8449" text-anchor="middle">&#955;&#8321; and &#955;&#8322; both large</text>
+  <!-- iso-response curve of Harris -->
+  <path d="M 330 280 C 340 180, 380 90, 670 62" fill="none" stroke="#4527a0" stroke-width="2.2" stroke-dasharray="7,4"/>
+  <text x="555" y="56" font-family="sans-serif" font-size="12" fill="#4527a0">Harris iso-response R = const</text>
+  <!-- Shi-Tomasi threshold -->
+  <line x1="290" y1="200" x2="670" y2="200" stroke="#0d6e63" stroke-width="2.2" stroke-dasharray="2,4"/>
+  <line x1="290" y1="200" x2="290" y2="40" stroke="#0d6e63" stroke-width="2.2" stroke-dasharray="2,4"/>
+  <text x="585" y="192" font-family="sans-serif" font-size="12" fill="#0d6e63">Shi-Tomasi: min(&#955;&#8321;, &#955;&#8322;) &gt; t</text>
+</svg>
+<figcaption><strong>Figure 10.1.2</strong> The eigenvalue plane of the structure tensor. Near the origin both eigenvalues are small (flat); along either axis one dominates (edge); the upper-right quadrant, where both are large, is corner territory. The dashed purple curve is a contour of the Harris response; the dashed teal lines show Shi-Tomasi's simpler rule, a hard threshold on the smaller eigenvalue.</figcaption>
+</figure>
+
+<h2>3. The Harris Response <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+In 1988, eigenvalue decompositions were expensive, and Harris and Stephens wanted a corner score for every pixel of every frame. Their trick: you do not need the eigenvalues themselves, only a function that is large when both are large. The determinant and trace of $M$ deliver them indirectly, since $\det M = \lambda_1 \lambda_2$ and $\operatorname{tr} M = \lambda_1 + \lambda_2$, both computable directly from the tensor entries. The <strong>Harris response</strong> is
+</p>
+<p>
+$$ R \;=\; \det M - k\,(\operatorname{tr} M)^2 \;=\; \lambda_1 \lambda_2 - k\,(\lambda_1 + \lambda_2)^2, $$
+</p>
+<p>
+with $k$ an empirical constant, conventionally between 0.04 and 0.06. Work through the three cases: both eigenvalues small gives $R \approx 0$; one large eigenvalue makes the trace term dominate, driving $R$ negative; two large eigenvalues make the determinant win, $R$ large and positive. One formula, three regimes, no eigendecomposition. The purple contour in Figure 10.1.2 shows the resulting decision boundary curving through the eigenvalue plane.
+</p>
+<p>
+The full detector is the response map plus two cleanup steps: threshold $R$ to keep only confident corners, and apply <strong>non-maximum suppression</strong> so that each corner contributes one detection rather than a blob of high-response pixels (the same hygiene Canny applied to edges in <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>). The implementation below builds all of it from operations you already own from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>: two Sobel passes, three Gaussian blurs, and pixelwise arithmetic.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def harris_response(gray: np.ndarray, k: float = 0.05,
+                    sigma: float = 1.5) -&gt; np.ndarray:
+    """Harris corner response for every pixel, from first principles."""
+    g = gray.astype(np.float32) / 255.0
+    Ix = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)    # horizontal gradient
+    Iy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)    # vertical gradient
+    # Structure-tensor entries: products of gradients, Gaussian-windowed
+    Sxx = cv2.GaussianBlur(Ix * Ix, (0, 0), sigma)
+    Syy = cv2.GaussianBlur(Iy * Iy, (0, 0), sigma)
+    Sxy = cv2.GaussianBlur(Ix * Iy, (0, 0), sigma)
+    det = Sxx * Syy - Sxy * Sxy                      # lambda1 * lambda2
+    trace = Sxx + Syy                                # lambda1 + lambda2
+    return det - k * trace * trace
+
+img = cv2.imread("building.jpg", cv2.IMREAD_GRAYSCALE)
+R = harris_response(img)
+
+# Keep strong responses that are also the maximum of their 7x7 neighborhood
+threshold = 0.01 * R.max()
+is_local_max = (R == cv2.dilate(R, np.ones((7, 7), np.uint8)))
+ys, xs = np.where((R &gt; threshold) &amp; is_local_max)
+print(f"{len(xs)} corners")        # typical photo of a building: ~400 corners</code></pre>
+<div class="code-caption">A complete Harris detector in about fifteen lines: Sobel gradients, Gaussian-windowed tensor entries, the determinant-minus-trace response, and dilation-based non-maximum suppression that keeps only pixels equal to their own neighborhood maximum.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.cornerHarris and cv2.cornerSubPix</div>
+<p>The fifteen-line detector above is one call in OpenCV: <code>R = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.05)</code>, roughly a 15-to-1 reduction. Internally the library fuses the gradient, windowing, and response arithmetic into a single cache-friendly pass and handles border replication for you. Production pipelines usually add <code>cv2.cornerSubPix</code>, which refines each integer corner to sub-pixel precision by fitting the local gradient field, a refinement camera calibration in <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> will treat as mandatory rather than optional.</p>
+</div>
+
+<h2>4. Shi-Tomasi: A Better Score for Trackers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Six years after Harris, Shi and Tomasi revisited the response formula while building a feature <em>tracker</em> and proposed something simpler: score each pixel by the smaller eigenvalue alone,
+</p>
+<p>
+$$ R_{\text{ST}} \;=\; \min(\lambda_1, \lambda_2). $$
+</p>
+<p>
+The reasoning is beautifully task-driven. A tracker's failure mode is drift along the direction of least information, and that direction's information content is exactly $\lambda_2$. If the worst direction is still strong, the point is trackable; the strength of the best direction is irrelevant once the worst one passes the bar. Geometrically (Figure 10.1.2 again, the teal lines) the acceptance region becomes a clean quadrant: $\min(\lambda_1, \lambda_2) > t$. On modern hardware the eigenvalues of a symmetric $2\times2$ matrix cost a square root, so the historical motivation for avoiding them is gone, and Shi-Tomasi is the default corner scorer in OpenCV's aptly named function:
+</p>
+
+<pre><code class="language-python">corners = cv2.goodFeaturesToTrack(
+    img,                  # 8-bit grayscale input
+    maxCorners=500,       # cap on detections, strongest first
+    qualityLevel=0.01,    # accept corners above 1% of the best score
+    minDistance=10,       # spatial spread: no two corners closer than this
+    blockSize=3)          # structure-tensor window size
+print(corners.shape)      # (500, 1, 2): float32 (x, y), ready for tracking</code></pre>
+<div class="code-caption">Shi-Tomasi detection via <code>cv2.goodFeaturesToTrack</code>: the <code>qualityLevel</code> threshold is relative to the strongest corner found, and <code>minDistance</code> enforces spatial spread so detections do not cluster on the most textured object in the scene.</div>
+
+<p>
+The <code>minDistance</code> parameter deserves a comment because it encodes a lesson detectors keep re-learning: raw response strength concentrates wherever texture is strongest, but downstream geometry wants coverage. Estimating a homography from 500 corners on one bush and zero on the rest of the frame is numerically legal and practically useless. Spreading detections, whether by minimum distance, per-tile quotas, or adaptive suppression, is standard practice in every serious pipeline, including the SLAM systems of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The Shi-Tomasi paper is titled "Good Features to Track," which makes it one of the few publications in computer vision whose title is also its API documentation. OpenCV adopted the name verbatim, so thirty years of students have typed a 1994 paper title into their editors, mostly without knowing it.</p>
+</div>
+
+<h2>5. FAST: Corners at Video Rate <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Harris and Shi-Tomasi compute gradients, products, and blurs for every pixel: a few dozen floating-point operations each. That is nothing for one photograph and a budget-breaker for a robot processing 60 frames per second on an embedded CPU while also doing everything else. FAST (Features from Accelerated Segment Test, Rosten and Drummond, 2006) attacks the cost with a different philosophy: do not measure cornerness, just test for it, as cheaply as possible.
+</p>
+<p>
+The <strong>segment test</strong> examines a Bresenham circle of 16 pixels at radius 3 around a candidate pixel $p$ with intensity $I_p$. The candidate is a corner if at least $n$ <em>contiguous</em> pixels on the circle are all brighter than $I_p + t$ or all darker than $I_p - t$, for a threshold $t$. The standard choice is $n = 9$ (FAST-9), which empirically beats the original $n = 12$ on repeatability. The intuition maps back to Figure 10.1.1: a flat region has no such run, an edge has two runs of about half the circle that are interrupted, and a corner has one long unbroken run of "different" on the outside of the corner.
+</p>
+<p>
+Two engineering moves make FAST genuinely fast. First, a quick-reject: examine the four compass pixels (top, right, bottom, left); if fewer than three of them are sufficiently brighter or darker, no run of 9 can exist, and most of the image exits after four comparisons. Second, Rosten and Drummond trained a decision tree (classic ID3, on labeled corner data) that orders the remaining pixel tests to maximize information gain, then compiled the tree to branchy code. The detector that results performs a handful of byte comparisons per pixel, no multiplications at all, and runs comfortably at video rate on a microcontroller. The price: FAST returns no cornerness measure of its own, so for non-maximum suppression a score $V$ (the largest $t$ for which the pixel remains a corner) is computed for accepted candidates only.
+</p>
+
+<pre><code class="language-python">fast = cv2.FastFeatureDetector_create(
+    threshold=25,             # intensity margin t for the segment test
+    nonmaxSuppression=True,
+    type=cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)   # FAST-9 on a 16-pixel circle
+kps = fast.detect(img, None)
+print(f"with NMS: {len(kps)} keypoints")
+
+fast.setNonmaxSuppression(False)
+print(f"without NMS: {len(fast.detect(img, None))} keypoints")
+# with NMS: 1247 keypoints
+# without NMS: 4108 keypoints   (clumps of adjacent detections)</code></pre>
+<div class="code-caption">FAST detection with and without non-maximum suppression: disabling NMS roughly triples the count because every true corner fires a clump of adjacent detections, which is why NMS stays on in practice.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robot's 4-Millisecond Budget</div>
+<p><strong>Who:</strong> A three-engineer perception team at a warehouse-automation startup, running visual odometry on autonomous tugger robots.</p>
+<p><strong>Situation:</strong> Each robot navigated by tracking features across a downward-tilted camera at 60 fps on a fanless ARM board shared with planning and safety processes. The perception slice of the frame budget was 8 ms, of which detection was allowed 4.</p>
+<p><strong>Problem:</strong> The prototype used Shi-Tomasi detection at 11 ms per frame on that CPU. It produced beautiful, well-spread corners and missed every deadline. Frames were dropped, odometry drifted, and the robots developed a reputation for gentle but unnerving wall encounters.</p>
+<p><strong>Decision:</strong> Switch detection to FAST-9 with a fixed threshold, then recover the two Shi-Tomasi properties they actually missed: spread, via a 8x6 grid with a per-cell cap of 12 keypoints; and stability, by keeping the per-corner FAST score and suppressing all but the strongest per cell.</p>
+<p><strong>Result:</strong> Detection time fell to 0.9 ms per frame, total tracking to 5.6 ms. Odometry drift per 100 meters improved by 22 percent, not because FAST corners were better, but because the system stopped dropping frames. The grid bucketing survived two full hardware generations.</p>
+<p><strong>Lesson:</strong> Detector quality is a systems property, not a per-keypoint property. A mediocre corner detected every frame beats an excellent corner detected when the CPU happens to be free.</p>
+</div>
+
+<h2>6. Choosing a Detector <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Three detectors, one decision. Table 10.1.1 condenses the trade-offs that the previous sections developed, and one column matters more than the others: none of these detectors survives a change of scale. A corner at one zoom level is a smooth curve at another; the structure tensor and the segment test both operate at a single, fixed neighborhood size. Fixing that is an idea important enough to get its own section, and <a href="section-10.2.html">Section 10.2</a> builds it.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 10.1.1:</strong> <em>The three corner detectors at a glance.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Detector</th><th scope="col">Score</th><th scope="col">Relative speed</th><th scope="col">Rotation invariant</th><th scope="col">Scale invariant</th><th scope="col">Typical role</th></tr>
+</thead>
+<tbody>
+<tr><td>Harris (1988)</td><td>$\det M - k(\operatorname{tr} M)^2$</td><td>1x (baseline)</td><td>Yes</td><td class="caution">No</td><td>Accurate corners, calibration targets</td></tr>
+<tr><td>Shi-Tomasi (1994)</td><td>$\min(\lambda_1, \lambda_2)$</td><td>~1x</td><td>Yes</td><td class="caution">No</td><td>Features for tracking (KLT)</td></tr>
+<tr><td>FAST-9 (2006)</td><td>segment test (binary)</td><td class="winner">20-40x</td><td>Yes (test is radial)</td><td class="caution">No</td><td>Real-time SLAM, basis of ORB</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+The table's speed column explains the field's revealed preference: when ORB (<a href="section-10.4.html">Section 10.4</a>) needed a detector to pair with its binary descriptor, it chose FAST and patched its weaknesses (adding a pyramid for scale, an intensity-centroid orientation, and a Harris score for ranking) rather than starting from Harris. Detector and descriptor choices are rarely independent.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Detectors That Learned the Job</div>
+<p>The structure tensor asks "does this window change under shift?"; modern research asks a network to learn what is detectable. SuperPoint (2018) made keypoint detection a self-supervised learning problem and remains the most-deployed learned detector. The 2024 to 2026 wave sharpens both ends of the trade-off this section mapped: XFeat (CVPR 2024) is a learned detector-descriptor explicitly engineered for the CPU-bound niche FAST and ORB occupy, running at hundreds of fps without a GPU; DeDoDe (3DV 2024) decouples detection from description and trains the detector directly on the objective that matters, 3D consistency across views of large reconstruction datasets; and ALIKED (2023) learns deformable, rotation-aware detection. Tellingly, every one of these systems still emits sparse, well-spread, sub-pixel-refined keypoints with non-maximum suppression: the output contract written by Harris in 1988 survived the replacement of everything inside it. The learned-representation story continues in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.1.1: Reading the Tensor <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following windows, state (without computing) the approximate eigenvalue pattern of the structure tensor ($\lambda_1$, $\lambda_2$ both small, one large, or both large) and the classification: (a) a window of pure sensor noise on a gray wall, (b) a vertical black-to-white step edge, (c) a 45-degree step edge, (d) the tip of a thin diagonal line two pixels wide, (e) a smooth circular blob much larger than the window. Then explain why case (a) is the dangerous one in practice and which parameter of the Harris pipeline defends against it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.1.2: Harris from Scratch, Verified <span class="exercise-type coding">Coding</span></div>
+<p>Implement the <code>harris_response</code> function from this section and compare it against <code>cv2.cornerHarris</code> on the same image: normalize both response maps to $[0, 1]$ and report the Pearson correlation and the overlap between their top-200 corners (a match is a pair within 2 pixels). Then sweep $k \in \{0.02, 0.04, 0.06, 0.10\}$ and report how the number of detections above a fixed relative threshold changes. Explain the direction of the change using the formula for $R$.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.1.3: Repeatability Under Rotation <span class="exercise-type analysis">Analysis</span></div>
+<p>Measure what this section claimed: detector repeatability. Rotate an image by 15-degree increments using the warping tools of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, run Shi-Tomasi and FAST on each rotation, map detections back through the inverse rotation, and count what fraction land within 2 pixels of an original detection. Plot repeatability versus angle for both detectors. Which one degrades at intermediate angles, and what about its sampling geometry explains this?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 10 Overview</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.2.html">Section 10.2: Scale &amp; Rotation Invariance: Scale Space &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

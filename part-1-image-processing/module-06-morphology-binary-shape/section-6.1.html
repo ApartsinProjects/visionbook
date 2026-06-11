@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.1: Binary Images, Neighborhoods &amp; Connectivity. Binary images as pixel sets, 4- and 8-neighborhoods, the digital Jordan curve paradox, grid distance metrics, and the library conventions that silently change your object counts." name="description"/>
+<title>Section 6.1: Binary Images, Neighborhoods &amp; Connectivity | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Binary Images, Neighborhoods &amp; Connectivity</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"People call me simple-minded. I prefer decisive. There are exactly two kinds of pixels in this world, and I have never once been unsure which kind I am."</p>
+<cite>A Strictly Binary Pixel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The moment an image becomes binary, it stops being a grid of measurements and becomes a set of pixels, and every question about objects (how many, how big, touching or separate) reduces to set membership plus one deceptively deep definition: which pixels count as neighbors.</strong> This section builds that foundation: binary images as sets, the 4- and 8-neighborhoods, the connectivity paradox that forces foreground and background to use <em>different</em> definitions, and the grid distances that the rest of the chapter, from structuring elements to distance transforms, is built on.</p>
+</div>
+
+<p>
+The previous chapter ended with a small triumph: the document scanner of <a href="../module-05-geometric-transformations/index.html">Chapter 5</a> rectified a photographed page and binarized it into crisp black text on white. The thresholding machinery of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> can do the same to a backlit machine part, a microscope slide, or a segmentation model's probability map. In every case we are left holding the same object: a binary image. Before we can clean it, count it, or measure it, we need vocabulary precise enough to survive contact with corner cases. That vocabulary, digital topology, is the business of this section, and it contains one of the best surprises in elementary computer vision: the obvious definition of "connected" is mathematically broken, and the fix is delightfully odd.
+</p>
+
+<h2>1. From Measurements to Sets <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A binary image assigns each pixel one of two values. Everything in this chapter flows from a change of perspective: instead of treating it as a function $I(x, y) \in \{0, 1\}$, treat it as a <em>set</em>. The <strong>foreground</strong> is the set of pixel coordinates where the image is on,
+</p>
+<p>
+$$ A \;=\; \{\, (x, y) \;:\; I(x, y) = 1 \,\}, $$
+</p>
+<p>
+and the <strong>background</strong> is its complement $A^c$. The payoff is that operations on objects become operations on sets: union, intersection, complement, and translation. When <a href="section-6.2.html">Section 6.2</a> defines erosion and dilation, the definitions will be one line of set notation each, and properties like duality will follow from set algebra rather than from staring at pixels.
+</p>
+<p>
+In code, two storage conventions coexist, and mixing them up is the most common beginner bug in this chapter. OpenCV represents binary images as <code>uint8</code> arrays holding 0 and 255 (so they display correctly and feed directly into its C++ kernels), while scikit-image and SciPy prefer boolean arrays of <code>False</code> and <code>True</code>. The second convention question is which side is foreground. The universal rule, inherited from morphology's origins in microscopy: <strong>foreground is white</strong> (nonzero), background is black. A scanned page violates this (ink is dark), so the standard first move is to threshold with inversion. The snippet below shows both conventions and the inversion, using Otsu's method from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> without re-introduction.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+page = cv2.imread("scanned_page.png", cv2.IMREAD_GRAYSCALE)
+
+# Ink is dark, so invert during thresholding: foreground must be white.
+_, mask = cv2.threshold(page, 0, 255,
+                        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+print(mask.dtype, mask.min(), mask.max())   # uint8 0 255  (OpenCV convention)
+
+mask_bool = mask &gt; 0                         # scikit-image / SciPy convention
+print(mask_bool.dtype)                       # bool
+
+# The set-theoretic view: foreground as coordinates.
+ys, xs = np.nonzero(mask_bool)
+print(f"|A| = {len(xs)} foreground pixels "
+      f"({100 * mask_bool.mean():.1f}% of the image)")
+# Representative output:
+# uint8 0 255
+# bool
+# |A| = 184302 foreground pixels (8.8% of the image)</code></pre>
+<div class="code-caption">Binarizing a scanned page with inverted Otsu thresholding and inspecting both storage conventions: OpenCV's 0/255 <code>uint8</code> and the boolean arrays preferred by scikit-image, plus the coordinate-set view that the chapter's mathematics is written in.</div>
+
+<p>
+One practical warning before moving on: a boolean array passed to an OpenCV function will usually raise an error or silently misbehave, and a 0/1 <code>uint8</code> array (rather than 0/255) will display as solid black in any viewer while still being a perfectly valid mask. When a morphology pipeline produces baffling results, the first check is always <code>dtype</code>, the value range, and which side is white.
+</p>
+
+<h2>2. Neighborhoods: Who Counts as Adjacent? <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Sets alone are not enough; objects are about pixels <em>sticking together</em>, and that requires deciding which pixels are neighbors. On a square grid there are two natural answers. The <strong>4-neighborhood</strong> $N_4(p)$ of a pixel $p = (x, y)$ contains the pixels that share an edge with it: $(x \pm 1, y)$ and $(x, y \pm 1)$. The <strong>8-neighborhood</strong> $N_8(p)$ adds the four diagonal pixels that share only a corner, the set sometimes written $N_D(p)$, so that $N_8(p) = N_4(p) \cup N_D(p)$. Figure 6.1.1 draws both.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two 3 by 3 pixel grids: the left shows the 4-neighborhood with edge-sharing pixels highlighted, the right shows the 8-neighborhood with all surrounding pixels highlighted including diagonals">
+  <text x="190" y="32" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">4-neighborhood N&#8324;(p): shared edges</text>
+  <g stroke="#2c3e50" stroke-width="1.5">
+    <rect x="70"  y="50"  width="80" height="80" fill="#ecf0f1"/>
+    <rect x="150" y="50"  width="80" height="80" fill="#aed6f1"/>
+    <rect x="230" y="50"  width="80" height="80" fill="#ecf0f1"/>
+    <rect x="70"  y="130" width="80" height="80" fill="#aed6f1"/>
+    <rect x="150" y="130" width="80" height="80" fill="#f5b041"/>
+    <rect x="230" y="130" width="80" height="80" fill="#aed6f1"/>
+    <rect x="70"  y="210" width="80" height="80" fill="#ecf0f1"/>
+    <rect x="150" y="210" width="80" height="80" fill="#aed6f1"/>
+    <rect x="230" y="210" width="80" height="80" fill="#ecf0f1"/>
+  </g>
+  <text x="190" y="178" font-family="sans-serif" font-size="18" font-weight="bold" fill="#7d3c00" text-anchor="middle">p</text>
+
+  <text x="570" y="32" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">8-neighborhood N&#8328;(p): edges + corners</text>
+  <g stroke="#2c3e50" stroke-width="1.5">
+    <rect x="450" y="50"  width="80" height="80" fill="#a9dfbf"/>
+    <rect x="530" y="50"  width="80" height="80" fill="#a9dfbf"/>
+    <rect x="610" y="50"  width="80" height="80" fill="#a9dfbf"/>
+    <rect x="450" y="130" width="80" height="80" fill="#a9dfbf"/>
+    <rect x="530" y="130" width="80" height="80" fill="#f5b041"/>
+    <rect x="610" y="130" width="80" height="80" fill="#a9dfbf"/>
+    <rect x="450" y="210" width="80" height="80" fill="#a9dfbf"/>
+    <rect x="530" y="210" width="80" height="80" fill="#a9dfbf"/>
+    <rect x="610" y="210" width="80" height="80" fill="#a9dfbf"/>
+  </g>
+  <text x="570" y="178" font-family="sans-serif" font-size="18" font-weight="bold" fill="#7d3c00" text-anchor="middle">p</text>
+</svg>
+<figcaption><strong>Figure 6.1.1</strong> The two standard pixel neighborhoods. Left: the 4-neighborhood contains only the pixels sharing an edge with $p$. Right: the 8-neighborhood adds the four diagonal pixels that touch $p$ only at a corner. Every connectivity, distance, and morphology decision in this chapter traces back to this choice.</figcaption>
+</figure>
+
+<p>
+From adjacency comes the central definition. A <strong>path</strong> from pixel $p$ to pixel $q$ within a set $S$ is a sequence of pixels $p = p_0, p_1, \ldots, p_n = q$, all belonging to $S$, where each consecutive pair is adjacent under the chosen neighborhood. Two pixels are <strong>connected</strong> in $S$ if such a path exists, and a <strong>connected component</strong> is a maximal subset of mutually connected pixels: an "object." Everything <a href="section-6.4.html">Section 6.4</a> does, labeling, counting, and measuring blobs, is the algorithmic realization of this definition. The choice of neighborhood is not cosmetic: a one-pixel-wide diagonal line is a single object under 8-connectivity and a scatter of $n$ isolated pixels under 4-connectivity, because consecutive diagonal pixels share corners but never edges.
+</p>
+
+<h2>3. The Digital Jordan Curve Paradox <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+So which neighborhood is correct? Here digital topology delivers its famous surprise. In the continuous plane, the Jordan curve theorem guarantees that any simple closed curve separates the plane into exactly two regions, an inside and an outside. A sensible digital geometry should preserve this. Neither uniform choice does.
+</p>
+<p>
+Consider a closed loop of foreground pixels arranged as a diamond, where each consecutive pair of loop pixels touches diagonally. Under 8-connectivity the loop is a perfectly good closed curve. But its background is also 8-connected, and a background path can slip <em>diagonally between</em> two diagonal loop pixels, crossing the curve without touching it. The inside leaks out: a closed curve that fails to enclose anything. Switch both to 4-connectivity and the opposite absurdity appears: the loop shatters into isolated fragments (no two diagonal pixels are 4-adjacent), yet those disconnected fragments still manage to separate the 4-connected background into an inside and an outside. A curve that is not connected separates the plane; a curve that is connected does not. Figure 6.1.2 shows the leak.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 9 by 9 pixel grid showing a diamond-shaped ring of foreground pixels with a background path leaking diagonally between two ring pixels from inside to outside">
+  <g stroke="#bdc3c7" stroke-width="1">
+    <rect x="40" y="20" width="320" height="320" fill="#fdfefe"/>
+    <line x1="75.5" y1="20" x2="75.5" y2="340"/><line x1="111" y1="20" x2="111" y2="340"/>
+    <line x1="146.5" y1="20" x2="146.5" y2="340"/><line x1="182" y1="20" x2="182" y2="340"/>
+    <line x1="217.5" y1="20" x2="217.5" y2="340"/><line x1="253" y1="20" x2="253" y2="340"/>
+    <line x1="288.5" y1="20" x2="288.5" y2="340"/><line x1="324" y1="20" x2="324" y2="340"/>
+    <line x1="40" y1="55.5" x2="360" y2="55.5"/><line x1="40" y1="91" x2="360" y2="91"/>
+    <line x1="40" y1="126.5" x2="360" y2="126.5"/><line x1="40" y1="162" x2="360" y2="162"/>
+    <line x1="40" y1="197.5" x2="360" y2="197.5"/><line x1="40" y1="233" x2="360" y2="233"/>
+    <line x1="40" y1="268.5" x2="360" y2="268.5"/><line x1="40" y1="304" x2="360" y2="304"/>
+  </g>
+  <!-- diamond ring |dx|+|dy| = 3 around center cell (col 4, row 4); cell size 35.5, origin 40,20 -->
+  <g fill="#34495e">
+    <rect x="182" y="55.5" width="35.5" height="35.5"/>
+    <rect x="146.5" y="91" width="35.5" height="35.5"/><rect x="217.5" y="91" width="35.5" height="35.5"/>
+    <rect x="111" y="126.5" width="35.5" height="35.5"/><rect x="253" y="126.5" width="35.5" height="35.5"/>
+    <rect x="75.5" y="162" width="35.5" height="35.5"/><rect x="288.5" y="162" width="35.5" height="35.5"/>
+    <rect x="111" y="197.5" width="35.5" height="35.5"/><rect x="253" y="197.5" width="35.5" height="35.5"/>
+    <rect x="146.5" y="233" width="35.5" height="35.5"/><rect x="217.5" y="233" width="35.5" height="35.5"/>
+    <rect x="182" y="268.5" width="35.5" height="35.5"/>
+  </g>
+  <!-- inside marker -->
+  <circle cx="199.75" cy="179.75" r="9" fill="#27ae60"/>
+  <text x="199.75" y="185" font-family="sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">in</text>
+  <!-- leak path: inside (col4,row4) -> (col3,row3 is ring? no, (3,3): |1|+|1|=2 inside) build: (4,4)->(3,3)? inside. Use (2,4)inside? |2|=2 in. (2,4)->(1,3) outside diagonal between ring (1,4) and (2,3) -->
+  <path d="M 199.75 179.75 L 164.25 179.75 L 128.75 144.25 L 93.25 108.75 L 57.75 73.25"
+        fill="none" stroke="#e74c3c" stroke-width="4" stroke-dasharray="8,5" stroke-linecap="round"/>
+  <circle cx="57.75" cy="73.25" r="9" fill="#e74c3c"/>
+  <text x="57.75" y="78" font-family="sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">out</text>
+  <!-- annotation panel -->
+  <text x="540" y="80"  font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">The leak</text>
+  <text x="540" y="110" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">Ring pixels touch only at corners,</text>
+  <text x="540" y="130" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">so an 8-connected background path</text>
+  <text x="540" y="150" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">(dashed red) slips diagonally</text>
+  <text x="540" y="170" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">between them: inside reaches outside.</text>
+  <text x="540" y="215" font-family="sans-serif" font-size="13" fill="#145a32" text-anchor="middle" font-weight="bold">Fix: foreground 8-connected,</text>
+  <text x="540" y="235" font-family="sans-serif" font-size="13" fill="#145a32" text-anchor="middle" font-weight="bold">background 4-connected.</text>
+  <text x="540" y="270" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">Then the ring is one closed curve</text>
+  <text x="540" y="290" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">and the inside is sealed.</text>
+</svg>
+<figcaption><strong>Figure 6.1.2</strong> The digital Jordan curve paradox. The dark diamond is a closed 8-connected curve, yet an 8-connected background path (dashed) escapes from the inside to the outside by passing diagonally between two ring pixels. Giving foreground and background <em>complementary</em> connectivities (8 and 4, or 4 and 8) restores the theorem.</figcaption>
+</figure>
+
+<p>
+The resolution, formalized by Azriel Rosenfeld in his founding papers on digital topology around 1970, is to treat foreground and background asymmetrically: if foreground objects use 8-connectivity, background must use 4-connectivity, and vice versa. With the complementary pair, every digital closed curve separates inside from outside exactly as Jordan promised. The convention used almost everywhere in practice, and the default in OpenCV's contour and component machinery, is <strong>8-connected foreground, 4-connected background</strong>, which matches human intuition that a diagonal pen stroke is one stroke.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Connectivity Is a Modeling Decision, Made Twice</div>
+<p>There is no single correct adjacency on a square grid; there is only a consistent <em>pair</em>. Choose 8-connectivity for foreground when thin diagonal structures (cracks, wires, pen strokes) must hold together, and accept that holes are then defined 4-connectedly. Every algorithm later in this chapter (labeling in <a href="section-6.4.html">Section 6.4</a>, hole counting, contour hierarchies in <a href="section-6.6.html">Section 6.6</a>) silently bakes in this pair, and two libraries with different defaults will report different object counts on the same mask.</p>
+</div>
+
+<p>
+The paradox is observable in eleven lines. The code below builds the diamond ring of Figure 6.1.2 and lets <code>cv2.connectedComponents</code> count objects under each connectivity, for the ring itself and for its background.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+yy, xx = np.mgrid[0:9, 0:9]
+ring = ((np.abs(xx - 4) + np.abs(yy - 4)) == 3).astype(np.uint8)  # diamond loop
+
+for conn in (8, 4):
+    n_fg, _ = cv2.connectedComponents(ring, connectivity=conn)
+    n_bg, _ = cv2.connectedComponents(1 - ring, connectivity=conn)
+    # retval includes label 0, so subtract 1 to count true components
+    print(f"connectivity={conn}: ring pieces = {n_fg - 1}, "
+          f"background regions = {n_bg - 1}")
+# Output:
+# connectivity=8: ring pieces = 1, background regions = 1   &lt;- inside leaks out!
+# connectivity=4: ring pieces = 12, background regions = 2  &lt;- curve in fragments</code></pre>
+<div class="code-caption">The Jordan paradox in executable form: under uniform 8-connectivity the closed ring fails to enclose its interior (one background region), while under uniform 4-connectivity the ring disintegrates into 12 fragments that somehow still separate inside from outside. Only the mixed convention behaves sanely.</div>
+
+<h2>4. Distances on the Grid <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Each neighborhood induces a notion of distance: the length of the shortest path between two pixels, stepping only between neighbors. Stepping through $N_4$ gives the <strong>city-block distance</strong> (count edge moves), stepping through $N_8$ gives the <strong>chessboard distance</strong> (diagonal moves cost the same as straight ones, exactly a chess king's move count), and the familiar <strong>Euclidean distance</strong> sits between them:
+</p>
+<p>
+$$ d_4(p, q) = |\Delta x| + |\Delta y|, \qquad
+   d_8(p, q) = \max(|\Delta x|, |\Delta y|), \qquad
+   d_E(p, q) = \sqrt{\Delta x^2 + \Delta y^2}, $$
+</p>
+<p>
+with the ordering $d_8 \le d_E \le d_4$ for every pair of pixels. The geometric fingerprint of each metric is its unit "disk," the set of pixels within distance $r$ of a center: a diamond for $d_4$, a square for $d_8$, and a discretized circle for $d_E$. Those three disks will reappear almost immediately: they are the cross, square, and ellipse structuring elements of <a href="section-6.2.html">Section 6.2</a>, and they are the level sets of the three distance-transform variants in <a href="section-6.5.html">Section 6.5</a>. A quick computation makes the gap between the metrics concrete:
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+p, q = np.array([0, 0]), np.array([5, 3])
+d = q - p
+print("city-block d4 =", np.abs(d).sum())          # 8
+print("chessboard d8 =", np.abs(d).max())          # 5
+print("euclidean  dE =", float(np.hypot(*d)))      # 5.830951894845301</code></pre>
+<div class="code-caption">The three grid metrics evaluated on the same pixel pair, illustrating the universal sandwich $d_8 \le d_E \le d_4$: chessboard undershoots true distance on diagonals, city-block overshoots, and Section 6.5's chamfer weights exist to split the difference cheaply.</div>
+
+<p>
+Why tolerate three metrics instead of just using Euclidean everywhere? Speed and exactness trade off. The path-based metrics $d_4$ and $d_8$ propagate across an image in two simple sweeps (the chamfer algorithm of <a href="section-6.5.html">Section 6.5</a>), while exact Euclidean distance requires cleverer machinery. For decisions like "is this blob within 3 pixels of that one," chessboard distance is usually accurate enough and dramatically cheaper, a trade-off with the same flavor as the separable-filter economics of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>.
+</p>
+
+<h2>5. Library Conventions: The Silent Disagreements <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The Python imaging stack assembled in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> contains three mature implementations of connected components, and they do not agree on defaults. <code>cv2.connectedComponents</code> defaults to 8-connectivity. <code>skimage.measure.label</code> also defaults to full connectivity (8 in 2D) but exposes it as <code>connectivity=2</code>, meaning "neighbors may differ in up to 2 coordinates." <code>scipy.ndimage.label</code> defaults to 4-connectivity via its cross-shaped structuring element. Run all three on the same diagonal-rich mask and you can get three different object counts, none of them a bug.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Three Labelers, One Line Each</div>
+<p>Identifying connected components from the path definition requires a hand-written flood fill or union-find pass, roughly 30 lines that <a href="section-6.4.html">Section 6.4</a> writes out for understanding. In production it is one line in any of the three libraries: <code>cv2.connectedComponents(mask, connectivity=8)</code>, <code>skimage.measure.label(mask, connectivity=2)</code>, or <code>scipy.ndimage.label(mask, structure=np.ones((3,3)))</code>. The libraries handle label compaction, cache-friendly memory traversal, and (in OpenCV's case) SIMD-parallel two-pass algorithms benchmarked in the YACCLAB suite. The only thing they cannot do is choose your connectivity for you: <strong>always pass it explicitly</strong>, precisely because the defaults disagree.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Shattered Bond Wires</div>
+<p><strong>Who:</strong> A two-person vision team at a semiconductor packaging plant, inspecting X-ray images of wire bonds inside chip packages.</p>
+<p><strong>Situation:</strong> Their pipeline thresholded each X-ray (using adaptive methods from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>), labeled the bright wire structures, and flagged any package whose wire count differed from the schematic. It had run reliably for a year on one product line.</p>
+<p><strong>Problem:</strong> On a new package layout, the system began rejecting nearly every unit, reporting 40 to 60 wires where the schematic said 14. The wires in the new layout ran at 45 degrees across the sensor grid, and a recent refactor had swapped the labeling call from OpenCV to <code>scipy.ndimage.label</code> with its default 4-connectivity. Each one-pixel-wide diagonal wire image shattered into dozens of single-pixel "wires."</p>
+<p><strong>Decision:</strong> Pass an explicit 8-connected structuring element (<code>np.ones((3, 3))</code>) to <code>scipy.ndimage.label</code>, and add a unit test: a synthetic diagonal line must always label as exactly one component, in every library the codebase touches.</p>
+<p><strong>Result:</strong> Counts returned to 14, the false-reject rate fell from 97 percent to under 0.5 percent, and the unit test later caught the same regression when a third library was introduced.</p>
+<p><strong>Lesson:</strong> Connectivity is an argument, not a constant of nature. Any pipeline that counts objects should pin it explicitly and test it on a diagonal line, the canonical input on which the two conventions diverge.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>An alternative fix for the Jordan paradox is to abandon the square grid entirely. On a hexagonal grid every neighbor shares an edge, there are no corner-only adjacencies, one connectivity works for foreground and background alike, and the paradox never arises. Hexagonal sensors and sampling schemes have been proposed regularly since the 1960s, and the human retina itself packs photoreceptors hexagonally. Square pixels won anyway, for the least topological reason imaginable: rectangular arrays were easier to manufacture and address.</p>
+</div>
+
+<h2>6. Where This Foundation Leads <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+It is worth pausing on how much is now in place. A binary image is a set; neighborhoods make it a graph; connectivity carves the graph into objects; distances measure the geometry of those objects. The next two sections add the missing ingredient, operators that <em>reshape</em> the sets: erosion and dilation in <a href="section-6.2.html">Section 6.2</a>, and their compositions in <a href="section-6.3.html">Section 6.3</a>. The definitions established here are not merely classical trivia, either. When the segmentation networks of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> output a probability per pixel, thresholding that map produces precisely the binary sets of this section, and the post-processing applied to them (hole filling, small-object removal, component counting) runs on the definitions fixed here. The watershed and graph-based methods of <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">Chapter 11</a> likewise inherit this section's adjacency graphs wholesale.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Teaching Networks About Connectivity</div>
+<p>Digital topology has moved from post-processing into the training loop. Standard per-pixel losses happily break a vessel or road into pieces if most pixels are classified correctly, so a wave of <em>topology-aware</em> losses now penalizes connectivity errors directly: clDice (Shit et al., CVPR 2021) matches skeletons between prediction and ground truth, Skeleton Recall Loss (Kirchhoff et al., ECCV 2024, arXiv:2404.03010) makes that practical at scale for thin tubular structures, and Efficient Betti Matching (Stucki et al., 2024, arXiv:2407.04683) optimizes the persistent-homology structure of the prediction so that the <em>number of components and holes</em>, the exact quantities defined in this section, matches the annotation. The 1970s definitions of Rosenfeld are now differentiable training signals for 2026 segmentation networks.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.1.1: The Minimal Paradox <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The smallest image exhibiting the connectivity paradox is the $2 \times 2$ checkerboard: foreground at the top-left and bottom-right pixels, background at the other two. Work through all four connectivity assignments (foreground/background each 4 or 8) and state, for each, how many foreground components and background components exist. Which assignments allow the two foreground pixels and the two background pixels to <em>both</em> form connected sets, and why is that geometrically absurd (think about the two "curves" crossing)?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.1.2: Percolation by Connectivity <span class="exercise-type coding">Coding</span></div>
+<p>Generate random binary images ($512 \times 512$) where each pixel is foreground independently with probability $p$, for $p$ from 0.30 to 0.70 in steps of 0.02. For each $p$, count foreground components under 4- and 8-connectivity (average over 10 trials) and plot both curves. You should see the component count peak and then collapse as blobs merge. At what $p$ does a single component first span the image edge to edge under each connectivity? (This threshold is the site-percolation threshold, near 0.5927 for 4-connectivity; observe how 8-connectivity shifts it.)</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.1.3: The Metric Sandwich <span class="exercise-type analysis">Analysis</span></div>
+<p>Prove the inequality chain $d_8(p,q) \le d_E(p,q) \le d_4(p,q) \le 2\, d_8(p,q)$ for all pixel pairs, and identify the displacement directions where each inequality becomes an equality. Then compute the worst-case relative error of $d_8$ as an estimate of $d_E$ (it occurs on the diagonal) and explain why <a href="section-6.5.html">Section 6.5</a>'s chamfer transform mixes edge steps of cost 3 with diagonal steps of cost 4 to shrink that error.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 6 Overview</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="section-6.2.html">Section 6.2: Erosion &amp; Dilation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -135,7 +135,7 @@ Part 4: Generative Vision Models (part-4-generative-vision-models/)
   Ch 33: Diffusion Models                           module-33-diffusion-models
   Ch 34: Text-to-Image Systems                      module-34-text-to-image
   Ch 35: Controllable Generation & Image Editing    module-35-controllable-generation-editing
-  Ch 36: Video, 3D & World Generation               module-36-video-3d-world-generation
+  Ch 36: Video, 3D Generation & World Models        module-36-video-3d-world-generation
   Ch 37: Evaluation, Safety & Generative Data Engines     module-37-evaluation-safety-data-engines
   Ch 38: Tools of the Trade: Generative Vision Stack      module-38-tools-of-the-trade
 ```
@@ -159,6 +159,19 @@ capstone in `capstone/`. See `toc.html` for the full plan.
 Two agents must never edit the same file at overlapping times. One chapter equals
 one file set; different chapters may proceed in parallel; agent waves within a
 chapter run strictly in sequence.
+
+## Course Alignment
+
+Part IV is the textbook companion to the HIT graduate course "Generative AI: From VAEs
+to World Models" (https://apartsin.github.io/hit_genai_grad/). Its 13-week arc maps onto
+the part as: weeks 1-4 -> Ch 30-31 (foundations, EBMs/score matching, VAEs incl.
+hierarchical/NVAE and posterior collapse), weeks 6-7 -> Ch 33 (DDPM, SDE view, samplers,
+guidance), week 9 -> Ch 33-34 (latent diffusion, DiT, flow matching, consistency models),
+weeks 10-12 -> Ch 36.5-36.8 (world models: RSSM/Dreamer, generative simulators such as
+GAIA-1 and interactive environments, JEPA-family predictive models, world-model
+evaluation). Course project weeks map to the capstone. The course's two open-access
+texts (Understanding Deep Learning; Probabilistic Machine Learning: Advanced Topics)
+belong in Part IV chapter bibliographies.
 
 ## The "Right Tool" Principle
 

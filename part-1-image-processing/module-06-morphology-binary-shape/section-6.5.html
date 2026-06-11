@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.5: Distance Transforms &amp; Skeletonization. How far is every pixel from the boundary: chamfer and exact Euclidean distance transforms, thickness measurement, watershed seeds for separating touching objects, and medial-axis skeletons." name="description"/>
+<title>Section 6.5: Distance Transforms &amp; Skeletonization | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Distance Transforms &amp; Skeletonization</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every pixel in this shape keeps asking me how far it is from the edge. I am the ridge where the answer stops growing. Some call it the medial axis. I call it the only place with a view of both coasts."</p>
+<cite>A Deeply Centered Medial Axis</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The distance transform answers one question for every pixel simultaneously, "how far is the nearest boundary?", and that single map converts hard geometric problems (where is a part thickest, where do touching objects meet, what is a shape's centerline) into cheap array operations: maxima, peaks, and ridges.</strong> This section builds the transform from scratch, reads measurements out of it, uses its peaks to split touching objects, and follows its ridge to the skeleton, the one-pixel summary of an elongated shape.</p>
+</div>
+
+<p>
+The previous section turned blobs into rows of measurements, but its properties were global per object: one area, one centroid, one eccentricity. Many industrial questions are local: is this weld seam at least 3 mm wide <em>everywhere</em>? Where exactly should the gripper pinch this part? Where do two touching tablets actually meet? All of these reduce to distances from boundaries, and computing them pixel by pixel against every boundary point would be ruinously quadratic. The distance transform computes them all in two sweeps. From it flows this section's second hero: the skeleton, which compresses an elongated object onto its centerline so that length and width become countable.
+</p>
+
+<h2>1. The Distance Transform, From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>distance transform</strong> of a foreground set $A$ assigns each foreground pixel its distance to the nearest background pixel:
+</p>
+<p>
+$$ \mathrm{DT}(p) \;=\; \min_{q \,\notin\, A} \; d(p, q), $$
+</p>
+<p>
+under one of the grid metrics from <a href="section-6.1.html">Section 6.1</a>: city-block, chessboard, or Euclidean. Background pixels get 0; values climb toward the interior like elevation rising away from a coastline. The classic <strong>chamfer algorithm</strong> computes an excellent Euclidean approximation in exactly two raster sweeps, by exploiting a simple fact: the distance at a pixel is at most the distance at a neighbor plus the cost of the step from it. Sweeping top-left to bottom-right propagates distances from above and the left; the mirrored return sweep finishes the job. Integer step costs of 3 (edge) and 4 (diagonal), divided by 3 at the end, approximate the true $1$ and $\sqrt{2} \approx 1.333\ldots \times 3/3$ remarkably well, resolving the metric sandwich of Section 6.1's Exercise 6.1.3:
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def chamfer_dt(mask):
+    """Two-pass (3,4)-chamfer distance transform of a boolean mask."""
+    INF = 10**9
+    h, w = mask.shape
+    d = np.where(mask, INF, 0).astype(np.int64)
+    for y in range(h):                       # forward sweep: causal neighbors
+        for x in range(w):
+            if d[y, x]:
+                if x:          d[y, x] = min(d[y, x], d[y, x-1] + 3)
+                if y:
+                    d[y, x] = min(d[y, x], d[y-1, x] + 3)
+                    if x:      d[y, x] = min(d[y, x], d[y-1, x-1] + 4)
+                    if x &lt; w-1: d[y, x] = min(d[y, x], d[y-1, x+1] + 4)
+    for y in range(h - 1, -1, -1):           # backward sweep: the mirror image
+        for x in range(w - 1, -1, -1):
+            if d[y, x]:
+                if x &lt; w-1:    d[y, x] = min(d[y, x], d[y, x+1] + 3)
+                if y &lt; h-1:
+                    d[y, x] = min(d[y, x], d[y+1, x] + 3)
+                    if x &lt; w-1: d[y, x] = min(d[y, x], d[y+1, x+1] + 4)
+                    if x:      d[y, x] = min(d[y, x], d[y+1, x-1] + 4)
+    return d / 3.0
+
+disk = (np.hypot(*np.mgrid[-50:51, -50:51]) &lt;= 40)
+print(f"chamfer max = {chamfer_dt(disk).max():.2f}  (true inradius 40)")
+# Output:
+# chamfer max = 40.33  (true inradius 40)</code></pre>
+<div class="code-caption">The (3,4)-chamfer transform in two raster sweeps: each pass relaxes every pixel against its already-finalized neighbors, and the integer costs 3 and 4 approximate the Euclidean 1 and $\sqrt 2$ to within about 6 percent worst case, recovering a 40-pixel disk's inradius as 40.33.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Exact Euclidean in One Line</div>
+<p>The 25-line chamfer above is an approximation and, in pure Python, a slow one. <code>scipy.ndimage.distance_transform_edt(mask)</code> returns the <em>exact</em> Euclidean transform in one line, using the Felzenszwalb-Huttenlocher style linear-time algorithm (a lower-envelope-of-parabolas construction run separably per dimension, the same separability dividend as Chapter 3's filters). It also accepts <code>sampling=</code> for anisotropic pixels (a CT slice whose voxels are 0.5 mm in-plane and 2 mm between slices) and returns nearest-boundary indices on request. OpenCV's <code>cv2.distanceTransform(mask, cv2.DIST_L2, 5)</code> is the speed-optimized chamfer equivalent, with <code>cv2.DIST_MASK_PRECISE</code> for the exact version.</p>
+</div>
+
+<h2>2. Reading the Map: Thickness, Inradius, Clearance <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A surprising number of measurements are single NumPy expressions on the distance map. The global maximum is the <strong>inradius</strong>, the radius of the largest inscribed disk, and its location is the deepest point of the object: the natural pick-point for a suction gripper and the most defensible "center" of a non-convex shape (the centroid of a crescent lies outside the crescent; the DT maximum never embarrasses you that way). Along a structure of roughly constant width, twice the DT value at the centerline is the local width. And running the transform on the <em>background</em> measures clearances: how close each free pixel is to the nearest obstacle, the standard costmap ingredient in robot path planning.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+mask = cv2.imread("gasket_mask.png", cv2.IMREAD_GRAYSCALE)
+dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+
+inradius = float(dist.max())
+cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
+print(f"largest inscribed disk: radius {inradius:.1f} px at ({cx},{cy})")
+print(f"minimum wall thickness: {2 * dist[dist &gt; 0].min():.1f} px")
+# Representative output:
+# largest inscribed disk: radius 47.3 px at (312,198)
+# minimum wall thickness: 2.0 px</code></pre>
+<div class="code-caption">Two production measurements as two expressions on a <code>cv2.distanceTransform</code> map of a gasket: the argmax locates the widest interior point for gripping, and the minimum positive distance (doubled) reports the thinnest wall, the number a quality spec actually cites.</div>
+
+<h2>3. Separating Touching Objects: Peaks as Seeds <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the distance transform's most celebrated trick. When two convex objects touch, their merged silhouette has one component but <em>two</em> interior summits in the distance map, one per object, separated by a saddle at the contact neck. Find the summits, and you have one seed per true object; grow the seeds back out (flooding downhill on the negated distance map) and the contact line falls exactly along the saddle. The growing step is the <strong>watershed</strong> algorithm, treated properly with the rest of classical segmentation in <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">Chapter 11</a>; here we use it as a black box, seeded by DT peaks. Figure 6.5.1 visualizes the elevation picture, and the code that follows is the standard recipe, worth keeping within arm's reach forever:
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: two overlapping disks shown as one merged blob with nested distance contours and two peak markers and a saddle at the neck. Right: the same blob after watershed separation with a cut line through the neck">
+  <text x="200" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Distance map of a merged pair</text>
+  <rect x="30" y="45" width="340" height="240" fill="#fdfefe" stroke="#bdc3c7"/>
+  <!-- merged blob: two overlapping circles, nested contours -->
+  <g fill="none" stroke-width="2">
+    <path d="M 138 95 a 70 70 0 1 0 0.1 0 Z" stroke="#aed6f1"/>
+    <path d="M 262 95 a 70 70 0 1 0 0.1 0 Z" stroke="#aed6f1"/>
+    <circle cx="138" cy="165" r="48" stroke="#5dade2"/>
+    <circle cx="262" cy="165" r="48" stroke="#5dade2"/>
+    <circle cx="138" cy="165" r="26" stroke="#2e86c1"/>
+    <circle cx="262" cy="165" r="26" stroke="#2e86c1"/>
+  </g>
+  <circle cx="138" cy="165" r="5" fill="#c0392b"/>
+  <circle cx="262" cy="165" r="5" fill="#c0392b"/>
+  <text x="138" y="150" font-family="sans-serif" font-size="11.5" fill="#c0392b" text-anchor="middle" font-weight="bold">peak 1</text>
+  <text x="262" y="150" font-family="sans-serif" font-size="11.5" fill="#c0392b" text-anchor="middle" font-weight="bold">peak 2</text>
+  <circle cx="200" cy="165" r="4" fill="#7d6608"/>
+  <text x="200" y="200" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">saddle at the neck</text>
+  <text x="200" y="305" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">one component, two summits</text>
+
+  <text x="580" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Watershed from the peaks</text>
+  <rect x="410" y="45" width="340" height="240" fill="#fdfefe" stroke="#bdc3c7"/>
+  <path d="M 580 100 A 70 70 0 1 0 580 230 L 580 100 Z" fill="#a9dfbf" transform="translate(-62 0)"/>
+  <path d="M 580 100 A 70 70 0 1 1 580 230 L 580 100 Z" fill="#f9e79f" transform="translate(62 0)"/>
+  <line x1="580" y1="98" x2="580" y2="232" stroke="#c0392b" stroke-width="3" stroke-dasharray="7,5"/>
+  <text x="518" y="170" font-family="sans-serif" font-size="13" fill="#145a32" text-anchor="middle" font-weight="bold">object 1</text>
+  <text x="642" y="170" font-family="sans-serif" font-size="13" fill="#7d6608" text-anchor="middle" font-weight="bold">object 2</text>
+  <text x="580" y="305" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">cut falls along the saddle line</text>
+</svg>
+<figcaption><strong>Figure 6.5.1</strong> Separation by elevation. Left: the distance map of two touching disks rises to a separate summit inside each disk (nested contours), with a saddle at the contact neck. Right: watershed flooding from the two summits assigns every pixel to its nearest summit's basin, and the resulting cut (dashed) traces the neck, splitting the merged component into the two true objects.</figcaption>
+</figure>
+
+<pre><code class="language-python">import numpy as np
+from scipy import ndimage as ndi
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
+
+# mask: bool array, touching tablets merged into single components
+dist = ndi.distance_transform_edt(mask)
+
+# One peak per tablet: enforce a minimum separation ~ tablet radius.
+coords = peak_local_max(dist, min_distance=18, labels=mask)
+seeds = np.zeros(dist.shape, dtype=bool)
+seeds[tuple(coords.T)] = True
+markers, n_seeds = ndi.label(seeds)
+
+labels = watershed(-dist, markers, mask=mask)     # flood downhill from seeds
+print(f"components before: {ndi.label(mask)[1]}   after: {labels.max()}")
+# Representative output on a tray of 24 tablets with 7 contacts:
+# components before: 17   after: 24</code></pre>
+<div class="code-caption">The canonical separation recipe: exact EDT, <code>peak_local_max</code> with a physically chosen <code>min_distance</code> to find one summit per object, <code>ndi.label</code> to number the seeds, and seeded <code>watershed</code> on the negated map; seventeen merged blobs become the correct twenty-four tablets.</div>
+
+<p>
+The recipe has one tuning parameter that matters, <code>min_distance</code>, and it should come from physics: just under the smallest expected object radius. Set it too low and a single elongated object yields two summits and gets cut in half; too high and genuinely separate small objects share a seed and stay merged. For objects far from convex, DT peaks stop being reliable seeds at all, which is the cue to graduate to the full marker strategies of <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">Chapter 11</a>.
+</p>
+
+<h2>4. Skeletons: The Shape, Minus Its Width <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Now follow the distance map's ridge. Harry Blum's <strong>medial axis</strong> (1967) is the set of interior points with <em>two or more</em> nearest boundary points, equivalently the centers of maximal inscribed disks, equivalently the ridge crest of the distance transform. Blum's metaphor is unimprovable: set fire to the entire boundary at once and let the flame front advance inward at uniform speed; the medial axis is where flame fronts meet. For an elongated object (wire, crack, vessel, road) the axis is a one-pixel-wide centerline that preserves the object's topology, and paired with the distance values along it, the axis carries the object's complete width profile: shape equals skeleton plus radius function, almost exactly.
+</p>
+<p>
+In practice two related operations coexist, and scikit-image ships both. <code>skimage.morphology.medial_axis(mask, return_distance=True)</code> computes the ridge definition and hands back the distance map with it. <code>skimage.morphology.skeletonize(mask)</code> instead runs morphological <strong>thinning</strong> (the Zhang-Suen style iterative peeling built from <a href="section-6.3.html">Section 6.3</a>'s hit-or-miss templates, removing boundary pixels whose deletion cannot break connectivity) and generally produces a smoother, less whiskery centerline. The whiskers deserve their warning label: the medial axis is exquisitely sensitive to boundary noise, since every small bump on the contour spawns a spur branch. A light opening before skeletonizing, or pruning of short branches after, is standard hygiene.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from skimage.morphology import medial_axis, skeletonize
+
+# crack_mask: bool mask of a crack traced on a concrete surface
+skel, dist = medial_axis(crack_mask, return_distance=True)
+skel2 = skeletonize(crack_mask)            # thinning variant: fewer spurs
+
+length_px = int(skel2.sum())               # centerline pixel count
+widths = 2.0 * dist[skel]                  # local width along the axis
+print(f"crack length ~ {length_px} px")
+print(f"width: mean {widths.mean():.1f} px, "
+      f"max {widths.max():.1f} px at the widest point")
+# Representative output:
+# crack length ~ 1841 px
+# width: mean 4.6 px, max 11.2 px at the widest point</code></pre>
+<div class="code-caption">Complete dimensioning of an elongated structure in five lines: <code>medial_axis</code> returns the centerline and the distance map together, so the crack's length is the skeleton's pixel count and its width profile is twice the distance values sampled along the ridge.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Map, Three Instruments</div>
+<p>The distance transform is computed once and read three ways: its <em>maximum</em> measures (inradius, thickness, clearance), its <em>peaks</em> seed the separation of touching objects, and its <em>ridge</em> is the skeleton that measures length and width. When a shape problem feels geometric and hard, the first question to ask is whether it becomes trivial on the distance map; the answer is yes unreasonably often.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Forty Bridges, One Drone, Two Numbers</div>
+<p><strong>Who:</strong> A structural-inspection startup contracted to survey concrete crack growth across 40 highway bridges twice a year.</p>
+<p><strong>Situation:</strong> Drones photograph the bridge undersides; a segmentation network from <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>, fine-tuned on crack imagery, outputs per-pixel crack masks. The civil engineers do not want masks; the inspection standard they certify against is written in terms of crack <em>length</em> and <em>maximum width</em> in millimeters, per crack.</p>
+<p><strong>Problem:</strong> Computing length and width from raw masks naively (bounding boxes, area divided by length guesses) misreported branched and curved cracks badly, and width by manual caliper clicks on images did not scale to 40 bridges.</p>
+<p><strong>Decision:</strong> Post-process every crack mask with this section's pipeline: light opening (per <a href="section-6.3.html">Section 6.3</a>) to de-fuzz the network's boundary, <code>medial_axis</code> with distances, branch-aware length summation along the skeleton graph, width as twice the 95th-percentile ridge distance, and millimeter conversion via the photogrammetric scale from the drone's pose (using the camera geometry of <a href="../module-05-geometric-transformations/index.html">Chapter 5</a>).</p>
+<p><strong>Result:</strong> Per-crack reports matched manual caliper measurements within 0.2 mm on the validation set; survey post-processing fell from three analyst-weeks to four hours of compute; and regulators accepted the method because every reported number traces to a definition (Blum's axis, the maximal-disk radius) with fifty years of literature behind it.</p>
+<p><strong>Lesson:</strong> Deep networks find the pixels; classical geometry turns pixels into certified engineering quantities. The handoff between them, mask to skeleton to numbers, is this section.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Skeletons and Distances Inside the Networks</div>
+<p>The objects of this section are now training signals and representations. Skeleton Recall Loss (Kirchhoff et al., ECCV 2024, arXiv:2404.03010) supervises segmentation networks with soft skeletons of the kind computed here, preserving the connectivity of vessels, roads, and cracks at a fraction of the cost of earlier differentiable-skeleton losses like clDice (CVPR 2021); it is precisely a bet that the medial axis captures what per-pixel losses miss. Distance maps have an even bigger second career: boundary-aware segmentation losses regress the signed distance transform instead of class labels, and in 3D the idea scales up to entire shape representations, the neural signed distance fields behind DeepSDF and its descendants that <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> develops. Meanwhile 3D skeletonization itself advances: Coverage Axis++ (Wang et al., 2024) selects medial spheres for point clouds and meshes, the maximal-disk definition of this section lifted to three dimensions.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Blum proposed the medial axis not for factories but for biology: he wanted a mathematical answer to "what makes two animal silhouettes the same shape?" and argued the grassfire skeleton was how brains might encode form. Psychophysics later gave him a measure of vindication: human observers asked to tap anywhere inside a shape on a touchscreen produce tap clouds that cluster along its medial axis, a result replicated repeatedly since the 2010s. You carry a distance-transform engine, and it runs at a glance.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.5.1: The Rectangle's Spine <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Derive, with a sketch and the maximal-disk definition, the exact medial axis of a $w \times h$ rectangle with $w &gt; h$: five line segments forming two Y-junctions. State the length of the central segment in terms of $w$ and $h$, what the axis degenerates to when $w = h$, and what happens to the axis when one corner of the rectangle is nicked by a single-pixel notch, explaining why that fragility forces the pruning hygiene this section recommends.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.5.2: The Separator, Stress-Tested <span class="exercise-type coding">Coding</span></div>
+<p>Synthesize masks of $n = 20$ disks (radius 20 px) with controllable overlap: place centers so each touching pair's center distance is $\alpha \cdot 40$ px for $\alpha \in \{1.0, 0.9, 0.8, 0.7, 0.6\}$. Run this section's peak-and-watershed recipe at each $\alpha$ and plot recovered count against $\alpha$. Find the $\alpha$ where separation collapses, inspect the distance map there, and explain the failure in terms of the saddle height approaching the summit height.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.5.3: Chamfer Error Audit <span class="exercise-type analysis">Analysis</span></div>
+<p>Compare this section's (3,4)-chamfer against <code>distance_transform_edt</code> on 100 random blob masks: report the maximum and mean relative error, and the boundary directions where the error concentrates. Then derive the worst-case relative error of the (3,4) weights analytically (consider a step direction of angle $\theta$ and minimize over integer step mixes), and check your formula against the measured maximum. Why do the popular weights use 3 and 4 rather than the more accurate 0.9581 and 1.3556?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.4.html">&#8592; Section 6.4: Connected Components &amp; Region Properties</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="section-6.6.html">Section 6.6: Contours, Moments &amp; Shape Descriptors &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

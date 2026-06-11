@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.4: Inpainting: Filling the Holes. Reconstructing missing image regions with diffusion PDEs and biharmonic smoothness, Telea fast marching, and exemplar-based texture copying, plus mask preparation and choosing a method by hole geometry." name="description"/>
+<title>Section 7.4: Inpainting: Filling the Holes | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Inpainting: Filling the Holes</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Nobody knows what was under the coffee stain, least of all me. But my brushstrokes never stop at the edge of it, so nobody ever asks."</p>
+<cite>An Overconfident Exemplar Patch</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Inpainting is restoration with zero data inside the hole: whatever appears there comes entirely from the prior, so the method's belief about images is not a correction term, it is the whole answer.</strong> Smoothness priors continue intensity into the hole, transport priors continue edges, and exemplar priors copy texture from elsewhere in the image. The craft is reading the hole, what structures it interrupts and how wide it is, and choosing the belief that can actually bridge it.</p>
+</div>
+<p>
+Denoising (<a href="section-7.2.html">Section 7.2</a>) had noisy data at every pixel; deconvolution (<a href="section-7.3.html">Section 7.3</a>) had blurred data at every pixel. Inpainting has <em>no</em> data where it matters: a scratch, a logo, a dust speck, a dead sensor column, or an ex-partner has replaced a region of the image outright. The term comes from art conservation, where restorers fill losses in a painting by extending the surrounding work into the gap, and the algorithmic versions follow the same ethic: the fill must be inferred from what survives, and the seams must not show.
+</p>
+<h2>1. Holes, Masks, and Honest Ground Rules <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Every inpainting algorithm consumes two inputs: the damaged image and a binary <strong>mask</strong> marking which pixels are missing (in OpenCV's convention, nonzero mask pixels are the hole). The algorithm never touches pixels outside the mask, which means the mask is a contract: anything damaged but unmasked will be treated as gospel truth and propagated <em>into</em> the fill. This makes mask preparation half the job. Masks come from thresholding when the damage has a distinctive color (the methods of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>), from manual annotation, or, later in the book, from segmentation models. Whatever the source, the standard finishing move is a morphological dilation from <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>: damage almost always bleeds a pixel or two beyond its visible core (JPEG halos around a logo, scattering around a scratch), and an under-mask poisons the fill with contaminated boundary values. Over-masking by two pixels costs almost nothing; under-masking by one ruins the result. Code 7.4.1 manufactures a test case so we can score every method against known truth.
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage import data
+from skimage.metrics import peak_signal_noise_ratio as psnr
+
+rng = np.random.default_rng(seed=7)
+clean = data.camera()                                   # uint8, 512x512
+
+# Synthesize scratch damage: random thin lines, then a fat blotch.
+mask = np.zeros_like(clean)
+for _ in range(12):
+    p1 = tuple(rng.integers(0, 512, 2))
+    p2 = tuple(rng.integers(0, 512, 2))
+    cv2.line(mask, p1, p2, color=255, thickness=2)
+cv2.circle(mask, (300, 180), 22, color=255, thickness=-1)
+
+# Dilate the mask so it overshoots the damage slightly (the safe direction).
+mask = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+
+damaged = clean.copy()
+damaged[mask &gt; 0] = 255                                 # burn the damage in
+print(f"damaged fraction: {(mask &gt; 0).mean():.1%}, "
+      f"PSNR of damaged image: {psnr(clean, damaged):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.1:</strong> Manufacturing ground-truth damage: twelve scratches and one blotch, burned to white, with the mask dilated by one ring of pixels. Because we kept the clean original, every fill in this section can be scored honestly.</div>
+<h2>2. Smoothness: Harmonic and Biharmonic Filling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The simplest belief about the missing region is that the image varies smoothly across it. Formally: find the fill that satisfies Laplace's equation $\nabla^2 I = 0$ inside the hole, with the surviving pixels on the boundary as fixed boundary conditions. The physical picture is a soap film or stretched membrane: clamp a rubber sheet to the intensity values around the hole's rim and let it relax; the relaxed surface is the fill. The numerical recipe is equally physical: repeatedly replace every hole pixel with the average of its four neighbors until nothing changes, which is exactly the heat-diffusion iteration, intensity leaking inward from the rim until equilibrium. Code 7.4.2 implements it in a dozen lines.
+</p>
+<pre><code class="language-python">def diffusion_inpaint(img, mask, n_iter=3000):
+    """Fill masked pixels by iterating Laplace's equation (Jacobi steps)."""
+    out = img.astype(np.float64)
+    hole = mask &gt; 0
+    out[hole] = out[~hole].mean()           # neutral initial guess
+    for _ in range(n_iter):
+        # four-neighbor average everywhere, applied only inside the hole
+        avg = (np.roll(out, 1, 0) + np.roll(out, -1, 0) +
+               np.roll(out, 1, 1) + np.roll(out, -1, 1)) / 4.0
+        out[hole] = avg[hole]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+filled_d = diffusion_inpaint(damaged, mask)
+print(f"diffusion inpaint PSNR: {psnr(clean, filled_d):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.2:</strong> Harmonic inpainting from scratch: clamp the rim, relax the interior. The iteration count scales with the squared width of the widest hole, since information diffuses inward roughly one pixel per step.</div>
+<p>
+On the thin scratches this works almost perfectly: a two-pixel gap in smooth content is bridged invisibly. On the 44-pixel blotch it fails in an instructive way. The membrane is maximally smooth, so the fill is a featureless gradient: no texture, no edges, a soft gray cloud where the wall's brick pattern should continue. Worse, an edge that hits the hole's rim stops dead, because Laplace's equation has no concept of "continue this line." The <em>biharmonic</em> upgrade ($\nabla^4 I = 0$, a stiff plate instead of a floppy membrane) matches boundary gradients as well as values, extending edges a little way into the hole before sagging, and is what scikit-image implements.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>skimage.restoration.inpaint_biharmonic</code> and <code>cv2.inpaint</code></div>
+<p>Both libraries reduce this section's algorithms to one call:</p>
+<pre><code class="language-python">from skimage.restoration import inpaint_biharmonic
+
+# Stiff-plate smoothness (best quality among smoothness priors, slowest)
+filled_b = inpaint_biharmonic(damaged, mask &gt; 0)
+
+# OpenCV: both classical fast methods, milliseconds each
+filled_ns = cv2.inpaint(damaged, mask, inpaintRadius=3, flags=cv2.INPAINT_NS)
+filled_te = cv2.inpaint(damaged, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.3:</strong> Three library inpainters: biharmonic smoothness, Navier-Stokes isophote transport, and Telea fast marching.</div>
+<p>The 12 lines of Code 7.4.2 (plus the hundreds you would need for biharmonic boundary handling) become 1 line per method. Internally the libraries solve the PDEs with proper sparse linear algebra rather than naive Jacobi sweeps, handle color channels jointly, and run orders of magnitude faster; <code>cv2.inpaint</code> processes a 512x512 image in a few milliseconds, fast enough for video.</p>
+</div>
+<h2>3. Continuing Structure: Isophotes and Fast Marching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The 2000 paper that imported the word "inpainting" into vision (Bertalmio, Sapiro, Caselles, and Ballester) fixed smoothness filling's blindness to edges. Their observation: what a human restorer continues into a gap is not intensity but <em>isophotes</em>, the level curves of constant brightness, which run perpendicular to the gradient, along the direction $\nabla^{\perp} I$. Their PDE transports boundary information into the hole along those curves, so an interrupted edge sails across the gap instead of stopping at the rim. The mathematics turned out to mirror fluid dynamics, with image intensity playing the role of a stream function, which is why OpenCV's implementation flag is <code>cv2.INPAINT_NS</code>, for Navier-Stokes.
+</p>
+<p>
+Telea's 2004 method, OpenCV's other flag, gets most of the same benefit with much simpler machinery. It fills the hole strictly from the rim inward, like rust eating into metal, processing pixels in order of their distance from the boundary (computed by the fast marching method, a cousin of the distance transforms in <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>). Each pixel is estimated as a weighted average of its already-known neighbors, with weights favoring neighbors whose direction aligns with the advancing front's normal and those closer by, so directional structure is respected without solving any PDE. Figure 7.4.1 lays the three classical strategies side by side; Code 7.4.4 races them on our test case.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three inpainting strategies side by side: smoothness diffusion from the rim, isophote and fast-marching transport continuing an edge, and exemplar patch copying from a source region">
+<style>
+.img7 { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.4; }
+.hole7 { fill: #ffffff; stroke: #dc2626; stroke-width: 2; stroke-dasharray: 6 4; }
+.ttl7 { font-family: Verdana, Arial, sans-serif; font-size: 13.5px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.sub7 { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #4b5563; text-anchor: middle; }
+.edge7 { stroke: #1f2937; stroke-width: 5; fill: none; }
+.edged7 { stroke: #1f2937; stroke-width: 5; fill: none; stroke-dasharray: 2 6; opacity: 0.55; }
+.front7 { fill: none; stroke: #2563eb; stroke-width: 1.6; stroke-dasharray: 5 4; }
+.darr7 { stroke: #2563eb; stroke-width: 1.8; fill: none; marker-end: url(#ab7); }
+.parr7 { stroke: #059669; stroke-width: 2; fill: none; marker-end: url(#ag7); }
+.srcp7 { fill: rgba(5, 150, 105, 0.15); stroke: #059669; stroke-width: 2; }
+.dstp7 { fill: none; stroke: #059669; stroke-width: 2; stroke-dasharray: 4 3; }
+</style>
+<defs>
+<marker id="ab7" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#2563eb"/></marker>
+<marker id="ag7" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#059669"/></marker>
+</defs>
+<!-- Panel 1: diffusion -->
+<text class="ttl7" x="160" y="26">1. Smoothness (diffusion)</text>
+<rect class="img7" x="40" y="44" width="240" height="200" rx="6"/>
+<circle class="hole7" cx="160" cy="144" r="58"/>
+<line class="darr7" x1="98" y1="144" x2="128" y2="144"/>
+<line class="darr7" x1="222" y1="144" x2="192" y2="144"/>
+<line class="darr7" x1="160" y1="82" x2="160" y2="112"/>
+<line class="darr7" x1="160" y1="206" x2="160" y2="176"/>
+<text class="sub7" x="160" y="276">intensity leaks inward from the rim;</text>
+<text class="sub7" x="160" y="292">result is smooth, edges stop dead</text>
+<!-- Panel 2: transport / fast marching -->
+<text class="ttl7" x="460" y="26">2. Transport (NS / Telea)</text>
+<rect class="img7" x="340" y="44" width="240" height="200" rx="6"/>
+<circle class="hole7" cx="460" cy="144" r="58"/>
+<circle class="front7" cx="460" cy="144" r="42"/>
+<circle class="front7" cx="460" cy="144" r="24"/>
+<path class="edge7" d="M 340 120 L 404 132"/>
+<path class="edged7" d="M 404 132 L 516 156"/>
+<path class="edge7" d="M 516 156 L 580 168"/>
+<text class="sub7" x="460" y="276">fill marches inward in distance order;</text>
+<text class="sub7" x="460" y="292">isophotes carry the edge across the gap</text>
+<!-- Panel 3: exemplar -->
+<text class="ttl7" x="760" y="26">3. Exemplar (copy texture)</text>
+<rect class="img7" x="640" y="44" width="240" height="200" rx="6"/>
+<circle class="hole7" cx="790" cy="120" r="46"/>
+<rect class="srcp7" x="668" y="186" width="38" height="38"/>
+<rect class="dstp7" x="756" y="96" width="38" height="38"/>
+<path class="parr7" d="M 706 196 C 750 180, 760 160, 768 134"/>
+<text class="sub7" x="760" y="276">best-matching patch is copied whole;</text>
+<text class="sub7" x="760" y="292">texture survives, structure goes first</text>
+</svg>
+<figcaption><strong>Figure 7.4.1:</strong> The three classical inpainting strategies on the same hole (red dashed). Diffusion (left) relaxes intensity inward and produces smooth fills. Transport methods (center) process pixels in fast-marching order (blue fronts) and continue interrupted isophotes, so the dark edge crosses the gap. Exemplar methods (right) copy whole patches from a source region elsewhere in the image, reproducing texture that the other two cannot invent.</figcaption>
+</figure>
+<pre><code class="language-python">candidates = {
+    'diffusion (scratch-built)': filled_d,
+    'biharmonic (skimage)':      (np.clip(filled_b * 255, 0, 255)
+                                  .astype(np.uint8)),
+    'navier-stokes (cv2)':       filled_ns,
+    'telea (cv2)':               filled_te,
+}
+for name, img in candidates.items():
+    print(f"{name:26s} PSNR = {psnr(clean, img):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.4:</strong> Scoring all four fills against the ground truth we kept in Code 7.4.1. Note that <code>inpaint_biharmonic</code> returns floats in [0, 1] and must be rescaled before comparison with the uint8 original.</div>
+<pre class="code-output">diffusion (scratch-built)  PSNR = 36.2 dB
+biharmonic (skimage)       PSNR = 37.0 dB
+navier-stokes (cv2)        PSNR = 36.6 dB
+telea (cv2)                PSNR = 36.8 dB
+</pre>
+<div class="code-caption"><strong>Output 7.4.4a:</strong> A typical run. The scores bunch tightly because 90 percent of our damage is thin scratches, which every method bridges well; the numbers are dominated by the easy pixels. Crop to the blotch and the ranking spreads: the smoothness methods leave a soft gray cloud, the transport methods a streaky but sharper patch. The metric, as the next callout argues, is asking the wrong question anyway.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Inpainting Is Judged by Plausibility, Not Fidelity</div>
+<p>For denoising, PSNR against ground truth is a fair score: there is one right answer and the method should approach it. For a large hole there are <em>many</em> right answers; nobody, including the metric, knows which bricks were behind the blotch. A fill can be pixel-wise far from the original yet perfectly convincing, and PSNR actively prefers the blurry "average of all plausible fills" over any single crisp one, the same blur-rewarding bias <a href="section-7.1.html">Section 7.1</a> warned about, now decisive. The honest evaluation for inpainting is: can an unwarned viewer find the hole? This shift, from fidelity to plausibility, is the conceptual hinge on which restoration swings toward generation, and it is why generative models eventually owned this problem. Carry the thought to <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>, where scoring plausibility becomes a discipline of its own.</p>
+</div>
+<h2>4. Copying Texture: Exemplar-Based Inpainting <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+PDE and marching methods share a fatal limitation: they synthesize the fill from boundary values, so they can only produce smooth or smoothly streaked content. A hole in a brick wall, a lawn, or a knit sweater needs <em>texture</em>, and the only place texture demonstrably matching this image exists is the image itself, the same self-similarity that powered non-local means in <a href="section-7.2.html">Section 7.2</a>. Exemplar-based inpainting therefore fills holes by copying whole patches from the intact region, as in the right panel of Figure 7.4.1.
+</p>
+<p>
+The landmark formulation (Criminisi, Perez, and Toyama, 2004) realized that copy <em>order</em> decides everything. Fill the easy flat areas first and interrupted edges get walled off, never to reconnect; the fill looks patched. Their algorithm scores every patch on the hole's rim with a priority $P(p) = C(p) \cdot D(p)$: a confidence term $C$ measuring how much already-known content the patch contains, and a data term $D$ that spikes where a strong isophote hits the boundary head-on. The product makes the algorithm extend structure first, exactly like the transport methods, then flood texture into the remaining areas. One iteration runs: pick the rim patch with the highest priority, search the known region for its best match (masked sum of squared differences over the known pixels only), copy the matching patch's pixels into the unknown ones, update confidences, repeat until the hole is gone. Structure propagates, then texture; large holes in textured scenes come out looking startlingly intact.
+</p>
+<p>
+We will not build Criminisi from scratch: a faithful implementation is a few hundred lines of boundary bookkeeping, and the algorithmic ideas are all stated above. What turned the approach from paper to product was <strong>PatchMatch</strong> (Barnes et al., 2009), a randomized algorithm that finds approximate nearest-neighbor patches orders of magnitude faster than exhaustive search by exploiting the coherence of natural images: good matches for neighboring patches are themselves neighbors. PatchMatch became the engine of Photoshop's Content-Aware Fill in 2010, which is the form in which a billion users met exemplar inpainting without learning its name.
+</p>
+<h2>5. Choosing by Hole Geometry <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+With three families in hand, selection becomes a matter of reading the hole: what does it interrupt, and how wide is it relative to the structures it cuts? Table 7.4.1 condenses the decision into the form it takes in practice.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 7.4.1:</strong> <em>Matching the inpainting method to the hole.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Hole</th><th scope="col">Typical source</th><th scope="col">Best classical method</th><th scope="col">Why</th></tr>
+</thead>
+<tbody>
+<tr><td>Thin lines (1-5 px)</td><td>scratches, wires, hairs, text overlays</td><td>Telea or Navier-Stokes</td><td>boundary information bridges the gap before it can drift</td></tr>
+<tr><td>Small blobs in smooth areas</td><td>dust, dead pixels, watermarks on sky</td><td>biharmonic</td><td>smoothness is the truth here, and gradients are matched</td></tr>
+<tr><td>Medium holes in texture</td><td>object removal in grass, fabric, brick</td><td>exemplar (Criminisi / PatchMatch)</td><td>only copying can manufacture believable texture</td></tr>
+<tr><td>Large holes crossing structures</td><td>removing a person, a car, a building</td><td>none of the above</td><td>requires semantic invention: the generative methods of <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a></td></tr>
+</tbody>
+</table>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Forty Thousand Negatives and One Summer</div>
+<p><strong>Who:</strong> The digitization lead at a regional newspaper archive.</p>
+<p><strong>Situation:</strong> Forty thousand press negatives from 1935 to 1980, being scanned for a public history portal. Decades of handling left fine scratches on nearly every frame, plus mold spots on a few thousand.</p>
+<p><strong>Problem:</strong> Manual retouching averaged eleven minutes per image; the grant budget covered a summer, not a decade. An intern's first automated attempt ran biharmonic inpainting with masks thresholded from the scans' infrared channel, and it erased scratches beautifully while leaving telltale soft smudges across faces and architectural detail, exactly where mold spots were wide.</p>
+<p><strong>Decision:</strong> Triage by mask geometry, computed with the shape statistics of <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>: masks under 4 pixels wide (98 percent of all damage) went to <code>cv2.inpaint</code> with the Telea flag, dilated by one pixel; wider mold spots were routed to an exemplar-based fill, and the few hundred frames where holes crossed faces went to the lone human retoucher.</p>
+<p><strong>Result:</strong> Throughput reached 9 seconds per frame on the automated path. Public-facing spot checks found no complaints about visible repairs; the human queue finished within the summer.</p>
+<p><strong>Lesson:</strong> Inpainting at scale is a routing problem. Classify each hole, send it to the cheapest method that can plausibly bridge it, and reserve humans (or, today, generative models) for the holes that interrupt meaning rather than texture.</p>
+</div>
+<h2>6. From Copying to Imagining <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Every method in this section is bounded by the same wall: the fill can only contain what the surviving image already shows. Smoothness methods extrapolate intensity, exemplar methods recombine existing patches, but none can reason that the missing region behind a removed person probably contained the continuation of a doorway, because "doorway" is not a concept any of them possess. Crossing that wall requires a model of what the world looks like, learned from millions of images rather than borrowed from one, and that is precisely the road the book travels: segmentation models in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> will generate the masks automatically, and the generative inpainters of <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a> will fill them with invented, semantically coherent content. When you get there, notice how much survives: masks still get dilated, fill order still matters (diffusion models fill coarse to fine), and the plausibility-over-fidelity principle of this section becomes the entire evaluation story.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Inpainting in the Generative Era</div>
+<p>The bridge from this section to modern practice has three spans. <strong>LaMa</strong> (Suvorov et al., WACV 2022) showed that fast Fourier convolutions, giving every layer the image-wide receptive field that exemplar search always had, let a feed-forward network fill very large holes; it remains a production workhorse because it is deterministic and cheap. <strong>RePaint</strong> (Lugmayr et al., CVPR 2022) demonstrated that an unmodified diffusion model can inpaint by repeatedly renoising and resampling the hole while clamping the known pixels, pure Bayesian conditioning with no retraining. The 2024 wave made diffusion inpainting controllable and product-grade: <strong>BrushNet</strong> (Ju et al., ECCV 2024) adds a dedicated branch that injects masked-image features into a frozen diffusion backbone, and <strong>PowerPaint</strong> (Zhuang et al., ECCV 2024) uses learnable task prompts so one model handles object removal, insertion, and outpainting. Commercial tools like Photoshop's Generative Fill put this in everyone's hands, which sharpened the forensic question this chapter keeps returning to: a Telea fill provably contains only local boundary information, while a generative fill contains a model's opinion, and the difference decides what counts as evidence.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most-viewed inpainting results in history are weather forecasts. The smooth, gap-free radar and satellite maps on the evening news are routinely inpainted: ground radar has cone-of-silence holes directly above each station and terrain shadows behind mountains, and the filling is done by methods directly descended from the diffusion and transport algorithms of this section, applied to precipitation fields instead of photographs. Millions of people see PDE inpainting every night and call it the weather.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.1: Read the Hole <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, choose a method from Table 7.4.1 and defend the choice in one sentence by naming what the hole interrupts: (a) removing timestamp text burned into the corner of dashcam footage; (b) erasing a power line crossing a sunset sky; (c) removing a parked car that occludes a hedge and part of a brick wall; (d) repairing a dead 1x512 sensor column in thousands of microscope images; (e) deleting a photobombing stranger standing in front of a crowded bookshelf.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.2: Criminisi-Lite <span class="exercise-type coding">Coding</span></div>
+<p>Implement a simplified exemplar inpainter: at each step, take the rim patch with the highest <em>confidence</em> (skip the data term), find its best match over a coarse grid of candidate source patches using masked SSD, and copy the unknown pixels. Run it on a 9x9-pixel-patch scale against a texture image (try <code>skimage.data.grass()</code>) with a 60x60 hole, and compare visually against <code>cv2.inpaint</code> with the Telea flag. Then add the data term $D(p) = |\nabla^{\perp} I \cdot n_p|$ and show one example where the fill order visibly changes the result.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.4.3: When the Metric Lies <span class="exercise-type analysis">Analysis</span></div>
+<p>Cut a 80x80 hole from a textured region of an image. Fill it with (a) biharmonic inpainting and (b) your exemplar inpainter from Exercise 7.4.2. Compute PSNR and SSIM for both against the original, then show both crops to three people and ask which repair they can spot. Report the (likely) disagreement between metric and humans, and explain it using the Key Insight callout: what exactly is PSNR averaging over, and why does that favor the blurry fill?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-7.3.html"><span class="nav-label">Section 7.3: Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="section-7.5.html"><span class="nav-label">Section 7.5: Classical Super-Resolution</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.4: Connected Components &amp; Region Properties. From pixels to objects: flood-fill and two-pass labeling algorithms, cv2.connectedComponentsWithStats, the regionprops measurement toolkit, and area filtering as a decision rule." name="description"/>
+<title>Section 6.4: Connected Components &amp; Region Properties | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Connected Components &amp; Region Properties</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"For years I was just foreground. Then one Tuesday a two-pass algorithm gave me a name, an area, a centroid, and a bounding box. I am component 17 now. I contain 4,212 pixels and my eccentricity is none of your business."</p>
+<cite>A Freshly Labeled Connected Component</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Connected-component labeling is the bridge between image processing and object reasoning: it converts a cleaned binary mask into a list of discrete things, and region properties convert each thing into a row of numbers, at which point vision problems become data problems.</strong> Everything before this section manipulated pixels; everything after it (counting, gating, classifying, the recognition pipelines of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>) manipulates objects. This section builds the bridge twice: once by hand to understand it, once with the library calls used in production.</p>
+</div>
+
+<p>
+The previous section delivered a clean mask: one connected blob per physical object, no speckle, no pinholes. The definitions are also already in place: <a href="section-6.1.html">Section 6.1</a> defined a connected component as a maximal set of mutually reachable pixels under a chosen adjacency. What remains is the algorithmic step of actually assigning every foreground pixel an integer identity (this pixel belongs to object 3), and then the measurement step of summarizing each identity into properties a decision rule can consume. Both steps are humble, and the second is arguably the most economically productive operation in this book: most deployed vision systems are, at bottom, <em>regionprops plus an if-statement</em>.
+</p>
+
+<h2>1. Labeling: Giving Pixels an Identity <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>labeling</strong> of a binary image is an integer image of the same size in which background pixels hold 0 and every foreground pixel holds the index of its component: all pixels of the first object hold 1, the second 2, and so on. Figure 6.4.1 shows the transformation on a small grid, together with the measurements that fall out of it almost for free.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A binary pixel grid with three blobs is transformed by labeling into the same grid with each blob colored and numbered 1, 2, 3, and a measurement table listing area and centroid per label">
+  <defs>
+    <marker id="arr64" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#5a626c"/>
+    </marker>
+  </defs>
+  <text x="150" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Binary mask</text>
+  <!-- 8x6 grid, cell 30, origin 30,45 -->
+  <g stroke="#d5d8dc" stroke-width="1" fill="none">
+    <rect x="30" y="45" width="240" height="180" fill="#fdfefe"/>
+    <path d="M60 45 V225 M90 45 V225 M120 45 V225 M150 45 V225 M180 45 V225 M210 45 V225 M240 45 V225"/>
+    <path d="M30 75 H270 M30 105 H270 M30 135 H270 M30 165 H270 M30 195 H270"/>
+  </g>
+  <g fill="#34495e">
+    <rect x="60" y="75" width="30" height="30"/><rect x="90" y="75" width="30" height="30"/>
+    <rect x="60" y="105" width="30" height="30"/><rect x="90" y="105" width="30" height="30"/>
+    <rect x="180" y="45" width="30" height="30"/><rect x="210" y="75" width="30" height="30"/>
+    <rect x="180" y="75" width="30" height="30"/>
+    <rect x="90" y="165" width="30" height="30"/><rect x="120" y="165" width="30" height="30"/>
+    <rect x="150" y="165" width="30" height="30"/><rect x="120" y="195" width="30" height="30"/>
+  </g>
+  <line x1="285" y1="135" x2="330" y2="135" stroke="#5a626c" stroke-width="2.5" marker-end="url(#arr64)"/>
+  <text x="307" y="122" font-family="sans-serif" font-size="12" fill="#b9770e" text-anchor="middle" font-weight="bold">label</text>
+
+  <text x="465" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Label image</text>
+  <g stroke="#d5d8dc" stroke-width="1" fill="none">
+    <rect x="345" y="45" width="240" height="180" fill="#fdfefe"/>
+    <path d="M375 45 V225 M405 45 V225 M435 45 V225 M465 45 V225 M495 45 V225 M525 45 V225 M555 45 V225"/>
+    <path d="M345 75 H585 M345 105 H585 M345 135 H585 M345 165 H585 M345 195 H585"/>
+  </g>
+  <g fill="#2e86c1">
+    <rect x="375" y="75" width="30" height="30"/><rect x="405" y="75" width="30" height="30"/>
+    <rect x="375" y="105" width="30" height="30"/><rect x="405" y="105" width="30" height="30"/>
+  </g>
+  <g fill="#27ae60">
+    <rect x="495" y="45" width="30" height="30"/><rect x="495" y="75" width="30" height="30"/>
+    <rect x="525" y="75" width="30" height="30"/>
+  </g>
+  <g fill="#e67e22">
+    <rect x="405" y="165" width="30" height="30"/><rect x="435" y="165" width="30" height="30"/>
+    <rect x="465" y="165" width="30" height="30"/><rect x="435" y="195" width="30" height="30"/>
+  </g>
+  <g font-family="sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">
+    <text x="405" y="100">1</text><text x="525" y="70">2</text><text x="450" y="185">3</text>
+  </g>
+
+  <!-- measurement table -->
+  <g font-family="sans-serif" font-size="12.5" fill="#2c3e50">
+    <text x="620" y="80"  font-weight="bold">label  area  centroid</text>
+    <text x="620" y="108" fill="#2e86c1">1      4     (2.5, 2.5)</text>
+    <text x="620" y="136" fill="#27ae60">2      3     (5.7, 1.7)</text>
+    <text x="620" y="164" fill="#e67e22">3      4     (3.5, 5.25)</text>
+    <text x="620" y="205" font-style="italic" fill="#5a626c">objects are now</text>
+    <text x="620" y="223" font-style="italic" fill="#5a626c">rows of numbers</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 6.4.1</strong> Labeling turns a binary mask (left) into a label image (center) where each connected component carries a distinct integer, here rendered as colors. From the label image, per-object measurements (right) such as area and centroid follow by simple accumulation, and the image has become a table.</figcaption>
+</figure>
+
+<p>
+The simplest correct algorithm is <strong>flood fill</strong>: scan for an unlabeled foreground pixel, assign it the next label, and propagate that label outward through neighbors (breadth-first or depth-first) until the component is exhausted; repeat. It visits each pixel a constant number of times, so it is linear in image size, and it makes the connectivity definition of <a href="section-6.1.html">Section 6.1</a> executable in a screenful of code:
+</p>
+
+<pre><code class="language-python">import numpy as np
+from collections import deque
+
+def label_floodfill(mask, connectivity=8):
+    """Connected-component labeling by BFS flood fill."""
+    offs = [(-1,0),(1,0),(0,-1),(0,1)]
+    if connectivity == 8:
+        offs += [(-1,-1),(-1,1),(1,-1),(1,1)]
+    h, w = mask.shape
+    labels = np.zeros((h, w), np.int32)
+    current = 0
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] and not labels[y, x]:
+                current += 1                      # found a new object
+                queue = deque([(y, x)])
+                labels[y, x] = current
+                while queue:                      # spread the label
+                    cy, cx = queue.popleft()
+                    for dy, dx in offs:
+                        ny, nx = cy + dy, cx + dx
+                        if (0 &lt;= ny &lt; h and 0 &lt;= nx &lt; w
+                                and mask[ny, nx] and not labels[ny, nx]):
+                            labels[ny, nx] = current
+                            queue.append((ny, nx))
+    return labels, current
+
+yy, xx = np.mgrid[0:9, 0:9]
+ring = ((np.abs(xx - 4) + np.abs(yy - 4)) == 3)
+print(label_floodfill(ring, 8)[1], label_floodfill(ring, 4)[1])
+# Output:
+# 1 12        (the Section 6.1 diamond: one object 8-connected, twelve 4-connected)</code></pre>
+<div class="code-caption">A complete flood-fill labeler in 25 lines, parameterized by connectivity and validated on Section 6.1's paradox diamond; readable and correct, but Python-loop slow, which is exactly the gap the library implementations close.</div>
+
+<p>
+Production labelers use a different classic, the <strong>two-pass algorithm</strong>: a single raster scan assigns provisional labels by looking only at already-visited neighbors (up and left), records an equivalence whenever two different provisional labels meet (a U-shaped object's two arms, discovered to be one object at the bottom of the U), and resolves all equivalences with a union-find structure before a second scan rewrites final labels. Two sequential, cache-friendly sweeps and a near-constant-time union-find make it extremely fast; the open YACCLAB benchmark tracks a whole zoo of refinements (block-based scanning, SIMD, GPU variants) that push hundreds of megapixels per second. You will never need to write one, but knowing the mechanism explains the otherwise mysterious phrase "label equivalence" in library documentation, and explains why labels come out in raster order.
+</p>
+
+<h2>2. The Production Call: connectedComponentsWithStats <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+OpenCV bundles labeling with the most common measurements in a single call, which is the workhorse of counting pipelines:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+mask = cv2.imread("cleaned_parts_mask.png", cv2.IMREAD_GRAYSCALE)
+
+n, labels, stats, centroids = cv2.connectedComponentsWithStats(
+    mask, connectivity=8)
+
+print(f"{n - 1} objects")               # label 0 is the background
+for i in range(1, n):
+    x, y, w, h, area = stats[i]         # bbox corner, bbox size, pixel count
+    cx, cy = centroids[i]
+    print(f"  #{i}: area={area:5d}  bbox=({x},{y},{w}x{h})  "
+          f"centroid=({cx:.1f},{cy:.1f})")
+# Representative output:
+# 4 objects
+#   #1: area= 8120  bbox=(64,40,112x99)   centroid=(119.6,89.2)
+#   #2: area= 7903  bbox=(241,38,109x101) centroid=(295.0,88.8)
+#   #3: area=  311  bbox=(402,71,25x31)   centroid=(414.1,86.0)
+#   #4: area= 8045  bbox=(78,210,110x100) centroid=(132.8,259.7)</code></pre>
+<div class="code-caption">One call, four return values: <code>cv2.connectedComponentsWithStats</code> yields the count, the label image, a per-label stats matrix (bounding box and area, indexed by the <code>cv2.CC_STAT_*</code> constants), and sub-pixel centroids; object #3's suspiciously small area marks it as a fragment, not a part.</div>
+
+<p>
+The stats matrix supports the single most useful post-cleanup operation: <strong>area filtering</strong>. Component #3 above is an order of magnitude smaller than its siblings, almost certainly debris that survived the opening of <a href="section-6.3.html">Section 6.3</a>. Rebuilding the mask while dropping every component outside an area band is three lines (<code>keep = np.isin(labels, good_ids)</code> after selecting <code>good_ids</code> from the stats column), and unlike a larger opening it removes the debris with zero distortion of the survivors. Area filtering and morphological cleanup are complements, not rivals: morphology fixes pixel-scale damage <em>within</em> objects, area filtering enforces object-scale sanity <em>between</em> them.
+</p>
+
+<h2>3. regionprops: The Measurement Toolkit <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+When a pipeline needs more than areas and boxes, scikit-image's <code>regionprops</code> is the standard instrument. It computes dozens of per-region properties lazily, and its sibling <code>regionprops_table</code> emits them as columnar data ready for pandas, which is the moment a vision problem officially becomes a data-science problem. The properties worth knowing by heart are summarized in Table 6.4.1.
+</p>
+
+<table>
+<caption><strong>Table 6.4.1</strong> The core <code>regionprops</code> measurements and what they are for.</caption>
+<thead>
+<tr><th scope="col">Property</th><th scope="col">What it measures</th><th scope="col">Typical decision it powers</th></tr>
+</thead>
+<tbody>
+<tr><td><code>area</code></td><td>Pixel count of the region</td><td>Size gating; part present/absent</td></tr>
+<tr><td><code>centroid</code></td><td>Mean pixel coordinate</td><td>Pick-point for a robot; position check</td></tr>
+<tr><td><code>bbox</code></td><td>Axis-aligned bounding box</td><td>Cropping; coarse size limits</td></tr>
+<tr><td><code>perimeter</code></td><td>Boundary length estimate</td><td>Compactness and roughness scores</td></tr>
+<tr><td><code>eccentricity</code></td><td>Elongation of the best-fit ellipse, 0 (circle) to 1 (line)</td><td>Round versus elongated part classes</td></tr>
+<tr><td><code>orientation</code></td><td>Angle of the ellipse's major axis</td><td>Grasp angle; alignment check</td></tr>
+<tr><td><code>solidity</code></td><td>area / convex hull area</td><td>Detecting bites, cracks, concavities</td></tr>
+<tr><td><code>extent</code></td><td>area / bounding-box area</td><td>Distinguishing crosses from blobs</td></tr>
+<tr><td><code>euler_number</code></td><td>Components minus holes (here 1 minus holes)</td><td>Counting holes: washers versus discs</td></tr>
+</tbody>
+</table>
+
+<p>
+Several of these will be derived properly in <a href="section-6.6.html">Section 6.6</a> (centroid and orientation from moments, perimeter from contours); here they are consumers' goods. The code below runs the full measurement pipeline on a parts image and lands the results in a dataframe:
+</p>
+
+<pre><code class="language-python">import pandas as pd
+from skimage import measure
+
+lbl = measure.label(mask &gt; 0, connectivity=2)        # 8-connectivity in 2D
+df = pd.DataFrame(measure.regionprops_table(
+    lbl,
+    properties=["label", "area", "centroid", "eccentricity",
+                "solidity", "euler_number"]))
+print(df.round(3).to_string(index=False))
+# Representative output:
+#  label  area  centroid-0  centroid-1  eccentricity  solidity  euler_number
+#      1  8120      89.21      119.62         0.214     0.987             1
+#      2  7903      88.83      295.04         0.198     0.991             0
+#      3   311      86.04      414.13         0.892     0.704             1
+#      4  8045     259.72     132.81          0.226     0.989             1</code></pre>
+<div class="code-caption">From mask to dataframe in four statements with <code>skimage.measure.regionprops_table</code>: region 2's Euler number of 0 betrays a hole (one component minus one hole), region 3's high eccentricity and low solidity mark it as an elongated sliver, and downstream logic is now ordinary pandas.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Image Disappears Here</div>
+<p>After labeling and measurement, the pipeline never touches pixels again: decisions run on a table of per-object features. This is the architectural pattern of all recognition, classical and deep. The pipelines of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a> replace these nine geometric features with hand-crafted descriptor vectors, and the detectors of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> replace them with learned ones, but the shape of the computation (image to objects to feature rows to decision) is the one established on this page.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: regionprops_table Replaces Your Measurement Loop</div>
+<p>Computing Table 6.4.1's nine properties by hand means looping over labels, masking each region, and writing each formula (the ellipse fits alone, via second-order moments, are a page of careful code); call it 60 to 80 lines. <code>regionprops_table(lbl, properties=[...])</code> is one line, evaluates lazily so you pay only for requested properties, handles edge-touching regions and empty inputs, and returns NumPy columns that drop straight into pandas. It also generalizes to 3D volumes unchanged, which matters the day your masks come from a CT scanner rather than a camera. Use <code>spacing=</code> to get physical units instead of pixels.</p>
+</div>
+
+<h2>4. From Measurements to Decisions <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The last step of a counting or gating pipeline is almost embarrassingly simple, and that simplicity is the selling point. A bolt-kit verifier might require exactly 12 regions with area in [7000, 9000] and eccentricity below 0.4 (the washers), plus 4 regions with eccentricity above 0.85 (the bolts), and reject otherwise. Such rules execute in microseconds, can be reviewed line by line in an audit, and fail loudly rather than plausibly. Their weakness is equally plain: they generalize exactly as far as the engineer's foresight. The moment classes overlap in every measured feature, rules give out, and that is the cliff edge where <a href="section-6.6.html">Section 6.6</a>'s richer shape descriptors, then <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>'s learned classifiers, take over.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Returns Station That Out-Counted the Detector</div>
+<p><strong>Who:</strong> The automation lead at an e-commerce hardware retailer, building a returns-verification station that must confirm the contents of opened fastener kits (mixed screws, nuts, washers, up to 200 pieces) poured onto a tray.</p>
+<p><strong>Situation:</strong> The first prototype used a fine-tuned object detector from <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>'s family. On dense piles it missed heavily occluded pieces and double-counted at tile boundaries, plateauing at 96 percent count accuracy, far below the 99.9 percent the business case needed, and each new kit SKU required retraining.</p>
+<p><strong>Problem:</strong> Counting many small, identical, high-contrast objects is precisely the regime where detection networks struggle (tiny instances, mutual occlusion) and classical machinery excels, but the team had not considered the classical route.</p>
+<p><strong>Decision:</strong> Rebuild the station around physics plus this chapter: a translucent backlit tray (making segmentation trivial per <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>), a vibration pulse to spread the pile, then threshold, open, label, and measure. Pieces were classified by area and eccentricity bands per SKU, configured from 20 golden samples in minutes rather than retraining. Clumps flagged by implausible area were routed to the distance-transform separator of <a href="section-6.5.html">Section 6.5</a>.</p>
+<p><strong>Result:</strong> 99.95 percent count accuracy at 1.8 seconds per tray on a fanless industrial PC, new SKUs onboarded by a technician without a data scientist, and the deep detector was retired from this station (it kept its job on the loading dock, where lighting could not be controlled).</p>
+<p><strong>Lesson:</strong> When you control the lighting, contrast is free, and once contrast is free, counting is connected components plus a dataframe. Engineer the scene before you engineer the model.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Counting and Labeling in 2024-2026</div>
+<p>Both halves of this section are active research surfaces. On the labeling side, GPU implementations matter at video rate and volume scale: RAPIDS cuCIM ports <code>label</code> and <code>regionprops</code> to CUDA for microscopy volumes, and the YACCLAB benchmark continues to absorb new block-and-union GPU labelers measured in gigapixels per second. On the counting side, the open-world counters now compete with the backlit tray: CountGD (Amini-Naieni et al., NeurIPS 2024, arXiv:2407.04619) counts arbitrary objects specified by text or visual exemplars in uncontrolled images, and SAM 2 (2024, arXiv:2408.00714) plus per-mask <code>regionprops</code> has become a standard zero-shot measurement pipeline in biology labs: a foundation model proposes the regions, and the 1960s measurement algebra of this section still produces the numbers that get published.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.4.1: Equivalences in the Wild <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Trace the two-pass algorithm by hand on a U-shaped object scanned top to bottom, writing the provisional labels each pixel receives and the moment the equivalence between the two arms is discovered. Then construct an object shape that generates not one but three pairwise equivalences that must all resolve to a single label (hint: think of a comb), and explain why a naive "relabel on discovery" strategy without union-find can degrade to quadratic time on such shapes.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.4.2: The Area-Filter Bake-Off <span class="exercise-type coding">Coding</span></div>
+<p>Create a mask of 50 random disks (radii 8 to 15 px) plus 500 specks (1 to 2 px). Clean it two ways: (a) morphological opening with an SE just large enough to kill the specks, and (b) labeling plus area filtering at a 50 px threshold. Compare the two results to the speck-free ground truth with a pixel-level intersection-over-union score, measure both runtimes, and explain the IoU gap you observe near disk boundaries in terms of Section 6.3's corner-rounding behavior.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.4.3: Euler's Typography Audit <span class="exercise-type analysis">Analysis</span></div>
+<p>Render the 26 uppercase letters in a bold sans-serif font, label each letter image, and compute its Euler number with <code>regionprops</code>. Verify the relation $E = C - H$ (components minus holes) letter by letter: B should give $1 - 2 = -1$, A and D give 0, and so on. Report which letters' results depend on the foreground connectivity chosen, and connect the failures you find at thin junctions back to the Jordan pairing of <a href="section-6.1.html">Section 6.1</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.3.html">&#8592; Section 6.3: Opening, Closing &amp; Morphological Gradients</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="section-6.5.html">Section 6.5: Distance Transforms &amp; Skeletonization &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

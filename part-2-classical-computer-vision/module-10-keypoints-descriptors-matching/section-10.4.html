@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.4: Fast Binary Alternatives: BRIEF, ORB &amp; AKAZE. Descriptors as bit strings: BRIEF's intensity comparisons, Hamming distance at hardware speed, ORB's oriented upgrade, and AKAZE's nonlinear scale space." name="description"/>
+<title>Section 10.4: Fast Binary Alternatives: BRIEF, ORB &amp; AKAZE | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>Fast Binary Alternatives: BRIEF, ORB &amp; AKAZE</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"SIFT writes you a 128-float essay about its neighborhood. I text you 256 bits, and by the time you finish reading this sentence I have matched three more frames."</p>
+<cite>An Extremely Impatient Binary Descriptor</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>If a descriptor only needs to be compared, not understood, then a string of bits answering yes-or-no questions about the patch is enough, and bits can be compared at the speed of a single CPU instruction.</strong> This section trades SIFT's careful 128 floats for binary descriptors: BRIEF's pairwise intensity tests, ORB's rotation-aware and de-correlated upgrade that powers real-time SLAM to this day, and AKAZE's nonlinear scale space that keeps edges sharp while it blurs. The price of the speed is paid in invariance and distinctiveness, and knowing the exchange rate is what lets you pick the right descriptor for a frame budget.</p>
+</div>
+
+<p>
+<a href="section-10.3.html">Section 10.3</a> closed by noting that SIFT is slow by modern standards. Be precise about where the time goes: extraction (the scale-space pyramid and 128-dimensional histograms) and, just as painfully, <em>matching</em>. Comparing two SIFT descriptors costs 128 multiply-accumulates; comparing 2,000 descriptors against 2,000 candidates costs half a billion floating-point operations per image pair, and storage runs to 512 bytes per keypoint. A SLAM system on a phone, matching every frame at 30 fps while budgeting most of the CPU for everything else, simply cannot pay that. The binary descriptor literature is the story of refusing to pay it.
+</p>
+
+<h2>1. BRIEF: A Descriptor Made of Questions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+BRIEF (Calonder et al., 2010) starts from an almost insolently simple idea. Choose, once and for all, a fixed set of $n = 256$ point pairs $(\mathbf{p}_i, \mathbf{q}_i)$ scattered around the keypoint (the original paper samples them from an isotropic Gaussian over the patch and freezes the pattern forever). The descriptor is the answers to 256 yes-or-no questions:
+</p>
+<p>
+$$ \tau_i \;=\; \begin{cases} 1 &amp; \text{if } I(\mathbf{p}_i) &lt; I(\mathbf{q}_i) \\ 0 &amp; \text{otherwise,} \end{cases} \qquad \mathbf{d} \;=\; (\tau_1, \tau_2, \ldots, \tau_{256}), $$
+</p>
+<p>
+packed into 32 bytes. Each bit records which of two pixels is brighter: a quantity invariant to any monotonic brightness change (if lighting brightens both pixels, the comparison flips never), echoing the rank-based robustness logic of the median filter from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. Because single pixels are noisy, the patch must be smoothed before testing (a Gaussian blur, or box filters via integral images in practice); without smoothing, BRIEF's bits flip with the sensor noise of <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> and matching collapses. Figure 10.4.1 shows the pattern, the bits, and the comparison that makes it all worthwhile.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="BRIEF descriptor construction: pairs of sample points in a patch produce one bit each, bits pack into a string, and two strings are compared by XOR and popcount giving the Hamming distance">
+  <!-- patch with pairs -->
+  <text x="150" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">frozen test pattern</text>
+  <circle cx="150" cy="150" r="105" fill="#eaf2f8" stroke="#2980b9" stroke-width="1.5"/>
+  <circle cx="150" cy="150" r="4" fill="#2c3e50"/>
+  <g stroke="#b9770e" stroke-width="1.4">
+    <line x1="95" y1="100" x2="190" y2="135"/>
+    <line x1="120" y1="200" x2="200" y2="80"/>
+    <line x1="70" y1="160" x2="150" y2="215"/>
+    <line x1="175" y1="180" x2="225" y2="150"/>
+    <line x1="110" y1="65" x2="85" y2="135"/>
+    <line x1="160" y1="110" x2="215" y2="205"/>
+  </g>
+  <g fill="#c0392b">
+    <circle cx="95" cy="100" r="5"/><circle cx="120" cy="200" r="5"/><circle cx="70" cy="160" r="5"/>
+    <circle cx="175" cy="180" r="5"/><circle cx="110" cy="65" r="5"/><circle cx="160" cy="110" r="5"/>
+  </g>
+  <g fill="#27ae60">
+    <circle cx="190" cy="135" r="5"/><circle cx="200" cy="80" r="5"/><circle cx="150" cy="215" r="5"/>
+    <circle cx="225" cy="150" r="5"/><circle cx="85" cy="135" r="5"/><circle cx="215" cy="205" r="5"/>
+  </g>
+  <text x="150" y="290" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">each pair asks: is red darker than green?</text>
+  <!-- arrow -->
+  <line x1="270" y1="150" x2="330" y2="150" stroke="#2c3e50" stroke-width="2"/>
+  <polygon points="330,150 318,144 318,156" fill="#2c3e50"/>
+  <!-- bit strings -->
+  <text x="555" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">two descriptors, compared in hardware</text>
+  <g font-family="monospace" font-size="16" text-anchor="middle">
+    <text x="360" y="105" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="start">A:</text>
+    <g>
+      <rect x="390" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="404" y="106" fill="#145a32">1</text>
+      <rect x="420" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="434" y="106" fill="#145a32">0</text>
+      <rect x="450" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="464" y="106" fill="#145a32">1</text>
+      <rect x="480" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="494" y="106" fill="#145a32">1</text>
+      <rect x="510" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="524" y="106" fill="#145a32">0</text>
+      <rect x="540" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="554" y="106" fill="#145a32">0</text>
+      <rect x="570" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="584" y="106" fill="#145a32">1</text>
+      <rect x="600" y="85" width="28" height="30" fill="#d5f5e3" stroke="#1e8449"/><text x="614" y="106" fill="#145a32">0</text>
+      <text x="660" y="106" font-size="13" fill="#5a626c">... 256 bits</text>
+    </g>
+    <text x="360" y="155" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="start">B:</text>
+    <g>
+      <rect x="390" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="404" y="156" fill="#1a5276">1</text>
+      <rect x="420" y="135" width="28" height="30" fill="#fadbd8" stroke="#c0392b"/><text x="434" y="156" fill="#922b21">1</text>
+      <rect x="450" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="464" y="156" fill="#1a5276">1</text>
+      <rect x="480" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="494" y="156" fill="#1a5276">1</text>
+      <rect x="510" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="524" y="156" fill="#1a5276">0</text>
+      <rect x="540" y="135" width="28" height="30" fill="#fadbd8" stroke="#c0392b"/><text x="554" y="156" fill="#922b21">1</text>
+      <rect x="570" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="584" y="156" fill="#1a5276">1</text>
+      <rect x="600" y="135" width="28" height="30" fill="#d6eaf8" stroke="#2980b9"/><text x="614" y="156" fill="#1a5276">0</text>
+    </g>
+    <text x="360" y="225" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="start">A&#8853;B:</text>
+    <g>
+      <rect x="390" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="404" y="226" fill="#5a626c">0</text>
+      <rect x="420" y="205" width="28" height="30" fill="#f9e79f" stroke="#b9770e"/><text x="434" y="226" fill="#7d6608">1</text>
+      <rect x="450" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="464" y="226" fill="#5a626c">0</text>
+      <rect x="480" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="494" y="226" fill="#5a626c">0</text>
+      <rect x="510" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="524" y="226" fill="#5a626c">0</text>
+      <rect x="540" y="205" width="28" height="30" fill="#f9e79f" stroke="#b9770e"/><text x="554" y="226" fill="#7d6608">1</text>
+      <rect x="570" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="584" y="226" fill="#5a626c">0</text>
+      <rect x="600" y="205" width="28" height="30" fill="#f4f6f7" stroke="#90a4ae"/><text x="614" y="226" fill="#5a626c">0</text>
+    </g>
+  </g>
+  <text x="520" y="278" font-family="sans-serif" font-size="13.5" fill="#2c3e50" text-anchor="middle" font-weight="bold">Hamming distance = popcount(A &#8853; B) = 2 (+ rest of the string)</text>
+  <text x="520" y="300" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">XOR and popcount are single CPU instructions on 64 bits at a time</text>
+</svg>
+<figcaption><strong>Figure 10.4.1</strong> BRIEF in one picture. Left: a frozen pattern of point pairs around the keypoint; each pair contributes one brighter-or-darker bit. Right: two descriptors compared by XOR; the popcount of the result (highlighted bits) is the Hamming distance. A 256-bit comparison is four 64-bit XOR-popcount pairs, which is why binary matching runs an order of magnitude faster than L2 on floats.</figcaption>
+</figure>
+
+<p>
+The matching speed shown on the right of Figure 10.4.1 is the entire economic argument. The <strong>Hamming distance</strong> between two bit strings (the number of disagreeing bits) is computed by XOR followed by a population count, both single instructions operating on 64 bits at once. A 256-bit descriptor comparison is roughly 8 instructions against the hundreds needed for 128-dimensional L2, with a 16x storage saving (32 bytes versus 512) that keeps whole descriptor databases in cache. The from-scratch implementation below makes the bit-construction concrete.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(42)
+# 256 test pairs (x1,y1,x2,y2), drawn once and frozen for all descriptors
+pattern = rng.normal(0, 31 / 5, size=(256, 4)).round().astype(int).clip(-15, 15)
+
+def mini_brief(img: np.ndarray, x: int, y: int) -&gt; np.ndarray:
+    """256-bit BRIEF descriptor at one keypoint (no orientation handling)."""
+    smooth = cv2.GaussianBlur(img, (0, 0), 2.0)       # mandatory pre-smoothing
+    bits = np.empty(256, np.uint8)
+    for i, (x1, y1, x2, y2) in enumerate(pattern):
+        bits[i] = smooth[y + y1, x + x1] &lt; smooth[y + y2, x + x2]
+    return np.packbits(bits)                          # 32 bytes
+
+img = cv2.imread("loading_dock.jpg", cv2.IMREAD_GRAYSCALE)
+d = mini_brief(img, 240, 180)
+print(d.shape, d.dtype)            # (32,) uint8: a neighborhood in 32 bytes</code></pre>
+<div class="code-caption">A from-scratch BRIEF: a frozen Gaussian-sampled test pattern, mandatory pre-smoothing so single-pixel noise cannot flip bits, 256 brightness comparisons, and <code>np.packbits</code> to store the answers in 32 bytes.</div>
+
+<p>
+BRIEF's fatal allergy is rotation. The test pattern is nailed to the image axes, so rotating the patch by more than 10 to 15 degrees scrambles which pixels each test compares, and matching performance falls off a cliff. The original authors knew it and considered it a fair trade for applications with controlled orientation. The fix arrived a year later from a team at Willow Garage with a robot to localize.
+</p>
+
+<h2>2. ORB: Oriented FAST and Rotated BRIEF <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+ORB (Rublee et al., 2011) is less a new algorithm than a superbly engineered assembly of the chapter so far. Its detector is FAST from <a href="section-10.1.html">Section 10.1</a>, patched for its two known holes: scale, by detecting on an image pyramid (the <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> kind, with a 1.2 ratio between levels rather than full octaves), and ranking, by scoring FAST detections with the Harris response and keeping the best. Its descriptor is BRIEF, patched for rotation: each keypoint gets an orientation, and the test pattern is rotated to match before the bits are read (steered BRIEF).
+</p>
+<p>
+The orientation trick is cheaper than SIFT's histogram and pure 1960s pattern recognition: the <strong>intensity centroid</strong>. Compute the patch moments $m_{pq} = \sum_{x,y} x^p y^q\, I(x, y)$ and take the angle from the patch center to the centroid of brightness,
+</p>
+<p>
+$$ \theta \;=\; \operatorname{atan2}(m_{01},\, m_{10}). $$
+</p>
+<p>
+A corner's brightness is asymmetric around it, so the centroid direction is stable under rotation and computable from sums already lying around. Crude, but it works, and it costs almost nothing.
+</p>
+<p>
+The subtlest contribution hides in the test pattern itself. Steering BRIEF's random pattern turns out to hurt distinctiveness: aligned to a canonical orientation, random tests become correlated with each other and their outputs stop being fair coins. The ORB authors therefore <em>searched</em> for a better pattern: starting from a large pool of candidate tests evaluated on 300,000 keypoints, a greedy algorithm selected 256 tests that are individually high-variance (mean near 0.5) and pairwise de-correlated. The result, rBRIEF, is a learned descriptor in everything but marketing, trained three years before the field decided learning descriptors was the future. Using it is one constructor call:
+</p>
+
+<pre><code class="language-python">orb = cv2.ORB_create(
+    nfeatures=1500,       # keep the 1500 strongest (Harris-ranked)
+    scaleFactor=1.2,      # pyramid ratio between levels
+    nlevels=8,            # 1.2**8: about 4.3x of scale coverage
+    fastThreshold=20,     # FAST segment-test margin
+    WTA_K=2)              # 2-point tests: match with NORM_HAMMING
+kps, desc = orb.detectAndCompute(img, None)
+print(desc.shape, desc.dtype)     # (1500, 32) uint8: 256 bits per keypoint
+print(round(kps[0].angle, 1))     # intensity-centroid orientation, degrees</code></pre>
+<div class="code-caption">ORB with its load-bearing parameters exposed: pyramid depth and ratio control scale coverage, the FAST threshold trades detection density against stability, and the 32-byte uint8 rows are matched with Hamming distance, never L2.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Invariance Is Bought a la Carte</div>
+<p>SIFT bundles scale, rotation, and illumination invariance into one integrated design and bills you for all of it on every keypoint. The binary family unbundles the menu: BRIEF buys only illumination robustness (nearly free), ORB adds rotation via the intensity centroid and scale via a pyramid (cheap), and AKAZE below adds a better scale space (moderate). Engineering a matching system starts by asking which invariances the application actually needs: a fixed downward-facing camera on a robot needs almost none, and paying for them anyway costs frames.</p>
+</div>
+
+<p>
+How much does the unbundling save? The benchmark below runs the full extract-and-match cycle for SIFT and ORB on the same image pair, and is worth running on your own hardware; the relative gap is remarkably stable even as absolute numbers vary.
+</p>
+
+<pre><code class="language-python">import time
+
+img1 = cv2.imread("frame_000.jpg", cv2.IMREAD_GRAYSCALE)
+img2 = cv2.imread("frame_001.jpg", cv2.IMREAD_GRAYSCALE)
+
+for name, feat, norm in [("SIFT", cv2.SIFT_create(nfeatures=1000), cv2.NORM_L2),
+                         ("ORB ", cv2.ORB_create(nfeatures=1000), cv2.NORM_HAMMING)]:
+    t0 = time.perf_counter()
+    k1, d1 = feat.detectAndCompute(img1, None)
+    k2, d2 = feat.detectAndCompute(img2, None)
+    t1 = time.perf_counter()
+    matches = cv2.BFMatcher(norm, crossCheck=True).match(d1, d2)
+    t2 = time.perf_counter()
+    print(f"{name} extract {1000 * (t1 - t0):4.0f} ms  "
+          f"match {1000 * (t2 - t1):5.1f} ms  {len(matches)} matches")
+# Typical laptop-CPU output on a 1080p pair:
+# SIFT extract  310 ms  match  46.0 ms  742 matches
+# ORB  extract   22 ms  match   3.4 ms  655 matches</code></pre>
+<div class="code-caption">Head-to-head timing of the extract-and-match cycle: ORB's roughly 14x extraction and 13x matching advantage over SIFT on the same pair is the entire reason real-time systems default to binary features; absolute milliseconds vary by machine, the ratio much less.</div>
+
+<h2>3. AKAZE: A Scale Space That Respects Edges <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+One ingredient of SIFT survived unchallenged into ORB: scale comes from <em>Gaussian</em> blurring, which is blind. As <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> discussed when motivating edge-preserving filters, Gaussian smoothing erodes object boundaries exactly as enthusiastically as it erases noise, so coarse scale-space levels localize features ever more sloppily. KAZE (Alcantarilla et al., 2012) and its accelerated successor AKAZE (2013) rebuild the scale space on <strong>nonlinear diffusion</strong>: blurring whose strength at each pixel is throttled by the local gradient, so smoothing floods flat regions but slows to a trickle at strong edges. This is the Perona-Malik idea that <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> develops for denoising, repurposed as a feature-detection substrate; AKAZE's "A" comes from Fast Explicit Diffusion, a numerical scheme that makes evolving the diffusion cheap enough for real time.
+</p>
+<p>
+On top of this edge-respecting pyramid, AKAZE detects Hessian extrema and describes them with M-LDB, a binary descriptor in BRIEF's family that compares region <em>means and gradients</em> instead of single pixels, rotated by the keypoint orientation, yielding 486 bits by default. The practical profile: AKAZE typically out-matches ORB on textured scenes with strong structure (its localization at coarse scales is visibly better), costs a few times more to extract, and remains far cheaper than SIFT. It also ships in OpenCV's core with zero licensing baggage:
+</p>
+
+<pre><code class="language-python">akaze = cv2.AKAZE_create()               # nonlinear scale space + M-LDB bits
+kps, desc = akaze.detectAndCompute(img, None)
+print(len(kps), desc.shape, desc.dtype)  # e.g. 2034 (2034, 61) uint8
+# 61 bytes = 486 bits; match with cv2.NORM_HAMMING, same as ORB</code></pre>
+<div class="code-caption">AKAZE out of the box: a nonlinear-diffusion scale space feeding a rotation-aware 486-bit M-LDB descriptor, still matched with Hamming distance; a strong default when you can afford 3x to 5x ORB's extraction time but not SIFT's.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The AR Furniture App That Could Not Afford SIFT</div>
+<p><strong>Who:</strong> A six-person mobile team at a furniture retailer, building "see the sofa in your living room" augmented reality for Android.</p>
+<p><strong>Situation:</strong> Placement anchoring tracked features frame to frame to keep the virtual sofa glued to the floor. The supported-device list reached down to mid-range phones with thermal throttling that cut sustained CPU by half.</p>
+<p><strong>Problem:</strong> The first build used SIFT at 4 fps on the floor devices; the sofa swam across the carpet whenever the user moved. Battery drain killed sessions in minutes.</p>
+<p><strong>Decision:</strong> Switch to ORB at 1,000 features with an 8x6 per-cell cap for spread, Hamming brute-force matching against the previous frame only, and a re-anchoring pass with AKAZE once per second on a background thread (textured rugs and wood grain matched noticeably better under AKAZE's nonlinear scale space, and once a second was affordable).</p>
+<p><strong>Result:</strong> 28 to 30 fps sustained on the floor devices, per-frame tracking under 9 ms, and drift corrected by the slow AKAZE anchor before users perceived it. Session length tripled.</p>
+<p><strong>Lesson:</strong> Descriptor choice is not one decision; hybrid designs that spend cheap bits every frame and better bits occasionally often dominate any single choice.</p>
+</div>
+
+<h2>4. Choosing a Descriptor <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Table 10.4.1 lines up this section's descriptors against SIFT. Read the speed column with the timing experiment above in mind, and the invariance columns with the a-la-carte principle: a missing invariance is only a defect if your application's geometry exercises it.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 10.4.1:</strong> <em>Float versus binary descriptors at a glance.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Descriptor</th><th scope="col">Size</th><th scope="col">Match metric</th><th scope="col">Scale</th><th scope="col">Rotation</th><th scope="col">Relative extract cost</th><th scope="col">Typical home</th></tr>
+</thead>
+<tbody>
+<tr><td>SIFT / RootSIFT</td><td>128 float (512 B)</td><td>L2</td><td>Yes</td><td>Yes</td><td>High</td><td>Reconstruction, stitching, retrieval</td></tr>
+<tr><td>BRIEF</td><td>256 bit (32 B)</td><td>Hamming</td><td class="caution">No</td><td class="caution">No (&lt; ~15&#176;)</td><td class="winner">Minimal</td><td>Fixed-orientation rigs</td></tr>
+<tr><td>ORB</td><td>256 bit (32 B)</td><td>Hamming</td><td>Pyramid</td><td>Yes (centroid)</td><td class="winner">Very low</td><td>Real-time SLAM, mobile AR</td></tr>
+<tr><td>AKAZE</td><td>486 bit (61 B)</td><td>Hamming</td><td>Yes (nonlinear)</td><td>Yes</td><td>Low-moderate</td><td>Textured scenes, better localization</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+The table explains a decade of deployment patterns: ORB anchors the ORB-SLAM family that <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> studies, BRIEF survives in industrial rigs where the camera never rotates, AKAZE is the quiet over-performer chosen by people who benchmarked on their own data, and SIFT keeps the offline, accuracy-first niches. Two relatives deserve a name-check: BRISK (2011), with a concentric sampling pattern and its own scale space, and FREAK (2012), with a retina-inspired pattern; both are in OpenCV and both lost the popularity contest to ORB without losing on merit.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Efficiency Race Did Not End, It Changed Teams</div>
+<p>The niche ORB defined (good-enough matching at negligible cost) is now contested by small neural networks. XFeat (CVPR 2024) is the most direct heir: a deliberately tiny CNN producing 64-dimensional descriptors plus a dense refinement mode, benchmarked explicitly against ORB on CPUs and against SIFT on accuracy, and fast enough for embedded deployment. ALIKED (2023) uses deformable convolutions to get rotation robustness the way ORB's steered pattern did, but learned end to end. Meanwhile the learned-matcher line (LightGlue, ICCV 2023, covered in <a href="section-10.5.html">Section 10.5</a>) changes the accounting: when the matcher itself tolerates weaker descriptors, spending less on description becomes rational. The constant across eras is the budget thinking this section taught; only the components change. The deep-learning side of the story unfolds in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.1: Bits as Coins <span class="exercise-type conceptual">Conceptual</span></div>
+<p>ORB's pattern search selected tests with mean near 0.5 and low pairwise correlation. Explain, using an information-theoretic argument, why each property matters for a 256-bit descriptor's distinctiveness: what is the effective number of independent bits if tests are individually biased (mean 0.9), and what if they are pairwise strongly correlated? Estimate how many random keypoints you can store before two unrelated descriptors collide within Hamming distance 30, under the idealized independent-fair-bits assumption.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.2: Break BRIEF, Fix It With ORB <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>mini_brief</code> implementation from this section, measure rotation sensitivity: for one keypoint, compute the descriptor on the original image and on copies rotated by 5, 10, 20, and 45 degrees (rotate with <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>'s tools, track the keypoint location through the rotation), and plot Hamming distance versus angle. Then repeat the experiment with OpenCV's ORB descriptor at the same location and overlay the curves. At what angle does each descriptor cross the typical match-acceptance threshold of about 64 bits?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.4.3: The Per-Frame Budget Audit <span class="exercise-type analysis">Analysis</span></div>
+<p>Run the timing benchmark from this section on your machine with SIFT, ORB, and AKAZE at 500, 1000, and 2000 features. Build a table of extraction time, matching time, and matches found, then answer as an engineer: which configurations fit a 33 ms frame budget if feature work may use at most 40 percent of it? Which would you pick for (a) a drone stabilizer, (b) an offline panorama stitcher, (c) a document-scanner app, and why?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.3.html">&#8592; Section 10.3: SIFT: The Descriptor That Defined a Decade</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.5.html">Section 10.5: Descriptor Matching &amp; the Ratio Test &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

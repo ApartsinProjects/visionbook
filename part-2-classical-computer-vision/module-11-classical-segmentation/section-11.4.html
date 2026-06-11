@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.4: Graph-Based Segmentation: Graph Cuts &amp; GrabCut. Pixels as graph nodes and similarities as edge weights, the min-cut/max-flow energy, Felzenszwalb-Huttenlocher efficient graph segmentation, and GrabCut's iterative foreground extraction from a single box." name="description"/>
+<title>Section 11.4: Graph-Based Segmentation: Graph Cuts &amp; GrabCut | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>Graph-Based Segmentation: Graph Cuts &amp; GrabCut</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Tell me which pixels are definitely yours and which are definitely mine. I will find the cheapest possible fence between us, and I promise it will be the globally optimal fence, not merely a locally convenient one."</p>
+<cite>A Min-Cut Solver Who Refuses to Settle for Greedy</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Graph-based segmentation reframes the whole problem as cutting a graph: pixels are nodes, similarities between neighbors are edge weights, and a segmentation is the set of edges you sever to split the graph into pieces.</strong> This reframing buys something none of the previous methods had: a single global objective whose exact minimum is the segmentation. For the two-region foreground/background case, the celebrated min-cut/max-flow theorem makes that minimum computable in low-order polynomial time, so graph cuts find the best partition over the entire image rather than the one greedy local steps stumbled into. GrabCut wraps this engine in an interface so friendly it became the one-click background remover in every photo editor: draw a box around the subject, and an iterated graph cut, refined by learned color models, peels the foreground from the background.</p>
+</div>
+
+<p>
+The previous three sections each made <em>local</em> decisions: clustering judged each pixel alone, region growing committed greedily one neighbor at a time, watershed dammed at the nearest ridge. None of them optimized anything global, and so none could trade a small local concession for a large global gain. This section changes the frame entirely. We will phrase segmentation as the minimization of an energy that scores an <em>entire</em> labeling of the image at once, balancing how well each pixel's label fits its own appearance against how much neighboring pixels disagree. Remarkably, for two labels this energy can be minimized exactly, which is what gives graph cuts their reputation. The graph machinery here is the same that underlies the robust fitting and consensus ideas of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, now applied to dense per-pixel labeling rather than sparse model fitting.
+</p>
+
+<h2>1. Segmentation as Energy Minimization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Assign each pixel $p$ a binary label $\ell_p \in \{0, 1\}$ (background or foreground). Score a complete labeling $\ell$ with an energy built from two terms:
+</p>
+<p>
+$$E(\ell) = \underbrace{\sum_{p} D_p(\ell_p)}_{\text{data (unary) term}} + \lambda \underbrace{\sum_{(p,q) \in \mathcal{N}} V_{pq}(\ell_p, \ell_q)}_{\text{smoothness (pairwise) term}}$$
+</p>
+<p>
+The <strong>data term</strong> $D_p(\ell_p)$ is the penalty for giving pixel $p$ the label $\ell_p$ based on $p$'s own appearance: small if $p$'s color matches the foreground model and you label it foreground, large if it does not. The <strong>smoothness term</strong> $V_{pq}$ penalizes neighboring pixels $p$ and $q$ taking different labels, and it is weighted to be small (cheap to cut) where the image gradient is large, because a label boundary is expected at an edge. The trade-off weight $\lambda$ sets how much the result prefers smooth boundaries over fitting every pixel's appearance. This is exactly the local-evidence-versus-global-consistency tension named in the chapter overview, now written as arithmetic.
+</p>
+<p>
+The standard smoothness term uses a contrast-sensitive weight,
+</p>
+<p>
+$$V_{pq}(\ell_p, \ell_q) = [\ell_p \ne \ell_q] \cdot \exp\!\left(-\frac{\lVert I_p - I_q \rVert^2}{2\sigma^2}\right),$$
+</p>
+<p>
+which is near zero when $p$ and $q$ straddle a strong edge (so cutting there is cheap) and near one when they look alike (so cutting there is expensive). The bracket $[\cdot]$ is 1 when the labels differ and 0 otherwise, so identically labeled neighbors cost nothing.
+</p>
+
+<h2>2. The Min-Cut/Max-Flow Connection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Here is the beautiful part. Build a graph with one node per pixel plus two special <strong>terminal</strong> nodes, the source $S$ (foreground) and the sink $T$ (background). Connect every pixel to both terminals with edges whose weights encode the data term $D_p$, and connect neighboring pixels with edges whose weights encode the smoothness term $V_{pq}$. An $s$-$t$ <strong>cut</strong> partitions the nodes into the side still connected to $S$ (labeled foreground) and the side connected to $T$ (labeled background). The cost of the cut is the sum of the weights of the severed edges, which is exactly $E(\ell)$ for the corresponding labeling.
+</p>
+<p>
+So minimizing the energy is the same as finding the minimum-cost $s$-$t$ cut. And the max-flow/min-cut theorem says the minimum cut equals the maximum flow from $S$ to $T$, which efficient algorithms (the Boykov-Kolmogorov solver is the vision standard) compute in low-order polynomial time. For two labels and a submodular smoothness term, this gives the <em>globally optimal</em> segmentation, not an approximation. Figure 11.4.1 shows the graph construction for a tiny image.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pixel grid wired to a source and sink terminal, with a cut line separating foreground from background nodes">
+<rect x="0" y="0" width="760" height="380" fill="#ffffff"/>
+<text x="380" y="28" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">Graph cut: pixels wired to source (FG) and sink (BG); the min cut is the boundary</text>
+<!-- source -->
+<circle cx="380" cy="70" r="26" fill="#c0392b"/><text x="380" y="75" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#fff" font-weight="bold">S</text>
+<text x="380" y="50" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#c0392b">source = foreground</text>
+<!-- sink -->
+<circle cx="380" cy="320" r="26" fill="#2c3e50"/><text x="380" y="325" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#fff" font-weight="bold">T</text>
+<text x="380" y="360" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#2c3e50">sink = background</text>
+<!-- pixel nodes: 2x3 grid -->
+<!-- positions -->
+<g>
+<!-- left column FG-ish, right column BG-ish -->
+<circle cx="250" cy="160" r="18" fill="#f6d9d4" stroke="#c0392b"/><text x="250" y="165" text-anchor="middle" font-size="11">p1</text>
+<circle cx="330" cy="160" r="18" fill="#f6d9d4" stroke="#c0392b"/><text x="330" y="165" text-anchor="middle" font-size="11">p2</text>
+<circle cx="430" cy="160" r="18" fill="#d6dde2" stroke="#2c3e50"/><text x="430" y="165" text-anchor="middle" font-size="11">p3</text>
+<circle cx="510" cy="160" r="18" fill="#d6dde2" stroke="#2c3e50"/><text x="510" y="165" text-anchor="middle" font-size="11">p4</text>
+<circle cx="250" cy="240" r="18" fill="#f6d9d4" stroke="#c0392b"/><text x="250" y="245" text-anchor="middle" font-size="11">p5</text>
+<circle cx="330" cy="240" r="18" fill="#f6d9d4" stroke="#c0392b"/><text x="330" y="245" text-anchor="middle" font-size="11">p6</text>
+<circle cx="430" cy="240" r="18" fill="#d6dde2" stroke="#2c3e50"/><text x="430" y="245" text-anchor="middle" font-size="11">p7</text>
+<circle cx="510" cy="240" r="18" fill="#d6dde2" stroke="#2c3e50"/><text x="510" y="245" text-anchor="middle" font-size="11">p8</text>
+</g>
+<!-- terminal edges (thin gray) -->
+<g stroke="#cfcfcf" stroke-width="1">
+<line x1="380" y1="93" x2="250" y2="143"/><line x1="380" y1="93" x2="330" y2="143"/><line x1="380" y1="93" x2="430" y2="143"/><line x1="380" y1="93" x2="510" y2="143"/>
+<line x1="380" y1="297" x2="250" y2="257"/><line x1="380" y1="297" x2="330" y2="257"/><line x1="380" y1="297" x2="430" y2="257"/><line x1="380" y1="297" x2="510" y2="257"/>
+</g>
+<!-- neighbor edges (n-links) -->
+<g stroke="#888" stroke-width="1.5">
+<line x1="268" y1="160" x2="312" y2="160"/>
+<line x1="348" y1="160" x2="412" y2="160" stroke="#27ae60" stroke-width="2.5"/>
+<line x1="448" y1="160" x2="492" y2="160"/>
+<line x1="268" y1="240" x2="312" y2="240"/>
+<line x1="348" y1="240" x2="412" y2="240" stroke="#27ae60" stroke-width="2.5"/>
+<line x1="448" y1="240" x2="492" y2="240"/>
+<line x1="250" y1="178" x2="250" y2="222"/><line x1="330" y1="178" x2="330" y2="222"/>
+<line x1="430" y1="178" x2="430" y2="222"/><line x1="510" y1="178" x2="510" y2="222"/>
+</g>
+<!-- the cut -->
+<path d="M380,118 L380,130 L380,140" stroke="none"/>
+<line x1="380" y1="135" x2="380" y2="185" stroke="#27ae60" stroke-width="0"/>
+<path d="M392,118 C405,150 405,250 392,282" fill="none" stroke="#e67e22" stroke-width="3" stroke-dasharray="8,5"/>
+<text x="470" y="110" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#e67e22" font-weight="bold">min cut (severs green n-links</text>
+<text x="470" y="126" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#e67e22">where contrast is high)</text>
+</svg>
+<figcaption><strong>Figure 11.4.1</strong> The graph-cut construction. Each pixel node is wired to the source $S$ (foreground) and sink $T$ (background) by terminal edges weighted with the data term, and to its neighbors by n-link edges weighted with the contrast-sensitive smoothness term. The minimum $s$-$t$ cut (orange) severs the cheapest set of edges that separates $S$ from $T$. It naturally falls on the high-contrast neighbor edges (green) between the red foreground pixels and the blue background pixels, because cutting there is cheapest.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Global Optimality Is the Whole Point</div>
+<p>Every earlier method in this chapter could be defeated by an unlucky local decision: a leaked region, a misplaced seed, an over-eager merge. Graph cuts cannot, for the two-label case, because they return the exact global minimum of the energy. If the energy is a good model of what you want, the answer is provably the best one. This is a genuinely different guarantee from "it usually works", and it is why interactive segmentation tools chose graph cuts: a user who corrects a mistake by scribbling a few extra foreground or background pixels is editing the data term, and the next min cut is again globally optimal under the new constraints. The catch, which the next section confronts, is that the energy needs good appearance models to score the data term, and those are not given for free.</p>
+</div>
+
+<h2>3. GrabCut: Graph Cuts From a Single Box <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Pure graph cuts need the foreground and background appearance models up front to compute the data term, but a user is not going to hand-label color distributions. GrabCut (Rother et al., 2004) solves this with an iterative bootstrap so light-touch it feels like magic: the user draws a single <strong>bounding box</strong> around the subject, and everything else follows automatically.
+</p>
+<ol>
+<li><strong>Initialize.</strong> Pixels outside the box are definite background; pixels inside are "probably foreground". Fit a Gaussian Mixture Model (GMM) of colors to each group.</li>
+<li><strong>Assign.</strong> Use the two GMMs to compute the data term $D_p$ for every pixel, then run a graph cut to get a current foreground/background labeling.</li>
+<li><strong>Re-learn.</strong> Refit the GMMs to the new labeling, which now describes the colors better than the crude box did.</li>
+<li>Repeat steps 2 and 3 until the labeling stops changing (a few iterations suffice).</li>
+</ol>
+<p>
+Each iteration is a globally optimal graph cut <em>under the current models</em>; alternating cut and model-refit drives the energy down monotonically. The result is a clean foreground mask from a single rectangle of user input. OpenCV exposes the whole loop as <code>cv2.grabCut</code>.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("portrait.jpg")
+mask = np.zeros(img.shape[:2], np.uint8)        # 0 = sure BG, filled by grabCut
+bgd_model = np.zeros((1, 65), np.float64)        # GMM scratch buffers (5 components)
+fgd_model = np.zeros((1, 65), np.float64)
+
+# Bounding box (x, y, w, h) loosely around the subject; that is the ONLY input.
+rect = (60, 40, 380, 460)
+cv2.grabCut(img, mask, rect, bgd_model, fgd_model, iterCount=5,
+            mode=cv2.GC_INIT_WITH_RECT)
+
+# grabCut writes 4 codes: 0/2 = background, 1/3 = foreground. Collapse to binary.
+fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+cutout = img * fg[:, :, None]                    # apply the mask
+print("foreground pixels:", int(fg.sum()), "of", fg.size)
+# foreground pixels: 96214 of 230000</code></pre>
+<div class="code-caption">Single-box foreground extraction with <code>cv2.grabCut</code>. The five iterations alternate a globally optimal graph cut with a Gaussian-mixture color-model refit; the only user input is the bounding rectangle. The returned mask uses four codes that collapse to a binary foreground mask.</div>
+
+<p>
+When the box alone is not enough, for instance a background object whose color matches the subject, GrabCut accepts user touch-ups: re-run with <code>mode=cv2.GC_INIT_WITH_MASK</code> after the user paints a few pixels as definite foreground (<code>cv2.GC_FGD</code>) or definite background (<code>cv2.GC_BGD</code>). Those strokes become hard constraints on the data term, and the next cut respects them while staying globally optimal everywhere else. This scribble-and-recut interaction is the direct ancestor of the click-and-refine loops in promptable models like SAM, covered in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.
+</p>
+
+<h2>4. Felzenszwalb-Huttenlocher: Fast, Unsupervised, No Box <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Graph cuts and GrabCut both need user input or appearance models. For fully automatic oversegmentation, the Felzenszwalb-Huttenlocher (2004) algorithm is the graph-based workhorse, and it runs in near-linear time. It treats the image as a graph with an edge between each pair of neighboring pixels weighted by their color difference, sorts all edges by weight, and greedily merges the two regions joined by the next edge if that edge is weaker than the internal variation already present in both regions, plus a size-dependent slack controlled by a scale parameter $k$. The adaptive predicate is the clever part: it allows large merges in high-variability (textured) regions while keeping fine boundaries in smooth ones, so a single $k$ behaves sensibly across heterogeneous images.
+</p>
+
+<pre><code class="language-python">from skimage.segmentation import felzenszwalb, mark_boundaries
+from skimage import data
+import numpy as np
+
+img = data.coffee()                              # an RGB photo
+# scale: higher -> larger regions; sigma: pre-smoothing; min_size: merge tiny regions.
+seg = felzenszwalb(img, scale=300, sigma=0.7, min_size=100)
+print("regions:", seg.max() + 1)                 # label image, one int per region
+# regions: 64
+
+overlay = mark_boundaries(img, seg)              # draw region borders for display</code></pre>
+<div class="code-caption">Felzenszwalb-Huttenlocher graph segmentation in scikit-image. The <code>scale</code> parameter trades region count against size; the adaptive boundary predicate is what lets one setting handle both smooth and textured areas of the same photo.</div>
+
+<p>
+Felzenszwalb output is rarely a final segmentation, it oversegments, but it is an excellent <em>initialization</em>: feed its regions into a region adjacency graph (as in <a href="section-11.2.html">Section 11.2</a>) for further merging, or use it as the superpixel substrate of <a href="section-11.5.html">Section 11.5</a>. It is the fast, label-free counterpart to the user-driven graph cuts above.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.grabCut and skimage.felzenszwalb</div>
+<p>A correct graph-cut segmenter from scratch means implementing a max-flow solver (Boykov-Kolmogorov is several hundred careful lines), building the n-link and t-link graph, and, for GrabCut, fitting and refitting Gaussian mixture models in a loop. The two library calls above replace all of it:</p>
+<ul>
+<li><code>cv2.grabCut</code>: the full GMM-plus-graph-cut iteration in one call. From-scratch, this is 300-plus lines (max-flow solver, GMM EM, the alternation loop); the library is a single function with five well-chosen arguments.</li>
+<li><code>skimage.segmentation.felzenszwalb</code>: the near-linear graph segmentation with its union-find region merging and adaptive predicate, roughly 150 lines of subtle code, as one call.</li>
+</ul>
+<p>The libraries also bring the performance that matters: OpenCV's GrabCut uses the optimized Boykov-Kolmogorov max-flow, and scikit-image's Felzenszwalb uses an efficient disjoint-set union-find, both far faster and more numerically careful than a teaching implementation. Reach for these whenever you need the result rather than the lesson.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Background Removal for an E-Commerce Catalog</div>
+<p>An online marketplace required every seller to upload product photos on a clean white background, but sellers shot products on kitchen tables, carpets, and car seats. Hiring photo editors did not scale to tens of thousands of daily uploads. The engineering team shipped an automatic background remover built on GrabCut: detect the largest central object with a quick saliency pass to propose the bounding box, run <code>cv2.grabCut</code> for five iterations, and composite the foreground onto white. This handled the large majority of uploads with no human in the loop and no training data.</p>
+<p>The decision that made it production-grade was the fallback path. For the roughly twelve percent of images where GrabCut's box-only result was poor (busy backgrounds, products colored like their surroundings), the system surfaced the result to a lightweight web tool where a reviewer painted two or three foreground and background strokes and re-ran GrabCut in <code>GC_INIT_WITH_MASK</code> mode, fixing each in seconds because the recut stayed globally optimal under the new strokes. The lesson: a classical, training-free graph cut cleared most of the volume cheaply, and the interactive scribble path turned the hard tail into a few seconds of human work rather than a full manual edit. Years later the team replaced the core with a learned matting model, but the box-then-scribble interaction they designed around GrabCut carried over unchanged.</p>
+</div>
+
+<h2>5. The Ceiling of Color-Only Energy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Graph cuts give the globally optimal segmentation <em>for the energy you wrote down</em>, and that qualifier is the whole limitation. The standard energy scores the data term from color models and the smoothness term from local contrast, so it has no notion of objects, parts, or semantics. A graph cut will happily separate a red shirt from a red wall along the faint shadow between them, or fail to separate a person from a same-colored door, because color and contrast are all it knows. Multi-region extensions (alpha-expansion for more than two labels) and the normalized-cut criterion of Shi and Malik exist, but they do not add semantics; they only refine the same appearance-based objective.
+</p>
+<p>
+The energy framework itself, however, is one of the most durable ideas in the chapter, because it survived the transition to deep learning almost intact. When <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> bolts a Conditional Random Field onto the output of a fully convolutional network, the CRF <em>is</em> this exact energy, with the data term now supplied by the network's per-pixel logits (learned, semantic) and the smoothness term still the contrast-sensitive pairwise penalty of this section. The classical insight, that good segmentation balances local evidence against pairwise consistency, was right; only the source of the local evidence changed. The last section of this chapter, <a href="section-11.5.html">Section 11.5</a>, takes a different exit: rather than improve the energy, it shrinks the problem, replacing millions of pixel nodes with a few hundred superpixel nodes so the graph methods of this section run far faster on a far smaller graph.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Energy Lives On Inside Networks</div>
+<p>The graph-cut energy did not lose to deep learning so much as get absorbed by it. DeepLab (Chen et al., the v1 and v2 lines, with the CRF-as-RNN formulation of Zheng et al., ICCV 2015) appended a dense CRF, the very energy of this section, to a CNN's logits, and the contrast-sensitive pairwise term sharpened blurry network boundaries enough to win benchmarks for years. Modern promptable models took the interactive thread instead: SAM (Kirillov et al., ICCV 2023) and SAM 2 (Ravi et al., ICLR 2025) replace GrabCut's box and scribbles with learned prompt encoders, so a click yields a mask without any per-image GMM or max-flow, but the user-in-the-loop spirit of GrabCut is unmistakable. On the unsupervised side, normalized cuts came back as a deep tool: CutLER (Wang et al., CVPR 2023) runs normalized cuts on self-supervised features to discover object masks with no labels, exactly Shi and Malik's criterion with the affinity matrix now built from learned embeddings. Across all three, the classical structure, an energy or a cut, persists; the weights it operates on became learned.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.1: Reading the Energy <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider the energy $E(\ell) = \sum_p D_p(\ell_p) + \lambda \sum_{(p,q)} V_{pq}(\ell_p, \ell_q)$. Describe qualitatively what the optimal segmentation looks like in three regimes: (a) $\lambda = 0$, (b) $\lambda \to \infty$, and (c) a moderate $\lambda$. For each, explain whether the result is dominated by the data term, the smoothness term, or a balance, and relate $\lambda = 0$ back to the speckle problem of <a href="section-11.1.html">Section 11.1</a>'s clustering.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.2: GrabCut With Scribbles <span class="exercise-type coding">Coding</span></div>
+<p>Run <code>cv2.grabCut</code> on a photo with a single bounding box and display the result. Then identify a region it got wrong, programmatically paint a small patch of that region as <code>cv2.GC_FGD</code> or <code>cv2.GC_BGD</code> in the mask, and re-run with <code>mode=cv2.GC_INIT_WITH_MASK</code>. Show before and after, and report how many foreground pixels changed. Explain in terms of hard constraints on the data term why the second cut still respects your strokes while improving the rest of the boundary.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.3: Felzenszwalb Scale Sweep <span class="exercise-type analysis">Analysis</span></div>
+<p>Run <code>skimage.segmentation.felzenszwalb</code> on one image across a range of <code>scale</code> values while holding <code>sigma</code> and <code>min_size</code> fixed. Plot region count versus <code>scale</code> and, for three representative scales, overlay the region boundaries on the image. Identify a textured region and a smooth region in the photo, and explain how the adaptive boundary predicate produces large regions in the textured area and small ones in the smooth area at the <em>same</em> scale setting. Contrast this adaptivity with the single global threshold of region growing in <a href="section-11.2.html">Section 11.2</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.3.html">&#8592; Section 11.3: The Watershed Transform</a>
+<a href="index.html">Chapter 11</a>
+<a class="next" href="section-11.5.html">Section 11.5: Superpixels: SLIC &amp; Friends &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

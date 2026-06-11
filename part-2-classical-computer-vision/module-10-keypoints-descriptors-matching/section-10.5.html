@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.5: Descriptor Matching &amp; the Ratio Test. From descriptor piles to correspondences: brute-force and FLANN nearest-neighbor search, cross-checking, and Lowe's ratio test that rejects ambiguous matches." name="description"/>
+<title>Section 10.5: Descriptor Matching &amp; the Ratio Test | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>Descriptor Matching &amp; the Ratio Test</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Being almost as close as the winner sounds flattering until you learn about the ratio test. Apparently, my very existence disqualifies the match."</p>
+<cite>A Bitterly Disqualified Second-Nearest Neighbor</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Matching descriptors is easy; the hard and valuable part is knowing which matches to distrust, and the single most cost-effective tool ever invented for that is comparing the best candidate against the second best.</strong> This section turns two piles of descriptors into a list of putative correspondences: brute-force and approximate nearest-neighbor search supply candidates, cross-checking and Lowe's ratio test filter out the liars, and what survives is clean enough for the geometric verification of <a href="section-10.6.html">Section 10.6</a> to finish the job. The ratio test costs one comparison per match and routinely removes the large majority of false matches; per line of code, it may be the highest-value test in classical vision.</p>
+</div>
+
+<p>
+The chapter so far has been about single images: detect keypoints (<a href="section-10.1.html">Sections 10.1</a> and <a href="section-10.2.html">10.2</a>), describe them (<a href="section-10.3.html">Sections 10.3</a> and <a href="section-10.4.html">10.4</a>). Now, finally, two images meet. Image one contributes descriptors $\{\mathbf{d}_i\}$, image two contributes $\{\mathbf{e}_j\}$, and the task is to output pairs $(i, j)$ that name the same physical point. The entire design of the descriptors was aimed at making this moment simple: if description worked, corresponding points are <em>nearby in descriptor space</em>, and matching reduces to nearest-neighbor search. The catch, as always, is in what "nearby" fails to guarantee.
+</p>
+
+<h2>1. Nearest Neighbors and Their Lies <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The baseline matcher could not be more direct: for each descriptor in image one, find the closest descriptor in image two (L2 distance for SIFT-family floats, Hamming for ORB-family bits, per <a href="section-10.4.html">Section 10.4</a>), and declare a match. The problem is that nearest-neighbor search <em>always</em> returns an answer. A keypoint whose physical point is occluded in the second image, or outside its frame, still gets a nearest neighbor; it is just a meaningless one. A keypoint on a repetitive structure (one window among forty identical windows on a facade) gets a nearest neighbor that is genuinely similar and very possibly the <em>wrong</em> window. Raw nearest-neighbor output is typically polluted with tens of percent of such false matches, and downstream geometry is exquisitely sensitive to them.
+</p>
+<p>
+Matching is therefore an exercise in filtering. Three filters do most of the work in practice, in increasing order of insight: an absolute distance threshold (weak, because "close" varies wildly between scenes and descriptors), the mutual cross-check, and the ratio test. Before reaching for any library, it is worth seeing the whole computation honestly in NumPy; the function below is the complete logic of a ratio-test matcher.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def match_nn_ratio(d1: np.ndarray, d2: np.ndarray, ratio: float = 0.75):
+    """Nearest-neighbor matching with Lowe's ratio test, pure NumPy."""
+    d1 = d1.astype(np.float32); d2 = d2.astype(np.float32)
+    # all pairwise squared distances: ||a||^2 + ||b||^2 - 2 a.b
+    dists = (d1**2).sum(1)[:, None] + (d2**2).sum(1)[None, :] - 2 * d1 @ d2.T
+    matches = []
+    for i, row in enumerate(dists):
+        j1, j2 = np.argsort(row)[:2]              # best and second-best
+        if np.sqrt(max(row[j1], 0)) &lt; ratio * np.sqrt(max(row[j2], 0)):
+            matches.append((i, j1))               # unambiguous: keep it
+    return matches</code></pre>
+<div class="code-caption">The whole matching pipeline with no library magic: a vectorized pairwise-distance matrix, the two best candidates per query via <code>argsort</code>, and the keep-only-if-clearly-best ratio rule that the rest of this section justifies.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.BFMatcher Owns This Loop</div>
+<p>The function above is a dozen lines and materializes an $N \times M$ distance matrix that will not fit in memory for large keypoint sets. OpenCV's <code>cv2.BFMatcher(norm)</code> with <code>knnMatch(d1, d2, k=2)</code> replaces it one-for-one (roughly a 12-to-2 reduction) while computing distances blockwise with SIMD vectorization, handling Hamming distance for binary descriptors via XOR-popcount, and optionally running the mutual cross-check (<code>crossCheck=True</code>) inside the same call. Note the API constraint: <code>crossCheck</code> works with <code>match()</code> but not with <code>knnMatch(k=2)</code>, so you choose cross-check or ratio test per call, not both at once.</p>
+</div>
+
+<h2>2. The Cross-Check: Symmetry as a Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>cross-check</strong> (mutual nearest neighbor) accepts a pair $(i, j)$ only if $j$ is the nearest neighbor of $i$ <em>and</em> $i$ is the nearest neighbor of $j$. The logic is symmetry: a true correspondence has no reason to prefer one direction, while a spurious one usually arises from descriptor $i$ having no real partner, in which case its arbitrary nearest neighbor $j$ almost certainly has a better partner of its own. Cross-checking is cheap (run matching both ways, intersect) and typically removes a third to a half of false matches. It is the standard default when you cannot afford k-nearest-neighbor queries, and it composes well with everything else. But it has no concept of <em>ambiguity</em>: on that facade of forty identical windows, descriptor $i$ and the wrong window $j$ can happily be each other's nearest neighbors. Detecting ambiguity needs a second opinion, which is exactly what the ratio test collects.
+</p>
+
+<h2>3. Lowe's Ratio Test <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the question the ratio test asks: <em>how much better is the best candidate than the runner-up?</em> Formally, with $d_1$ the distance from a query descriptor to its nearest neighbor and $d_2$ the distance to the second-nearest, accept the match only if
+</p>
+<p>
+$$ \frac{d_1}{d_2} \;&lt;\; \tau, \qquad \tau \approx 0.7 \text{ to } 0.8. $$
+</p>
+<p>
+The reasoning is a small gem of practical statistics. If the match is correct, $d_1$ is drawn from the distribution of "same point, different photo" distances: small, by descriptor design. The second-nearest neighbor, meanwhile, is almost surely some unrelated point, so $d_2$ is a sample from the background distribution of "different points" distances. A correct match therefore shows a wide gap between $d_1$ and $d_2$. If the match is wrong or ambiguous, $d_1$ and $d_2$ are <em>both</em> samples from the background (or both from a set of look-alikes), and the ratio crawls toward 1. The second-nearest neighbor acts as a per-query, self-calibrating estimate of what "meaninglessly close" looks like, which is why the ratio test crushes any fixed absolute threshold: it adapts to the scene, the descriptor, and even the individual keypoint. Figure 10.5.1 draws the two situations.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two descriptor-space situations: an unambiguous match where the nearest neighbor is far closer than the second nearest, and an ambiguous one where both candidates are nearly equidistant from the query">
+  <!-- left: unambiguous -->
+  <text x="195" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">unambiguous: keep</text>
+  <rect x="40" y="45" width="310" height="200" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <!-- background points -->
+  <g fill="#aab7c4">
+    <circle cx="90" cy="90" r="4"/><circle cx="300" cy="80" r="4"/><circle cx="270" cy="200" r="4"/>
+    <circle cx="120" cy="210" r="4"/><circle cx="320" cy="150" r="4"/><circle cx="80" cy="160" r="4"/>
+  </g>
+  <circle cx="190" cy="150" r="7" fill="#2c3e50"/>
+  <text x="190" y="135" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">query</text>
+  <circle cx="225" cy="165" r="6" fill="#27ae60"/>
+  <line x1="190" y1="150" x2="225" y2="165" stroke="#27ae60" stroke-width="2"/>
+  <text x="236" y="186" font-family="sans-serif" font-size="12" fill="#145a32">d&#8321; (small)</text>
+  <circle cx="310" cy="220" r="6" fill="#b9770e"/>
+  <line x1="190" y1="150" x2="310" y2="220" stroke="#b9770e" stroke-width="1.6" stroke-dasharray="5,4"/>
+  <text x="282" y="248" font-family="sans-serif" font-size="12" fill="#7d6608">d&#8322; (large)</text>
+  <text x="195" y="278" font-family="sans-serif" font-size="13" fill="#145a32" text-anchor="middle" font-weight="bold">d&#8321;/d&#8322; &#8776; 0.4 &lt; 0.75 &#10003;</text>
+
+  <!-- right: ambiguous -->
+  <text x="585" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">ambiguous: reject</text>
+  <rect x="430" y="45" width="310" height="200" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <g fill="#aab7c4">
+    <circle cx="480" cy="90" r="4"/><circle cx="700" cy="100" r="4"/><circle cx="660" cy="215" r="4"/>
+    <circle cx="500" cy="215" r="4"/><circle cx="715" cy="170" r="4"/>
+  </g>
+  <circle cx="580" cy="150" r="7" fill="#2c3e50"/>
+  <text x="580" y="135" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">query</text>
+  <circle cx="618" cy="167" r="6" fill="#27ae60"/>
+  <line x1="580" y1="150" x2="618" y2="167" stroke="#27ae60" stroke-width="2"/>
+  <text x="634" y="160" font-family="sans-serif" font-size="12" fill="#145a32">d&#8321;</text>
+  <circle cx="552" cy="190" r="6" fill="#c0392b"/>
+  <line x1="580" y1="150" x2="552" y2="190" stroke="#c0392b" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="520" y="200" font-family="sans-serif" font-size="12" fill="#922b21">d&#8322; &#8776; d&#8321;</text>
+  <text x="585" y="262" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">two look-alikes (repeated texture, or no true partner)</text>
+  <text x="585" y="282" font-family="sans-serif" font-size="13" fill="#922b21" text-anchor="middle" font-weight="bold">d&#8321;/d&#8322; &#8776; 0.93 &gt; 0.75 &#10007;</text>
+</svg>
+<figcaption><strong>Figure 10.5.1</strong> The ratio test in descriptor space. Left: a correct match sits far below the background distances, so the best-to-second-best ratio is small and the match is kept. Right: with repeated structure or a missing true partner, the two best candidates are nearly equidistant; a ratio near 1 flags the ambiguity and the match is dropped before it can poison the geometry.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Ratio Test Measures Ambiguity, Not Quality</div>
+<p>The ratio test never decides whether a match is good; it decides whether the matcher had any business choosing at all. That distinction explains both its power and its blind spot. Power: it adapts per keypoint with zero training and rejects precisely the matches no descriptor could resolve. Blind spot: a confidently wrong match (the descriptor genuinely looks like the wrong place, with nothing similar nearby) sails through at a low ratio. Those survivors are why <a href="section-10.6.html">Section 10.6</a> exists: ambiguity is filtered here, in descriptor space; correctness is verified there, in geometric space.</p>
+</div>
+
+<p>
+In the 2004 SIFT paper, Lowe quantified the test on a large ground-truth set: at $\tau = 0.8$, the ratio test discarded about 90 percent of false matches while sacrificing under 5 percent of correct ones. Practitioners since have mostly tightened it to 0.7 to 0.75 for geometry pipelines (precision matters more when RANSAC iterations are at stake) and loosened it toward 0.8 for retrieval. The standard recipe, end to end, looks like this:
+</p>
+
+<pre><code class="language-python">import cv2
+
+img1 = cv2.imread("ridge_left.jpg", cv2.IMREAD_GRAYSCALE)
+img2 = cv2.imread("ridge_right.jpg", cv2.IMREAD_GRAYSCALE)
+
+sift = cv2.SIFT_create(nfeatures=3000)
+k1, d1 = sift.detectAndCompute(img1, None)
+k2, d2 = sift.detectAndCompute(img2, None)
+
+bf = cv2.BFMatcher(cv2.NORM_L2)               # no crossCheck with knnMatch
+pairs = bf.knnMatch(d1, d2, k=2)              # two best candidates per query
+good = [m for m, n in pairs if m.distance &lt; 0.75 * n.distance]
+print(f"{len(pairs)} candidates -&gt; {len(good)} after ratio test")
+# 3000 candidates -&gt; 642 after ratio test
+
+vis = cv2.drawMatches(img1, k1, img2, k2, good, None,
+                      flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+cv2.imwrite("matches.jpg", vis)</code></pre>
+<div class="code-caption">The canonical SIFT matching recipe: k-nearest-neighbor search with $k=2$, the 0.75 ratio gate applied per query, and <code>cv2.drawMatches</code> to render surviving correspondences for the visual sanity check no metric replaces.</div>
+
+<p>
+Look at the printed numbers: four out of five candidates died at the gate. That attrition is normal and healthy. With ORB descriptors the same recipe applies with <code>cv2.NORM_HAMMING</code>; the ratio of two Hamming distances is just as meaningful as the ratio of two Euclidean ones.
+</p>
+
+<h2>4. Scaling Up: Approximate Search With FLANN <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Brute force compares every query against every candidate: fine at 2,000 versus 2,000, painful at 100,000 versus 10 million, which is where panorama engines, reconstruction farms, and image-retrieval systems operate. The classical answer is <strong>approximate nearest-neighbor</strong> search: index the candidate descriptors in a space-partitioning structure, accept a small probability of missing the true neighbor, gain orders of magnitude in speed. OpenCV bundles FLANN (Fast Library for Approximate Nearest Neighbors), with two indexes you should know: randomized KD-tree forests for float descriptors, and multi-probe locality-sensitive hashing (LSH) for binary ones.
+</p>
+
+<pre><code class="language-python"># Float descriptors (SIFT family): forest of randomized KD-trees
+FLANN_INDEX_KDTREE = 1
+flann = cv2.FlannBasedMatcher(
+    dict(algorithm=FLANN_INDEX_KDTREE, trees=5),
+    dict(checks=50))            # leaves visited: the accuracy/speed dial
+pairs = flann.knnMatch(d1, d2, k=2)
+good = [m for m, n in pairs if m.distance &lt; 0.75 * n.distance]
+print(len(good))                # within a few matches of brute force
+
+# Binary descriptors (ORB/AKAZE): multi-probe LSH instead
+FLANN_INDEX_LSH = 6
+index_params = dict(algorithm=FLANN_INDEX_LSH,
+                    table_number=6, key_size=12, multi_probe_level=1)</code></pre>
+<div class="code-caption">FLANN matching for both descriptor families: KD-tree forests for floats with <code>checks</code> trading recall against speed, and the LSH parameter set for binary descriptors; at a few thousand keypoints brute force is often faster, so FLANN earns its keep only at scale.</div>
+
+<p>
+A rule of thumb worth keeping: below roughly 5,000 descriptors per image, optimized brute force usually wins (no index to build, perfect recall); above that, and especially when one side of the match is a persistent database queried many times, approximate search dominates. The idea of organizing descriptors for sub-linear lookup grows in two directions later in the book: quantizing them into visual words for the retrieval systems of <a href="../module-16-classical-recognition/index.html">Chapter 16</a>, and, in the modern era, embedding whole images for vector search, where <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>'s CLIP vectors play the role descriptors play here.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Deduplicating Eleven Million Product Photos</div>
+<p><strong>Who:</strong> A data-platform engineer and one intern at an online marketplace aggregating third-party seller catalogs.</p>
+<p><strong>Situation:</strong> Sellers re-upload the same product photos with crops, watermarks, brightness tweaks, and slight rescales. Duplicate listings degraded search, and perceptual hashes caught only the near-exact copies, missing anything cropped or watermarked.</p>
+<p><strong>Problem:</strong> Eleven million images, a nightly batch window of four hours, and a false-merge budget near zero: wrongly merging two different products is a seller-relations incident, while a missed duplicate is merely untidy.</p>
+<p><strong>Decision:</strong> ORB descriptors (512 per image) indexed in a multi-probe LSH structure; candidate pairs from index lookups; each candidate pair then verified with the full recipe: ratio test at a strict 0.7, followed by a homography check requiring 40 geometric inliers (a preview of <a href="section-10.6.html">Section 10.6</a>) before any merge.</p>
+<p><strong>Result:</strong> The nightly job processed the catalog in 3.1 hours on 16 CPU workers. Manual audit of 2,000 merges found one error, against 9 percent false merges for the hash-only baseline at equal recall. The strict ratio threshold alone removed 84 percent of candidate pairs before the expensive geometric stage ran.</p>
+<p><strong>Lesson:</strong> In large-scale matching, the ratio test's real job is economic: it is the cheap filter that protects the expensive verifier. Tuning it against the cost of the next pipeline stage, not in isolation, is what made the budget close.</p>
+</div>
+
+<h2>5. What Matching Cannot Fix <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Run the recipe on a real pair and inspect the drawn matches; you will find the picture mostly right and stubbornly imperfect. A few lines cross the image at impossible angles, connecting a roof corner to a fence post: confidently wrong matches the ratio test cannot see. Some correct correspondences died at the gate because the scene really does repeat. This is the honest endpoint of descriptor-space reasoning: every filter in this section judges matches one at a time, in isolation, and no amount of per-match cleverness can exploit the one constraint that binds all true matches together: they were produced by the <em>same camera motion</em> looking at the <em>same rigid scene</em>. Enforcing that collective constraint, and surviving the outliers that violate it, is robust model fitting, and it is where this chapter has been heading all along. The payoff arrives in <a href="section-10.6.html">Section 10.6</a>, and it is what the two-view geometry of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> will inherit.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: When the Matcher Became a Network</div>
+<p>The assumption this section never questioned (match each descriptor independently, then filter) is exactly what learned matchers abandoned. SuperGlue (2020) framed matching as joint assignment over <em>all</em> keypoints of both images, using a graph neural network with attention so every tentative match informs every other, plus an explicit dustbin for unmatchable points: the occlusion case raw nearest-neighbor search handles so badly. LightGlue (ICCV 2023) made that practical, with adaptive early stopping on easy pairs, and is now a standard component in reconstruction stacks. OmniGlue (CVPR 2024) adds foundation-model guidance to generalize across domains, and RoMa (CVPR 2024) drops sparse keypoints entirely in favor of dense learned matching. Notably, the ratio test's core insight (judge a match by its margin over alternatives) survives inside these systems as the softmax over candidate assignments; the heuristic became a differentiable layer. The attention machinery behind all of this is built in <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.1: Three Filters, Three Failure Modes <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each filter (absolute distance threshold, cross-check, ratio test), construct a concrete scenario where it accepts a false match that one of the other two would reject, and a scenario where it rejects a true match the others would keep. Repetitive facades, occluded regions, and low-texture scenes are fertile ground. Conclude with a recommendation: in what order would you compose the filters for a panorama stitcher, and which would you drop for a 30 fps tracker?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.2: Reproduce Lowe's Histogram <span class="exercise-type coding">Coding</span></div>
+<p>Create a ground-truthed pair by warping an image with a known homography (the tools of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>). Match SIFT descriptors with <code>knnMatch(k=2)</code>, label each candidate correct or incorrect using the known warp (3-pixel tolerance), and plot two histograms of the ratio $d_1/d_2$: one for correct matches, one for incorrect. Mark the 0.7, 0.75, and 0.8 thresholds and report precision and recall at each. How closely does your incorrect-match histogram crowd toward 1.0, and does 0.75 look like the right default for your image?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 10.5.3: The Repetition Stress Test <span class="exercise-type analysis">Analysis</span></div>
+<p>Photograph (or synthesize) a scene with strong repetition: a tiled wall, a keyboard, a parking lot. Match it against a shifted view using (a) nearest neighbor only, (b) cross-check, (c) ratio test at 0.75, (d) cross-check plus ratio. For each, report match count and, by visual inspection of <code>drawMatches</code> output on 50 random survivors, an estimated precision. Where does the ratio test's rejection rate spike, and what fraction of the scene's true correspondences become unrecoverable by any per-match filter? Relate the result to why <a href="section-10.6.html">Section 10.6</a>'s geometric consensus is the only fix.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.4.html">&#8592; Section 10.4: Fast Binary Alternatives: BRIEF, ORB &amp; AKAZE</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.6.html">Section 10.6: RANSAC &amp; Robust Model Fitting &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

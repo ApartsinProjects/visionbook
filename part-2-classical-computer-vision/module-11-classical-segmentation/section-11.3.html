@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.3: The Watershed Transform. Reading an image as a topographic surface and flooding it from below: catchment basins, watershed lines, the oversegmentation problem, and marker-controlled watershed that separates touching objects." name="description"/>
+<title>Section 11.3: The Watershed Transform | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>The Watershed Transform</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I flood your image like a valley in spring rain. Where two lakes are about to merge, I build a dam. The dams are your boundaries; the lakes are your objects. You are welcome."</p>
+<cite>A Watershed Transform With a Flair for Hydrology</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The watershed transform treats a grayscale image as a three-dimensional landscape, intensity is altitude, and segments it by simulating a flood rising from every valley at once.</strong> As the water rises, each valley becomes a growing lake (a catchment basin); the moment two lakes are about to merge, a dam is built between them, and those dams are the segment boundaries. The power of this idea is that it separates objects by the <em>shape</em> of the terrain, not by intensity similarity, which is exactly what region growing could not do. Run on the distance transform of a binary mask, watershed will split two touching coins or two abutting cells along the thin neck where they meet, the single most useful trick in the classical segmentation toolbox and still the default in cell-counting microscopy today.</p>
+</div>
+
+<p>
+<a href="section-11.2.html">Section 11.2</a> ended on a problem region growing cannot solve: two objects of the same intensity that touch present no boundary to grow up against, so a homogeneity predicate floods straight from one into the other. The watershed transform attacks this from a completely different angle. Instead of asking "are these pixels similar?" it asks "if water rose through this terrain, where would the ridges between basins fall?" Because the answer depends on the geometry of the surface rather than on absolute values, watershed can place a boundary exactly where two blobs pinch together, even when there is no intensity difference across the pinch at all. The trick is choosing the right surface to flood, and that choice connects directly to the morphological distance transform from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>.
+</p>
+
+<h2>1. The Topographic Metaphor <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+Picture a grayscale image as a relief map: dark pixels are low ground, bright pixels are peaks. A <strong>regional minimum</strong> is a connected set of pixels surrounded by higher ground, the bottom of a valley. The <strong>catchment basin</strong> of a minimum is every pixel from which a drop of water would flow down into that minimum. The <strong>watershed lines</strong> are the ridges separating one basin from the next, the points where water is undecided about which valley to fall into.
+</p>
+<p>
+The immersion algorithm of Vincent and Soille (1991) builds these basins by simulating a flood. Imagine piercing a hole at each regional minimum and slowly immersing the whole landscape in water. Water wells up from each minimum, filling its basin. Whenever the water from two distinct basins would meet, a dam is erected at that location to keep them separate. When the entire surface is submerged, the dams that remain are the watershed lines, and the basins they enclose are the segments. Figure 11.3.1 shows this flooding for a one-dimensional intensity profile with two valleys.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 1D intensity profile shown as terrain with two valleys filling with water up to a ridge where a dam is built">
+<rect x="0" y="0" width="760" height="360" fill="#ffffff"/>
+<text x="380" y="28" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">Watershed by immersion: flood the valleys, dam where lakes meet</text>
+<!-- terrain (intensity as altitude): two valleys separated by a ridge -->
+<path d="M60,120 C120,300 180,300 230,170 C270,70 300,70 340,150 C380,250 440,250 480,300 C520,330 560,330 700,160"
+      fill="none" stroke="#7f6a4d" stroke-width="3"/>
+<!-- ground fill under the curve -->
+<path d="M60,120 C120,300 180,300 230,170 C270,70 300,70 340,150 C380,250 440,250 480,300 C520,330 560,330 700,160 L700,330 L60,330 Z"
+      fill="#efe6d6"/>
+<!-- water in left basin -->
+<path d="M95,255 C130,300 180,300 230,255 L230,255 Z" fill="#bfe0f2" opacity="0.85"/>
+<rect x="95" y="255" width="135" height="0" fill="none"/>
+<path d="M95,255 C150,300 175,300 230,255 L230,300 L95,300 Z" fill="#bfe0f2" opacity="0.85"/>
+<!-- water in right basin -->
+<path d="M400,275 C440,305 470,305 505,290 L505,300 L400,300 Z" fill="#bfe0f2" opacity="0.85"/>
+<path d="M400,275 C440,305 470,305 505,290 L505,300 L400,300 Z" fill="#bfe0f2" opacity="0.85"/>
+<!-- minima markers -->
+<circle cx="165" cy="298" r="5" fill="#2980b9"/>
+<text x="165" y="324" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#2980b9">minimum A</text>
+<circle cx="452" cy="300" r="5" fill="#27ae60"/>
+<text x="452" y="324" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#27ae60">minimum B</text>
+<!-- ridge / dam -->
+<line x1="298" y1="72" x2="298" y2="200" stroke="#c0392b" stroke-width="3" stroke-dasharray="6,4"/>
+<text x="298" y="62" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#c0392b" font-weight="bold">dam = watershed line</text>
+<!-- axis hint -->
+<text x="42" y="120" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666" transform="rotate(-90 42 200)">altitude = intensity</text>
+</svg>
+<figcaption><strong>Figure 11.3.1</strong> The watershed by immersion, shown on a 1D intensity profile read as terrain. Water rises from regional minima A and B, filling their catchment basins. The ridge between them is where the two rising lakes would merge; a dam is built there, and that dam is the watershed line that separates the two segments. The boundary lands at the topographic ridge regardless of the basins' depths.</figcaption>
+</figure>
+
+<p>
+Applied naively to a raw image, the surface to flood is usually the <strong>gradient magnitude</strong>, not the intensity itself, because object boundaries are where the gradient is high (ridges) and object interiors are where it is low (valleys). Flooding the gradient image puts watershed lines on the edges, which is what we want. The gradient comes straight from the Sobel operator of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>.
+</p>
+
+<h2>2. The Oversegmentation Problem <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+There is a catch, and it is severe. Real images contain a regional minimum almost everywhere, because sensor noise creates thousands of tiny local dips. Since the immersion algorithm starts a basin at <em>every</em> regional minimum, naive watershed produces one segment per minimum, which means hundreds or thousands of segments where you wanted five. This is the notorious <strong>oversegmentation</strong> of the watershed, and it is so reliable that an unguided watershed is essentially never used in practice.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Every Noise Dip Becomes a Basin</div>
+<p>The watershed's strength and its weakness are the same property: it is exquisitely sensitive to local minima. That sensitivity is what lets it find the precise ridge between two touching objects, but it also means that a single noisy pixel, sitting one gray level below its neighbors, opens its own catchment basin and therefore its own segment. The number of segments a naive watershed returns is the number of regional minima in the surface, which for a real photograph is enormous. Every practical use of watershed is therefore really a strategy for <em>controlling which minima are allowed to seed a basin</em>. The two strategies are smoothing the surface (fewer minima) and, far more powerfully, supplying the minima by hand as markers.</p>
+</div>
+
+<h2>3. Marker-Controlled Watershed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The fix that makes watershed useful is <strong>marker-controlled watershed</strong>. Instead of letting every regional minimum seed a basin, you supply a small set of markers, one per object you want, plus one for the background, and force the flood to originate only from those markers. The result has exactly as many segments as you have markers (plus background), and the watershed lines fall on the ridges between marked regions. The genius is in how the markers are obtained for the touching-objects case, and it threads together three tools you already have:
+</p>
+<ol>
+<li><strong>Threshold</strong> the image to a binary foreground mask (Otsu's method from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> is the usual choice).</li>
+<li>Compute the <strong>distance transform</strong> of the foreground (from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>): each foreground pixel is labeled with its distance to the nearest background pixel. The center of each blob is a peak; the thin neck where two blobs touch is a valley.</li>
+<li>Threshold the distance transform high to get one sure-foreground marker per blob (the peaks survive, the neck does not), label them with connected components, and flood the negated gradient or the negated distance from those markers.</li>
+</ol>
+<p>
+Because the distance-transform peak of each blob is separated by the low ridge at the neck, the markers are distinct, and watershed dams the flood exactly at the neck. This is the standard recipe for separating touching cells, coins, or grains, and Figure 11.3.2 illustrates why the distance transform turns the touching-objects problem into a watershed it can solve.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two touching circles, their distance transform with two peaks separated by a saddle, and the resulting watershed boundary at the neck">
+<rect x="0" y="0" width="760" height="320" fill="#ffffff"/>
+<!-- panel 1: binary touching blobs -->
+<text x="130" y="34" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333" font-weight="bold">1. binary mask</text>
+<rect x="40" y="50" width="180" height="180" fill="#fafbfc" stroke="#ccc"/>
+<circle cx="105" cy="140" r="52" fill="#333"/>
+<circle cx="160" cy="140" r="52" fill="#333"/>
+<text x="130" y="252" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">two blobs, touching</text>
+<text x="130" y="270" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">(no intensity boundary)</text>
+<!-- arrow -->
+<line x1="232" y1="140" x2="270" y2="140" stroke="#333" stroke-width="2"/><polygon points="270,140 258,134 258,146" fill="#333"/>
+<!-- panel 2: distance transform -->
+<text x="385" y="34" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333" font-weight="bold">2. distance transform</text>
+<rect x="295" y="50" width="180" height="180" fill="#fafbfc" stroke="#ccc"/>
+<radialGradient id="dtL" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#fff"/><stop offset="100%" stop-color="#1a3a5a"/></radialGradient>
+<radialGradient id="dtR" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#fff"/><stop offset="100%" stop-color="#1a3a5a"/></radialGradient>
+<circle cx="360" cy="140" r="52" fill="url(#dtL)"/>
+<circle cx="415" cy="140" r="52" fill="url(#dtR)"/>
+<circle cx="360" cy="140" r="4" fill="#c0392b"/><circle cx="415" cy="140" r="4" fill="#c0392b"/>
+<text x="385" y="252" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">two peaks (red) =</text>
+<text x="385" y="270" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">markers; saddle at neck</text>
+<!-- arrow -->
+<line x1="487" y1="140" x2="525" y2="140" stroke="#333" stroke-width="2"/><polygon points="525,140 513,134 513,146" fill="#333"/>
+<!-- panel 3: watershed result -->
+<text x="640" y="34" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333" font-weight="bold">3. watershed split</text>
+<rect x="550" y="50" width="180" height="180" fill="#fafbfc" stroke="#ccc"/>
+<circle cx="615" cy="140" r="52" fill="#9ec6e8"/>
+<circle cx="670" cy="140" r="52" fill="#a9d8a0"/>
+<line x1="642" y1="92" x2="642" y2="188" stroke="#c0392b" stroke-width="3"/>
+<text x="640" y="252" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">dam at the neck</text>
+<text x="640" y="270" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">separates the two objects</text>
+</svg>
+<figcaption><strong>Figure 11.3.2</strong> Marker-controlled watershed separates touching objects. The binary mask of two touching blobs (panel 1) has no boundary between them. Its distance transform (panel 2) peaks at each blob center and dips to a saddle at the neck; thresholding the peaks gives one marker per blob. Flooding from those markers (panel 3) builds a dam exactly at the saddle, splitting the blobs. This three-step recipe is the standard way to count touching cells or coins.</figcaption>
+</figure>
+
+<p>
+The OpenCV implementation, <code>cv2.watershed</code>, takes a marker image of 32-bit integer labels: positive integers for known regions, zero for "unknown" pixels to be assigned, and it writes -1 onto the watershed lines. Below is the complete coin-separation pipeline.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("coins.jpg")
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+# 1. Otsu threshold -> binary foreground (coins white, background black).
+_, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+# 2. Clean the mask and find SURE background by dilating.
+kernel = np.ones((3, 3), np.uint8)
+opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+sure_bg = cv2.dilate(opened, kernel, iterations=3)
+
+# 3. Distance transform -> peaks are coin centers. Threshold high for sure FG.
+dist = cv2.distanceTransform(opened, cv2.DIST_L2, 5)
+_, sure_fg = cv2.threshold(dist, 0.5 * dist.max(), 255, 0)
+sure_fg = sure_fg.astype(np.uint8)
+
+# 4. Unknown = background minus foreground; label markers with connected comps.
+unknown = cv2.subtract(sure_bg, sure_fg)
+n_markers, markers = cv2.connectedComponents(sure_fg)
+markers = markers + 1               # so sure background is 1, not 0
+markers[unknown == 255] = 0         # mark unknown region with 0
+
+# 5. Flood. cv2.watershed writes -1 on the boundary ridges.
+markers = cv2.watershed(img, markers)
+img[markers == -1] = [0, 0, 255]    # paint watershed lines red
+
+n_objects = n_markers - 1           # minus the background label
+print("coins separated:", n_objects)
+# coins separated: 24</code></pre>
+<div class="code-caption">The complete marker-controlled watershed pipeline for separating touching coins: Otsu threshold, morphological cleanup, distance transform for foreground markers, and <code>cv2.watershed</code> to flood from the markers. The boundary ridges come back as -1 and are painted red.</div>
+
+<p>
+The chain of operations is worth pausing on, because every link is a tool from an earlier chapter: thresholding from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, morphological opening and dilation and the distance transform from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>, connected components for marker labeling, and watershed itself to flood. The watershed is the climax, but it is the distance transform that does the conceptual heavy lifting, turning "two blobs that touch" into "two peaks separated by a valley" that the flood can resolve.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: scikit-image's watershed With peak_local_max</div>
+<p>The marker-finding dance, threshold the distance transform, run connected components, build the integer marker image, is several careful lines and easy to get wrong (off-by-one label offsets, the unknown-region encoding). scikit-image packages marker detection and watershed into a cleaner pair:</p>
+<pre><code class="language-python">import numpy as np
+from scipy import ndimage as ndi
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
+
+dist = ndi.distance_transform_edt(binary_mask)            # distance transform
+coords = peak_local_max(dist, min_distance=20, labels=binary_mask)
+markers = np.zeros(dist.shape, dtype=int)
+markers[tuple(coords.T)] = np.arange(1, len(coords) + 1)  # one label per peak
+labels = watershed(-dist, markers, mask=binary_mask)      # flood the negated distance
+print("objects:", labels.max())</code></pre>
+<div class="code-caption">scikit-image's <code>watershed</code> with <code>peak_local_max</code> marker detection, replacing the manual threshold-and-label marker construction with a single peak finder.</div>
+<p>The reduction is modest in line count but large in correctness: <code>peak_local_max</code> with a <code>min_distance</code> guard handles the "merge nearby peaks so one blob gets one marker" problem that a raw threshold of the distance transform does not, removing the most common source of residual oversegmentation. The library also accepts a <code>compactness</code> argument that biases basins toward convex shapes, a knob the OpenCV version lacks.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting Cells in a Drug-Screening Lab</div>
+<p>A pharmaceutical screening lab needed to count cultured cells in thousands of fluorescence-microscopy wells per day to measure how a candidate drug affected cell proliferation. The cells were bright on a dark background, so thresholding found the foreground easily, but cells in dense wells pressed against one another, and a plain connected-components count merged every cluster into one giant object, badly undercounting exactly the wells where the drug had the strongest effect. The analyst rebuilt the pipeline around marker-controlled watershed: threshold, distance transform, <code>peak_local_max</code> to seed one marker per cell, then flood.</p>
+<p>The decisive parameter was <code>min_distance</code> in the peak finder, which encodes the smallest expected cell radius. Set too small, it split single large cells into halves; set correctly to the known cell size, it gave one marker per cell and watershed dammed the necks between touching cells cleanly. Validated against a biologist's manual counts on 200 wells, the automated count landed within three percent, and the throughput went from a few wells an hour by hand to thousands per minute. The lesson the team carried forward: watershed turned an uncountable pile into countable objects precisely because the distance transform encoded cell shape, and no amount of intensity tuning would have done the same.</p>
+</div>
+
+<h2>4. Where Watershed Fits, and Where It Hands Off <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Watershed earns its keep whenever objects are blob-like and the main difficulty is that they touch: cells, coins, grains, pills, bubbles, nuclei. Its weaknesses are equally specific. It struggles with elongated or branching objects whose distance transform has no single clean peak, with objects of wildly varying size (one <code>min_distance</code> cannot fit all), and with scenes where the gradient surface is noisy enough that even smoothing leaves spurious basins. And like every method in this chapter so far, it knows nothing about what an object <em>is</em>; it separates blobs whether or not they are meaningful.
+</p>
+<p>
+There is one more conceptual gap. Watershed makes a hard, local commitment, the dam goes at the ridge, full stop, with no notion of a global cost that might prefer a slightly different cut. The next section, <a href="section-11.4.html">Section 11.4</a>, replaces local commitment with global optimization: it writes the segmentation as the minimum of an energy over the whole image and solves it exactly for the two-region case. That global view is what finally lets a segmenter trade a little local boundary accuracy for a lot of global coherence, and it is the bridge to the learned segmentation of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Watershed, Learned and Differentiable</div>
+<p>The watershed idea did not retire when networks arrived; it merged with them. The Deep Watershed Transform (Bai and Urtasun, CVPR 2017) trains a network to predict a watershed energy whose basins are object instances, turning instance segmentation into a single watershed cut and remaining a touchstone for instance-segmentation design. In modern microscopy, StarDist (Schmidt et al., 2018, with active 2023-2024 extensions to 3D and dense tissue) predicts star-convex polygons for nuclei and sidesteps watershed's elongation weakness, while Cellpose (Stringer et al., Nature Methods 2021, and the 2024 Cellpose 3 release) predicts spatial flow fields whose sinks act as learned watershed markers, generalizing across cell types without retraining. The throughline is striking: these systems keep watershed's flood-from-markers skeleton and replace the hand-built distance-transform markers with learned ones, exactly the classical-skeleton-with-learned-parts pattern this chapter keeps surfacing. Cell-counting labs that ran <code>cv2.watershed</code> a decade ago now run Cellpose, but the algorithm underneath is recognizably the same.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.1: Why the Distance Transform? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in your own words why marker-controlled watershed floods the <em>negated distance transform</em> rather than the raw binary mask or the raw intensity. Specifically: (a) what role does negation play, (b) why does the distance transform's saddle point at the neck of two touching blobs end up as the watershed line, and (c) what would go wrong if you flooded the intensity image directly for the touching-coins case?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.2: Marker Sensitivity Study <span class="exercise-type coding">Coding</span></div>
+<p>Take an image of touching objects (coins, beans, or the scikit-image <code>data.coins()</code> sample). Run the scikit-image watershed pipeline while sweeping <code>min_distance</code> in <code>peak_local_max</code> over a range from very small to very large. Plot the resulting object count against <code>min_distance</code> and mark the plateau where the count equals the true number. Discuss why the plateau exists and what it tells you about choosing the parameter without knowing the answer in advance.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.3.3: Gradient Watershed vs Distance Watershed <span class="exercise-type analysis">Analysis</span></div>
+<p>For a natural image with textured regions (not blob-like objects), compare two watershed strategies: (a) flooding the Sobel gradient magnitude with no markers, and (b) the same but with markers placed at the regional minima of a heavily smoothed gradient. Count the segments each produces, overlay both boundary maps on the image, and write a paragraph explaining why the unmarked gradient watershed oversegments so badly and how smoothing-then-marking tames it. Relate your finding to the noise-sensitivity insight in this section.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.2.html">&#8592; Section 11.2: Region Growing &amp; Split-and-Merge</a>
+<a href="index.html">Chapter 11</a>
+<a class="next" href="section-11.4.html">Section 11.4: Graph-Based Segmentation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

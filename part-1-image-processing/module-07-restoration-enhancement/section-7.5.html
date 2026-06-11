@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.5: Classical Super-Resolution. Why interpolation cannot add information, the multi-frame observation model, sub-pixel registration and shift-and-add fusion, iterative back-projection, and the honest limits of resolution recovery." name="description"/>
+<title>Section 7.5: Classical Super-Resolution | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Classical Super-Resolution</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"One frame is a rumor. Eight frames with sub-pixel shifts are a sworn deposition, and I am the court stenographer."</p>
+<cite>A Meticulous Multi-Frame Super-Resolver</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Single-image interpolation redistributes the information you have; multi-frame super-resolution collects information you did not have.</strong> Each slightly shifted, aliased low-resolution frame samples the scene at a different phase. Registered to sub-pixel accuracy and fused onto a fine grid, those samples reconstruct frequencies that no single frame contains. The entire discipline lives inside the words "slightly shifted" and inside the aliasing that everyone else in this book tries to remove.</p>
+</div>
+<p>
+The previous sections repaired pixels that were noisy (<a href="section-7.2.html">Section 7.2</a>), smeared (<a href="section-7.3.html">Section 7.3</a>), or missing (<a href="section-7.4.html">Section 7.4</a>). This section asks for pixels that were never captured at all: given a low-resolution image, produce a higher-resolution one. Phrased that way it sounds impossible, and for a single image, in the strict information-theoretic sense, it is. The classical escape is to stop asking one image to do it. Before deep networks learned to hallucinate plausible detail, super-resolution meant honest accounting: finding measurements that genuinely exist, scattered across multiple frames, and assembling them.
+</p>
+<h2>1. Adding Pixels Is Not Adding Information <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+<a href="../module-05-geometric-transformations/index.html">Chapter 5</a> built the interpolation toolbox: bilinear, bicubic, Lanczos. All of them can resize an image to any dimensions you like, and none of them perform super-resolution. The sampling theorem from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> says why: a grid of $N \times N$ samples can represent spatial frequencies up to its Nyquist limit and nothing above. Interpolating to $2N \times 2N$ creates new pixel values, but every one of them is a weighted average of the original samples; the spectrum gains no content beyond the original Nyquist limit. The result is larger, smoother, and exactly as informative. Upscaled text remains unreadable at any size, just more politely blurred.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "enhance" scene, where a detective squints at four blobs of surveillance footage and orders the computer to produce a license plate, is such a reliable fixture of crime television that signal-processing courses use it as a running gag. The joke has aged strangely: multi-frame methods (this section) can legitimately extract a plate that no single frame shows, and generative models (later in this book) will cheerfully print you a crisp plate that was never in the data at all. The detective's question has quietly changed from "can we enhance it?" to "can we trust what the enhancer says?"</p>
+</div>
+<p>
+So where could genuinely new information come from? Three honest sources exist: more measurements of the same scene (multiple frames, the core of this section), prior knowledge about the scene's structure (the example-based methods of Section 5), and knowledge of the camera's own blur (folding in the deconvolution of <a href="section-7.3.html">Section 7.3</a>). Everything classical is some mix of the three.
+</p>
+<h2>2. The Observation Model, and Aliasing the Ally <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+As always in this chapter, the cure starts with a forward model. Let $x$ be the high-resolution (HR) image we want, and let each captured low-resolution (LR) frame $y_k$ be produced by warping, blurring, and downsampling it:
+</p>
+$$
+y_k = D \, B \, W_k \, x + n_k ,
+$$
+<p>
+where $W_k$ is a geometric warp (for handheld video, nearly a pure translation between consecutive frames), $B$ is the camera blur from <a href="section-7.3.html">Section 7.3</a>, $D$ is decimation to the coarse grid, and $n_k$ is noise from <a href="section-7.1.html">Section 7.1</a>. Each frame is a different set of linear equations about the same unknown $x$; collect enough independent equations and the system becomes solvable. The independence comes from the warps: if frame $k$ is shifted by half an LR pixel relative to frame $j$, its sensor wells integrate different parts of the scene, and its equations are new.
+</p>
+<p>
+Here is the counterintuitive heart of the subject: this only works if the LR frames are <em>aliased</em>. <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> presented aliasing as a sin: frequencies above Nyquist fold down and masquerade as low frequencies. But masquerading information is still information. In an aliased frame, the high frequencies of the scene are present, folded and entangled with the low ones; different sub-pixel shifts entangle them with different phases, and a set of differently-shifted frames gives you the linear system that disentangles them. A camera with a perfect anti-aliasing filter destroys those high frequencies before sampling, and then no quantity of frames can recover them: the equations all say the same thing. Figure 7.5.1 shows the mechanics on the sampling grid.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three coarse sampling grids with different sub-pixel shifts interleave into one dense sampling grid after registration">
+<style>
+.glab { font-family: Verdana, Arial, sans-serif; font-size: 12.5px; font-weight: bold; text-anchor: middle; fill: #1f2937; }
+.gsub { font-family: Verdana, Arial, sans-serif; font-size: 11px; text-anchor: middle; fill: #4b5563; }
+.cell { fill: none; stroke: #cbd5e1; stroke-width: 1; }
+.farr { stroke: #1f2937; stroke-width: 2.2; fill: none; marker-end: url(#ah5); }
+</style>
+<defs>
+<marker id="ah5" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#1f2937"/></marker>
+</defs>
+<!-- Frame 1 grid: blue circles -->
+<text class="glab" x="120" y="28">frame 1</text>
+<text class="gsub" x="120" y="44">shift (0, 0)</text>
+<g>
+<rect class="cell" x="50" y="60" width="140" height="140"/>
+<line class="cell" x1="120" y1="60" x2="120" y2="200"/>
+<line class="cell" x1="50" y1="130" x2="190" y2="130"/>
+<circle cx="85" cy="95" r="7" fill="#2563eb"/><circle cx="155" cy="95" r="7" fill="#2563eb"/>
+<circle cx="85" cy="165" r="7" fill="#2563eb"/><circle cx="155" cy="165" r="7" fill="#2563eb"/>
+</g>
+<!-- Frame 2 grid: green squares, shifted right -->
+<text class="glab" x="340" y="28">frame 2</text>
+<text class="gsub" x="340" y="44">shift (+&#189;, 0) LR px</text>
+<g>
+<rect class="cell" x="270" y="60" width="140" height="140"/>
+<line class="cell" x1="340" y1="60" x2="340" y2="200"/>
+<line class="cell" x1="270" y1="130" x2="410" y2="130"/>
+<rect x="313" y="88" width="14" height="14" fill="#059669"/><rect x="383" y="88" width="14" height="14" fill="#059669"/>
+<rect x="313" y="158" width="14" height="14" fill="#059669"/><rect x="383" y="158" width="14" height="14" fill="#059669"/>
+</g>
+<!-- Frame 3 grid: red triangles, shifted down -->
+<text class="glab" x="560" y="28">frame 3</text>
+<text class="gsub" x="560" y="44">shift (0, +&#189;) LR px</text>
+<g>
+<rect class="cell" x="490" y="60" width="140" height="140"/>
+<line class="cell" x1="560" y1="60" x2="560" y2="200"/>
+<line class="cell" x1="490" y1="130" x2="630" y2="130"/>
+<polygon points="525,123 518,137 532,137" fill="#dc2626"/><polygon points="595,123 588,137 602,137" fill="#dc2626"/>
+<polygon points="525,193 518,207 532,207" fill="#dc2626"/><polygon points="595,193 588,207 602,207" fill="#dc2626"/>
+</g>
+<!-- Arrow -->
+<line class="farr" x1="645" y1="130" x2="715" y2="130"/>
+<text class="gsub" x="680" y="112">register +</text>
+<text class="gsub" x="680" y="156">interleave</text>
+<!-- Fused dense grid -->
+<text class="glab" x="810" y="28">fused fine grid</text>
+<text class="gsub" x="810" y="44">2x the sample density</text>
+<g>
+<rect class="cell" x="740" y="60" width="140" height="140"/>
+<line class="cell" x1="775" y1="60" x2="775" y2="200"/>
+<line class="cell" x1="810" y1="60" x2="810" y2="200"/>
+<line class="cell" x1="845" y1="60" x2="845" y2="200"/>
+<line class="cell" x1="740" y1="95" x2="880" y2="95"/>
+<line class="cell" x1="740" y1="130" x2="880" y2="130"/>
+<line class="cell" x1="740" y1="165" x2="880" y2="165"/>
+<circle cx="757" cy="77" r="6" fill="#2563eb"/><circle cx="827" cy="77" r="6" fill="#2563eb"/>
+<circle cx="757" cy="147" r="6" fill="#2563eb"/><circle cx="827" cy="147" r="6" fill="#2563eb"/>
+<rect x="786" y="71" width="12" height="12" fill="#059669"/><rect x="856" y="71" width="12" height="12" fill="#059669"/>
+<rect x="786" y="141" width="12" height="12" fill="#059669"/><rect x="856" y="141" width="12" height="12" fill="#059669"/>
+<polygon points="757,106 751,118 763,118" fill="#dc2626"/><polygon points="827,106 821,118 833,118" fill="#dc2626"/>
+<polygon points="757,176 751,188 763,188" fill="#dc2626"/><polygon points="827,176 821,188 833,188" fill="#dc2626"/>
+</g>
+<text class="gsub" x="460" y="262">each frame samples the same scene on a coarse grid, offset by a sub-pixel amount;</text>
+<text class="gsub" x="460" y="280">after registration the samples interleave, and the fused grid is genuinely denser,</text>
+<text class="gsub" x="460" y="298">carrying frequencies no single frame could represent</text>
+</svg>
+<figcaption><strong>Figure 7.5.1:</strong> Why multiple frames beat one. Three coarse grids (circles, squares, triangles) sample the scene with different sub-pixel offsets. No single grid can represent detail finer than its own spacing, but registered and interleaved (right), the samples form a denser grid. The blank positions remaining on the fine grid are filled by the back-projection iteration of Section 4.</figcaption>
+</figure>
+<h2>3. Shift-and-Add: Super-Resolution by Bookkeeping <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The simplest fusion algorithm follows Figure 7.5.1 literally. Estimate each frame's shift relative to a reference, scale the shifts up to the fine grid, then deposit every LR pixel onto its registered fine-grid position and average whatever lands in each bin. Registration must be sub-pixel accurate, and <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> already supplied the tool: phase correlation, which reads translation off the Fourier phase difference and, with local upsampling of the correlation peak, resolves shifts to a few hundredths of a pixel. Code 7.5.1 runs the full pipeline on synthetic frames so the gain over bicubic is measurable.
+</p>
+<pre><code class="language-python">import numpy as np
+import cv2
+from scipy.ndimage import shift as nd_shift
+from skimage import data, img_as_float
+from skimage.registration import phase_cross_correlation
+from skimage.metrics import peak_signal_noise_ratio as psnr
+
+rng = np.random.default_rng(seed=7)
+hr = img_as_float(data.camera())                  # ground-truth HR, 512x512
+SCALE = 2
+
+def capture_lr(hr_img, dy, dx):
+    """One observation: sub-pixel shift, mild blur, decimate, noise."""
+    shifted = nd_shift(hr_img, (dy, dx), order=3, mode='reflect')
+    blurred = cv2.GaussianBlur(shifted, (3, 3), 0.6)
+    lr = blurred[::SCALE, ::SCALE]                # decimation keeps aliasing!
+    return np.clip(lr + rng.normal(0, 0.01, lr.shape), 0, 1)
+
+true_shifts = [(0.0, 0.0)] + [tuple(rng.uniform(0, SCALE, 2)) for _ in range(7)]
+frames = [capture_lr(hr, dy, dx) for dy, dx in true_shifts]
+
+# --- Register every frame to frame 0, to sub-pixel precision ---
+est = [phase_cross_correlation(frames[0], f, upsample_factor=50)[0]
+       for f in frames]                           # shift in LR pixels
+
+# --- Deposit samples onto the fine grid, average per bin ---
+acc  = np.zeros(hr.shape)
+hits = np.zeros(hr.shape)
+for f, (sy, sx) in zip(frames, est):
+    ys = (np.arange(f.shape[0]) * SCALE - sy * SCALE).round().astype(int)
+    xs = (np.arange(f.shape[1]) * SCALE - sx * SCALE).round().astype(int)
+    yy, xx = np.meshgrid(ys % hr.shape[0], xs % hr.shape[1], indexing='ij')
+    np.add.at(acc,  (yy, xx), f)
+    np.add.at(hits, (yy, xx), 1)
+
+fused = np.where(hits &gt; 0, acc / np.maximum(hits, 1), 0)
+empty = hits == 0                                 # fine-grid bins nobody hit
+fused[empty] = cv2.resize(frames[0], hr.shape[::-1],
+                          interpolation=cv2.INTER_CUBIC)[empty]
+
+bicubic = cv2.resize(frames[0], hr.shape[::-1], interpolation=cv2.INTER_CUBIC)
+print(f"bicubic x2 (1 frame):    PSNR = {psnr(hr, bicubic):.1f} dB")
+print(f"shift-and-add (8 frames): PSNR = {psnr(hr, fused):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.1:</strong> A complete multi-frame pipeline in 30 lines: synthesize 8 sub-pixel-shifted LR captures, register them with upsampled phase correlation, and deposit every sample onto the 2x grid. Note that decimation uses bare slicing, no anti-aliasing, exactly as Section 2 demands; <code>INTER_AREA</code> here would destroy the very information we are harvesting.</div>
+<pre class="code-output">bicubic x2 (1 frame):    PSNR = 27.5 dB
+shift-and-add (8 frames): PSNR = 31.2 dB
+</pre>
+<div class="code-caption"><strong>Output 7.5.1a:</strong> A typical run (values move a decibel or so with the random shifts). Nearly 4 dB over bicubic, and the visual difference is starker than the number: edges that bicubic renders as soft ramps come back crisp, and fine texture that aliasing had scrambled into moire reassembles. This gain is real information, harvested, not invented.</div>
+<h2>4. Iterative Back-Projection: Simulate, Compare, Correct <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Shift-and-add ignores two terms of the observation model: the blur $B$, and the fact that an LR pixel is an <em>average</em> over a fine-grid neighborhood rather than a point sample. Irani and Peleg's iterative back-projection (1991) honors the full model with a loop you have already met twice in this chapter: guess the HR image, push the guess <em>forward</em> through the model to simulate every LR frame, compare against the real frames, and push the errors backward to correct the guess. Formally,
+</p>
+$$
+x^{(t+1)} = x^{(t)} + \sum_k U_k\!\left( y_k - D B W_k\, x^{(t)} \right),
+$$
+<p>
+where $U_k$ upsamples each residual and routes it back through the inverse warp. Code 7.5.2 implements it compactly, seeding the loop with the shift-and-add result.
+</p>
+<pre><code class="language-python">def simulate_lr(x, sy, sx):
+    """The forward model for frame k, matching capture_lr (minus noise)."""
+    warped = nd_shift(x, (sy * SCALE, sx * SCALE), order=3, mode='reflect')
+    return cv2.GaussianBlur(warped, (3, 3), 0.6)[::SCALE, ::SCALE]
+
+x_hat = fused.copy()
+for _ in range(15):
+    correction = np.zeros_like(x_hat)
+    for f, (sy, sx) in zip(frames, est):
+        residual = f - simulate_lr(x_hat, sy, sx)         # what we got wrong
+        up = cv2.resize(residual, x_hat.shape[::-1],
+                        interpolation=cv2.INTER_CUBIC)
+        correction += nd_shift(up, (-sy * SCALE, -sx * SCALE),
+                               order=3, mode='reflect')
+    x_hat = np.clip(x_hat + correction / len(frames), 0, 1)
+
+print(f"back-projection (15 iters): PSNR = {psnr(hr, x_hat):.1f} dB")
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.2:</strong> Iterative back-projection seeded by shift-and-add. Each pass simulates all eight captures from the current guess and redistributes the disagreement; the deblurring of <a href="section-7.3.html">Section 7.3</a> is happening implicitly, because residuals sharpen the estimate until the simulated blur matches the observed one.</div>
+<pre class="code-output">back-projection (15 iters): PSNR = 32.6 dB
+</pre>
+<div class="code-caption"><strong>Output 7.5.2a:</strong> Another decibel and a half over shift-and-add in a typical run, mostly recovered at edges. Like Richardson-Lucy, the loop semi-converges: with noisy frames, running it far past this point starts amplifying noise, and for the same reason.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Simulate-and-Correct Is the Master Pattern</div>
+<p>Look at what this chapter has quietly repeated three times. Richardson-Lucy: blur the guess, compare with the observation, push the ratio back. Back-projection: simulate the captures from the guess, compare, push the residuals back. Even the Anscombe sandwich was "model the noise forward, operate, invert." When you have a trustworthy forward model and an ill-posed inverse, <em>iterate the forward model</em> rather than inverting it directly. This pattern survives the deep-learning transition intact: diffusion-based restoration in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> guides its sampling loop with exactly these data-consistency corrections, a back-projection step wearing a generative prior.</p>
+</div>
+<h2>5. Single-Image Routes, and the Bridge to Learning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+When only one image exists, the missing information must come from priors, and the classical era built a clear progression of them. Edge-directed methods sharpened interpolation by snapping it to detected contours: honest, mild gains. <em>Example-based</em> super-resolution (Freeman et al., 2002) was the conceptual leap: build a dictionary of corresponding (LR patch, HR patch) pairs from training images, then assemble the output by looking up each input patch's HR counterpart. Sparse-coding variants (Yang et al., 2010) made the dictionary compact and the lookup a convex optimization, and Glasner et al. (2009) showed the dictionary could come from the input image itself, exploiting the cross-scale self-similarity cousin of <a href="section-7.2.html">Section 7.2</a>'s patch prior. Read those pipelines closely, patch encoding, a learned mapping, patch aggregation, and you can see SRCNN (2015) coming: it replaced each hand-built stage with a convolutional layer trained end to end, outperformed every dictionary method, and ended the classical era in three layers. The arc from hand-crafted pipeline to learned network repeats across all of vision, and <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> picks up super-resolution's deep, efficiency-obsessed present.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>cv2.dnn_superres</code></div>
+<p>OpenCV's contrib module wraps pretrained single-image SR networks (including FSRCNN, the fast successor of SRCNN, and EDSR) behind a four-line API, the practical replacement for everything in this section when you have one frame and no forensic constraints:</p>
+<pre><code class="language-python">from cv2 import dnn_superres                  # pip install opencv-contrib-python
+
+sr = dnn_superres.DnnSuperResImpl_create()
+sr.readModel('FSRCNN_x2.pb')                  # weights from the official repo
+sr.setModel('fsrcnn', 2)
+upscaled = sr.upsample(lr_bgr_uint8)          # uint8 BGR in, upscaled out
+</code></pre>
+<div class="code-caption"><strong>Code 7.5.3:</strong> Pretrained deep super-resolution through OpenCV's <code>dnn_superres</code> interface; swap in <code>'edsr'</code> weights for quality over speed.</div>
+<p>Our 60-line multi-frame pipeline becomes 4 lines (plus a weight download), and on a single frame the network will beat bicubic by margins the classical single-image methods never reached. Internally it handles the color-space bookkeeping (most SR networks enhance luma only), tiling, and pre/post-normalization. What it cannot do is harvest sub-pixel evidence from multiple frames; the two approaches are complementary, not competing.</p>
+</div>
+<h2>6. Honest Limits, and Why Honesty Matters <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+How far can multi-frame methods go? In principle, $N^2$ ideally-placed frames support an $N\times$ factor; in practice the budget is spent by three taxes. Registration error: fusing at 4x demands registration good to a quarter of an LR pixel, and errors blur exactly the detail being recovered. Noise: each fine-grid bin receives only a few samples, so the averaging that denoised at 2x thins out. And the optical blur $B$: once the lens itself cannot pass a frequency, no sampling cleverness retrieves it, the same hard wall as the spectral zeros of <a href="section-7.3.html">Section 7.3</a>. Practical systems top out around 2x to 4x, and the literature's standard advice stands: past there, you are deblurring and denoising, not resolving.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Plate That Eight Frames Could Prove</div>
+<p><strong>Who:</strong> A consultant retained by an insurance company's special investigations unit.</p>
+<p><strong>Situation:</strong> A hit-and-run in a parking garage, captured by a ceiling camera at 1080p. The suspect plate occupied 41 pixels across; individual frames showed an unreadable smear. The claimant's version of events hinged on identifying the vehicle.</p>
+<p><strong>Problem:</strong> A vendor tool with a learned "AI enhance" mode produced a crisply readable plate, and the legal team rejected it immediately: a model that can invent plausible glyphs is useless as evidence, since the output reflects its training prior as much as the scene.</p>
+<p><strong>Decision:</strong> The car idled for four seconds, drifting slightly: 90 usable frames with natural sub-pixel motion. The consultant ran exactly this section's pipeline, phase-correlation registration of the plate region, shift-and-add at 3x, ten back-projection iterations, and documented every step, every frame's estimated shift, and the forward model.</p>
+<p><strong>Result:</strong> Six of seven characters resolved unambiguously; the seventh narrowed to two candidates, enough for a registry match corroborated by paint evidence. The method survived expert challenge because every output pixel was an auditable linear combination of measured data.</p>
+<p><strong>Lesson:</strong> Multi-frame super-resolution's superpower is not its PSNR, it is its provenance. When the answer must be defended, "harvested" beats "hallucinated," and knowing both toolkits lets you choose deliberately.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Burst Pixels and One-Step Diffusion</div>
+<p>The classical pipeline of this section did not die; it moved into your phone. Google's Super Res Zoom, built on the handheld multi-frame pipeline of Wronski et al. (SIGGRAPH 2019), runs registration and robust fusion on every burst, using your hand tremor as the shift generator; Apple's Deep Fusion plays the same game. The learned single-image line, meanwhile, went generative: <strong>Real-ESRGAN</strong> (2021) trained on the compound degradations of <a href="section-7.1.html">Section 7.1</a> and became the default open-source upscaler, <strong>SUPIR</strong> (Yu et al., CVPR 2024) scaled diffusion-prior restoration to billions of parameters, and <strong>OSEDiff</strong> (Wu et al., NeurIPS 2024) distilled diffusion SR into a single sampling step, fast enough for interactive use. The field's open tension is exactly the one in the practical example above: perceptual quality keeps improving while pixel-evidence fidelity does not, and the upscalers inside text-to-image systems (<a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>) sit unapologetically at the hallucination end.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.1: The Anti-Aliasing Paradox <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Explain, using Figure 7.5.1 and the sampling discussion of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, why a camera with a perfect optical anti-aliasing filter defeats multi-frame super-resolution no matter how many frames are captured. (b) Many modern cameras omit the anti-aliasing filter to maximize per-frame sharpness; what does this trade away, and why is it the right trade for a burst-photography pipeline? (c) Why did Code 7.5.1 decimate with bare slicing instead of <code>cv2.INTER_AREA</code>?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.2: Diminishing Depositions <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 7.5.1 to sweep the number of frames $N \in \{2, 4, 8, 16, 32\}$ at scale 2x, plotting fused PSNR against $N$ (average 5 random shift draws each). Then repeat at 4x. Where does each curve flatten, and why? Relate the flattening points to the three taxes of Section 6, and check one prediction: adding frame noise ($\sigma = 0.03$) should shift the 4x curve down more than the 2x curve.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.5.3: Harvest versus Hallucination <span class="exercise-type analysis">Analysis</span></div>
+<p>Render an image containing random 5-character strings at a size where 2x downsampling makes them marginally unreadable. Reconstruct at 2x via (a) bicubic, (b) the multi-frame pipeline of Codes 7.5.1 and 7.5.2 from 8 shifted captures, and (c) a pretrained single-image network via Code 7.5.3. Measure character-recognition accuracy (your eyes or an OCR package) and PSNR for each. Then make the critical observation: when method (c) gets a character wrong, <em>how</em> does it get it wrong, and why does that failure mode matter more than its average accuracy?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-7.4.html"><span class="nav-label">Section 7.4: Inpainting: Filling the Holes</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="section-7.6.html"><span class="nav-label">Section 7.6: HDR Imaging &amp; Tone Mapping</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.2: Erosion &amp; Dilation. The two atoms of mathematical morphology: structuring elements, the fits and hits definitions, from-scratch NumPy implementations checked against OpenCV, the algebra of duality and composition, and grayscale morphology." name="description"/>
+<title>Section 6.2: Erosion &amp; Dilation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Erosion &amp; Dilation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My job description is three words: slide, fit, judge. I visit every pixel in the image and ask one question. You would be amazed how many careers in manufacturing depend on my answer."</p>
+<cite>An Overworked Structuring Element</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>All of mathematical morphology is built from two atoms: erosion asks "does my probe shape fit entirely inside the object here?" and dilation asks "does my probe shape touch the object here?", and every cleanup, measurement, and detection operator in this chapter is a composition of those two questions.</strong> This section defines both atoms precisely, implements them from scratch, establishes the small algebra that makes them predictable (duality, composition, monotonicity), and extends them from binary masks to grayscale images, where they turn out to be the min and max cousins of the convolution from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>.</p>
+</div>
+
+<p>
+The previous section established what binary images are (sets) and when pixels form objects (connectivity). Nothing so far <em>changes</em> a mask; this section introduces the operators that do. Both take the same two inputs: the image, and a small probe shape called a structuring element. Both produce a new mask by sliding the probe across every pixel position and recording the answer to a single yes/no question. The genius of the construction, due to Georges Matheron and Jean Serra in 1964, is that the probe's geometry becomes the operator's behavior: choose the probe well and erosion-plus-dilation pipelines delete speckle, fill pinholes, break or build bridges, and measure sizes, all with completely predictable effects.
+</p>
+
+<h2>1. The Structuring Element: A Question Made of Pixels <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>structuring element</strong> (SE, also called a kernel in OpenCV's API) is a small binary set $B$ with a designated <strong>origin</strong>, almost always its center. It plays the same role the kernel played in <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, but where a convolution kernel holds weights to multiply, a structuring element holds only membership: these pixels are part of my question, those are not. The three standard shapes are exactly the unit disks of the three grid metrics from <a href="section-6.1.html">Section 6.1</a>: the <strong>cross</strong> (city-block disk), the <strong>square</strong> (chessboard disk), and the <strong>ellipse</strong> (discretized Euclidean disk). OpenCV constructs all three:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+for shape, name in [(cv2.MORPH_CROSS, "cross"),
+                    (cv2.MORPH_RECT, "rect"),
+                    (cv2.MORPH_ELLIPSE, "ellipse")]:
+    se = cv2.getStructuringElement(shape, (5, 5))
+    print(name); print(se)
+# Output:
+# cross            rect             ellipse
+# [[0 0 1 0 0]     [[1 1 1 1 1]     [[0 0 1 0 0]
+#  [0 0 1 0 0]      [1 1 1 1 1]      [1 1 1 1 1]
+#  [1 1 1 1 1]      [1 1 1 1 1]      [1 1 1 1 1]
+#  [0 0 1 0 0]      [1 1 1 1 1]      [1 1 1 1 1]
+#  [0 0 1 0 0]]     [1 1 1 1 1]      [0 0 1 0 0]]</code></pre>
+<div class="code-caption">The three standard $5 \times 5$ structuring elements from <code>cv2.getStructuringElement</code>, printed side by side: each is the unit disk of one grid metric from Section 6.1, and the choice imprints that metric's geometry onto every result downstream.</div>
+
+<p>
+Which shape to use is a real decision, not a formality. A square SE grows and shrinks objects with square corners and treats diagonals generously; an elliptical SE preserves roundness and is the default for organic shapes; a cross is the cheapest and matches 4-connectivity. The SE can also be anything else: a horizontal line to operate only on horizontal structure, a single off-center pixel to translate the image, or a ring to detect specific gaps. Asymmetric, task-shaped SEs are an underused superpower; we will meet a line-shaped one in the practical example below.
+</p>
+
+<h2>2. Erosion: Does It Fit? <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The <strong>erosion</strong> of a foreground set $A$ by a structuring element $B$ keeps exactly the positions where the probe, planted with its origin at that position, fits entirely inside the foreground:
+</p>
+<p>
+$$ A \ominus B \;=\; \{\, z \;:\; B_z \subseteq A \,\}, $$
+</p>
+<p>
+where $B_z$ denotes $B$ translated so its origin sits at $z$. The consequences follow directly from the definition, and you should be able to predict each one before running any code. Objects shrink by roughly the SE's radius on every side. Any foreground island smaller than the SE vanishes entirely (nowhere inside it does the probe fit). Thin bridges narrower than the SE are severed. Holes and gulfs grow. Erosion is the pessimist's operator: a pixel survives only if its entire neighborhood, as defined by $B$, agrees it should.
+</p>
+<p>
+Implementing erosion from scratch is worth doing once, because it reveals the operator's computational identity: erosion by a flat SE is nothing more than a sliding <strong>minimum filter</strong>. Where Chapter 3's filters computed weighted sums over a window, erosion computes the minimum over the SE's footprint; for a 0/1 mask, the window minimum is 1 exactly when every probed pixel is 1, which is the "fits" test verbatim.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+def erode_scratch(mask01, k=3):
+    """Erosion by a k x k square SE, as a sliding-window minimum."""
+    pad = k // 2
+    # OpenCV treats out-of-image pixels as foreground during erosion,
+    # so border objects are not eaten from outside; pad with 1 to match.
+    padded = np.pad(mask01, pad, mode="constant", constant_values=1)
+    windows = sliding_window_view(padded, (k, k))   # shape (H, W, k, k)
+    return windows.min(axis=(2, 3)).astype(np.uint8)
+
+mask = (cv2.imread("part_mask.png", cv2.IMREAD_GRAYSCALE) &gt; 0).astype(np.uint8)
+ours   = erode_scratch(mask, 3)
+opencv = cv2.erode(mask, np.ones((3, 3), np.uint8))
+print("matches cv2.erode:", bool((ours == opencv).all()))
+print("foreground before:", int(mask.sum()), " after:", int(ours.sum()))
+# Representative output:
+# matches cv2.erode: True
+# foreground before: 48211  after: 44705</code></pre>
+<div class="code-caption">Erosion built from scratch as a windowed minimum via <code>sliding_window_view</code> and verified pixel-for-pixel against <code>cv2.erode</code>; the padding comment captures OpenCV's border convention, the same boundary question that Chapter 3 raised for convolution, answered differently here.</div>
+
+<h2>3. Dilation: Does It Hit? <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+<strong>Dilation</strong> is erosion's optimistic twin. A position belongs to the dilation if the probe, planted there, touches the foreground anywhere:
+</p>
+<p>
+$$ A \oplus B \;=\; \{\, z \;:\; (\hat{B})_z \cap A \neq \emptyset \,\}, $$
+</p>
+<p>
+where $\hat{B}$ is $B$ reflected through its origin. (The reflection is a technicality that makes the algebra below come out clean; for the symmetric crosses, squares, and disks used in practice, $\hat{B} = B$ and you may ignore it.) Dilation's effects mirror erosion's exactly: objects grow by the SE's radius, holes and gaps smaller than the SE close up, nearby objects merge, and concavities fill in. Computationally it is the sliding <strong>maximum filter</strong>. Figure 6.2.1 puts the two operators side by side on one shape.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels showing a blob with a small speck and a notch: the original probed by a disk structuring element, the eroded result where the shape shrinks and the speck disappears, and the dilated result where the shape grows and the notch fills in">
+  <!-- Panel 1: original -->
+  <text x="135" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Original A, probe B</text>
+  <rect x="20" y="40" width="230" height="220" fill="#fdfefe" stroke="#bdc3c7"/>
+  <path d="M 60 90 L 180 90 L 180 140 L 150 140 L 150 165 L 180 165 L 180 220 L 60 220 Z"
+        fill="#34495e"/>
+  <circle cx="210" cy="75" r="6" fill="#34495e"/>
+  <text x="222" y="68" font-family="sans-serif" font-size="11" fill="#5a626c">speck</text>
+  <text x="196" y="158" font-family="sans-serif" font-size="11" fill="#5a626c">notch</text>
+  <circle cx="92" cy="120" r="16" fill="none" stroke="#e67e22" stroke-width="3"/>
+  <circle cx="92" cy="120" r="2.5" fill="#e67e22"/>
+  <text x="92" y="245" font-family="sans-serif" font-size="12" fill="#b9770e" text-anchor="middle">disk SE probes every position</text>
+
+  <!-- Panel 2: erosion -->
+  <text x="395" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Erosion A &#8854; B: fits only</text>
+  <rect x="280" y="40" width="230" height="220" fill="#fdfefe" stroke="#bdc3c7"/>
+  <path d="M 332 102 L 428 102 L 428 128 L 398 128 L 398 177 L 428 177 L 428 208 L 332 208 Z"
+        fill="#7f8c8d"/>
+  <path d="M 320 90 L 440 90 L 440 140 L 410 140 L 410 165 L 440 165 L 440 220 L 320 220 Z"
+        fill="none" stroke="#bdc3c7" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <text x="395" y="245" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">shrinks; speck gone; notch wider</text>
+
+  <!-- Panel 3: dilation -->
+  <text x="650" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Dilation A &#8853; B: hits anywhere</text>
+  <rect x="535" y="40" width="230" height="220" fill="#fdfefe" stroke="#bdc3c7"/>
+  <path d="M 563 78 L 707 78 Q 712 78 712 83 L 712 227 Q 712 232 707 232 L 563 232 Q 558 232 558 227 L 558 83 Q 558 78 563 78 Z"
+        fill="#2e86c1"/>
+  <path d="M 575 90 L 695 90 L 695 140 L 665 140 L 665 165 L 695 165 L 695 220 L 575 220 Z"
+        fill="none" stroke="#d6eaf8" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <circle cx="725" cy="75" r="13" fill="#2e86c1"/>
+  <text x="650" y="245" font-family="sans-serif" font-size="12" fill="#1a5276" text-anchor="middle">grows; notch sealed; speck inflated</text>
+</svg>
+<figcaption><strong>Figure 6.2.1</strong> One shape, two questions. The disk structuring element (orange) visits every position of the original mask (left). Erosion (center) keeps positions where the disk fits entirely inside: the shape shrinks, the isolated speck vanishes, and the notch widens. Dilation (right) keeps positions where the disk touches foreground: the shape grows, the notch seals over, and the speck inflates instead of disappearing. Dashed outlines show the original boundary.</figcaption>
+</figure>
+
+<p>
+Notice in Figure 6.2.1 that the two operators are not inverses: erosion deleted the speck, and no dilation can resurrect it, while dilation sealed the notch, and no erosion can reopen it. That irreversibility looks like a defect and is actually the entire point. Applying one after the other discards structure smaller than the SE <em>permanently</em> while restoring everything else to its original size, and that composition (opening and closing) is the subject of <a href="section-6.3.html">Section 6.3</a>. In code, both atoms are one-liners, and stacking them via the <code>iterations</code> argument behaves exactly as the algebra in the next subsection predicts:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+eroded   = cv2.erode(mask, se)               # one radius inward
+dilated  = cv2.dilate(mask, se)              # one radius outward
+dilated2 = cv2.dilate(mask, se, iterations=2)  # two radii outward
+
+n_before, _ = cv2.connectedComponents(mask)
+n_eroded, _ = cv2.connectedComponents(eroded)
+n_dilated, _ = cv2.connectedComponents(dilated)
+print(f"components: original {n_before - 1}, "
+      f"eroded {n_eroded - 1}, dilated {n_dilated - 1}")
+# Representative output on a speckled multi-part mask:
+# components: original 143, eroded 9, dilated 31
+# (erosion deleted 134 specks; dilation merged nearby blobs)</code></pre>
+<div class="code-caption">The atoms in production form: <code>cv2.erode</code> and <code>cv2.dilate</code> with an elliptical SE, plus component counts showing erosion wiping out speckle and dilation merging close neighbors, the two raw effects that Section 6.3 will tame into opening and closing.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Line, and Faster Than It Has Any Right to Be</div>
+<p>The from-scratch erosion above is about ten lines and allocates a large window view; <code>cv2.erode(mask, se)</code> is one line and typically runs an order of magnitude faster. Internally OpenCV decomposes rectangular SEs into a horizontal and a vertical pass (the same separability trick as Chapter 3's Gaussian, but with min in place of sum), uses the van Herk/Gil-Werman algorithm that computes any-width sliding minima in just three comparisons per pixel independent of SE size, vectorizes with SIMD, and handles the border convention and arbitrary SE shapes. scikit-image users get the same atoms as <code>skimage.morphology.binary_erosion</code> and <code>binary_dilation</code> operating on boolean arrays.</p>
+</div>
+
+<h2>4. The Algebra: Four Laws That Make Morphology Predictable <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Morphology earns the name "mathematical" from a small set of laws. Four matter in daily practice.
+</p>
+<p>
+<strong>Duality.</strong> Eroding the foreground is the same as dilating the background, and vice versa:
+$(A \ominus B)^c = A^c \oplus \hat{B}$. This is why every statement in this chapter comes in pairs (specks versus pinholes, bridges versus gaps): each fact about erosion is a fact about dilation viewed from the background's side, with the foreground/background asymmetry of <a href="section-6.1.html">Section 6.1</a> lurking underneath.
+</p>
+<p>
+<strong>Composition.</strong> Successive dilations combine into one dilation by a grown SE: $(A \oplus B) \oplus C = A \oplus (B \oplus C)$, and likewise $(A \ominus B) \ominus C = A \ominus (B \oplus C)$. This is what makes <code>iterations=n</code> meaningful: $n$ erosions by a $3 \times 3$ square equal one erosion by a $(2n{+}1) \times (2n{+}1)$ square. It is also a real performance lever, the morphological analogue of the Gaussian cascade property from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>: repeated small probes are usually cheaper than one big one.
+</p>
+<p>
+<strong>Monotonicity.</strong> Both operators are increasing: if $A \subseteq A'$ then $A \ominus B \subseteq A' \ominus B$ and $A \oplus B \subseteq A' \oplus B$. Growing the input can never shrink the output. Combined with $A \ominus B \subseteq A \subseteq A \oplus B$ (for an SE containing its origin), this gives hard guarantees about what a pipeline can and cannot do, which is precisely the auditability that makes morphology beloved in regulated industries.
+</p>
+<p>
+<strong>Translation invariance.</strong> Shifting the image shifts the result identically. Morphology has no privileged location, just as convolution does not; all the spatial intelligence lives in the SE.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Morphology Is Convolution in a Different Algebra</div>
+<p>Convolution computes <em>sum of products</em> over a window; erosion and dilation compute <em>min and max</em> over a window. Swap the algebra (sum, product) for (min, plus) or (max, plus), the so-called tropical semirings, and the entire filtering theory of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> has a morphological mirror image: SEs are kernels, composition is the convolution theorem, and the van Herk sliding-min trick is the separability speedup. The mirror extends into deep learning: max pooling in the CNNs of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> is exactly a grayscale dilation by a square SE, executed with a stride.</p>
+</div>
+
+<h2>5. Grayscale Morphology: Shadows and Peaks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Nothing in the min/max formulation requires the input to be binary. For a grayscale image $f$ and a flat SE $B$, define
+</p>
+<p>
+$$ (f \ominus B)(x) \;=\; \min_{s \in B} f(x + s), \qquad
+   (f \oplus B)(x) \;=\; \max_{s \in B} f(x - s). $$
+</p>
+<p>
+Grayscale erosion replaces each pixel with the darkest value in its neighborhood; dilation with the brightest. The visual effect is distinctive: erosion grows dark regions and eats bright peaks narrower than the SE, dilation does the opposite. A useful mental image is terrain: dilation is the landscape seen after a glowing ball of the SE's shape rolls <em>over</em> the surface (peaks broaden), erosion after it rolls <em>under</em> (valleys broaden). These grayscale atoms power the top-hat illumination correction in <a href="section-6.3.html">Section 6.3</a>, and they connect back to a filter you already know: for any fixed window, erosion is the 0th percentile, dilation the 100th, and the median filter of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> the 50th. All three are rank filters; morphology simply claims the extremes.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+gray = cv2.imread("pcb_photo.jpg", cv2.IMREAD_GRAYSCALE)
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+
+bright_floor = cv2.erode(gray, se)    # local darkest: bright details erased
+bright_ceil  = cv2.dilate(gray, se)   # local brightest: dark details erased
+
+# Per-pixel dynamic range of each neighborhood, a texture/edge indicator:
+local_range = cv2.subtract(bright_ceil, bright_floor)
+print(gray.mean(), bright_floor.mean(), bright_ceil.mean())
+# Representative output:
+# 117.4  86.2  151.9   (erosion darkens, dilation brightens, mean shifts ~30)</code></pre>
+<div class="code-caption">Grayscale erosion and dilation on a circuit-board photo with a $15 \times 15$ elliptical SE: the eroded image keeps only what is dark over the whole neighborhood, the dilated image only what is bright somewhere in it, and their difference (a preview of Section 6.3's morphological gradient) lights up wherever intensity changes.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Conveyor That Counted Double</div>
+<p><strong>Who:</strong> The automation engineer at a confectionery plant, responsible for verifying that each tray leaving the enrobing line carries exactly 24 pralines.</p>
+<p><strong>Situation:</strong> A camera above the line photographs each backlit tray; thresholding (per <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>) yields clean silhouettes, and a component count (per <a href="section-6.4.html">Section 6.4</a>) checks for 24. The system worked until a recipe change made the chocolate coating slightly tackier, and pralines began landing in contact with their neighbors.</p>
+<p><strong>Problem:</strong> Touching pralines merged into single blobs, so trays of 24 were counted as 19 or 20 and wrongly rejected; rejects climbed to 11 percent and the night shift started ignoring the alarm, which is how real defects get through.</p>
+<p><strong>Decision:</strong> Since pralines are uniform in size (28 px radius) and contacts are shallow, the engineer inserted a single erosion with an elliptical SE of radius 9 before counting: large enough to sever any plausible contact neck, far too small to delete a praline. Counting then ran on the eroded mask.</p>
+<p><strong>Result:</strong> Counting accuracy returned to 99.8 percent at zero added hardware cost and 0.4 ms added latency. The team documented the SE radius against praline geometry in the line's QA file, and added a flag to route heavily merged trays (necks thicker than the erosion could cut) to the distance-transform separator they later built from <a href="section-6.5.html">Section 6.5</a>.</p>
+<p><strong>Lesson:</strong> When object sizes are known and uniform, a single well-sized erosion is a separator, a denoiser, and a guarantee, and its failure condition (necks wider than the SE) is exactly statable in advance. Predictable failure modes are a feature you will miss the first time a neural network fails creatively.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Morphology Joins the Computation Graph</div>
+<p>Erosion and dilation are differentiable almost everywhere (max and min have well-defined subgradients, the same fact that lets max pooling train), and that has pulled morphology inside modern pipelines. Kornia's <code>kornia.morphology</code> module ships GPU-batched, autograd-compatible erosion, dilation, opening, and closing for PyTorch 2.x, so a mask-cleanup step can sit <em>inside</em> a trained model rather than after it. A parallel research line learns the structuring elements themselves: morphological layers built on the max-plus (tropical) algebra of this section's Key Insight, trained end to end, with soft-morphology relaxations (log-sum-exp approximations of min/max) smoothing the gradients. And at the applied end, the post-processing recipes for Segment Anything outputs, including SAM 2 (Ravi et al., 2024, arXiv:2408.00714), still lead with a dilation/erosion pass to seal mask pinholes before downstream use: the 1964 atoms, now cleaning the masks of a 2024 foundation model.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The term "erosion" is geological on purpose. Matheron and Serra's employer, the Paris School of Mines, wanted to quantify how mineral grains in rock sections would survive progressively aggressive acid etching, which physically is erosion by an ever-larger probe. Dilation entered as the dual needed to make the algebra close. Industrial vision later adopted both words unchanged, which is why a bottling plant's QA code reads like a weather report for canyons.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.2.1: Predict Before You Run <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A mask contains: (a) a $20 \times 20$ solid square, (b) a one-pixel-wide horizontal line of length 30, (c) a one-pixel-wide diagonal line of length 30, and (d) a $3 \times 3$ solid square. For erosion by a $3 \times 3$ square SE and separately by a $3 \times 3$ cross SE, predict what survives of each object and its exact dimensions. Then explain why the diagonal line's fate differs between the two SEs, and connect the explanation to the connectivity discussion of <a href="section-6.1.html">Section 6.1</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.2.2: Dilation From Scratch, Borders and All <span class="exercise-type coding">Coding</span></div>
+<p>Implement <code>dilate_scratch(mask01, k)</code> as a sliding-window maximum, mirroring this section's erosion implementation, and decide what constant the padding must use so that results match <code>cv2.dilate</code> exactly at the image border (hint: it is not the same constant as for erosion, and the duality law tells you why). Verify equality against OpenCV on 100 random masks, then verify the composition law numerically: two dilations by your $3 \times 3$ SE must equal one dilation by the corresponding $5 \times 5$ SE.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.2.3: Duality, Empirically and Then Properly <span class="exercise-type analysis">Analysis</span></div>
+<p>Test the duality law $(A \ominus B)^c = A^c \oplus \hat{B}$ numerically: on random masks, compare <code>cv2.erode(mask, se)</code> against the complement of <code>cv2.dilate</code> applied to the complemented mask, using an asymmetric SE (for instance a $1 \times 3$ line with the origin at one end, built by hand) so the reflection $\hat{B}$ actually matters. Identify the flip you must apply to the SE to make the two sides agree, then prove the law in two lines of set algebra starting from the definitions in this section.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.1.html">&#8592; Section 6.1: Binary Images, Neighborhoods &amp; Connectivity</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="section-6.3.html">Section 6.3: Opening, Closing &amp; Morphological Gradients &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

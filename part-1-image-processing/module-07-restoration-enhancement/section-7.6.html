@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.6: HDR Imaging &amp; Tone Mapping. Bridging the dynamic range gap with bracketed exposures: Debevec-Malik radiance recovery, global and local tone mapping operators, Mertens exposure fusion, deghosting, and modern gain-map HDR delivery." name="description"/>
+<title>Section 7.6: HDR Imaging &amp; Tone Mapping | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>HDR Imaging &amp; Tone Mapping</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"The scene speaks in twenty stops, my sensor hears twelve, and your screen repeats eight. I am the simultaneous interpreter who decides what gets lost in translation."</p>
+<cite>A Diplomatic Tone Mapping Operator</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>HDR imaging splits one impossible measurement into several possible ones, and tone mapping is the lossy diplomacy that fits the merged result onto a display.</strong> Bracketed exposures each capture a different slice of the scene's brightness range; calibration and merging recover a radiance map that is a genuine physical measurement; tone mapping then spends that measurement on an eight-bit rendering, deciding which contrasts survive. Keep the two halves separate in your head: one is metrology, the other is taste.</p>
+</div>
+<p>
+Every earlier section of this chapter repaired damage inflicted <em>after</em> the light was recorded. This closing section confronts a degradation that happens at the moment of recording and cannot be filtered away afterward: the scene contains a wider range of brightness than the sensor can represent in one exposure. The highlights clip to pure white, carrying no information at all (the inpainting situation of <a href="section-7.4.html">Section 7.4</a>, minus the mask), or the shadows drown beneath the read-noise floor of <a href="section-7.1.html">Section 7.1</a>, or, in the classic interior-with-a-window shot, both at once. The cure is the chapter's recurring move one final time: change the acquisition so the inverse problem becomes solvable, then model your way back to the quantity you actually wanted, which here is the scene's true radiance.
+</p>
+<h2>1. The Dynamic Range Gap <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Photographers measure brightness ranges in <strong>stops</strong>: one stop is a factor of two in light, so a range of $n$ stops spans a ratio of $2^n$. A sunlit scene with open shade can span 17 to 20 stops (a ratio above 100,000:1, and far more if the sun itself is in frame). A good modern sensor captures 12 to 14 stops in a single exposure, bounded above by pixel full-well capacity (the bucket overflows: clipping) and below by the noise floor (the signal drowns: <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> covered both ends of this pipeline). A typical SDR display renders maybe 8 to 10 stops in practice. Two gaps, then: scene to sensor, and sensor to display. The first is closed by capturing more data; the second cannot be closed at all, only negotiated. Figure 7.6.1 draws both, and the whole section is a walk along its arrows. You can diagnose the problem without any new tools: the histogram skills of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> show a scene exceeding the sensor as a histogram slammed against one or both ends, with tall clipping spikes at 0 and 255.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Log luminance axis with bars showing the wide scene range, three narrower bracketed exposures covering it in slices, the merged radiance map, and the much narrower display range">
+<style>
+.ax6 { stroke: #1f2937; stroke-width: 1.6; fill: none; marker-end: url(#ah6); }
+.lab6 { font-family: Verdana, Arial, sans-serif; font-size: 12.5px; fill: #1f2937; }
+.lab6s { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #4b5563; }
+.scene6 { fill: rgba(37, 99, 235, 0.16); stroke: #2563eb; stroke-width: 1.6; }
+.exp6 { fill: rgba(5, 150, 105, 0.18); stroke: #059669; stroke-width: 1.5; }
+.rad6 { fill: rgba(37, 99, 235, 0.16); stroke: #2563eb; stroke-width: 1.6; stroke-dasharray: 6 4; }
+.disp6 { fill: rgba(220, 38, 38, 0.14); stroke: #dc2626; stroke-width: 1.6; }
+.flow6 { stroke: #1f2937; stroke-width: 1.8; fill: none; marker-end: url(#ah6); }
+</style>
+<defs>
+<marker id="ah6" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#1f2937"/></marker>
+</defs>
+<!-- axis -->
+<line class="ax6" x1="60" y1="330" x2="880" y2="330"/>
+<text class="lab6" x="700" y="352">log luminance (stops)</text>
+<!-- scene range -->
+<rect class="scene6" x="80" y="40" width="760" height="30" rx="4"/>
+<text class="lab6" x="90" y="60">scene radiance: ~20 stops</text>
+<!-- exposures -->
+<rect class="exp6" x="80" y="100" width="340" height="26" rx="4"/>
+<text class="lab6s" x="90" y="118">long exposure (shadows land in range; highlights clip)</text>
+<rect class="exp6" x="290" y="140" width="340" height="26" rx="4"/>
+<text class="lab6s" x="300" y="158">middle exposure</text>
+<rect class="exp6" x="500" y="180" width="340" height="26" rx="4"/>
+<text class="lab6s" x="510" y="198">short exposure (highlights land in range; shadows drown)</text>
+<!-- radiance map -->
+<rect class="rad6" x="80" y="236" width="760" height="26" rx="4"/>
+<text class="lab6s" x="90" y="254">merged radiance map: full scene range, float32 (a measurement)</text>
+<!-- display -->
+<rect class="disp6" x="330" y="290" width="260" height="26" rx="4"/>
+<text class="lab6s" x="340" y="308">display: ~8 stops (a rendering)</text>
+<!-- flows -->
+<line class="flow6" x1="60" y1="113" x2="74" y2="113"/>
+<text class="lab6s" x="62" y="92">bracket: each exposure slides a 12-stop window along the scene range</text>
+<line class="flow6" x1="460" y1="212" x2="460" y2="230"/>
+<text class="lab6s" x="472" y="228">merge + calibrate (Section 2)</text>
+<line class="flow6" x1="460" y1="266" x2="460" y2="284"/>
+<text class="lab6s" x="472" y="282">tone map or fuse (Sections 3, 4)</text>
+</svg>
+<figcaption><strong>Figure 7.6.1:</strong> The dynamic range gap on a log-luminance axis. The scene (blue, top) spans more stops than any single exposure window (green) can capture, so bracketing slides the window: each exposure records a different slice with overlap. Merging recovers the full-range radiance map (dashed), a physical measurement; tone mapping then compresses it into the display's far narrower budget (red), an aesthetic decision.</figcaption>
+</figure>
+<h2>2. Radiance from Brackets: Debevec-Malik <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Bracketing is easy: shoot the same scene at, say, 1/400, 1/50, and 1/6 of a second. Merging is subtler than averaging, because pixel values are not light. Every camera applies a nonlinear <em>response curve</em> $f$ between collected exposure and stored value, $Z = f(E \cdot \Delta t)$, where $E$ is the irradiance we want and $\Delta t$ the exposure time. To get back to radiance we need $f^{-1}$, and the elegant result of Debevec and Malik (1997) is that the brackets themselves reveal it. Taking $g = \ln f^{-1}$, each pixel $i$ in each exposure $j$ supplies one linear equation,
+</p>
+$$
+g(Z_{ij}) = \ln E_i + \ln \Delta t_j ,
+$$
+<p>
+with the unknowns being the 256 values of $g$ and the per-pixel log irradiances $\ln E_i$. The same scene point photographed at known different $\Delta t$ pins down the curve's shape; a smoothness penalty on $g$ and a hat-shaped weighting $w(Z)$ that distrusts values near 0 and 255 (clipped or noise-drowned, per Section 1) complete a small least-squares problem solvable from a few hundred sampled pixels. With $g$ known, every exposure votes for each pixel's radiance, weighted by how well-exposed that pixel was in that frame. The output is a float32 <strong>radiance map</strong> proportional to actual scene radiance, the quantity the whole pipeline exists to recover. Code 7.6.1 runs the entire flow in OpenCV.
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# Three handheld brackets of the same scene, 2 stops apart.
+files = ['win_short.jpg', 'win_mid.jpg', 'win_long.jpg']
+images = [cv2.imread(f) for f in files]               # uint8 BGR
+times = np.array([1/400, 1/100, 1/25], dtype=np.float32)
+
+# 1. Align: handheld brackets are never perfectly registered.
+cv2.createAlignMTB().process(images, images)
+
+# 2. Recover the response curve g from the brackets themselves.
+calibrate = cv2.createCalibrateDebevec()
+response = calibrate.process(images, times)
+
+# 3. Merge into a float32 radiance map (values proportional to radiance).
+merge = cv2.createMergeDebevec()
+hdr = merge.process(images, times, response)
+
+cv2.imwrite('scene.hdr', hdr)                         # Radiance RGBE format
+print(f"radiance range: {hdr.min():.4f} .. {hdr.max():.1f}, "
+      f"ratio {hdr.max() / max(hdr.min(), 1e-6):.0f}:1")
+</code></pre>
+<div class="code-caption"><strong>Code 7.6.1:</strong> The full radiometric HDR pipeline: align, self-calibrate, merge. The printed ratio routinely exceeds 100,000:1, confirming that the float32 map holds a range no single uint8 image could. Save the <code>.hdr</code> file; it is the measurement, and everything after this point is rendering.</div>
+<p>
+Note what step 2 quietly does: it inverts a stage of the in-camera processing pipeline from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> using nothing but the photographs themselves. If you shoot RAW, the response is already linear and calibration is unnecessary; the Debevec step exists because the world runs on JPEGs.
+</p>
+<h2>3. Tone Mapping: Spending the Range <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Now the second gap. Naively normalizing the radiance map to [0, 255] produces a nearly black image with a few bright speckles: radiance is so skewed that the window and the lamp own the entire linear range while the room's contents huddle in the bottom few codes. Tone mapping operators (TMOs) compress intelligently instead, and they split into two families. <strong>Global</strong> operators apply one monotone curve to every pixel. Reinhard's classic is barely more than one line,
+</p>
+$$
+L_d = \frac{L}{1 + L},
+$$
+<p>
+applied to suitably scaled luminance $L$: it maps zero to zero, infinity to one, and leaves mid-tones nearly linear, a graceful soft shoulder (Drago's logarithmic operator is the same spirit with a different curve). Global operators are fast, artifact-free, and fundamentally limited: one curve cannot give both the window and the bookshelf generous contrast, because it must be monotone over the whole range. <strong>Local</strong> operators adapt to neighborhoods, brightening this shadow while preserving detail in that highlight. Durand and Dorsey's classic uses the bilateral filter of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> to split the image into a base layer (compressed hard) and a detail layer (preserved fully); Mantiuk's operator works on gradients instead of intensities. Local operators recover far more visible detail and, pushed hard, produce the halos and radioactive "HDR look" that gave the term a bad name in the late 2000s. Code 7.6.2 renders the same radiance map through three operators so the family differences are visible side by side.
+</p>
+<pre><code class="language-python">def to_uint8(ldr_float):
+    return np.clip(ldr_float * 255, 0, 255).astype(np.uint8)
+
+reinhard = cv2.createTonemapReinhard(gamma=2.2)         # global, gentle
+drago    = cv2.createTonemapDrago(gamma=2.2, bias=0.85) # global, log curve
+mantiuk  = cv2.createTonemapMantiuk(gamma=2.2, scale=0.8)  # local, gradients
+
+for name, tmo in [('reinhard', reinhard), ('drago', drago),
+                  ('mantiuk', mantiuk)]:
+    ldr = tmo.process(hdr)                # float32 in [0, 1], NaNs possible
+    cv2.imwrite(f'tm_{name}.jpg', to_uint8(np.nan_to_num(ldr)))
+print("wrote tm_reinhard.jpg, tm_drago.jpg, tm_mantiuk.jpg")
+</code></pre>
+<div class="code-caption"><strong>Code 7.6.2:</strong> One measurement, three renderings. Compare the JPEGs: the global pair keeps the scene natural but lets the window wash out or the room sink; Mantiuk pulls detail from both at the cost of a flatter, more "processed" character. None is wrong; they are different spending decisions.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Radiance Map Is the Measurement; the JPEG Is an Opinion</div>
+<p>Tone mapping destroys information by design, and there are infinitely many defensible ways to do it. So never archive only the tone-mapped output. The float32 radiance map is the scene's photometric record: it can be re-rendered by any future operator, displayed natively on an HDR screen, or used as physical input for relighting and image-based lighting. This is the same archival logic that makes RAW files precious in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, one level higher up the pipeline. Measurement and rendering are different artifacts; keep the measurement.</p>
+</div>
+<h2>4. Exposure Fusion: Skipping Radiometry Entirely <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Step back and ask what the consumer use case actually needs. Nobody photographing their kitchen wants a radiance measurement; they want a nice JPEG where the window and the cabinets are both visible. Mertens, Kautz, and Van Reeth (2007) observed that you can get that directly from the brackets, with no exposure times, no response curve, and no tone mapping. <strong>Exposure fusion</strong> scores every pixel of every bracket on three qualities: contrast (does it carry local detail, measured by a Laplacian response), saturation (channel standard deviation), and well-exposedness (a Gaussian bump around mid-gray, $\exp(-(z - 0.5)^2 / 2\sigma^2)$), then blends the brackets per pixel with the scores as weights. The blend must be done within a Laplacian pyramid, the multi-scale machinery of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, or the weight maps' seams show; pyramid blending hides the transitions across scales. Code 7.6.3 computes the Mertens weights from scratch, both to demystify them and because per-pixel quality maps are a broadly reusable trick.
+</p>
+<pre><code class="language-python">def mertens_weights(img_u8, sigma=0.2):
+    """Per-pixel quality scores for one bracket: contrast * sat * exposedness."""
+    img = img_u8.astype(np.float32) / 255.0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    contrast = np.abs(cv2.Laplacian(gray, cv2.CV_32F))          # local detail
+    saturation = img.std(axis=2)                                # colorfulness
+    well_exposed = np.exp(-((img - 0.5) ** 2) / (2 * sigma ** 2)).prod(axis=2)
+    return contrast * saturation * well_exposed + 1e-12
+
+W = np.stack([mertens_weights(im) for im in images])
+W /= W.sum(axis=0, keepdims=True)        # weights sum to 1 at every pixel
+# A naive per-pixel blend (visible seams; the pyramid fixes this):
+naive = sum(w[..., None] * im.astype(np.float32)
+            for w, im in zip(W, images))
+cv2.imwrite('fusion_naive.jpg', np.clip(naive, 0, 255).astype(np.uint8))
+</code></pre>
+<div class="code-caption"><strong>Code 7.6.3:</strong> The three Mertens quality measures and a deliberately naive per-pixel blend. Inspect <code>fusion_naive.jpg</code> closely and you will find soft seams where the dominant bracket switches; the production version blends inside a Laplacian pyramid precisely to erase them.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>cv2.createMergeMertens</code></div>
+<p>The complete algorithm, weights plus pyramid blending plus normalization, is two lines:</p>
+<pre><code class="language-python">fusion = cv2.createMergeMertens().process(images)     # no times needed!
+cv2.imwrite('fusion.jpg', np.clip(fusion * 255, 0, 255).astype(np.uint8))
+</code></pre>
+<div class="code-caption"><strong>Code 7.6.4:</strong> Production exposure fusion: brackets in, displayable image out, with no exposure metadata required.</div>
+<p>Our weight computation plus a correct multi-resolution blend is 80-odd lines; the library call is 2. Internally it builds Gaussian pyramids of the weight maps and Laplacian pyramids of the images, blends level by level, and collapses, the exact construction from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Notice what it never computes: radiance. Fusion produces a rendering directly, which is why it cannot feed photometric applications, and why it powers virtually every phone "HDR" button, where the rendering is the entire point.</p>
+</div>
+<h2>5. Ghosts: When the Scene Refuses to Hold Still <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Everything above assumed the brackets photograph the same scene, and across a second of shooting they never quite do. Camera motion is the tractable half: <code>AlignMTB</code> in Code 7.6.1 aligns brackets by translating <em>median threshold bitmaps</em>, binary images that mark whether each pixel is above or below the frame's median, a representation deliberately invariant to exposure (the same thresholding instinct as <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, used here because pixel values differ wildly across brackets while their ordering largely does not). Subject motion is the hard half: a pedestrian who moved between brackets appears in different positions, and merging produces a translucent <em>ghost</em> at each. Classical deghosting detects pixels whose values across brackets are inconsistent with a static scene, then locally falls back to a single reference bracket, building the motion masks with exactly the difference-threshold-dilate toolkit of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> and <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>. Modern burst pipelines sidestep the problem by shooting many short identical exposures and merging with per-tile robust alignment, trading bracket depth for motion immunity.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Four Hundred Listings a Week and One Bright Window</div>
+<p><strong>Who:</strong> The pipeline developer at a real-estate photography service processing about four hundred property shoots weekly.</p>
+<p><strong>Situation:</strong> Interior shots must show the room <em>and</em> the view through the window; agents reject either a cave with a glowing rectangle or a lovely view framed by silhouettes. Photographers shoot 3-bracket sequences on tripods.</p>
+<p><strong>Problem:</strong> The first pipeline ran the full radiometric chain (Code 7.6.1) followed by a local tone mapper tuned for maximum detail. Output quality was technically impressive and clients hated it: halos around window frames, grayish "dynamic" skies, the unmistakable overcooked-HDR look. Tuning per shoot did not scale.</p>
+<p><strong>Decision:</strong> Switch the default path to Mertens fusion (Code 7.6.4), which has essentially no parameters to mistune, and keep the radiometric path only for the premium "twilight" product, where editors hand-blend a tone-mapped layer. A cheap ghost detector (bracket disagreement above threshold, dilated, per <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>) flags shots with moving curtains or ceiling fans for the reference-bracket fallback.</p>
+<p><strong>Result:</strong> Client rejections for "unnatural look" fell to near zero, per-image processing dropped from 14 seconds to under 2, and the parameter-tuning queue disappeared.</p>
+<p><strong>Lesson:</strong> Choose the pipeline by the deliverable. If the output is an 8-bit image for human eyes, fusion's directness is a feature, not a shortcut; reserve radiometry for when you need the measurement.</p>
+</div>
+<h2>6. HDR Without the Tone Mapping Funeral <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+This section's framing, capture wide, then compress for an 8-bit screen, is quietly becoming dated in its second half. Phone and laptop displays now reach brightness ranges that cover much of a radiance map's span, and the delivery format caught up in 2023 and 2024: <strong>gain maps</strong>. A gain-map file carries a normal SDR rendering plus a small map of per-pixel brightness multipliers; SDR screens show the base image, HDR screens apply the gains and recover the wide-range version, and the standard was formalized as ISO 21496-1 with Adobe, Google (Ultra HDR in Android 14), and Apple (Adaptive HDR) shipping interoperable support. Notice the architecture: it is precisely this section's separation of measurement and rendering, frozen into a file format, with the tone-mapping decision deferred to the display instead of buried at capture time. The pipeline you learned does not disappear; its output just stops being forced through the 8-bit bottleneck.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Single Shots, Learned Curves, Generative Range</div>
+<p>Three active fronts as of 2024 to 2026. First, <em>single-image HDR reconstruction</em> (inverse tone mapping): networks hallucinate plausible radiance for clipped regions, with GAN-based work like <strong>GlowGAN</strong> (Wang et al., ICCV 2023) learning HDR structure from ordinary LDR photo collections, and diffusion-prior follow-ups inheriting both the power and the evidentiary caveats of <a href="section-7.5.html">Section 7.5</a>: invented highlights are not measurements. Second, <em>learned merging and tone mapping</em>: burst pipelines such as the HDR+ lineage behind Google's Night Sight replaced hand-designed weights with trained components while keeping the classical architecture (align, merge robustly, tone map) fully recognizable. Third, the <em>gain-map ecosystem</em> (ISO 21496-1, Ultra HDR, Adaptive HDR) is shifting research from "how to compress range" toward "how to render intent across wildly different displays," reviving tone mapping as a display-adaptive, sometimes learned, runtime decision. The through-line: every one of these systems still speaks this section's vocabulary of response curves, radiance, and rendering intent.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Debevec and Malik's 1997 paper was motivated less by pretty pictures than by physics: a radiance map can serve as a light source. Photograph a mirrored ball with brackets, recover the radiance of the entire surrounding environment, and you can illuminate computer-generated objects with the real world's light. That technique, image-based lighting, became the backbone of film visual effects compositing, which means this section's pipeline has been quietly lighting movie monsters for over two decades.</p>
+</div>
+<p>
+With dynamic range handled, the chapter's repair shop is fully stocked: you can model damage, denoise, deblur, fill holes, recover resolution, and capture range beyond the sensor's reach. What remains for Part I is engineering: <a href="../module-08-tools-of-the-trade/index.html">Chapter 8</a> surveys the library landscape where all of these algorithms live in production form, and how to compose them into pipelines that survive contact with real data.
+</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.6.1: Trust and the Hat Function <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Explain why the Debevec-Malik weighting $w(Z)$ must vanish at both $Z = 0$ and $Z = 255$, connecting each end to a specific degradation from <a href="section-7.1.html">Section 7.1</a>. (b) A colleague proposes saving time by merging just two brackets, 6 stops apart, instead of three spaced 2 stops apart. Using Figure 7.6.1, identify what goes wrong in the luminance range between them. (c) Why does exposure fusion need no equivalent of the response-curve recovery step?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.6.2: Build Your Own Reinhard <span class="exercise-type coding">Coding</span></div>
+<p>Implement the Reinhard global operator from scratch on the radiance map from Code 7.6.1: compute log-average luminance $\bar L = \exp(\mathrm{mean}(\ln(L + \epsilon)))$, scale by a key parameter $a$ so $L = a \cdot L_{\mathrm{world}} / \bar L$, apply $L_d = L / (1 + L)$, and reattach color by scaling each channel by $L_d / L_{\mathrm{world}}$. Render with $a \in \{0.09, 0.18, 0.36, 0.72\}$ and describe what the key controls. Verify your $a = 0.18$ output approximates <code>cv2.createTonemapReinhard</code>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.6.3: Measurement versus Rendering <span class="exercise-type analysis">Analysis</span></div>
+<p>Shoot (or download) a 3-bracket interior scene and produce two outputs: the radiometric path (Code 7.6.1 plus your Exercise 7.6.2 tone mapper) and direct fusion (Code 7.6.4). Compare them three ways: visually; by the fraction of clipped pixels in each (histogram analysis per <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>); and by a thought experiment for two clients, a listing website and a daylighting-simulation consultancy that needs luminance ratios between window and wall. Which pipeline serves each client, and what exactly does the fusion path fail to provide the second one?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-7.5.html"><span class="nav-label">Section 7.5: Classical Super-Resolution</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="../module-08-tools-of-the-trade/index.html"><span class="nav-label">Chapter 8: Tools of the Trade: The Image Processing Stack</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
