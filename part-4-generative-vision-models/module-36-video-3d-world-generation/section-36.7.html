@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.7: Predictive World Models: JEPA &amp; Decoder-Free Latents. The contrarian alternative to generative simulation: predict in representation space, not pixel space. The JEPA objective, why throwing away the decoder helps, and V-JEPA for video." name="description"/>
+<title>Section 36.7: Predictive World Models: JEPA &amp; Decoder-Free Latents | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Predictive World Models: JEPA &amp; Decoder-Free Latents</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Everyone kept asking me to predict the exact dance of every leaf in the wind. I refused. I predict that the tree will still be a tree. It turns out that is the part worth knowing, and the leaves were never the point."</p>
+<cite>A Predictor That Declined to Render Pixels</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The generative simulators of the previous sections predict the future in pixel space, which forces them to model irrelevant detail; the Joint-Embedding Predictive Architecture (JEPA) takes the contrarian path of predicting the future in representation space and throwing the pixel decoder away entirely.</strong> By predicting abstract features rather than exact pixels, JEPA spends its capacity on what is predictable and structural, and ignores the noise it could never get right anyway. This section presents the JEPA objective, why it avoids the trap that plagues generative prediction, and V-JEPA for video.</p>
+</div>
+
+<p>
+Sections <a href="section-36.5.html">36.5</a> and <a href="section-36.6.html">36.6</a> built world models that predict observations: latent frames decoded to pixels (RSSM) or pixels directly (GAIA-1, GameNGen). Yann LeCun's influential critique, realized in the JEPA family, is that pixel-space prediction is the wrong objective. The future is full of detail that is genuinely unpredictable (the exact texture of every leaf, the precise speckle of noise) and irrelevant to understanding. A model trained to predict every pixel wastes enormous capacity trying to render that detail and is penalized for failing at something no model could do. JEPA proposes to predict in the abstract representation space instead, where the unpredictable detail has already been discarded.
+</p>
+
+<h2>1. The JEPA Objective: Predict Features, Not Pixels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+JEPA descends directly from the self-supervised learning of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, specifically the masked-prediction lineage of MAE and the joint-embedding lineage of DINO and contrastive methods. The cross-reference map names this arc precisely: self-supervision (DINO, MAE, contrastive) deepened into foundation models, transformed here into decoder-free prediction. The architecture has three parts. A <strong>context encoder</strong> $f_\theta$ embeds an observed (context) part of the input. A <strong>target encoder</strong> $f_{\bar\theta}$ embeds the part to be predicted (the future, or a masked region). A <strong>predictor</strong> $g_\phi$ tries to map the context embedding to the target embedding. The loss is computed entirely in embedding space:
+</p>
+
+<p>
+$$ \mathcal{L}_{\text{JEPA}} \;=\; \big\lVert\, g_\phi\!\big(f_\theta(x_{\text{context}}),\, m\big) \;-\; \operatorname{sg}\!\big[f_{\bar\theta}(x_{\text{target}})\big] \,\big\rVert_2^2, $$
+</p>
+
+<p>
+where $m$ encodes which target is being predicted (its position or the masking pattern) and $\operatorname{sg}[\cdot]$ is the stop-gradient. The target encoder $f_{\bar\theta}$ is not trained by backpropagation; its weights are an exponential moving average (EMA) of the context encoder's, the same teacher-student trick that stabilizes DINO. Critically, there is no decoder and no pixel-reconstruction term anywhere: the model never renders an image.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The JEPA architecture: a context part of the input goes through a context encoder, a target part goes through an EMA target encoder with a stop-gradient, and a predictor maps the context embedding toward the target embedding; the loss is the distance between embeddings, with no pixel decoder anywhere">
+  <g font-family="sans-serif" font-size="12.5">
+    <rect x="30" y="40" width="100" height="50" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.4" rx="5"/>
+    <text x="80" y="62" text-anchor="middle" font-size="11" fill="#1b4f72">context part</text>
+    <text x="80" y="80" text-anchor="middle" font-size="10" fill="#1b4f72">(observed)</text>
+    <rect x="30" y="185" width="100" height="50" fill="#fcf3cf" stroke="#b7950b" stroke-width="1.4" rx="5"/>
+    <text x="80" y="207" text-anchor="middle" font-size="11" fill="#7d6608">target part</text>
+    <text x="80" y="225" text-anchor="middle" font-size="10" fill="#7d6608">(to predict)</text>
+    <line x1="130" y1="65" x2="180" y2="65" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <line x1="130" y1="210" x2="180" y2="210" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <rect x="185" y="40" width="120" height="50" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="245" y="62" text-anchor="middle" font-weight="bold" fill="#9c4a00">context encoder</text>
+    <text x="245" y="80" text-anchor="middle" font-size="10" fill="#9c4a00">f_theta (trained)</text>
+    <rect x="185" y="185" width="120" height="50" fill="#ebdef0" stroke="#7d3c98" stroke-width="1.5" rx="6"/>
+    <text x="245" y="205" text-anchor="middle" font-weight="bold" fill="#512e5f">target encoder</text>
+    <text x="245" y="222" text-anchor="middle" font-size="10" fill="#512e5f">f_bar (EMA, stop-grad)</text>
+    <line x1="305" y1="65" x2="375" y2="105" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <rect x="380" y="90" width="120" height="50" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.6" rx="6"/>
+    <text x="440" y="112" text-anchor="middle" font-weight="bold" fill="#1a5276">predictor</text>
+    <text x="440" y="130" text-anchor="middle" font-size="10" fill="#1a5276">g_phi</text>
+    <line x1="500" y1="115" x2="575" y2="115" stroke="#5a626c" stroke-width="1.6" marker-end="url(#ah)"/>
+    <line x1="305" y1="210" x2="575" y2="150" stroke="#7d3c98" stroke-width="1.4" marker-end="url(#ahp)"/>
+    <rect x="580" y="95" width="150" height="55" fill="#fadbd8" stroke="#c0392b" stroke-width="1.6" rx="6"/>
+    <text x="655" y="117" text-anchor="middle" font-weight="bold" fill="#922b21">L2 in embedding</text>
+    <text x="655" y="135" text-anchor="middle" font-size="11" fill="#922b21">space (no pixels!)</text>
+    <text x="440" y="200" text-anchor="middle" font-size="11" fill="#5a626c">predict the TARGET EMBEDDING, not the target pixels</text>
+    <text x="440" y="218" text-anchor="middle" font-size="11" fill="#5a626c">no decoder exists anywhere in this diagram</text>
+  </g>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5a626c"/></marker>
+    <marker id="ahp" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#7d3c98"/></marker>
+  </defs>
+</svg>
+<figcaption><strong>Figure 36.7.1</strong>: The Joint-Embedding Predictive Architecture. The context part is encoded by a trained encoder; the target part is encoded by an EMA target encoder under a stop-gradient; a predictor maps the context embedding to the target embedding; and the loss is an L2 distance in embedding space. There is no decoder and no pixel-reconstruction term, which is the entire point: the model predicts abstract structure, not renderable detail.</figcaption>
+</figure>
+
+<p>
+Figure 36.7.1 makes the absence conspicuous: nowhere does an image come out. The code below implements the JEPA training step, and the comments mark the two design choices, embedding-space loss and the EMA target, that distinguish it from a generative predictor.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+import copy
+
+class JEPA(torch.nn.Module):
+    """Joint-Embedding Predictive Architecture: predict target embeddings from
+    context embeddings, with no pixel decoder."""
+    def __init__(self, encoder, predictor, ema_decay=0.996):
+        super().__init__()
+        self.context_encoder = encoder
+        self.predictor = predictor
+        self.target_encoder = copy.deepcopy(encoder)   # EMA teacher, not trained by grad
+        for p in self.target_encoder.parameters():
+            p.requires_grad_(False)
+        self.ema_decay = ema_decay
+
+    @torch.no_grad()
+    def update_target(self):
+        # target encoder follows the context encoder slowly (prevents collapse)
+        for tp, cp in zip(self.target_encoder.parameters(),
+                          self.context_encoder.parameters()):
+            tp.data.mul_(self.ema_decay).add_(cp.data, alpha=1 - self.ema_decay)
+
+    def forward(self, x_context, x_target, mask_tokens):
+        ctx = self.context_encoder(x_context)                 # embed observed part
+        with torch.no_grad():
+            tgt = self.target_encoder(x_target)               # embed target part (EMA)
+        pred = self.predictor(ctx, mask_tokens)               # predict target embedding
+        # loss lives entirely in embedding space; pixels never appear
+        return F.smooth_l1_loss(pred, tgt.detach())
+
+# Each step: compute loss, backprop into context_encoder + predictor only,
+# then model.update_target(). The stop-gradient + EMA teacher prevent the
+# trivial collapse where both encoders output a constant.</code></pre>
+<div class="code-caption">The JEPA training step: the loss is a smooth-L1 distance between predicted and target embeddings, the target encoder is a stop-gradient EMA of the context encoder, and no decoder or pixel loss appears. The EMA teacher and stop-gradient are what prevent representational collapse to a constant.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Predicting Abstractions Sidesteps the Unpredictable</div>
+<p>
+The deep reason JEPA works is that prediction error in pixel space is dominated by detail that is irreducibly uncertain and uninformative. If you ask a model to predict the next video frame exactly, most of its loss comes from getting the precise pixel values of textures, reflections, and fine motion wrong, things no model can predict and that do not matter for understanding the scene. JEPA predicts in a learned representation where those details have been abstracted away, so the loss reflects only predictable, semantic structure: that the object is still there, roughly where physics says it should be. This is why JEPA representations transfer so well to downstream tasks while a pixel-predicting generative model can ace photorealism yet learn shallow dynamics. The decoder you remove is the capacity you save for understanding.
+</p>
+</div>
+
+<h2>2. The Collapse Problem and Why EMA Saves It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Predicting in embedding space has a built-in danger you do not face in pixel space: <strong>representational collapse</strong>. If both encoders are free to learn, the easiest way to make the prediction loss zero is for both to output the same constant vector for every input, a perfect but useless solution. Generative models avoid this automatically because the pixel target is fixed ground truth; JEPA's target is itself learned, so it can cheat. The fix, inherited from the self-supervised methods of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, is the asymmetry between the two encoders: the target encoder is a stop-gradient EMA of the context encoder, so it cannot collude, plus architectural asymmetries (the predictor, masking) that make the constant solution unreachable. Understanding collapse and its prevention is the single most important practical fact about training any joint-embedding predictive model.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+Ask a JEPA to "predict the embedding" and let both encoders cheat, and it discovers the laziest answer in machine learning: map every image, every video, every frame of every leaf in the wind, to the number 7. The prediction loss is now a flawless zero, and the model has learned absolutely nothing. The stop-gradient EMA teacher is the chaperone who refuses to agree on "7" in advance, which is the entire reason JEPA training does not curl up and die. Half of self-supervised learning is inventing clever ways to forbid the constant function.
+</p>
+</div>
+
+<h2>3. V-JEPA: Prediction in Video <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+V-JEPA (Bardes et al., 2024) applies the architecture to video and is the most direct predictive-world-model member of the family. It masks large spatiotemporal regions of a video and trains the model to predict the <em>representations</em> of the masked regions from the visible context, never reconstructing pixels. The learned features are strong: V-JEPA transfers well to action recognition and other video understanding tasks (the domain of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>) with frozen features, and the follow-up work positions it as the perception-and-prediction core of an agent that plans in representation space rather than by rendering imagined video. The contrast with <a href="section-36.6.html">Section 36.6</a> is stark and deliberate: GAIA-1 renders the future you can watch; V-JEPA predicts the future you can reason about but never see.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Robotics Lab That Stopped Rendering</div>
+<p>
+A robotics research group built a manipulation agent whose first world model was generative: it predicted future camera frames pixel by pixel, then planned by imagining video of candidate action sequences. It worked in clean lab conditions but was slow (rendering high-resolution futures for every candidate plan was expensive) and brittle (the model burned capacity perfecting tabletop reflections and shadows, then mispredicted whether a grasp would actually hold). The team rebuilt the predictor on a JEPA-style objective: encode the scene, predict the embedding of the post-action scene, and plan by comparing predicted embeddings to a goal embedding, with no rendering at all. Planning sped up because comparing vectors is far cheaper than generating images, and grasp-success prediction improved because the representation captured contact and object state rather than glossy pixels. The lesson the PI summarized: <em>we were paying, in compute and in accuracy, to render details our planner immediately threw away; predicting in representation space spent that budget on the physics that actually decided the task.</em>
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Pretrained V-JEPA Features in a Few Lines</div>
+<p>
+Training a JEPA from scratch needs large-scale video data and careful collapse-prevention tuning. The released V-JEPA checkpoints give you the learned predictor and encoder directly:
+</p>
+<pre><code class="language-python">import torch
+# Load a pretrained V-JEPA video encoder (released weights via torch.hub).
+encoder = torch.hub.load("facebookresearch/jepa", "vjepa_vit_large")
+encoder.eval()
+with torch.no_grad():
+    feats = encoder(video_clip)   # (B, num_tokens, dim) representation, no pixels out
+# Attach a small linear head for action recognition or use feats for planning.</code></pre>
+<div class="code-caption">Loading pretrained V-JEPA video features via torch.hub: one call returns transfer-ready representations, the decoder-free analogue of loading a pretrained ResNet.</div>
+<p>
+This replaces the entire context encoder, EMA target encoder, predictor, masking pipeline, and the collapse-avoidance training loop, a substantial research codebase, with one load call that returns transfer-ready video representations, the decoder-free analogue of loading a pretrained ResNet.
+</p>
+</div>
+
+<h2>4. Two Philosophies, One Question <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The chapter now holds two competing answers to "what is a world model?" The <strong>generative</strong> answer (Sections 36.5, 36.6): a model that can render the future, prized for interactivity, scenario generation, and the fact that humans and downstream pixel-consumers can directly use its output. The <strong>predictive</strong> answer (this section): a model that predicts abstract future state without rendering it, prized for efficiency, robustness, and the quality of the representations it learns for planning and understanding. They are not strictly opposed, hybrid systems use a JEPA-style predictive core with an optional decoder for visualization, but they embody a real disagreement about where to spend capacity.
+</p>
+
+<p>
+The disagreement cannot be settled by appearance, because the predictive model produces no appearance to judge. It can only be settled by measuring what a world model is actually for: does it predict consequences correctly, does it obey physics, does it respond to actions coherently, does it stay coherent over long horizons? Those measurements are not photorealism, and standard generative metrics do not capture them. Building the evaluations that can adjudicate between a beautiful generative simulator and an invisible but accurate predictive one is the task of the final section, <a href="section-36.8.html">Section 36.8</a>.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The JEPA Program and Agentic Prediction (2024-2026)</div>
+<p>
+JEPA is the centerpiece of an explicit research program (LeCun's "path toward autonomous machine intelligence") arguing that predictive, energy-based, decoder-free models are the route to agents that plan. The 2024 to 2025 frontier is filling it in: <strong>I-JEPA</strong> (Assran et al., 2023) established image features that rival contrastive and masked-autoencoder methods without augmentation engineering; <strong>V-JEPA</strong> and its successors extend this to video and toward action-conditioned prediction, the predictive counterpart of the action conditioning in <a href="section-36.6.html">Section 36.6</a>; and a growing body of robotics work plans directly in JEPA latent space. The open debates are sharp and unresolved: can a decoder-free model match the data efficiency and physical fidelity of large generative video models, can it be made action-conditioned and long-horizon without quietly reintroducing a decoder, and is abstraction or rendering the better substrate for planning? This is one of the genuine forks in the road of the field, and which branch wins is, as of this writing, undecided.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> Explain why a pixel-reconstruction objective (like the generative world models of Section 36.5) and a JEPA embedding-prediction objective allocate model capacity differently, and give a concrete example of detail that a pixel model is forced to learn but a JEPA model is free to ignore. Then explain why JEPA needs an EMA target encoder and stop-gradient, while a pixel-reconstruction model does not.</p>
+<p><span class="exercise-type">Coding.</span> Take the <code>JEPA</code> class and deliberately break collapse prevention: replace the EMA target encoder with the context encoder itself (sharing weights, no stop-gradient). Train on any small dataset and monitor the variance of the output embeddings across a batch. Show that the variance collapses toward zero (constant output) and that restoring the EMA target encoder keeps the variance healthy. Explain what you observed in terms of the trivial solution.</p>
+<p><span class="exercise-type">Analysis.</span> A robot must plan 50 candidate action sequences of 20 steps each to pick the best grasp. Estimate the relative cost of evaluating these plans with (a) a generative world model that renders a future video per candidate versus (b) a JEPA that predicts a goal-distance in embedding space per candidate. Beyond speed, argue which approach is more robust to visually distracting but task-irrelevant scene changes (a moving shadow, a reflection) and why.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.6.html">&#8592; Section 36.6: Generative World Simulators</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.8.html">Section 36.8: Evaluating World Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

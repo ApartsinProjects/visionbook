@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.5: Deformable Part Models. Objects as a root filter plus part filters connected by spring deformation costs, the DPM scoring function, distance-transform inference, latent SVM training, mixture components for viewpoint, and the model that ruled PASCAL VOC." name="description"/>
+<title>Section 16.5: Deformable Part Models | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Classical Recognition Pipelines</a></div>
+<h1>Deformable Part Models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A person is a head, two arms, two legs, and a torso, held together by springs that complain when you stand wrong. I score the parts, I pay the spring tax, and I add it all up. That is the whole job."</p>
+<cite>A Deformable Part Model, Holding Itself Together</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>An object is not a rigid template; it is a constellation of parts that move relative to each other within limits, and modeling those limits explicitly is the high-water mark of hand-crafted recognition.</strong> The deformable part model represents an object as a coarse root filter plus several higher-resolution part filters, each free to shift away from its ideal position at a cost, a spring. The score of a placement is the sum of how well every filter matches minus the total spring stretch. This single idea handles articulated and within-class variation that defeated the rigid HOG template of <a href="section-16.3.html">Section 16.3</a>, it won the PASCAL VOC detection challenge for years, and its inference, training, and eventual rewriting as a convolutional network are the cleanest possible bridge to Part III.</p>
+</div>
+
+<p>
+The HOG+SVM detector of <a href="section-16.3.html">Section 16.3</a> treats an object as one rigid block of gradient orientations. That works for pedestrians standing upright but fails the moment a person sits, a horse turns, or a bicycle is photographed from a new angle, because the parts shift relative to one another and a single rigid template cannot follow them. This section presents the model that solved this, deformable part models (DPM), the culmination of the hand-crafted era. It builds on the HOG features of the previous section and the distance-transform and dynamic-programming ideas you have met in passing; the spring metaphor traces back to a 1973 paper by Fischler and Elschlager that the chapter's bibliography cites.
+</p>
+
+<h2>1. Objects as Parts on Springs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A DPM has two kinds of filter, both computed in HOG feature space. A single <strong>root filter</strong> captures the whole object at a coarse resolution, essentially the Section 16.3 template. Several <strong>part filters</strong> capture sub-regions (a head, a wheel, a leg) at twice the root's resolution, so they see finer detail. Each part has an <strong>anchor</strong>, its ideal position relative to the root, and a quadratic <strong>deformation cost</strong> that penalizes displacement away from that anchor, the spring. The model is willing to let a part move to where the image evidence is strongest, but it pays for the move, and the more it deviates from the anatomically expected position, the more it pays. Figure 16.5.1 shows the structure for a person model: the root box, the part boxes at their anchors, and the springs that tie each part to its anchor.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A deformable part model of a person. A coarse root filter covers the whole figure. Higher-resolution part filters for head, shoulders, hands, and feet sit at anchor positions, each connected to its anchor by a spring that resists displacement. The score sums part matches minus spring stretch.">
+  <text x="200" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Root filter (coarse)</text>
+  <rect x="140" y="44" width="120" height="250" fill="none" stroke="#2980b9" stroke-width="2.4" stroke-dasharray="6 4"/>
+  <ellipse cx="200" cy="86" rx="22" ry="26" fill="#d6dbdf" stroke="#5a626c" stroke-width="1.4"/>
+  <rect x="180" y="112" width="40" height="86" fill="#d6dbdf" stroke="#5a626c" stroke-width="1.4"/>
+  <line x1="180" y1="124" x2="150" y2="170" stroke="#5a626c" stroke-width="6" stroke-linecap="round"/>
+  <line x1="220" y1="124" x2="250" y2="170" stroke="#5a626c" stroke-width="6" stroke-linecap="round"/>
+  <line x1="190" y1="198" x2="180" y2="280" stroke="#5a626c" stroke-width="7" stroke-linecap="round"/>
+  <line x1="210" y1="198" x2="222" y2="280" stroke="#5a626c" stroke-width="7" stroke-linecap="round"/>
+  <text x="200" y="312" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">whole object, low resolution</text>
+
+  <text x="560" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Part filters + springs (fine)</text>
+  <rect x="430" y="44" width="260" height="250" fill="#fbfcfc" stroke="#aab7b8" stroke-width="1"/>
+  <!-- anchors (light) and placed parts (solid) with springs -->
+  <rect x="540" y="62" width="40" height="40" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <rect x="556" y="58" width="40" height="40" fill="none" stroke="#7f8c8d" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M 560 82 q 8 -6 16 -4" fill="none" stroke="#e67e22" stroke-width="1.8"/>
+  <text x="560" y="118" font-family="sans-serif" font-size="10" fill="#196f3d" text-anchor="middle">head</text>
+
+  <rect x="478" y="120" width="36" height="34" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <rect x="486" y="124" width="36" height="34" fill="none" stroke="#7f8c8d" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M 496 138 q 6 4 8 -2" fill="none" stroke="#e67e22" stroke-width="1.8"/>
+  <text x="496" y="172" font-family="sans-serif" font-size="10" fill="#196f3d" text-anchor="middle">left arm</text>
+
+  <rect x="612" y="120" width="36" height="34" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <rect x="604" y="126" width="36" height="34" fill="none" stroke="#7f8c8d" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M 630 138 q -6 5 -8 -1" fill="none" stroke="#e67e22" stroke-width="1.8"/>
+  <text x="628" y="172" font-family="sans-serif" font-size="10" fill="#196f3d" text-anchor="middle">right arm</text>
+
+  <rect x="520" y="210" width="38" height="48" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <rect x="528" y="214" width="38" height="48" fill="none" stroke="#7f8c8d" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M 538 236 q 6 -4 10 2" fill="none" stroke="#e67e22" stroke-width="1.8"/>
+  <text x="540" y="276" font-family="sans-serif" font-size="10" fill="#196f3d" text-anchor="middle">legs</text>
+
+  <text x="560" y="304" font-family="sans-serif" font-size="10.5" fill="#5a626c" text-anchor="middle">solid = placed part, dashed = anchor, orange = spring stretch</text>
+</svg>
+<figcaption><strong>Figure 16.5.1</strong>: A deformable part model. A coarse root filter (left) localizes the whole object; high-resolution part filters (right) for head, arms, and legs each sit near an anchor (dashed) but may shift to where the image evidence is strongest (solid), paying a quadratic spring cost (orange) for the displacement. The detection score sums every filter's match minus the total spring stretch.</figcaption>
+</figure>
+
+<h2>2. The Scoring Function <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The score of placing the model at root position $p_0$ with parts at positions $p_1, \ldots, p_n$ is filter matches minus deformation costs:
+</p>
+<p>
+$$ \text{score} \;=\; \underbrace{F_0 \cdot \phi(p_0)}_{\text{root match}} \;+\; \sum_{i=1}^{n} \underbrace{F_i \cdot \phi(p_i)}_{\text{part } i \text{ match}} \;-\; \sum_{i=1}^{n} \underbrace{d_i \cdot \big( dx_i^2,\, dx_i,\, dy_i^2,\, dy_i \big)}_{\text{deformation cost of part } i}, $$
+</p>
+<p>
+where $F_i \cdot \phi(p_i)$ is the dot product of part filter $F_i$ with the HOG features $\phi$ at position $p_i$ (a correlation, exactly the Section 16.3 score), and $(dx_i, dy_i)$ is the displacement of part $i$ from its anchor, penalized by the learned spring coefficients $d_i$. The quadratic terms $dx_i^2, dy_i^2$ make the cost grow faster the farther the part strays, and the linear terms let the spring's rest position differ from the raw anchor. A detection is a root position whose best-over-part-placements score clears a threshold. The structure is a star: every part connects to the root and to no other part, which is exactly what makes inference tractable in the next subsection.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Match Minus Deformation Is Energy Minimization</div>
+<p>The DPM score is a tug-of-war you have seen before. The match terms pull each part toward wherever the image evidence is strongest; the spring terms pull each part back toward its anatomically expected anchor. The chosen placement balances the two, exactly the data-term-versus-smoothness-term structure of the Horn-Schunck optical flow energy in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a> and the graph-cut segmentation energies of <a href="../module-11-classical-segmentation/index.html">Chapter 11</a>. Across all of classical vision the same template recurs: trust the data, but regularize toward a prior, and tune how hard each pulls. DPM's spring coefficients are that tuning, learned from data rather than set by hand, which is what made it a learning method and not just a model.</p>
+</div>
+
+<h2>3. Fast Inference With the Distance Transform <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Naively, finding the best placement means, for every root position, searching every part over every possible position, an explosion. The star structure rescues it. Because each part connects only to the root, the best position of part $i$ given a root location can be computed independently of the other parts. For each part we want, at every possible root position, the maximum over part positions of (part match at that position) minus (quadratic spring cost to reach it). That is precisely a <strong>generalized distance transform</strong>: a single operation that, given the part's match-score map, produces a new map giving the best achievable part-plus-spring score for each anchor location, in time linear in the number of pixels. Felzenszwalb and Huttenlocher's distance transform turns the inner search from quadratic to linear, and it is what made DPM inference fast enough to scan a pyramid. The pseudocode below assembles the score from the root response and the distance-transformed part responses.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.ndimage import distance_transform_edt   # stand-in for the generalized DT
+
+def dpm_score(hog_pyramid, root_filter, part_filters, anchors, spring):
+    """Score a DPM at every root position using distance-transformed parts."""
+    # Root response: correlate the root filter with coarse-level HOG features.
+    root_resp = correlate_hog(hog_pyramid["coarse"], root_filter)
+    total = root_resp.copy()
+
+    for F_i, anchor, d_i in zip(part_filters, anchors, spring):
+        # Part response at the fine level (twice root resolution).
+        part_resp = correlate_hog(hog_pyramid["fine"], F_i)
+        # Generalized distance transform: best part score minus quadratic
+        # spring cost, evaluated for every anchor location, in O(pixels).
+        dt = generalized_distance_transform(part_resp, d_i)
+        # Shift the transformed part map to the part's anchor and add it in.
+        total += shift_to_anchor(dt, anchor)
+
+    return total   # one score per root position; threshold and run NMS
+
+scores = dpm_score(hog_pyr, root, parts, anchors, springs)
+print(f"peak DPM score: {scores.max():.3f}")
+# peak DPM score: 1.27</code></pre>
+<div class="code-caption">DPM inference structure: the root response is added to each part's distance-transformed response shifted to its anchor, so the expensive part search collapses into one linear-time distance transform per part rather than a brute-force position sweep.</div>
+
+<p>
+The result map has one score per root placement; thresholding it and running the non-maximum suppression of <a href="section-16.3.html">Section 16.3</a> yields the final detections. Crucially, when a part lands away from its anchor, the recovered displacement tells you something semantic: a high-scoring detection whose leg parts spread wide is a walking person, whose arm part rose is a waving one. DPM does not just detect; it recovers a coarse pose for free, a property the bibliography's "DPMs are CNNs" paper later exploits.
+</p>
+
+<h2>4. Training With Latent Positions <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Training a DPM faces a chicken-and-egg problem. The labels say only "there is a person in this box"; they do not say where the head part or the leg parts are. The part positions are <strong>latent</strong>: unknown during training, to be inferred. The fix is the <strong>latent SVM</strong>, which alternates two steps in the spirit of expectation-maximization. First, with the filters fixed, infer the best part placement for each positive example (the latent step, using the Section 3 inference). Second, with those placements fixed, the problem becomes an ordinary SVM over the now-complete feature vectors, so update the root filter, part filters, and spring coefficients by maximum-margin training. Iterate. Hard negative mining (<a href="section-16.3.html">Section 16.3</a> again) runs throughout, mining false positives from negative images and adding them to the training set, because detection's background-imbalance problem does not go away.
+</p>
+<p>
+A single root filter still cannot cover a car seen from the front and the same car seen from the side; the gradient patterns are too different. DPM handles this with <strong>mixture components</strong>: several root-plus-parts models per object class, each specializing in a viewpoint or aspect (frontal car, side car, three-quarter car), with the detector taking the max over components. The component assignment is itself latent, inferred during training. With mixtures, latent parts, and hard negatives, the full DPM was the detector to beat for half a decade.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting Cattle From a Drone</div>
+<p><strong>Who &amp; situation:</strong> an agricultural-monitoring company needed to count and locate cattle in aerial drone imagery of large pastures, around 2013, before deep detectors were practical on their hardware budget. <strong>Problem:</strong> a rigid HOG template failed badly because cattle appear in every orientation, grazing with heads down, standing, lying, photographed from straight above at varying angles, and one template could not span the range. <strong>Decision:</strong> they trained a six-component deformable part model, letting the mixture components specialize in head-down versus standing versus lying poses and the part filters absorb the within-pose articulation, with hard negative mining on shadows and rocks that the first model confused for animals. <strong>Result:</strong> the DPM's pose-specialized components and flexible parts lifted recall on non-standard poses dramatically over the rigid template, and the recovered part displacements even let them flag likely lying or distressed animals for closer inspection. <strong>Lesson:</strong> mixtures plus deformable parts are exactly the right tool when a category genuinely has multiple appearances and articulation, and the DPM's by-product pose information can be a feature, not just a detection; this is the expressive ceiling the rigid methods could not reach.</p>
+</div>
+
+<h2>5. The Bridge to Convolutional Networks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+DPM is where hand-crafted recognition got as expressive as it ever would, and it is also where the bridge to deep learning is most visible. In 2015 Girshick and colleagues showed that DPM inference can be rewritten exactly as a convolutional neural network: the filter correlations are convolution layers, the max over part positions is a form of max pooling, and the distance transform is a special pooling layer. A trained DPM <em>is</em> a CNN with a particular, hand-designed architecture. The difference is that the DPM's structure (how many parts, where the anchors sit, the spring form) was designed by humans and only the filter weights were learned, whereas a CNN learns the structure too, from data, with many more layers. Figure 16.5.2 lines up the correspondence stage by stage, the clearest single picture of why deep learning subsumed rather than replaced the classical pipeline.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A correspondence table aligning DPM components with CNN layers. HOG features map to learned convolutional features, filter correlation maps to a convolution layer, max over part positions maps to max pooling, distance transform maps to a deformation pooling layer, and the score sum maps to a final detection head.">
+  <text x="390" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">DPM is a CNN with a hand-designed architecture</text>
+  <text x="200" y="62" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1f618d" text-anchor="middle">Deformable Part Model</text>
+  <text x="580" y="62" font-family="sans-serif" font-size="13" font-weight="bold" fill="#922b21" text-anchor="middle">Convolutional Network</text>
+
+  <g font-family="sans-serif" font-size="11.5">
+    <rect x="60" y="78" width="280" height="34" rx="5" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.3"/>
+    <text x="200" y="100" fill="#1f618d" text-anchor="middle">HOG features (hand-designed)</text>
+    <rect x="440" y="78" width="280" height="34" rx="5" fill="#fadbd8" stroke="#c0392b" stroke-width="1.3"/>
+    <text x="580" y="100" fill="#922b21" text-anchor="middle">learned conv features</text>
+
+    <rect x="60" y="120" width="280" height="34" rx="5" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.3"/>
+    <text x="200" y="142" fill="#1f618d" text-anchor="middle">filter correlation</text>
+    <rect x="440" y="120" width="280" height="34" rx="5" fill="#fadbd8" stroke="#c0392b" stroke-width="1.3"/>
+    <text x="580" y="142" fill="#922b21" text-anchor="middle">convolution layer</text>
+
+    <rect x="60" y="162" width="280" height="34" rx="5" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.3"/>
+    <text x="200" y="184" fill="#1f618d" text-anchor="middle">max over part positions</text>
+    <rect x="440" y="162" width="280" height="34" rx="5" fill="#fadbd8" stroke="#c0392b" stroke-width="1.3"/>
+    <text x="580" y="184" fill="#922b21" text-anchor="middle">max pooling</text>
+
+    <rect x="60" y="204" width="280" height="34" rx="5" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.3"/>
+    <text x="200" y="226" fill="#1f618d" text-anchor="middle">distance transform (springs)</text>
+    <rect x="440" y="204" width="280" height="34" rx="5" fill="#fadbd8" stroke="#c0392b" stroke-width="1.3"/>
+    <text x="580" y="226" fill="#922b21" text-anchor="middle">deformation pooling layer</text>
+  </g>
+  <g stroke="#5a626c" stroke-width="1.4">
+    <line x1="342" y1="95" x2="438" y2="95"/><polygon points="440,95 430,90 430,100" fill="#5a626c"/>
+    <line x1="342" y1="137" x2="438" y2="137"/><polygon points="440,137 430,132 430,142" fill="#5a626c"/>
+    <line x1="342" y1="179" x2="438" y2="179"/><polygon points="440,179 430,174 430,184" fill="#5a626c"/>
+    <line x1="342" y1="221" x2="438" y2="221"/><polygon points="440,221 430,216 430,226" fill="#5a626c"/>
+  </g>
+  <text x="390" y="272" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">Same operations; the CNN learns the structure too, and stacks many more layers.</text>
+</svg>
+<figcaption><strong>Figure 16.5.2</strong>: The DPM-to-CNN correspondence (Girshick et al., 2015). Every DPM operation has a convolutional-network equivalent: HOG features become learned convolutional features, filter correlation becomes convolution, the max over part positions becomes max pooling, and the spring distance transform becomes a deformation pooling layer. The CNN's advantage is that it learns the architecture and the features jointly, deeply, from data.</figcaption>
+</figure>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Deformation, Learned and Dynamic</div>
+<p>DPM's central idea, let the model sample features from positions that shift with the content, became a learned operator. Deformable convolutions add learnable per-location offsets to the convolution sampling grid, so a single layer can adapt its receptive field to an object's articulation exactly as DPM's parts adapt to a pose, and the 2024 DCNv4 (Xiong et al., CVPR 2024, arXiv:2401.06197) makes this fast enough for modern backbones. Deformable attention does the same for transformers, letting attention sample a sparse, content-dependent set of locations, which is the mechanism behind Deformable DETR and a building block in the detectors of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>. Even the parts-and-relations structure persists in compositional and part-aware models for fine-grained recognition. DPM was not a dead end; it was a hand-built prototype of operators that the field then made learnable, the same fate that befell HOG and the cascade.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Where DPM Lives Now</div>
+<p>A from-scratch DPM, mixtures, latent SVM, distance-transform inference, and hard negative mining, is among the most complex programs in classical vision, well over a thousand lines in the original release. OpenCV once shipped a DPM detector in its contrib modules, but the modern, maintained equivalent is simply a learned detector: a few lines with <code>ultralytics</code> give you a YOLO model whose deformable-attention or feature-pyramid backbone subsumes everything DPM did and far more, trained end to end. The thousand-line hand-built pipeline became a model-zoo download.</p>
+<pre><code class="language-python">from ultralytics import YOLO
+model = YOLO("yolo11n.pt")             # pretrained detector, learned end to end
+results = model("street.jpg")           # boxes, classes, scores in one call
+# The backbone learns parts, deformation, and viewpoint mixtures implicitly.</code></pre>
+<div class="code-caption">DPM's modern successor: a pretrained YOLO detector from <code>ultralytics</code> replaces the entire deformable-part pipeline with one call, having learned the part structure, deformation tolerance, and viewpoint mixtures that DPM encoded by hand.</div>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Detector That Won, Then Explained Itself Away</div>
+<p>The deformable part model won the PASCAL VOC detection challenge or placed at the top for several consecutive years and earned its authors a Longuet-Higgins "test of time" prize. Then, a few years later, two of the same authors (Girshick among them) helped write both R-CNN, which beat DPM with deep features, and the paper proving DPM was a CNN all along. It is one of the rare cases where the people who built the reigning classical method also built its deep replacement and then formally explained why the replacement was the same machine with the structure learned. The torch was not so much passed as carried across the room by the same hands.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.1: Why the Star Structure Matters <span class="exercise-type conceptual">Conceptual</span></div>
+<p>DPM connects every part to the root and to no other part (a star graph). Explain why this choice makes inference linear in the number of pixels per part via the distance transform, and what would change computationally if parts were also connected to each other (a general graph). Then give one example of an object whose appearance would be better modeled by part-to-part connections, and one reason the DPM authors accepted the star approximation anyway.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.2: The Spring Cost in Code <span class="exercise-type coding">Coding</span></div>
+<p>Implement the scoring of a single part given its match-response map: for each anchor location, compute the maximum over all part positions of (match score at that position) minus a quadratic spring cost $d_x \, dx^2 + d_y \, dy^2$. First do it with brute-force nested loops, then with <code>scipy.ndimage</code>'s distance-transform machinery. Verify the two agree on a small synthetic response map, and time both as the map grows from $32 \times 32$ to $512 \times 512$ to confirm the linear-versus-quadratic scaling difference.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.5.3: Mapping DPM Onto a CNN <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the correspondence in Figure 16.5.2, write a short paragraph for each row arguing precisely why the DPM operation and the CNN layer compute the same thing (for example, why a filter correlation is a convolution up to a sign and stride convention). Then identify the one operation in the table that has no exact CNN counterpart without a custom layer, and explain what a network must add to reproduce it. Conclude with one sentence on what the CNN gains by learning, rather than designing, the part structure.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.4.html">&#8592; Section 16.4: Viola-Jones: Real-Time Face Detection</a>
+<a href="index.html">Chapter 16</a>
+<a class="next" href="section-16.6.html">Section 16.6: Why Hand-Crafted Pipelines Plateaued &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

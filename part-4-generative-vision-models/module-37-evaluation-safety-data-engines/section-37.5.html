@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.5: Watermarking &amp; Content Provenance. The proactive complement to detection: a from-scratch DCT-domain invisible watermark and its robustness, in-generation watermarking like Stable Signature and Google SynthID, the C2PA cryptographically signed manifest standard for content provenance, and the robustness limits that make provenance a layered rather than absolute guarantee." name="description"/>
+<title>Section 37.5: Watermarking &amp; Content Provenance | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Evaluation, Safety &amp; Generative Data Engines</a></div>
+<h1>Watermarking &amp; Content Provenance: C2PA &amp; Beyond</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They hid a secret in my pixels and signed a note saying where I came from. Crop me, compress me, screenshot me: the note may tear, but the secret was woven into the weave, not stapled to the corner."</p>
+<cite>A Watermarked Image, Quietly Confident</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Where detection asks "is this fake?" after the fact and loses the arms race, provenance asks "where did this come from?" at the moment of creation, and answers it with two complementary tools: invisible watermarks woven into the pixels and cryptographically signed manifests attached to the file.</strong> An invisible watermark embeds a recoverable signal into an image so imperceptibly that it survives compression, resizing, and cropping, with the strongest variants baked directly into the generator so every output is marked. The C2PA standard takes the opposite approach, attaching a tamper-evident, cryptographically signed record of an image's origin and edit history. Neither is unbreakable alone (a determined adversary can strip both), so they are deployed as overlapping layers that raise the cost of deception and let honest content prove itself.</p>
+</div>
+
+<p>
+<a href="section-37.4.html">Section 37.4</a> ended on a hard truth: passive detection cannot win against an adversary who always moves last. This section presents the proactive answer. Instead of inferring authenticity from artifacts, we assert it at creation. The shift in burden is the whole point. A detector must catch every fake to be useful; a provenance system only has to let genuine content carry a verifiable claim, which is a far more tractable goal. The methods here connect directly to two earlier threads: invisible watermarking lives in the frequency domain of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and in-generation watermarking modifies the diffusion decoder of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.
+</p>
+
+<h2>1. Invisible Watermarking: The Idea <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+An invisible watermark hides a payload (often just a few bits, or a model identifier) inside an image so that the human eye sees no change but a detector with the right key can recover it. The two requirements pull against each other: <strong>imperceptibility</strong> demands the change be tiny, while <strong>robustness</strong> demands the signal survive the transformations real images undergo (JPEG compression, the <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">resizing and cropping of Chapter 5</a>, screenshotting, mild color edits). The classic engineering answer is to embed in a transform domain rather than directly in pixels. The discrete cosine transform (DCT), the same transform that underlies JPEG itself, is a natural host: nudging mid-frequency DCT coefficients changes the image imperceptibly but in a way that compression tends to preserve, because compression also operates in the DCT domain. Embedding in pixels is fragile; embedding in frequency is the start of robustness.
+</p>
+
+<h2>2. A DCT-Domain Watermark From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The minimal scheme embeds one bit by raising or lowering a chosen mid-frequency DCT coefficient of an 8x8 block, then recovers the bit by inspecting that coefficient. Real systems spread many bits across many blocks with error-correcting codes, but the one-block version shows the mechanism cleanly. The code embeds and extracts a single bit; Figure 37.5.1 shows where in the spectrum the perturbation lands and why it survives compression.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.fftpack import dct, idct
+
+def dct2(b):  return dct(dct(b.T, norm="ortho").T, norm="ortho")
+def idct2(b): return idct(idct(b.T, norm="ortho").T, norm="ortho")
+
+COEF = (3, 4)        # a mid-frequency coefficient: imperceptible yet JPEG-stable
+STRENGTH = 12.0      # embedding strength; larger = more robust, less invisible
+
+def embed_bit(block, bit):
+    """Embed one bit in an 8x8 grayscale block via a mid-freq DCT coeff."""
+    c = dct2(block.astype(float))
+    # Quantize the coefficient to an even (bit 0) or odd (bit 1) multiple.
+    q = round(c[COEF] / STRENGTH)
+    if q % 2 != bit:
+        q += 1
+    c[COEF] = q * STRENGTH
+    return np.clip(idct2(c), 0, 255)
+
+def extract_bit(block):
+    """Recover the embedded bit from an 8x8 block."""
+    c = dct2(block.astype(float))
+    return int(round(c[COEF] / STRENGTH)) % 2
+
+# Round-trip on one block:
+blk = np.random.randint(80, 160, (8, 8)).astype(float)
+marked = embed_bit(blk, 1)
+print("recovered:", extract_bit(marked))            # recovered: 1
+print("max pixel change:", np.abs(marked - blk).max())  # a few gray levels
+</code></pre>
+<div class="code-caption">A single-bit DCT-domain watermark using quantization index modulation: embed by snapping a mid-frequency coefficient to an even or odd quantization level, extract by reading its parity. The pixel change is a few gray levels, below perceptual threshold.</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An 8 by 8 DCT coefficient grid with low frequency at top-left, high frequency at bottom-right, and a mid-frequency cell highlighted as the watermark host">
+<style>
+.wl{font:12px sans-serif;fill:#1a1a1a;}
+.ws{font:10px sans-serif;fill:#555;}
+.wcell{fill:#f6f7f9;stroke:#bbb;stroke-width:1;}
+.wlow{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1;}
+.whigh{fill:#efe9e4;stroke:#8a7a6a;stroke-width:1;}
+.wmid{fill:#fbe2cf;stroke:#d6802b;stroke-width:2;}
+</style>
+<text class="wl" x="220" y="22" text-anchor="middle">8x8 DCT coefficient grid</text>
+<g>
+<!-- draw 8x8 grid -->
+<!-- row 0 -->
+<rect class="wlow" x="60" y="35" width="22" height="22"/><rect class="wlow" x="82" y="35" width="22" height="22"/><rect class="wcell" x="104" y="35" width="22" height="22"/><rect class="wcell" x="126" y="35" width="22" height="22"/><rect class="wcell" x="148" y="35" width="22" height="22"/><rect class="wcell" x="170" y="35" width="22" height="22"/><rect class="wcell" x="192" y="35" width="22" height="22"/><rect class="whigh" x="214" y="35" width="22" height="22"/>
+<rect class="wlow" x="60" y="57" width="22" height="22"/><rect class="wcell" x="82" y="57" width="22" height="22"/><rect class="wcell" x="104" y="57" width="22" height="22"/><rect class="wcell" x="126" y="57" width="22" height="22"/><rect class="wcell" x="148" y="57" width="22" height="22"/><rect class="wcell" x="170" y="57" width="22" height="22"/><rect class="wcell" x="192" y="57" width="22" height="22"/><rect class="whigh" x="214" y="57" width="22" height="22"/>
+<rect class="wcell" x="60" y="79" width="22" height="22"/><rect class="wcell" x="82" y="79" width="22" height="22"/><rect class="wcell" x="104" y="79" width="22" height="22"/><rect class="wcell" x="126" y="79" width="22" height="22"/><rect class="wcell" x="148" y="79" width="22" height="22"/><rect class="wcell" x="170" y="79" width="22" height="22"/><rect class="whigh" x="192" y="79" width="22" height="22"/><rect class="whigh" x="214" y="79" width="22" height="22"/>
+<rect class="wcell" x="60" y="101" width="22" height="22"/><rect class="wcell" x="82" y="101" width="22" height="22"/><rect class="wcell" x="104" y="101" width="22" height="22"/><rect class="wmid" x="126" y="101" width="22" height="22"/><rect class="wcell" x="148" y="101" width="22" height="22"/><rect class="whigh" x="170" y="101" width="22" height="22"/><rect class="whigh" x="192" y="101" width="22" height="22"/><rect class="whigh" x="214" y="101" width="22" height="22"/>
+<rect class="wcell" x="60" y="123" width="22" height="22"/><rect class="wcell" x="82" y="123" width="22" height="22"/><rect class="wcell" x="104" y="123" width="22" height="22"/><rect class="wcell" x="126" y="123" width="22" height="22"/><rect class="whigh" x="148" y="123" width="22" height="22"/><rect class="whigh" x="170" y="123" width="22" height="22"/><rect class="whigh" x="192" y="123" width="22" height="22"/><rect class="whigh" x="214" y="123" width="22" height="22"/>
+</g>
+<text class="ws" x="71" y="30" text-anchor="middle" fill="#2c6fb5">low f</text>
+<text class="ws" x="225" y="160" text-anchor="middle" fill="#8a7a6a">high f</text>
+<text class="ws" x="137" y="138" text-anchor="middle" fill="#d6802b">host coeff (3,4)</text>
+<text class="wl" x="430" y="80" fill="#2c6fb5">low frequency:</text>
+<text class="ws" x="430" y="98">changes are visible (blotches)</text>
+<text class="wl" x="430" y="125" fill="#8a7a6a">high frequency:</text>
+<text class="ws" x="430" y="143">destroyed by JPEG compression</text>
+<text class="wl" x="430" y="170" fill="#d6802b">mid frequency:</text>
+<text class="ws" x="430" y="188">invisible AND compression-stable</text>
+</svg>
+<figcaption><strong>Figure 37.5.1:</strong> Why the watermark lives in mid frequencies. Perturbing low-frequency DCT coefficients (top-left, blue) is visible as blotchy artifacts; perturbing high frequencies (bottom-right, brown) is invisible but wiped out by JPEG compression. The mid-frequency host coefficient (orange) is the sweet spot: imperceptible to the eye yet preserved through the compression that destroys the high band. This is the tradeoff the code in subsection 2 navigates.</figcaption>
+</figure>
+
+<h2>3. In-Generation Watermarking: Stable Signature and SynthID <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A watermark applied after generation can be skipped by anyone running the model themselves. The stronger approach bakes the watermark into the generator so every output is marked, with no optional post-step to remove. <strong>Stable Signature</strong> (Fernandez et al., 2023) fine-tunes the latent-diffusion decoder of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> so that a trained extractor network recovers a fixed bit-string from any image it produces, embedding the watermark in the very weights that turn latents into pixels. Google DeepMind's <strong>SynthID</strong> (deployed across Google's image, audio, and text products and partly open-sourced in 2024) similarly integrates marking into the generation pipeline and pairs it with a learned detector robust to common edits. The crucial design property both share is that the watermark is a property of the model, not an afterthought, so a user of the official model cannot produce unmarked output, which is exactly the policy lever regulators have begun to require.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Watermark in the Decoder, Not After It</div>
+<p>The difference between a post-hoc watermark and an in-generation one is the difference between an opt-in and a default. A post-hoc tool watermarks the images you choose to run through it; anyone bypassing the tool produces clean images. An in-generation watermark like Stable Signature is welded into the decoder weights, so the model physically cannot emit an unmarked image without retraining. That makes it the right primitive for the policy goal of "all images from this service are identifiable as AI-generated," and it is why the 2024 to 2026 regulatory push (the EU AI Act's transparency obligations, US executive action) lands on in-generation watermarking rather than optional post-processing.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>A post-hoc watermark is a sticker on the bumper; an in-generation watermark is the VIN stamped into the chassis. You can peel a sticker; removing a VIN takes a grinder and intent, which is precisely the friction the design is buying. The mid-frequency band, meanwhile, is the Goldilocks zone of the spectrum: the low frequencies are too loud to hide in, the high frequencies are too fragile to survive JPEG, and the middle is just right. Mnemonic for the section: <strong>weave the secret into the weave, not the corner; and remember that no manifest proves nothing, while a valid manifest proves something.</strong></p>
+</div>
+
+<h2>4. C2PA: Cryptographically Signed Provenance <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Watermarking hides a signal in the pixels. C2PA (the Coalition for Content Provenance and Authenticity standard, the technology behind the "Content Credentials" mark in deployed tools) takes the orthogonal approach of attaching metadata: a <strong>manifest</strong> recording what created the image, what edits were applied, and by whom, all sealed with a cryptographic signature from the producing software's certificate. Any later tampering breaks the signature, so the manifest is tamper-evident: you cannot silently alter the recorded history without invalidating it. The manifest travels with the file and can be verified offline against the signer's certificate chain. Figure 37.5.2 shows the structure: a chain of signed assertions from camera capture through each editing step to the final published image.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A C2PA provenance chain: capture, edit, and generative steps each producing a signed assertion linked into a tamper-evident manifest">
+<style>
+.cl{font:12px sans-serif;fill:#1a1a1a;}
+.cs{font:10px sans-serif;fill:#555;}
+.cbox{fill:#eef0f2;stroke:#555;stroke-width:1.3;}
+.csig{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.3;}
+.carr{stroke:#555;stroke-width:1.6;marker-end:url(#cah);fill:none;}
+</style>
+<defs>
+<marker id="cah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#555"/></marker>
+</defs>
+<rect class="cbox" x="20" y="60" width="120" height="50"/>
+<text class="cl" x="80" y="82" text-anchor="middle">Capture / Generate</text>
+<text class="cs" x="80" y="100" text-anchor="middle">camera or model</text>
+<rect class="cbox" x="200" y="60" width="120" height="50"/>
+<text class="cl" x="260" y="82" text-anchor="middle">Edit</text>
+<text class="cs" x="260" y="100" text-anchor="middle">crop, color, inpaint</text>
+<rect class="cbox" x="380" y="60" width="120" height="50"/>
+<text class="cl" x="440" y="82" text-anchor="middle">Publish</text>
+<text class="cs" x="440" y="100" text-anchor="middle">final asset</text>
+<rect class="csig" x="560" y="55" width="140" height="60"/>
+<text class="cl" x="630" y="80" text-anchor="middle">Verify</text>
+<text class="cs" x="630" y="98" text-anchor="middle">check signature chain</text>
+<line class="carr" x1="142" y1="85" x2="198" y2="85"/>
+<line class="carr" x1="322" y1="85" x2="378" y2="85"/>
+<line class="carr" x1="502" y1="85" x2="558" y2="85"/>
+<rect class="csig" x="20" y="140" width="480" height="34"/>
+<text class="cs" x="260" y="162" text-anchor="middle" fill="#2c6fb5">signed manifest: each step adds a cryptographically signed assertion (tamper-evident)</text>
+<line class="carr" x1="80" y1="112" x2="80" y2="138"/>
+<line class="carr" x1="260" y1="112" x2="260" y2="138"/>
+<line class="carr" x1="440" y1="112" x2="440" y2="138"/>
+</svg>
+<figcaption><strong>Figure 37.5.2:</strong> The C2PA provenance chain. Each stage of an image's life (capture or generation, each edit, publication) appends a cryptographically signed assertion to the manifest that travels with the file. A verifier checks the signature chain against trusted certificates; any tampering after signing breaks the chain. Unlike a watermark, C2PA records the full edit history rather than a hidden bit, and unlike detection it asserts origin rather than inferring it.</figcaption>
+</figure>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Reading C2PA Manifests</div>
+<p>You do not implement the cryptography yourself; the C2PA project ships the <code>c2pa</code> library (Rust core with Python bindings) that reads, verifies, and writes manifests. Inspecting an image's provenance is a few lines:</p>
+<pre><code class="language-python">from c2pa import Reader
+
+# Read and verify the embedded manifest of an image file.
+with Reader.from_file("published_image.jpg") as reader:
+    manifest = reader.json()      # full provenance: actions, signer, ingredients
+    print(manifest)               # includes "claim_generator", edit assertions
+
+# Validation status (signature checks) is included; a broken chain is flagged.
+</code></pre>
+<div class="code-caption">Reading a C2PA manifest with the official c2pa library: one reader returns the full signed provenance and flags a broken signature chain, hiding the certificate and JUMBF handling.</div>
+<p>This replaces hundreds of lines of certificate parsing, JUMBF box handling, and signature verification with a single reader, and it is the same library that deployed cameras and editing tools use to write those manifests in the first place.</p>
+</div>
+
+<h2>5. The Robustness Reality <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Neither tool is a guarantee, and it is important to be precise about why. Watermarks face removal attacks: regeneration (passing the image through another generator), strong cropping and rescaling, and purpose-built adversarial perturbations can erase or scramble the embedded signal, and 2023 to 2024 research showed several deployed watermarks can be removed or even forged with modest effort. C2PA manifests can simply be stripped (a screenshot or a re-encode that discards metadata produces a clean file with no manifest at all), so absence of a manifest proves nothing, only presence of a valid one proves something. The honest framing is that provenance is a layered, probabilistic defense, not a cryptographic certainty: it raises the cost and friction of deception, makes honest content easy to verify, and is most powerful when watermarking and signed manifests reinforce each other and combine with the detection of <a href="section-37.4.html">Section 37.4</a>. No single layer is the answer; the stack is.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Stock-Photo Platform Rolls Out Content Credentials</div>
+<p><strong>Who:</strong> the trust-and-safety engineering team at a large stock-imagery marketplace, 2024, required by enterprise customers to label AI-generated content. <strong>Situation:</strong> contributors were uploading a growing share of generated images, and buyers wanted to filter or knowingly license them. <strong>Problem:</strong> contributors could not be trusted to self-declare accurately, and a pure detector (from <a href="section-37.4.html">Section 37.4</a>) was too unreliable cross-generator to gate payments on. <strong>Decision:</strong> they adopted a layered scheme: accept C2PA manifests at upload and preserve them through their pipeline, run an in-generation watermark check for the major model providers they integrated, and fall back to a learned detector only as a soft flag for human review. <strong>Result:</strong> images arriving with valid C2PA manifests or recognized watermarks were labeled with high confidence and required no review, which covered the majority of generated uploads from cooperating tools; the unreliable detector was relegated to triage rather than verdict. <strong>Lesson:</strong> provenance worked precisely where the producers cooperated and the layers reinforced each other, and the team designed for the realistic case (most generation comes from a handful of major, watermark-cooperating providers) rather than the adversarial worst case, which detection alone could never have covered.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Robust and Regulated Watermarking</div>
+<p>The 2023 to 2026 frontier is robustness under adversarial pressure and the policy machinery being built on top. On robustness, Zhao et al. ("Invisible Image Watermarks Are Provably Removable Using Generative AI," 2023, arXiv:2306.01953) and the Tree-Ring watermark line (Wen et al., NeurIPS 2023, arXiv:2305.20030, which embeds the mark in the diffusion initial-noise pattern for far stronger robustness) define the attack-and-defense edge, while SynthID's 2024 Nature publication and partial open-sourcing pushed production-grade marking into the open. On policy, the EU AI Act's transparency provisions and US executive guidance increasingly require that AI-generated media be machine-detectable, which is turning in-generation watermarking and C2PA from optional features into compliance requirements. The open technical question driving the field is whether any watermark can be simultaneously imperceptible, robust to regeneration attacks, and unforgeable; the current consensus, consistent with subsection 5, is that no single scheme achieves all three, so layered provenance plus regulation, rather than a perfect watermark, is the realistic trajectory.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.5.1: Detection Versus Provenance <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in a short paragraph why "absence of a C2PA manifest" cannot be treated as evidence that an image is fake, while "presence of a valid manifest" can be treated as evidence of origin. Then contrast this asymmetry with deepfake detection from <a href="section-37.4.html">Section 37.4</a>, and state which of the two (detection or provenance) shifts the burden onto honest content and which onto suspicious content.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.5.2: Measure Watermark Robustness <span class="exercise-type coding">Coding</span></div>
+<p>Extend the single-bit scheme from subsection 2 to embed an 8-bit payload by spreading bits across multiple 8x8 blocks of a real grayscale image. Embed a known byte, then measure the bit-error rate after each of: JPEG compression at quality 50, downscaling to half resolution and back, and a 10 percent center crop. Report which transformations the watermark survives and which destroy it, and relate your findings to the mid-frequency tradeoff in Figure 37.5.1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.5.3: Design a Layered Provenance Stack <span class="exercise-type analysis">Analysis</span></div>
+<p>You are designing the content-authenticity system for a news platform. Specify how you would combine in-generation watermarking, C2PA manifests, and post-hoc detection into a single trust score, stating what each layer contributes and how the system behaves when (a) an image arrives with a valid manifest and a recognized watermark, (b) an image arrives with no manifest at all, and (c) a manifest is present but its signature fails to verify. Justify your handling of each case using the robustness limits of subsection 5.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-37.4.html">&#8592; Section 37.4: Deepfakes, Detection &amp; Misuse</a>
+<a href="index.html">Chapter 37</a>
+<a class="next" href="section-37.6.html">Section 37.6: Licensing, Copyright &amp; Responsible Deployment &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

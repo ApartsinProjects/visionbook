@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.3: The Score-Based View. Diffusion as a stochastic differential equation, the variance-exploding and variance-preserving formulations, why the reverse drift is the score of the data distribution, and the deterministic probability-flow ODE that shares the noisy SDE's marginals." name="description"/>
+<title>Section 33.3: The Score-Based View | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>The Score-Based View: VE/VP SDEs &amp; the Probability-Flow ODE</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Tell me which way the density rises and I will climb it forever. That gradient is the only compass I have ever needed, and the only one I ever trusted."</p>
+<cite>A Score Function Pointing Uphill</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Take the discrete DDPM steps to a continuous limit and the forward process becomes a stochastic differential equation; its time reversal is another SDE whose drift contains exactly one unknown quantity, the score of the noisy data distribution, which is the gradient of its log-density and which the denoiser already learns.</strong> This continuous view unifies DDPM with score matching from <a href="../module-30-generative-foundations/index.html">Chapter 30</a>, classifies the design choices into two families (variance-exploding and variance-preserving), and reveals a deterministic twin of the noisy SDE: the probability-flow ODE, which carries the same distribution of samples without injecting any randomness. That ODE is the gateway to the fast samplers of the next section.</p>
+</div>
+
+<p>
+The DDPM of <a href="section-33.2.html">Section 33.2</a> is a discrete chain of $T$ steps. This section asks what happens as $T \to \infty$ and the steps become infinitesimal. The answer connects diffusion to a body of theory, stochastic calculus and score matching, that at first looks unrelated and then turns out to be the same thing in better notation. We will see that the noise-prediction network you trained in <a href="section-33.1.html">Section 33.1</a> is secretly estimating the <a href="../module-30-generative-foundations/index.html">score function</a> of Chapter 30, that there are two natural ways to set up the forward SDE, and that every diffusion model has a hidden deterministic counterpart, the probability-flow ODE, that the rest of the chapter relies on heavily.
+</p>
+
+<h2>1. From Discrete Steps to a Continuous SDE <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A stochastic differential equation describes how a quantity evolves under a deterministic push plus continuous random noise. Written in the standard form, the forward diffusion is
+</p>
+
+<div class="math-block">
+$$dx = f(x, t)\, dt + g(t)\, dW,$$
+</div>
+
+<p>
+where $f(x, t)$ is the <strong>drift</strong> (a deterministic vector field pulling the sample somewhere), $g(t)$ is the <strong>diffusion coefficient</strong> (how much noise is injected per unit time), and $dW$ is the increment of a Wiener process, the continuous-time analogue of adding a fresh Gaussian at each step. The DDPM update from <a href="section-33.2.html">Section 33.2</a>, $x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,z$, is exactly the Euler discretization of such an SDE; in the limit of small steps it becomes a specific $f$ and $g$. The forward SDE is not learned. The whole point is what happens when you reverse it.
+</p>
+
+<h2>2. The Reverse SDE and the Score <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A 1982 result by Anderson states that any forward SDE has a time-reversed SDE, and gives its form explicitly. The reverse of the equation above is
+</p>
+
+<div class="math-block">
+$$dx = \left[\,f(x, t) - g(t)^2\, \nabla_x \log p_t(x)\,\right] dt + g(t)\, d\bar{W},$$
+</div>
+
+<p>
+where $p_t(x)$ is the distribution of noisy samples at time $t$ and $d\bar W$ is a reverse-time Wiener increment. Everything in this equation is known except one term: $\nabla_x \log p_t(x)$, the <strong>score</strong>, the gradient with respect to the image of the log-density of noisy data. This is the same score you met in the energy-based models and score matching of <a href="../module-30-generative-foundations/index.html">Chapter 30</a>; there it was the gradient that Langevin dynamics climbed, here it is the only unknown standing between us and a generator. If we can estimate the score at every noise level, we can simulate the reverse SDE and turn noise into data. Figure 33.3.1 shows how the forward SDE flattens a structured density into a Gaussian and the reverse SDE, steered by the score, rebuilds it.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a bimodal density. Forward SDE arrow flattens it into a single Gaussian on the right. Reverse SDE arrow guided by the score rebuilds the bimodal density.">
+<style>
+.sl{font:12px sans-serif;fill:#1a1a1a;}
+.ss{font:10.5px sans-serif;fill:#555;}
+.curve{stroke:#2c6fb5;stroke-width:2.2;fill:#eaf2fb;}
+.gauss{stroke:#8a7a6a;stroke-width:2.2;fill:#efe9e4;}
+.fwd{stroke:#d6802b;stroke-width:1.8;marker-end:url(#sah);fill:none;}
+.rev{stroke:#2f9e5c;stroke-width:1.8;marker-end:url(#sahg);fill:none;}
+.score{stroke:#2f9e5c;stroke-width:1.4;marker-end:url(#sahg2);fill:none;}
+</style>
+<defs>
+<marker id="sah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#d6802b"/></marker>
+<marker id="sahg" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+<marker id="sahg2" markerWidth="7" markerHeight="7" refX="5" refY="2.5" orient="auto"><path d="M0,0 L5,2.5 L0,5 Z" fill="#2f9e5c"/></marker>
+</defs>
+<path class="curve" d="M40,200 C80,200 90,90 130,90 C170,90 175,160 200,160 C225,160 230,90 270,90 C310,90 320,200 360,200 Z"/>
+<text class="sl" x="200" y="225" text-anchor="middle">data density p_0</text>
+<path class="gauss" d="M440,200 C490,200 500,80 540,80 C580,80 590,200 640,200 Z"/>
+<text class="sl" x="540" y="225" text-anchor="middle">Gaussian p_T</text>
+<line class="fwd" x1="365" y1="120" x2="435" y2="120"/>
+<text class="ss" x="400" y="110" text-anchor="middle" fill="#d6802b">forward SDE</text>
+<line class="rev" x1="435" y1="165" x2="365" y2="165"/>
+<text class="ss" x="400" y="185" text-anchor="middle" fill="#2f9e5c">reverse SDE</text>
+<line class="score" x1="170" y1="135" x2="140" y2="105"/>
+<line class="score" x1="240" y1="135" x2="270" y2="105"/>
+<text class="ss" x="205" y="255" text-anchor="middle" fill="#2f9e5c">score points toward the modes</text>
+</svg>
+<figcaption><strong>Figure 33.3.1:</strong> The score-based picture. The forward SDE (orange) erodes a structured, here bimodal, data density $p_0$ into a featureless Gaussian $p_T$. The reverse SDE (green) undoes it, and its only data-dependent ingredient is the score $\nabla_x \log p_t(x)$ (small green arrows), which everywhere points toward higher density, that is, toward the modes of the data. Estimating that score at every noise level is the entire learning problem.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Noise Prediction Is Score Estimation in Disguise</div>
+<p>
+For the Gaussian forward process, the score of the noisy distribution has a closed-form relationship to the added noise: $\nabla_x \log p_t(x_t) = -\,\epsilon / \sqrt{1 - \bar\alpha_t}$, where $\epsilon$ is the noise that produced $x_t$. So the noise-prediction network $\epsilon_\theta$ from <a href="section-33.1.html">Section 33.1</a> and a score network $s_\theta$ are the same object up to a fixed rescaling: $s_\theta(x_t, t) = -\,\epsilon_\theta(x_t, t) / \sqrt{1 - \bar\alpha_t}$. You did not train a new kind of model in this chapter; you trained the score estimator of Chapter 30, just with the clever closed-form corruption that made the targets cheap to compute. This identity is the bridge between the variational view of DDPM and the score-matching view, and it is why both communities ended up at the same algorithm.
+</p>
+</div>
+
+<h2>2b. VE and VP: Two Ways to Add Noise <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The forward SDE has two canonical instantiations, distinguished by what they do to the total variance of $x_t$.
+</p>
+
+<ul>
+<li><strong>Variance Exploding (VE):</strong> the drift is zero and the noise scale $g(t)$ grows without bound, so $x_t = x_0 + \sigma(t)\,\epsilon$ with $\sigma(t)$ rising to a very large value. The variance "explodes" because nothing shrinks the signal; corruption is achieved by drowning it in ever-larger noise. This is the formulation of the original score-matching models (NCSN).</li>
+<li><strong>Variance Preserving (VP):</strong> the drift shrinks the signal as noise is added, exactly the $\sqrt{1-\beta_t}$ factor of DDPM, so the total variance stays near one throughout. DDPM is the discrete VP SDE.</li>
+</ul>
+
+<p>
+The two are related by a simple change of variables and produce equivalent models, but they differ in numerical conditioning and in how the noise levels are chosen, which is why a sampler written for one needs care to apply to the other. The EDM framework of <a href="section-33.2.html">Section 33.2</a> reparameterizes both in terms of a single noise scale $\sigma$, which is the cleanest way to hold them in one head. The practical upshot: when you read that a model uses a "VP schedule" it is a DDPM-style process; "VE" means the NCSN-style explode-the-variance process; and EDM's $\sigma$-parameterization subsumes both.
+</p>
+
+<h2>3. The Probability-Flow ODE <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Here is the result that the rest of the chapter leans on. For every forward SDE there exists an <strong>ordinary differential equation</strong>, with no noise term at all, whose solution trajectories have the same marginal distributions $p_t(x)$ at every time as the noisy SDE. It is called the probability-flow ODE:
+</p>
+
+<div class="math-block">
+$$\frac{dx}{dt} = f(x, t) - \tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x).$$
+</div>
+
+<p>
+Compare this to the reverse SDE in subsection 2: the score appears again, but the noise injection $g(t)\,d\bar W$ is gone and the score term carries a factor of one half instead of one. Because there is no randomness, this ODE defines a <em>deterministic</em>, invertible map between a noise sample and a data sample. Two consequences make it central. First, deterministic trajectories are smooth, so you can solve them with large, accurate steps using standard ODE solvers, which is the entire basis of fast sampling in <a href="section-33.4.html">Section 33.4</a>. Second, the map being invertible means you can run it forward to encode a real image into its corresponding noise, the foundation of the inversion-based editing you will meet in <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>. The code below solves the probability-flow ODE for the trained 2D denoiser using a simple Euler integrator over the $\sigma$-schedule.
+</p>
+
+<pre><code class="language-python">import torch
+
+@torch.no_grad()
+def pf_ode_sample(model, alpha_bars, n=512, steps=50, T=200):
+    """Deterministic sampling by Euler-integrating the probability-flow ODE."""
+    x = torch.randn(n, 2)                                   # start from noise
+    ts = torch.linspace(T - 1, 0, steps).long()             # coarse time grid
+    for i in range(len(ts) - 1):
+        t, t_next = ts[i], ts[i + 1]
+        ab, ab_next = alpha_bars[t], alpha_bars[t_next]
+        eps = model(x, t.repeat(n))                         # eps_theta = score (rescaled)
+        # predict x0, then move deterministically toward the next (lower) noise level
+        x0_hat = (x - (1 - ab).sqrt() * eps) / ab.sqrt()
+        x = ab_next.sqrt() * x0_hat + (1 - ab_next).sqrt() * eps
+    return x
+
+# samples = pf_ode_sample(model, alpha_bars)   # 50 deterministic steps, no torch.randn inside
+print("probability-flow ODE: deterministic, ~50 steps instead of 200")</code></pre>
+<div class="code-caption">Sampling by integrating the probability-flow ODE deterministically. Unlike the ancestral sampler of Section 33.1, no fresh noise is drawn inside the loop, so the same starting point always yields the same output. This determinism, plus the smoothness of the ODE, is what lets us use far fewer steps. This update rule is exactly DDIM, which Section 33.4 derives.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The probability-flow ODE makes a diffusion model into a <em>continuous normalizing flow</em>, the deterministic invertible generators studied separately in the flow literature. For a while the score-based and flow-based communities published in parallel without realizing how close their objects were. The SDE paper's appendix quietly noted the connection, and within a year "diffusion" and "continuous flow" had largely merged into one research conversation. The flow-matching of <a href="section-33.5.html">Section 33.5</a> is the full reconciliation.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Reproducible Generations for a Compliance Audit</div>
+<p><strong>Who:</strong> an ML platform team at a media company shipping a generative-image feature, 2024. <strong>Situation:</strong> their legal group required that every image the product generated could be exactly reproduced from a stored seed and prompt, for audit and takedown purposes. <strong>Problem:</strong> their initial pipeline used the stochastic ancestral sampler, which draws fresh noise at every step, so even with a fixed seed, framework and hardware differences in the RNG produced slightly different images, breaking reproducibility. <strong>Decision:</strong> they switched the production sampler to a deterministic probability-flow ODE solver (DDIM, the subject of <a href="section-33.4.html">Section 33.4</a>), which draws randomness only once to form the initial noise and is fully deterministic thereafter. <strong>Result:</strong> given the same initial latent, the pipeline reproduced byte-stable outputs across machines, satisfying the audit requirement, and as a bonus the deterministic sampler needed only 30 steps instead of the stochastic sampler's hundreds. <strong>Lesson:</strong> the SDE-versus-ODE choice is not only about speed; the determinism of the probability-flow ODE is a product requirement in any setting that needs reproducibility, and it comes essentially for free.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The SDE View as the Common Language</div>
+<p>The continuous SDE and ODE framing (Song et al., 2021, arXiv:2011.13456) turned out to be the language in which nearly all subsequent progress was expressed. The EDM design space (Karras et al., 2022) is stated entirely in $\sigma$-space SDE/ODE terms. The flow-matching and rectified-flow methods of <a href="section-33.5.html">Section 33.5</a> (Lipman et al., 2023; Liu et al., 2023) are about choosing a better probability path and learning its ODE velocity field directly. Consistency models (Song et al., 2023) are defined as learning the solution map of the probability-flow ODE. Even diffusion-based solvers for inverse problems (deblurring, super-resolution, MRI reconstruction in 2023 to 2025) plug a measurement-consistency term into the reverse SDE. If you internalize one idea from this section, make it that the reverse-time SDE and its deterministic ODE twin are the substrate on which the modern field reasons.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.1: Score and Noise Are the Same Network <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the closed form $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ and the fact that for a Gaussian $\mathcal N(\mu, \sigma^2 I)$ the score is $-(x-\mu)/\sigma^2$, derive the relationship $\nabla_x \log p_t(x_t) = -\,\epsilon/\sqrt{1-\bar\alpha_t}$ stated in the Key Insight. Explain in one sentence what this means for someone who trained a noise-prediction model in <a href="section-33.1.html">Section 33.1</a> but now wants a score network.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.2: Deterministic vs Stochastic Sampling <span class="exercise-type coding">Coding</span></div>
+<p>Using your trained 2D moons model, generate 512 samples twice from the <em>same</em> fixed initial noise tensor: once with the stochastic ancestral sampler of <a href="section-33.1.html">Section 33.1</a> and once with the <code>pf_ode_sample</code> function above. Overlay both. Confirm that re-running the ODE sampler with the same initial noise reproduces identical points while the stochastic sampler does not, and reduce the ODE step count from 50 to 20 to 10, reporting at what point quality visibly degrades.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.3: VE versus VP Conditioning <span class="exercise-type analysis">Analysis</span></div>
+<p>Write a short note (one to two paragraphs) explaining the practical difference between the variance-exploding and variance-preserving formulations from subsection 2b. Address: what happens to the magnitude of $x_t$ in each as $t$ grows, why a network trained on VP-scaled inputs would behave poorly if fed VE-scaled inputs without rescaling, and why the EDM $\sigma$-parameterization (referenced in <a href="section-33.2.html">Section 33.2</a>) is a convenient unification. Tie your answer to the normalization-statistics discussion from <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.2.html">&#8592; Section 33.2: DDPM</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.4.html">Section 33.4: Fast Sampling &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

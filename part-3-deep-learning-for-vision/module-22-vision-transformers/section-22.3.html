@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.3: Data-Efficient Training: DeiT &amp; Augmentation for ViTs. Why the original ViT needed 300 million images, and how DeiT's heavy augmentation, regularization, and distillation token brought competitive accuracy down to plain ImageNet on a single node." name="description"/>
+<title>Section 22.3: Data-Efficient Training: DeiT &amp; Augmentation for ViTs | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Vision Transformers</a></div>
+<h1>Data-Efficient Training: DeiT &amp; Augmentation for ViTs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My first trainer fed me three hundred million pictures and called me a prodigy. My second trainer had one million, a bag of tricks, and a wise old CNN sitting next to me whispering answers. I learned just as much. The second trainer had the better story."</p>
+<cite>A Vision Transformer Who Found a Mentor</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The original ViT only beat CNNs after pretraining on roughly 300 million images, because a model with no locality bias has to learn from data what a convolution gets for free; DeiT closed that gap on plain ImageNet by replacing scale with three things, very heavy augmentation, strong regularization, and a distillation token that learns from a CNN teacher.</strong> This is the section that turned the ViT from a result you could only reproduce inside a large lab into a model you can train on a single 8-GPU node in a few days. The recipe matters as much as the architecture, exactly the lesson of <a href="../module-21-training-recipes/index.html">Chapter 21</a>, and ViTs feel that lesson more acutely than any CNN.</p>
+</div>
+
+<p>
+<a href="section-22.2.html">Section 22.2</a> left us with a working ViT and an unanswered question: it needs "enough data", but how much, and what do you do if you do not have it? The honest answer from the 2020 paper was sobering. On ImageNet alone, trained from scratch, ViT-Base scored several points <em>below</em> a comparable ResNet of the kind you met in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. It only pulled ahead after pretraining on JFT-300M, Google's internal 300-million-image dataset, which almost no one outside a handful of labs can touch. For a year that made the ViT look like a beautiful idea gated behind data most teams will never have. This section is the story of how that gate came down.
+</p>
+
+<h2>1. Why ViTs Are Data-Hungry <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The data appetite is a direct consequence of the missing inductive bias from <a href="section-22.1.html">Section 22.1</a>. A convolution assumes locality and translation equivariance, and those assumptions are correct for natural images, so a CNN starts partway to the answer and needs comparatively little data to finish. A ViT assumes nothing about spatial structure; it must learn, purely from labeled examples, that nearby patches are related and that an object looks the same wherever it appears. Learning a true fact about the world from data, rather than having it hard-coded, costs examples. With a small dataset the ViT has enough freedom to fit the training set in ways that do not generalize, so it overfits where the CNN, hemmed in by its biases, does not.
+</p>
+
+<p>
+Figure 22.3.1 sketches the qualitative picture the ViT paper reported: at small data scales the CNN wins because its biases substitute for data, but the curves cross, and at large scales the ViT's flexibility lets it keep improving past the point where the CNN's biases become a ceiling. The exact crossover depends on the architectures and recipe, and pinning it down quantitatively is the subject of <a href="section-22.5.html">Section 22.5</a>; here it motivates the problem DeiT solves.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 560 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Accuracy versus dataset size: CNN curve above ViT at small data, crossing so ViT is above at large data">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.daxis{stroke:#333;stroke-width:1.4;}
+.dcnn{stroke:#2f9e5c;stroke-width:2.4;fill:none;}
+.dvit{stroke:#8e44ad;stroke-width:2.4;fill:none;}
+</style>
+<line class="daxis" x1="60" y1="30" x2="60" y2="230"/>
+<line class="daxis" x1="60" y1="230" x2="510" y2="230"/>
+<text class="dl" x="20" y="130" transform="rotate(-90 20 130)" text-anchor="middle">accuracy</text>
+<text class="dl" x="285" y="262" text-anchor="middle">dataset size (log scale)</text>
+<text class="ds" x="110" y="248" text-anchor="middle">ImageNet-1k</text>
+<text class="ds" x="300" y="248" text-anchor="middle">ImageNet-21k</text>
+<text class="ds" x="470" y="248" text-anchor="middle">JFT-300M</text>
+<path class="dcnn" d="M70,150 C160,95 300,75 500,68"/>
+<path class="dvit" d="M70,205 C180,150 320,82 500,45"/>
+<circle cx="278" cy="100" r="4" fill="#c0392b"/>
+<text class="ds" x="300" y="118" fill="#c0392b">crossover</text>
+<text class="dl" x="120" y="135" fill="#2f9e5c">CNN</text>
+<text class="dl" x="120" y="190" fill="#8e44ad">ViT</text>
+<text class="ds" x="430" y="60" fill="#8e44ad">ViT keeps climbing</text>
+</svg>
+<figcaption><strong>Figure 22.3.1:</strong> The qualitative data-scale story (after the ViT paper). At small data the CNN's inductive biases substitute for examples and it leads; the curves cross as data grows, and at very large scale the ViT's freedom from those biases lets it surpass the CNN. DeiT's goal is to lift the ViT curve at the ImageNet-1k end without 300 million images.</figcaption>
+</figure>
+
+<h2>2. The DeiT Recipe: Augmentation and Regularization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+DeiT (Data-efficient image Transformer, Touvron et al., 2021) made one central claim: most of the ViT's data hunger can be fed by augmentation and regularization instead of by more images. The recipe is essentially the modern training bundle of <a href="../module-21-training-recipes/index.html">Chapter 21</a>, applied unusually aggressively. It combines RandAugment (automated, stacked photometric and geometric ops), MixUp and CutMix (the label-mixing augmentations of <a href="../module-21-training-recipes/index.html">Section 21.2</a> that blend both pixels and targets), random erasing, strong stochastic depth (randomly dropping whole transformer blocks during training), label smoothing, weight decay, and a long cosine schedule with warmup. Each technique fights overfitting from a different angle; together they let ViT-Base reach competitive ImageNet accuracy trained only on ImageNet's $1.28$ million images.
+</p>
+
+<p>
+The point worth internalizing is that the augmentation is doing the job the missing inductive bias used to do. MixUp and CutMix manufacture a near-endless supply of varied training images, forcing the model to rely on robust, generalizable features rather than memorizing the finite training set, which is exactly the freedom-without-data problem subsection 1 described. The code below assembles the DeiT-style transform stack with the torchvision v2 transforms from <a href="../module-21-training-recipes/index.html">Chapter 21</a>.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.transforms import v2
+
+# DeiT-style training augmentation: aggressive by CNN standards.
+train_tf = v2.Compose([
+    v2.RandomResizedCrop(224, antialias=True),
+    v2.RandomHorizontalFlip(),
+    v2.RandAugment(num_ops=2, magnitude=9),          # automated stacked ops
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.485, 0.456, 0.406],         # ImageNet statistics
+                 std=[0.229, 0.224, 0.225]),
+    v2.RandomErasing(p=0.25),                         # cut out a random region
+])
+
+# MixUp / CutMix operate on a whole batch (mixing images AND labels):
+mixup_cutmix = v2.RandomChoice([
+    v2.MixUp(num_classes=1000),
+    v2.CutMix(num_classes=1000),
+])
+# in the loop:  images, labels = mixup_cutmix(images, labels)</code></pre>
+<div class="code-caption">The DeiT-style augmentation stack. Per-image RandAugment and random erasing plus batch-level MixUp/CutMix substitute synthetic data variety for the millions of real images the original ViT required.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Augmentation Is a Substitute for Inductive Bias</div>
+<p>A CNN gets locality and translation equivariance from its architecture, for free, with no data cost. A ViT must learn invariances from examples, so you manufacture those examples: random crops teach translation tolerance, flips teach reflection tolerance, color jitter teaches photometric robustness, MixUp and CutMix teach the model not to over-trust any single region. Seen this way, heavy augmentation is not a hack bolted onto ViT training; it is how you pay, in synthetic data, the inductive-bias bill that the convolution settled in hardware. This is why ViTs are far more sensitive to the augmentation recipe than CNNs are: turn the augmentation off and a ViT overfits badly, while a CNN merely loses a point or two.</p>
+</div>
+
+<h2>3. Distillation Through a Token <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+DeiT's signature contribution is a new way to do knowledge distillation. The classical idea (Hinton et al.) is to train a small "student" to match the softened output probabilities of a strong "teacher", transferring the teacher's knowledge. DeiT adapts this to the transformer in an architecturally native way: it adds a second special token, the <strong>distillation token</strong>, alongside the class token from <a href="section-22.2.html">Section 22.2</a>. The distillation token flows through the encoder just like the class token, but its output is trained to predict the teacher's label rather than the ground-truth label. At inference the predictions from both tokens are combined.
+</p>
+
+<p>
+The teacher in DeiT is, pointedly, a strong CNN (a RegNet). The ViT student therefore learns from a network that already has the locality and translation biases the ViT lacks, in effect importing those biases through the teacher's predictions rather than rediscovering them from scratch. This explains why CNN teachers worked better than ViT teachers in their experiments: the student is borrowing exactly the inductive bias it is missing. The training objective combines a standard cross-entropy on the class token with a distillation loss on the distillation token,
+</p>
+
+<div class="math-block">
+$$\mathcal{L} = \tfrac{1}{2}\,\mathcal{L}_{\text{CE}}\big(\psi(z_{\text{cls}}),\, y\big) \;+\; \tfrac{1}{2}\,\mathcal{L}_{\text{CE}}\big(\psi(z_{\text{dist}}),\, y_{\text{teacher}}\big)$$
+</div>
+
+<p>
+where $z_{\text{cls}}$ and $z_{\text{dist}}$ are the two tokens' output logits, $\psi$ is the softmax, $y$ is the true label, and $y_{\text{teacher}}$ is the CNN teacher's predicted (hard) label. Figure 22.3.2 shows the two-token architecture, and the code sketches the training step.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 620 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DeiT architecture with both a class token and a distillation token, the latter supervised by a CNN teacher">
+<style>
+.tl{font:12px sans-serif;fill:#1a1a1a;}
+.ts{font:10px sans-serif;fill:#555;}
+.tcls{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.tdist{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.tpatch{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.2;}
+.tenc{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.tteach{fill:#fff6e0;stroke:#d6a32b;stroke-width:1.5;}
+.tar{stroke:#777;stroke-width:1.5;marker-end:url(#tah);fill:none;}
+.tlossc{stroke:#8e44ad;stroke-width:1.6;stroke-dasharray:4 3;fill:none;marker-end:url(#tah);}
+.tlossd{stroke:#d6802b;stroke-width:1.6;stroke-dasharray:4 3;fill:none;marker-end:url(#tah);}
+</style>
+<defs><marker id="tah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="tcls" x="20" y="40" width="34" height="16"/>
+<text class="ts" x="37" y="52" text-anchor="middle">cls</text>
+<rect class="tdist" x="20" y="60" width="34" height="16"/>
+<text class="ts" x="37" y="72" text-anchor="middle">dist</text>
+<rect class="tpatch" x="20" y="82" width="34" height="14"/>
+<rect class="tpatch" x="20" y="100" width="34" height="14"/>
+<rect class="tpatch" x="20" y="118" width="34" height="14"/>
+<text class="ts" x="37" y="148" text-anchor="middle">patches</text>
+<line class="tar" x1="56" y1="90" x2="92" y2="90"/>
+<rect class="tenc" x="94" y="44" width="96" height="92"/>
+<text class="tl" x="142" y="86" text-anchor="middle">Transformer</text>
+<text class="tl" x="142" y="102" text-anchor="middle">Encoder</text>
+<line class="tar" x1="190" y1="58" x2="232" y2="58"/>
+<line class="tar" x1="190" y1="74" x2="232" y2="118"/>
+<rect class="tcls" x="234" y="48" width="60" height="22"/>
+<text class="ts" x="264" y="63" text-anchor="middle">cls head</text>
+<rect class="tdist" x="234" y="108" width="60" height="22"/>
+<text class="ts" x="264" y="123" text-anchor="middle">dist head</text>
+<line class="tlossc" x1="296" y1="59" x2="356" y2="59"/>
+<text class="tl" x="404" y="55" text-anchor="middle">CE vs true y</text>
+<line class="tlossd" x1="296" y1="119" x2="356" y2="119"/>
+<text class="tl" x="404" y="115" text-anchor="middle">CE vs teacher</text>
+<rect class="tteach" x="360" y="160" width="120" height="44"/>
+<text class="tl" x="420" y="180" text-anchor="middle">CNN teacher</text>
+<text class="ts" x="420" y="196" text-anchor="middle">(e.g. RegNet)</text>
+<line class="tar" x1="420" y1="160" x2="420" y2="128"/>
+<text class="ts" x="500" y="124" text-anchor="middle">y_teacher</text>
+</svg>
+<figcaption><strong>Figure 22.3.2:</strong> DeiT's token-based distillation. A second learnable token, the distillation token, passes through the same encoder as the class token. Its head is trained to match a CNN teacher's predictions while the class head is trained on the true labels, importing the teacher's inductive bias through a token.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch.nn.functional as F
+
+def deit_distillation_loss(cls_logits, dist_logits, targets, teacher_logits):
+    """Hard-label distillation: average of true-label CE and teacher-label CE."""
+    teacher_labels = teacher_logits.argmax(dim=1)          # CNN teacher's prediction
+    loss_cls = F.cross_entropy(cls_logits, targets)        # supervise on ground truth
+    loss_dist = F.cross_entropy(dist_logits, teacher_labels)  # supervise on teacher
+    return 0.5 * loss_cls + 0.5 * loss_dist
+
+# at inference, fuse the two predictions:
+def deit_predict(cls_logits, dist_logits):
+    return (F.softmax(cls_logits, -1) + F.softmax(dist_logits, -1)) / 2</code></pre>
+<div class="code-caption">The DeiT distillation objective and inference fusion. The distillation token learns from the CNN teacher's hard labels while the class token learns from ground truth; their softmaxes are averaged at test time.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>DeiT's authors found that the class token and the distillation token, trained on the same images but different targets, end up genuinely different: the cosine similarity between their final representations is well below one, and the two heads disagree on a meaningful fraction of images. The model is not just learning one thing twice; it learns two complementary views, one anchored to the ground truth and one anchored to the CNN's worldview, and averaging them beats either alone. The transformer got a second opinion and used it.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Train-Ready DeiT From timm</div>
+<p>You do not implement the distillation token, the teacher loop, and the full augmentation stack by hand for a real project. <code>timm</code> ships DeiT with pretrained weights and the entire recipe wired in:</p>
+<pre><code class="language-python">import timm
+# distilled DeiT-Base: both tokens already trained, fused at inference
+model = timm.create_model("deit_base_distilled_patch16_224", pretrained=True).eval()
+# fine-tune on your data with timm's training script, which already includes
+# RandAugment, MixUp, CutMix, random erasing, stochastic depth, and EMA.</code></pre>
+<div class="code-caption">A train-ready distilled DeiT-Base from <code>timm</code>. The single <code>create_model</code> call returns the two-token architecture with both heads pretrained and fused at inference; the training script supplies the full augmentation recipe spelled out by hand above.</div>
+<p>The library handles the two-token architecture, the prediction fusion, and the dozen-knob augmentation recipe that this section spells out by hand. Reproducing DeiT's recipe yourself is roughly a few hundred lines of careful configuration; <code>timm.create_model</code> plus its training script is the production path, and the from-scratch version above exists so you understand what those knobs do.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A ViT That Would Not Train Until the Recipe Changed</div>
+<p><strong>Who:</strong> a computer-vision team at a medical-imaging startup, 2023, classifying skin-lesion photos. <strong>Situation:</strong> they had read that ViTs were state-of-the-art and swapped their ResNet-50 backbone for a ViT-Base, reusing their existing training script (light augmentation, a flip and a small crop, tuned years earlier for the CNN). <strong>Problem:</strong> the ViT trained to near-perfect training accuracy and a validation accuracy several points <em>worse</em> than the ResNet it replaced, a textbook overfit. The team nearly concluded "ViTs do not work for us". <strong>Decision:</strong> instead of abandoning the architecture, an engineer who had read the DeiT paper switched to the full DeiT recipe (RandAugment, MixUp, CutMix, stochastic depth, a longer cosine schedule) and initialized from ImageNet-pretrained DeiT weights rather than from scratch. <strong>Result:</strong> the same ViT now matched and then beat the ResNet on validation, with the train-validation gap shrinking to normal. <strong>Lesson:</strong> a ViT trained on a CNN's recipe is set up to fail, because the recipe is where the ViT's missing inductive bias gets paid for. The architecture was never the problem; the augmentation and the pretrained initialization were.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Distillation to Self-Supervised Pretraining</div>
+<p>DeiT solved the data problem with augmentation and a CNN teacher, but the 2022 to 2024 frontier solved it a different way: pretrain the ViT on unlabeled images with a self-supervised objective, then fine-tune. Masked Autoencoders (He et al., 2022, arXiv:2111.06377) mask out most patches and train the ViT to reconstruct them, learning rich features with no labels at all; DINOv2 (Oquab et al., 2024, arXiv:2304.07193) combines self-distillation and masking to produce a frozen ViT backbone whose features transfer to classification, detection, segmentation, and depth without fine-tuning. These methods make the data-hunger of subsection 1 a non-issue by feeding the model enormous amounts of unlabeled data, the natural sequel to DeiT and the subject of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. DeiT remains the cleanest demonstration that the supervised ImageNet gap was a recipe gap, not an architecture gap.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.1: Why a CNN Teacher? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>DeiT found that distilling from a strong CNN teacher worked better than distilling from a strong ViT teacher of equal accuracy. Using the inductive-bias argument of subsections 1 and 3, explain in a paragraph why a CNN teacher might transfer something a ViT teacher cannot, even when both achieve the same top-1 accuracy. Then propose a falsifiable prediction: if your explanation is correct, how should the benefit of the CNN teacher change as the student ViT is given more and more training data?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.2: Ablate the Augmentation <span class="exercise-type coding">Coding</span></div>
+<p>Take a small ViT (reduce <code>depth</code> and <code>embed_dim</code> in the Section 22.2 code so it trains quickly) and train it on CIFAR-100 (resized to $224$) under two regimes: (a) flips and crops only, the CNN-style light augmentation; (b) the full DeiT stack from subsection 2 plus MixUp. Plot training and validation accuracy for both. You should observe regime (a) reaching higher <em>training</em> accuracy but lower <em>validation</em> accuracy, the overfitting signature of the medical-imaging example. Report the train-validation gap for each and relate it to the Key Insight.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.3.3: Quantify the Distillation Benefit <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the <code>deit_distillation_loss</code> and <code>deit_predict</code> functions, train a student ViT three ways on a subset of ImageNet or a similar dataset: class token only, distillation token only (teacher labels only), and both with fused inference. A pretrained CNN from torchvision can serve as the teacher. Report the three validation accuracies and the agreement rate between the two heads. Discuss whether the fused model's gain over the better single head is consistent with the "second opinion" framing in the Fun Fact, and analyze one image where the two heads disagree.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.2.html">&#8592; Section 22.2: ViT: Images as Sequences of Patches</a>
+<a href="index.html">Chapter 22</a>
+<a class="next" href="section-22.4.html">Section 22.4: Hierarchical Designs: Swin &amp; Pyramid Transformers &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

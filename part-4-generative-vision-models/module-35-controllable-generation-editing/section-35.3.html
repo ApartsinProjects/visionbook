@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.3: Inpainting, Outpainting and Object Replacement with diffusion. How a mask tells the model where it may paint, masked-latent blending, the inpainting U-Net's extra channels, the seam and context problems, extending a canvas by outpainting, and replacing an object by combining a SAM segmentation mask with a new prompt." name="description"/>
+<title>Section 35.3: Inpainting, Outpainting &amp; Object Replacement | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Inpainting, Outpainting &amp; Object Replacement</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You drew a white blob over the ex-boyfriend and asked me to fill it with a potted plant. I have done so. The lighting even matches. I am very discreet."</p>
+<cite>An Inpainting Model With Excellent Boundaries</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Inpainting edits a chosen region of an image while preserving everything outside it, by letting the diffusion model generate freely inside a binary mask and forcing it to keep the original pixels (or latents) outside the mask at every denoising step.</strong> The mask is the contract: white means "you may repaint here," black means "leave this exactly alone." Three variations follow from one mechanism: inpainting fills or replaces a region, outpainting extends the canvas beyond its original borders by masking new empty area, and object replacement combines a precise segmentation mask with a new prompt to swap one object for another. The recurring difficulty is the boundary: making the generated region blend seamlessly into the preserved region, in both texture and lighting, is where naive masking fails and the engineering lives.</p>
+</div>
+
+<p>
+This is the generative form of a problem the book met long ago. <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> covered classical inpainting: filling a scratch or a removed object by diffusing surrounding pixel values inward or copying matching patches. Those methods preserve texture but cannot invent plausible new content; they can hide a small blemish but cannot replace a face with a potted plant. Diffusion inpainting can, because it has a generative prior over whole images. This section builds the masking mechanism, the blending that fixes seams, the inpainting-specific model variant, and then outpainting and object replacement as applications of the same idea.
+</p>
+
+<h2>1. The Mask as a Contract <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The simplest inpainting recipe needs no special model at all. Take any latent diffusion model, run the reverse process as usual, but at every denoising step overwrite the latents outside the mask with the (correctly-noised) latents of the original image. The masked region is free to evolve toward whatever the prompt wants; the unmasked region is repeatedly snapped back to the original, so it cannot drift. Let $m$ be the binary mask (1 inside the region to edit, 0 outside), let $z_t$ be the current noisy latent of the generation, and let $z_t^{\text{orig}}$ be the original image's latent noised to step $t$ with the closed-form formula from <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. The blend applied after each reverse step is
+</p>
+
+<div class="math-block">
+$$z_t \leftarrow m \odot z_t \;+\; (1 - m) \odot z_t^{\text{orig}},$$
+</div>
+
+<p>
+where $\odot$ is elementwise multiplication. The masked area keeps the model's evolving output; the rest is forced back to the original. This is sometimes called "blended latent diffusion," and it works with any model, which is why diffusers offers it for non-inpainting checkpoints. Figure 35.3.1 shows the data flow.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="At each reverse step the model output inside the mask is kept and the original noised latent is restored outside the mask">
+<style>
+.m1{font:12px sans-serif;fill:#1a1a1a;}
+.m2{font:10px sans-serif;fill:#555;}
+.bb{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.bo{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.bm{fill:#f3eafe;stroke:#7d4fc4;stroke-width:1.5;}
+.bz{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.5;}
+.fa{stroke:#444;stroke-width:1.6;marker-end:url(#ma);fill:none;}
+</style>
+<defs>
+<marker id="ma" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect class="bb" x="40" y="40" width="130" height="44"/><text class="m2" x="105" y="60" text-anchor="middle">model reverse step</text>
+<text class="m2" x="105" y="76" text-anchor="middle">output latent z_t</text>
+<rect class="bo" x="40" y="160" width="130" height="44"/><text class="m2" x="105" y="180" text-anchor="middle">original image</text>
+<text class="m2" x="105" y="196" text-anchor="middle">noised to t: z_t^orig</text>
+<rect class="bm" x="290" y="100" width="120" height="44"/><text class="m2" x="350" y="120" text-anchor="middle">mask blend</text>
+<text class="m2" x="350" y="136" text-anchor="middle">m&#8857;z_t + (1-m)&#8857;z_t^orig</text>
+<rect class="bz" x="540" y="100" width="140" height="44"/><text class="m2" x="610" y="120" text-anchor="middle">next step input</text>
+<text class="m2" x="610" y="136" text-anchor="middle">(loop until t=0)</text>
+<path class="fa" d="M170,62 C 230,62 240,110 288,114"/>
+<path class="fa" d="M170,182 C 230,182 240,134 288,130"/>
+<line class="fa" x1="410" y1="122" x2="538" y2="122"/>
+<path class="fa" d="M610,144 C 610,225 105,225 105,86"/>
+<text class="m2" x="350" y="220" text-anchor="middle">repeat each denoising step</text>
+</svg>
+<figcaption><strong>Figure 35.3.1:</strong> Blended latent inpainting. After each reverse-diffusion step the model's output is kept only inside the mask $m$; outside the mask the original image's latent (noised to the current step) is restored. Looping this for every step lets the masked region generate freely while the rest stays locked to the original.</figcaption>
+</figure>
+
+<h2>2. The Inpainting U-Net: Telling the Model About the Mask <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Blended latent diffusion has a weakness: the model inside the mask does not <em>know</em> it is inpainting. It generates as if from scratch and only learns about the surrounding context through the blend, which can produce content that is locally plausible but contextually wrong (a tree growing out of a person's shoulder because the model never saw the shoulder while painting). Dedicated <strong>inpainting models</strong> fix this by giving the U-Net the mask and the masked image as extra input channels. A standard latent U-Net takes 4 latent channels; an inpainting U-Net takes 9: the 4 noisy latent channels, 4 channels of the masked original image's latent, and 1 channel for the downsampled mask itself.
+</p>
+
+<p>
+With these extra channels the model sees, at every step and every layer, exactly which region it must fill and what surrounds it. It can match texture, continue lines across the boundary, and place content that fits the scene. The cost is a model trained specifically for inpainting (Stable Diffusion ships an <code>sd-v1-5-inpainting</code> checkpoint). The code below runs a proper inpainting pipeline.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionInpaintPipeline
+from diffusers.utils import load_image
+
+pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-inpainting", torch_dtype=torch.float16).to("cuda")
+
+image = load_image("room.png")          # the original photo
+mask = load_image("mask.png")           # white where to repaint, black elsewhere
+
+result = pipe(
+    prompt="a leafy potted monstera plant, soft window light",
+    image=image,
+    mask_image=mask,
+    num_inference_steps=30,
+    strength=0.99,                       # how much to change inside the mask
+).images[0]
+result.save("edited_room.png")</code></pre>
+<div class="code-caption">A dedicated inpainting pipeline. Unlike blended latent diffusion, this checkpoint receives the mask and masked image as extra U-Net channels, so it generates the plant with full awareness of the surrounding room, matching the light and continuing the floor under the pot.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Difference Between "Where" and "What Surrounds"</div>
+<p>
+Both blended latent diffusion and an inpainting U-Net know <em>where</em> to paint (the mask). Only the inpainting U-Net also knows <em>what surrounds</em> the painted region from the inside, because the masked image is fed in as conditioning channels rather than only enforced afterward through the blend. That single difference is why dedicated inpainting checkpoints produce far fewer boundary absurdities. When an inpaint looks locally fine but contextually wrong, the first fix is to switch from blended latent diffusion on a base model to a real inpainting checkpoint.
+</p>
+</div>
+
+<h2>3. The Seam Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Even with an inpainting model, the boundary between generated and original pixels can show a visible seam: a faint edge, a color or sharpness mismatch, a lighting discontinuity. Three techniques, often combined, soften it. <strong>Mask feathering</strong> blurs the mask edge so the blend transitions gradually rather than at a hard pixel line. <strong>Context expansion</strong> gives the model a generous margin of original pixels around the masked region (crop a box larger than the mask, inpaint, paste back) so it has enough surroundings to match. And <strong>VAE round-trip awareness</strong>: because editing happens in latent space, encoding and decoding through the VAE of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> slightly alters even unmasked pixels, so high-quality pipelines paste the original unmasked pixels back at full resolution after decoding rather than trusting the decoded version everywhere.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from PIL import Image, ImageFilter
+
+def composite_with_feather(original, generated, mask, feather_px=12):
+    """Paste the generated region over the original with a feathered mask edge."""
+    # Feather the mask so the blend is gradual, not a hard pixel boundary.
+    soft = mask.convert("L").filter(ImageFilter.GaussianBlur(feather_px))
+    soft = np.asarray(soft, dtype=np.float32)[..., None] / 255.0   # (H,W,1) in [0,1]
+    o = np.asarray(original, dtype=np.float32)
+    g = np.asarray(generated, dtype=np.float32)
+    out = soft * g + (1.0 - soft) * o          # generated inside, original outside
+    return Image.fromarray(out.astype(np.uint8))
+
+# original unmasked pixels are restored everywhere the mask is black,
+# and the transition across the boundary is smoothed over `feather_px`.</code></pre>
+<div class="code-caption">A post-decode feathered composite. Pasting the generated region back onto the original full-resolution pixels with a Gaussian-blurred mask removes the hard seam and the VAE round-trip drift in the unmasked area, the single most common fix for "the edit looks pasted on."</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Object removal is the feature people reach for most and admit to least. The classic stress test is the unwanted ex in a vacation photo, but the same inpainting call quietly powers "remove the tourist from the monument," "delete the trash can from the listing photo," and "make the power line disappear from the sunset." The model does not know it is rewriting history; it just sees a white mask and a prompt that says "plausible background," and dutifully invents a wall, some sky, or a patch of grass where a person used to be. The honest difficulty is always the same one: the shadow the removed object cast is outside the mask, so a careless removal leaves a ghost shadow with nothing to cast it.</p>
+</div>
+
+<h2>4. Outpainting: Painting Past the Border <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Outpainting is inpainting with the mask placed outside the original image. To extend a photo to a wider aspect ratio, you create a larger blank canvas, paste the original into part of it, and mark the new empty area as the inpainting mask. The model fills the new area to continue the scene. The only twist over ordinary inpainting is that the masked region touches the original on just one or two edges, so giving the model context is even more important: a strip of the original along the shared border, plus a prompt that describes the continuation, keeps the extension coherent. Many tools outpaint in overlapping tiles, extending a little at a time and re-using the freshly generated strip as context for the next, to avoid the model losing track of the scene over a large extension.
+</p>
+
+<h2>5. Object Replacement: Mask Meets Prompt <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The most useful editing primitive in practice is replacing one object with another: swap the sedan for an SUV, the coffee cup for a wine glass, the cloudy sky for a sunset. This is inpainting where the mask is a precise object segmentation and the prompt names the replacement. The mask precision is what matters most, and this is where the <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">promptable segmentation of Chapter 24</a> pays off: Segment Anything (SAM) produces a tight mask from a single click or box, far better than a hand-drawn blob. The pipeline is: segment the object with SAM, dilate the mask slightly so the new object can occupy a touch more room, then inpaint with the replacement prompt.
+</p>
+
+<pre><code class="language-python">import numpy as np, cv2, torch
+from PIL import Image
+from segment_anything import sam_model_registry, SamPredictor
+from diffusers import StableDiffusionInpaintPipeline
+
+# 1. Segment the target object with SAM from a single click point.
+sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b.pth").to("cuda")
+predictor = SamPredictor(sam)
+img = cv2.cvtColor(cv2.imread("street.png"), cv2.COLOR_BGR2RGB)
+predictor.set_image(img)
+masks, scores, _ = predictor.predict(
+    point_coords=np.array([[420, 300]]),    # a click on the car
+    point_labels=np.array([1]), multimask_output=True)
+mask = masks[scores.argmax()]               # pick the highest-confidence mask
+
+# 2. Dilate so the new object has a little breathing room at the edges.
+mask_u8 = (mask.astype(np.uint8) * 255)
+mask_u8 = cv2.dilate(mask_u8, np.ones((15, 15), np.uint8), iterations=1)
+
+# 3. Inpaint the replacement object into the masked region.
+pipe = StableDiffusionInpaintPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-inpainting", torch_dtype=torch.float16).to("cuda")
+out = pipe(prompt="a red double-decker bus", image=Image.fromarray(img),
+           mask_image=Image.fromarray(mask_u8), num_inference_steps=30).images[0]
+out.save("replaced.png")</code></pre>
+<div class="code-caption">Object replacement: SAM produces a tight mask from one click, a dilation gives the replacement room to breathe, and the inpainting model paints a bus where the car was. The tightness of the SAM mask is what keeps the edit from bleeding onto the road or the building behind.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: Grounded-SAM for Text-Driven Masks</div>
+<p>The click-based SAM above still needs a human to point at the object. Grounded-SAM chains an open-vocabulary detector (Grounding DINO) to SAM so you can produce the mask from a <em>text</em> phrase: "the car" becomes a box becomes a mask, with no click. Combined with an inpainting pipeline, this turns object replacement into a single text-to-text operation ("replace the car with a bus") in a few lines, where a hand-rolled version would need a detector, a segmenter, mask post-processing, and the inpainting loop wired together. The libraries handle the detector-to-segmenter prompt passing and the mask formatting internally; you supply two phrases.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Real-Estate Platform Stages Empty Rooms</div>
+<p><strong>Who:</strong> the product team at a property-listing platform, 2024. <strong>Situation:</strong> sellers uploaded photos of empty rooms, and listings with furnished "staged" photos sold faster, but physical staging cost hundreds per room and could not scale to millions of listings. <strong>Problem:</strong> they needed to add furniture to empty rooms without altering the walls, windows, floor, or the room's actual geometry, since a misleading photo is a legal and trust problem. <strong>Decision:</strong> they built a pipeline that segmented the floor and open space with SAM, masked only that region, and inpainted furniture with a depth ControlNet from <a href="section-35.1.html">Section 35.1</a> conditioned on the room's depth so the furniture sat in correct perspective. The walls and windows, outside the mask, were never touched. <strong>Result:</strong> photorealistic virtual staging at near-zero marginal cost, with the structural truth of the room preserved because the mask forbade any change to walls and fixtures. <strong>Lesson:</strong> the mask is not just a convenience, it is a guarantee; constraining the edit to a region is what made an otherwise risky feature trustworthy enough to ship.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Masks to Object-Aware Editing</div>
+<p>Hand or click masks are a bottleneck. The 2024 to 2025 frontier removes the mask entirely for many edits. SmartBrush and the broader "blended" inpainting line condition on the text so the model paints only where the description applies. More dramatically, the instruction-editing models of <a href="section-35.4.html">Section 35.4</a> and in-context editors like FLUX.1 Kontext (2025, arXiv:2506.15742) let you say "remove the car" or "make the sky stormy" with no mask at all; the model localizes the edit itself. Inpainting remains the most controllable and predictable primitive (you know exactly which pixels can change), so it stays the workhorse for production pipelines that need guarantees, while mask-free editing wins for quick, exploratory edits where a precise region is not required.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.3.1: Why Feed the Mask to the U-Net? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Blended latent diffusion enforces the mask only <em>after</em> each reverse step, while an inpainting U-Net receives the mask and masked image as input channels. Explain in two or three sentences why the second approach produces more context-appropriate fills, using the example of a region adjacent to a person's shoulder. Then state one situation where blended latent diffusion on a base model is still the better choice (hint: consider when no inpainting checkpoint exists for the base model you must use).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.3.2: Build a Feathered Object Remover <span class="exercise-type coding">Coding</span></div>
+<p>Combine the SAM masking of subsection 5 with the inpainting pipeline of subsection 2 to <em>remove</em> an object (replace it with plausible background, prompt "empty background, matching surroundings"). Apply the <code>composite_with_feather</code> function from subsection 3 to paste the result back. Try <code>feather_px</code> of 0, 8, and 24 and report which gives the least visible seam, and explain why too much feathering can let the removed object faintly reappear.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.3.3: Outpainting Coherence <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a portrait photo and outpaint it to triple its width in one shot (mask the whole new area at once), then again in three overlapping steps (extend by one-third each time, reusing the new strip as context). Compare the coherence of the extended scene in the two approaches and explain, in terms of how much original context the model sees, why the tiled approach usually stays consistent over large extensions while the single-shot approach can drift or repeat.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-35.2.html">&#8592; Section 35.2: Personalization</a>
+<a href="index.html">Chapter 35</a>
+<a class="next" href="section-35.4.html">Section 35.4: Instruction-Based Editing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

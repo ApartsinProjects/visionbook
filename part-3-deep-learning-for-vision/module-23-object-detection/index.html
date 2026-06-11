@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 23: Object Detection. Where are the objects and what are they: the task that drives much of applied vision. Boxes, IoU and mAP; the two-stage R-CNN family; one-stage detectors YOLO, SSD and RetinaNet; anchor-free and keypoint detection; DETR as set prediction; and training and deploying a detector on your own data." name="description"/>
+<title>Chapter 23: Object Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>Chapter 23: Object Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Classification asked me one easy question: what is this? Detection asks me a thousand questions at once, and they all start with 'where', and they all expect a tidy rectangle for an answer. I have learned to draw boxes in my sleep, and to apologize for the ones that overlap."</p>
+<cite>An Anchor Box With Attachment Problems</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Object detection answers two questions for every image at once: where is each object, and what is it.</strong> A classifier produces a single label for a whole image; a detector produces a variable-length list of (box, class, confidence) triples, one per object, and it must do this for crowded scenes it has never seen. That change of output, from one label to an unknown number of localized labels, forces every design decision in this chapter: how to score an imperfect box against the truth (IoU), how to summarize a detector's quality across all confidence thresholds (mean average precision), how to turn a fixed-size network into a variable-length predictor (anchors, then anchor-free centers, then learned object queries), and how to suppress the duplicate boxes that every dense predictor emits. Detection is also where deep vision became a product: face unlock, autonomous driving perception, retail shelf audits, medical lesion finding, and sports analytics all run a detector in their inner loop. By the end of the chapter you will understand the three architectural families that have defined the field, you will know which to reach for, and you will have trained and exported one on your own data.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+For the last four chapters you built networks that consume an image and emit a single decision: a class, in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, or a sequence of patch tokens fused into one in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. Detection breaks that contract. The output is no longer one thing; it is a set whose size you do not know in advance, and every element of that set carries a spatial location. A photo of a street may contain three cars, eight pedestrians, and a dog, or it may contain none of those; the network must commit to a count and a position for each. This single requirement, predicting a variable-length set of localized labels, is the source of nearly every idea in the chapter, and it is why detection architectures look so different from the classifiers that feed them.
+</p>
+<p>
+We begin with the rules of the game. <a href="section-23.1.html">Section 23.1</a> defines the bounding box, the intersection-over-union (IoU) that measures how well a predicted box overlaps the truth, and mean average precision (mAP), the precision-recall-derived score that ranks every detector you will ever read about. These metrics are not bookkeeping; they shape the loss functions and the post-processing of every model that follows, so we build them carefully and from scratch.
+</p>
+<p>
+Then we walk the three architectural families in the order history discovered them. <a href="section-23.2.html">Section 23.2</a> covers the two-stage R-CNN family, which first proposes regions that might contain objects and then classifies each one, the accurate-but-slower lineage that culminates in Faster R-CNN and its region proposal network. <a href="section-23.3.html">Section 23.3</a> covers the one-stage detectors, YOLO, SSD, and RetinaNet, which skip the proposal step and predict boxes and classes directly on a grid, trading a little accuracy for the real-time speed that put detection in phones and cameras; RetinaNet's focal loss is the idea that finally let one-stage models match two-stage accuracy. <a href="section-23.4.html">Section 23.4</a> shows how the field shed the hand-designed anchor box entirely, predicting object centers and sizes directly (FCOS, CenterNet) and even casting detection as keypoint estimation. <a href="section-23.5.html">Section 23.5</a> arrives at DETR, which reframes detection as direct set prediction with a transformer decoder and bipartite matching, eliminating both anchors and the non-maximum suppression step that every previous family needed.
+</p>
+<p>
+Finally, <a href="section-23.6.html">Section 23.6</a> is the hands-on payoff: you will label a small custom dataset, fine-tune a modern detector on it with the augmentation and transfer-learning practices from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, read its mAP honestly, and export it to a deployable format for the edge devices of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>. This is the workflow you will actually run in industry, distilled from the four sections of theory that precede it.
+</p>
+<p>
+A thread runs through the whole chapter and onward. Detection localizes objects to rectangles; the moment you want pixel-precise outlines instead of rectangles you are doing segmentation, and Mask R-CNN (a one-line extension of Faster R-CNN) is the bridge to <a href="../module-24-segmentation/index.html">Chapter 24</a>. The attention you built in <a href="../module-22-vision-transformers/index.html">Chapter 22</a> returns as the engine of DETR. And the feature-pyramid fusion that detectors live on is the same multi-scale idea you first met as the image pyramid in <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Detection is not a side quest; it is the hub where most of applied computer vision connects.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a> and <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures</a>, because every detector in this chapter sits on top of a convolutional or transformer backbone and reuses its feature maps. <a href="../module-21-training-recipes/index.html">Chapter 21: Training Recipes</a> supplies the transfer learning, augmentation, and learning-rate schedules that the training section depends on. <a href="../module-22-vision-transformers/index.html">Chapter 22: Vision Transformers</a> is the direct prerequisite for the DETR section, whose decoder is the attention block you built there. From the classical part, the box-overlap and grouping intuitions of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16: Classical Recognition Pipelines</a> and the multi-scale pyramids of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> give useful background, but are not strictly required. You should be comfortable reading and writing PyTorch <code>nn.Module</code> code.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">23.1</span>
+<a href="section-23.1.html"><span class="section-title">The Detection Problem: Boxes, IoU &amp; mAP</span></a>
+<span class="section-desc">What detection outputs and why it is hard: the bounding box and its coordinate conventions, intersection-over-union as the overlap measure, precision-recall curves, average precision per class, and mean average precision across classes. All built and verified from scratch in NumPy.</span>
+</li>
+<li>
+<span class="section-num">23.2</span>
+<a href="section-23.2.html"><span class="section-title">Two-Stage Detectors: The R-CNN Family</span></a>
+<span class="section-desc">The propose-then-classify lineage: R-CNN, the shared-backbone speedups of Fast R-CNN with RoI pooling, and Faster R-CNN's region proposal network that makes proposals learnable and the whole detector end-to-end trainable. The accurate baseline the rest of the field is measured against.</span>
+</li>
+<li>
+<span class="section-num">23.3</span>
+<a href="section-23.3.html"><span class="section-title">One-Stage Detectors: YOLO, SSD &amp; RetinaNet</span></a>
+<span class="section-desc">Detection as dense grid prediction with no proposal step: YOLO's single forward pass, SSD's multi-scale default boxes, and RetinaNet's focal loss, the idea that solved the extreme foreground-background imbalance and let one-stage detectors finally match two-stage accuracy at real-time speed.</span>
+</li>
+<li>
+<span class="section-num">23.4</span>
+<a href="section-23.4.html"><span class="section-title">Anchor-Free &amp; Keypoint-Based Detection</span></a>
+<span class="section-desc">Dropping the hand-tuned anchor box: FCOS predicting boxes per feature-map location with a center-ness branch, CenterNet detecting objects as heatmap peaks, and the keypoint view of detection. Why anchor-free designs simplified the pipeline and became the backbone of modern real-time detectors.</span>
+</li>
+<li>
+<span class="section-num">23.5</span>
+<a href="section-23.5.html"><span class="section-title">DETR: Detection as Set Prediction</span></a>
+<span class="section-desc">Detection reframed as predicting a fixed-size set with a transformer decoder and a learned set of object queries. The Hungarian bipartite matching loss that removes non-maximum suppression, why the original DETR trained slowly, and how Deformable DETR and the DINO family fixed it.</span>
+</li>
+<li>
+<span class="section-num">23.6</span>
+<a href="section-23.6.html"><span class="section-title">Training &amp; Deploying a Detector on Custom Data</span></a>
+<span class="section-desc">The end-to-end practitioner workflow: labeling a small dataset, choosing and fine-tuning a modern detector with Ultralytics YOLO, reading validation mAP without fooling yourself, common training failures and their fixes, and exporting to ONNX and TensorRT for deployment.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+A detector tells you that an object sits inside a rectangle, but a rectangle is a coarse summary of a thing with an actual outline. The instant you need the precise silhouette, the count of touching instances, or a mask you can composite, you have crossed into segmentation. <a href="../module-24-segmentation/index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a> picks up exactly where this chapter ends: Mask R-CNN adds a single mask-prediction head to the Faster R-CNN of <a href="section-23.2.html">Section 23.2</a> and turns boxes into instance masks, the mask transformers generalize the DETR decoder of <a href="section-23.5.html">Section 23.5</a> to per-pixel prediction, and the Segment Anything Model makes masks promptable. Detection and segmentation are two readings of the same localized-recognition problem; learn detection well here and segmentation will feel like a refinement rather than a new subject. The deployment skills from <a href="section-23.6.html">Section 23.6</a> carry directly into the edge-efficiency techniques of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Girshick, R. et al. "Rich feature hierarchies for accurate object detection and semantic segmentation (R-CNN)." CVPR (2014). <a href="https://arxiv.org/abs/1311.2524" target="_blank" rel="noopener">arXiv:1311.2524</a></div>
+<div class="bib-annotation">The paper that brought deep features to detection: region proposals classified by a CNN. Slow, but it shattered the previous state of the art and launched the two-stage family of Section 23.2.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ren, S. et al. "Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks." NeurIPS (2015). <a href="https://arxiv.org/abs/1506.01497" target="_blank" rel="noopener">arXiv:1506.01497</a></div>
+<div class="bib-annotation">The region proposal network made proposals learnable and the detector end-to-end trainable, the design that defines two-stage detection in Section 23.2 to this day.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Redmon, J. et al. "You Only Look Once: Unified, Real-Time Object Detection." CVPR (2016). <a href="https://arxiv.org/abs/1506.02640" target="_blank" rel="noopener">arXiv:1506.02640</a></div>
+<div class="bib-annotation">YOLO, the founding one-stage detector of Section 23.3. A single network predicts all boxes and classes in one pass, trading some accuracy for the speed that put detection on live video.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, W. et al. "SSD: Single Shot MultiBox Detector." ECCV (2016). <a href="https://arxiv.org/abs/1512.02325" target="_blank" rel="noopener">arXiv:1512.02325</a></div>
+<div class="bib-annotation">SSD of Section 23.3 predicts default boxes at multiple feature-map scales in one shot, the multi-scale dense-prediction template that later detectors refined.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lin, T.-Y. et al. "Focal Loss for Dense Object Detection (RetinaNet)." ICCV (2017). <a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener">arXiv:1708.02002</a></div>
+<div class="bib-annotation">Focal loss, the idea of Section 23.3 that down-weights easy background examples so the rare foreground dominates training, letting a one-stage detector match two-stage accuracy.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lin, T.-Y. et al. "Feature Pyramid Networks for Object Detection." CVPR (2017). <a href="https://arxiv.org/abs/1612.03144" target="_blank" rel="noopener">arXiv:1612.03144</a></div>
+<div class="bib-annotation">The FPN that fuses coarse-semantic and fine-spatial feature maps, the multi-scale neck nearly every detector in this chapter sits on, and the learned descendant of the image pyramids of Chapter 4.</div>
+</div>
+
+<h3>Recent Research (2020-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Carion, N. et al. "End-to-End Object Detection with Transformers (DETR)." ECCV (2020). <a href="https://arxiv.org/abs/2005.12872" target="_blank" rel="noopener">arXiv:2005.12872</a></div>
+<div class="bib-annotation">DETR of Section 23.5 reframes detection as set prediction with a transformer decoder and Hungarian matching, removing anchors and non-maximum suppression entirely.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tian, Z. et al. "FCOS: Fully Convolutional One-Stage Object Detection." ICCV (2019). <a href="https://arxiv.org/abs/1904.01355" target="_blank" rel="noopener">arXiv:1904.01355</a></div>
+<div class="bib-annotation">The anchor-free detector of Section 23.4: per-location box regression with a center-ness branch, no anchor hyperparameters at all, and the basis of many modern real-time models.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhou, X. et al. "Objects as Points (CenterNet)." arXiv (2019). <a href="https://arxiv.org/abs/1904.07850" target="_blank" rel="noopener">arXiv:1904.07850</a></div>
+<div class="bib-annotation">The keypoint view of detection in Section 23.4: represent each object by its center as a peak in a class heatmap and regress size at the peak, an NMS-free design that also seeds pose estimation and tracking.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, H. et al. "DINO: DETR with Improved DeNoising Anchor Boxes for End-to-End Object Detection." ICLR (2023). <a href="https://arxiv.org/abs/2203.03605" target="_blank" rel="noopener">arXiv:2203.03605</a></div>
+<div class="bib-annotation">The DETR-family detector of Section 23.5 that finally beat the best convolutional models on COCO, combining query denoising, mixed query selection, and deformable attention.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, S. et al. "Grounding DINO: Marrying DINO with Grounded Pre-Training for Open-Set Object Detection." ECCV (2024). <a href="https://arxiv.org/abs/2303.05499" target="_blank" rel="noopener">arXiv:2303.05499</a></div>
+<div class="bib-annotation">The open-vocabulary frontier of Section 23.5: detect objects named by an arbitrary text prompt, not a fixed label set, by fusing a DETR detector with a language model.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Jocher, G. et al. Ultralytics YOLO (YOLO11). <a href="https://docs.ultralytics.com/" target="_blank" rel="noopener">docs.ultralytics.com</a></div>
+<div class="bib-annotation">The most widely used training and deployment toolkit for modern YOLO detectors, the library behind the custom-training and export workflow of Section 23.6.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">torchvision detection models and reference scripts. <a href="https://pytorch.org/vision/stable/models.html#object-detection" target="_blank" rel="noopener">pytorch.org/vision</a></div>
+<div class="bib-annotation">Pretrained Faster R-CNN, RetinaNet, FCOS, and SSD with a uniform API, the library shortcut used throughout Sections 23.2 to 23.4.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hugging Face Transformers object-detection models (DETR, Deformable DETR, RT-DETR). <a href="https://huggingface.co/docs/transformers/tasks/object_detection" target="_blank" rel="noopener">huggingface.co/docs/transformers</a></div>
+<div class="bib-annotation">High-level loaders and a post-processor for the DETR family, the shortcut used in Section 23.5 to run set-prediction detection in a handful of lines.</div>
+</div>
+
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Lin, T.-Y. et al. "Microsoft COCO: Common Objects in Context." ECCV (2014). <a href="https://cocodataset.org/" target="_blank" rel="noopener">cocodataset.org</a></div>
+<div class="bib-annotation">The 80-class benchmark and the COCO mAP protocol (average precision across IoU thresholds 0.50 to 0.95) that every detector in this chapter reports against. The standard yardstick of Section 23.1.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Everingham, M. et al. "The PASCAL Visual Object Classes (VOC) Challenge." IJCV (2010). <a href="http://host.robots.ox.ac.uk/pascal/VOC/" target="_blank" rel="noopener">host.robots.ox.ac.uk/pascal/VOC</a></div>
+<div class="bib-annotation">The 20-class predecessor to COCO and the source of the original VOC mAP (a single IoU threshold of 0.50), the simpler metric we build first in Section 23.1.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-22-vision-transformers/index.html">&#8592; Chapter 22: Vision Transformers</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-23.1.html">Section 23.1: The Detection Problem: Boxes, IoU &amp; mAP &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

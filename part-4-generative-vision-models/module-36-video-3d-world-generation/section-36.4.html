@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.4: Generative Neural Rendering: From Splats to Scenes. From fitting a scene to imagining one: generative 3D Gaussian splatting, diffusion priors over radiance fields, and amortized scene generators built on the neural rendering of Chapter 27." name="description"/>
+<title>Section 36.4: Generative Neural Rendering: From Splats to Scenes | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Generative Neural Rendering: From Splats to Scenes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"For years they fed me fifty photos of a real room and I learned to render it from new angles. Then one day they fed me no photos and a sentence, and asked for a room that never existed. The renderer did not change. Only my imagination got a prior."</p>
+<cite>A 3D Gaussian That Stopped Memorizing and Started Dreaming</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Neural rendering and generative modeling are two halves of one idea: a differentiable renderer turns 3D parameters into images, and a generative prior over those parameters turns the renderer from a memory of one captured scene into a machine that imagines new ones.</strong> This section takes the 3D Gaussian splatting of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> and makes it generative, by diffusing over splat parameters, by amortizing scene generation into a feed-forward network, and by using the video and 3D generators of the previous sections as scene-building blocks.</p>
+</div>
+
+<p>
+<a href="section-36.3.html">Section 36.3</a> generated individual <em>objects</em>: a chair, an animal, a prop. This section scales up to <em>scenes</em> and dwells on the representation that has come to dominate, 3D Gaussian splatting. In <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> you fit a cloud of millions of anisotropic 3D Gaussians, each with a position, covariance, opacity, and color, to a set of photographs, and rasterized them into novel views in real time. That was reconstruction: the Gaussians memorized one real scene. Generative neural rendering asks the renderer to instead produce Gaussians for a scene that was never photographed, conditioned on text, an image, or nothing at all.
+</p>
+
+<h2>1. The Renderer Is Already Generative-Ready <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The key realization is that the splatting renderer of Chapter 27 is differentiable and fast, which makes it a perfect generative-model output head. Recall the rendering equation for a pixel as a depth-ordered alpha composite over the Gaussians that project onto it:
+</p>
+
+<p>
+$$ C \;=\; \sum_{i} c_i\, \alpha_i \prod_{j<i} (1 - \alpha_j), $$
+</p>
+
+<p>
+where $c_i$ is the color of Gaussian $i$, $\alpha_i$ is its effective opacity at this pixel (its stored opacity modulated by the projected Gaussian footprint), and the product is the transmittance through the Gaussians in front of it. Because $C$ is differentiable in every Gaussian parameter, gradients flow from a rendered image back to positions, covariances, colors, and opacities. A generative model only has to produce those parameters; the renderer turns them into viewable, view-consistent images for free, and the same gradient path supports the score distillation of <a href="section-36.3.html">Section 36.3</a>.
+</p>
+
+<p>
+This means generative neural rendering needs no new rendering theory. It needs a prior, a way to sample plausible sets of Gaussians, plugged into the front of the renderer you already have. Three priors are in use, in increasing order of abstraction.
+</p>
+
+<h2>2. Three Ways to Make Splatting Generative <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+<strong>Distillation prior (per-scene optimization).</strong> The most direct route, used by DreamGaussian (Tang et al., 2024), is the score-distillation loop of <a href="section-36.3.html">Section 36.3</a> with Gaussians as the optimized parameters instead of a NeRF. The 2D diffusion model critiques rendered views and the gradient sculpts the Gaussian cloud. This needs no 3D training data but optimizes each scene from scratch.
+</p>
+
+<p>
+<strong>Diffusion prior (generate the parameters directly).</strong> Treat the set of Gaussian parameters as the data and train a diffusion model to denoise them, the same DDPM machinery from <a href="../module-33-diffusion-models/index.html">Chapter 33</a> applied to splat tensors rather than pixels. The challenge is that a Gaussian set is unordered and variable-size, so these models often impose structure (a fixed grid of Gaussians, or a latent that decodes to Gaussians) to make the data a regular tensor a U-Net or transformer can denoise. This gives genuine sampling diversity without per-scene optimization.
+</p>
+
+<p>
+<strong>Amortized prior (feed-forward scene generation).</strong> Train a network that maps a conditioning signal (one image, a few images, or a text embedding) directly to a Gaussian cloud in one forward pass, the LRM-style amortization of <a href="section-36.3.html">Section 36.3</a> extended to splats and to whole scenes. The pixelSplat and MVSplat lines (2024) predict Gaussians from sparse views in milliseconds; the latent-LRM successors generate room-scale scenes from text.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three generative priors feeding one differentiable splatting renderer: a distillation prior optimizes Gaussians per scene with a 2D diffusion critic, a diffusion prior denoises Gaussian parameters directly, and an amortized prior maps a conditioning signal to Gaussians in one forward pass; all three output a Gaussian cloud that the shared renderer turns into view-consistent images">
+  <g font-family="sans-serif" font-size="12.5">
+    <rect x="20" y="30" width="190" height="55" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="115" y="52" text-anchor="middle" font-weight="bold" fill="#9c4a00">Distillation prior</text>
+    <text x="115" y="72" text-anchor="middle" font-size="11" fill="#9c4a00">2D diffusion critic, per scene</text>
+    <rect x="20" y="115" width="190" height="55" fill="#e8daef" stroke="#7d3c98" stroke-width="1.5" rx="6"/>
+    <text x="115" y="137" text-anchor="middle" font-weight="bold" fill="#512e5f">Diffusion prior</text>
+    <text x="115" y="157" text-anchor="middle" font-size="11" fill="#512e5f">denoise Gaussian params</text>
+    <rect x="20" y="200" width="190" height="55" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.5" rx="6"/>
+    <text x="115" y="222" text-anchor="middle" font-weight="bold" fill="#1a5276">Amortized prior</text>
+    <text x="115" y="242" text-anchor="middle" font-size="11" fill="#1a5276">feed-forward, one pass</text>
+    <line x1="210" y1="57" x2="320" y2="135" stroke="#5a626c" stroke-width="1.4" marker-end="url(#ah)"/>
+    <line x1="210" y1="142" x2="320" y2="142" stroke="#5a626c" stroke-width="1.4" marker-end="url(#ah)"/>
+    <line x1="210" y1="227" x2="320" y2="149" stroke="#5a626c" stroke-width="1.4" marker-end="url(#ah)"/>
+    <rect x="325" y="110" width="150" height="65" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.6" rx="6"/>
+    <text x="400" y="138" text-anchor="middle" font-weight="bold" fill="#145a32">Gaussian cloud</text>
+    <text x="400" y="158" text-anchor="middle" font-size="11" fill="#145a32">pos, cov, opacity, color</text>
+    <line x1="475" y1="142" x2="525" y2="142" stroke="#5a626c" stroke-width="1.6" marker-end="url(#ah)"/>
+    <rect x="530" y="110" width="150" height="65" fill="#fadbd8" stroke="#c0392b" stroke-width="1.6" rx="6"/>
+    <text x="605" y="138" text-anchor="middle" font-weight="bold" fill="#922b21">Splat Renderer</text>
+    <text x="605" y="158" text-anchor="middle" font-size="11" fill="#922b21">differentiable, real-time</text>
+    <line x1="680" y1="142" x2="730" y2="142" stroke="#5a626c" stroke-width="1.6" marker-end="url(#ah)"/>
+    <text x="785" y="138" text-anchor="middle" font-weight="bold" fill="#1b4f72">consistent</text>
+    <text x="785" y="155" text-anchor="middle" font-weight="bold" fill="#1b4f72">novel views</text>
+  </g>
+  <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5a626c"/></marker></defs>
+</svg>
+<figcaption><strong>Figure 36.4.1</strong>: Three generative priors share one differentiable splatting renderer. The distillation prior optimizes Gaussians per scene against a 2D diffusion critic; the diffusion prior denoises Gaussian parameters directly; the amortized prior maps a conditioning signal to Gaussians in a single forward pass. All three emit a Gaussian cloud, and the shared real-time renderer of Chapter 27 turns it into view-consistent images. The renderer is the constant; the prior is the variable.</figcaption>
+</figure>
+
+<p>
+Figure 36.4.1 makes the architecture explicit: the renderer is fixed and the three priors are interchangeable front ends. The code below shows the minimal differentiable splat-rendering forward pass that every one of these priors targets, so you can see exactly what a generative model must produce.
+</p>
+
+<pre><code class="language-python">import torch
+
+def render_gaussians(means2d, colors, opacities, depths, image_size):
+    """Front-to-back alpha compositing of 2D-projected Gaussians (simplified).
+    A generative prior produces means/colors/opacities; this renderer is fixed."""
+    H, W = image_size
+    out = torch.zeros(H, W, 3)
+    transmittance = torch.ones(H, W)
+    order = torch.argsort(depths)                # composite near-to-far
+    for i in order:
+        # splat this Gaussian's footprint as a soft weight over pixels (simplified)
+        alpha = opacities[i] * gaussian_footprint(means2d[i], image_size)  # (H, W)
+        out += transmittance.unsqueeze(-1) * alpha.unsqueeze(-1) * colors[i]
+        transmittance = transmittance * (1.0 - alpha)   # attenuate behind
+    return out
+
+# Everything is differentiable: backprop reaches means2d, colors, opacities,
+# so any prior (distillation, diffusion, amortized) trains through this renderer.</code></pre>
+<div class="code-caption">A simplified differentiable Gaussian-splat renderer: front-to-back alpha compositing with running transmittance, exactly the operation from Chapter 27. Because every operation is differentiable, all three generative priors of Figure 36.4.1 can train through it without modification.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Prior Is the Only New Thing</div>
+<p>
+Across this section the renderer never changes; only the source of its inputs does. This is the cleanest illustration of a theme that runs through all of Part IV: a generative model is a prior plus a likelihood, and in neural rendering the likelihood (the renderer mapping parameters to images) is borrowed wholesale from the reconstruction era. Reconstruction taught us a differentiable, fast, view-consistent renderer; generation just learns to feed it. Whenever you can write a differentiable forward model of how parameters become observations, you can turn a fitting problem into a generation problem by putting a learned prior in front of it.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Real Splat Rendering with gsplat</div>
+<p>
+The naive Python loop above is for understanding only; it would be hopelessly slow for the millions of Gaussians a real scene needs. The <code>gsplat</code> library provides the optimized, fully differentiable CUDA rasterizer:
+</p>
+<pre><code class="language-python">from gsplat import rasterization
+# means: (N,3), quats: (N,4), scales: (N,3), opacities: (N,), colors: (N,3)
+rendered, alpha, info = rasterization(
+    means, quats, scales, opacities, colors,
+    viewmats, Ks, width=512, height=512)   # tile-based CUDA, fully differentiable</code></pre>
+<div class="code-caption">Real splat rendering with gsplat: one differentiable CUDA call rasterizes millions of Gaussians in milliseconds, replacing the hand-written compositing loop.</div>
+<p>
+This replaces the hand-written compositing loop, plus projection, tiling, and sorting, hundreds of lines of CUDA, with one call that handles millions of Gaussians in milliseconds and still backpropagates to every parameter, exactly what an amortized or distillation prior needs in its training loop.
+</p>
+</div>
+
+<h2>3. Composing Scenes from Generated Pieces <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A practical route to whole scenes, rather than training one giant scene generator, is composition: generate or retrieve individual objects (<a href="section-36.3.html">Section 36.3</a>), place them in a layout, and let a generative model harmonize lighting and fill background. Because splats are an explicit point-like representation, two Gaussian clouds can be merged by concatenating their parameter lists and re-rendering, an editability that NeRF's implicit field lacks. This explicitness is why the field has largely migrated to splats for generative and editable 3D, and it connects forward to world models: a world model that must place and move objects benefits from a representation where objects are separable, addressable things rather than entangled in a single MLP.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+Adding a sofa to a splat scene is, gloriously, <code>torch.cat</code>. The whole room and the new couch are just two lists of fuzzy little ellipsoids, and merging them is concatenation, not surgery. Try that with a NeRF, whose entire scene is baked into one tangled MLP, and "put a lamp in the corner" becomes "please retrain the universe." Splats won the generative-3D popularity contest partly on physics and speed, and partly because they let you rearrange the furniture without a lawsuit from the renderer.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: Real Estate Walkthroughs from a Few Phone Photos</div>
+<p>
+A property-tech company let agents capture a handful of phone photos of an empty apartment and wanted to deliver an interactive 3D walkthrough plus virtually staged furniture. Their v1 used classical photogrammetry (the structure-from-motion of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>) and produced holey, low-quality meshes that looked worse than the photos. The v2 pipeline used a feed-forward sparse-view Gaussian generator to reconstruct the room from as few as five photos in seconds, then composed in furniture generated by a text-to-3D model (Section 36.3), merging the Gaussian clouds and re-rendering so the lighting matched. Because splats render in real time in a browser, the walkthrough was smooth on a phone. The lesson the CTO drew: <em>the move from meshes to generative splats turned a fragile, capture-heavy reconstruction pipeline into a forgiving, few-shot generative one, and the explicit splat representation is what made virtual staging a concatenation rather than a re-optimization.</em>
+</p>
+</div>
+
+<h2>4. From Static Scenes to Worlds <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Generative neural rendering, as covered so far, produces a static 3D scene: beautiful, view-consistent, but frozen in time. The natural next axis is the one this whole chapter is building toward, dynamics. A scene that changes over time, with objects that move and respond, is a <em>world</em>, and a generative model of such a thing is a world model. The bridge is conceptual but short: take the latent-space view (a scene is a set of parameters), add a learned transition function that predicts the next parameters from the current ones and an action, and you have moved from generative rendering to generative simulation.
+</p>
+
+<p>
+That transition function, the learned dynamics, is the subject of the rest of the chapter. <a href="section-36.5.html">Section 36.5</a> builds it in its most explicit and classical form, a recurrent state-space model that predicts the next latent from the current latent and an action, and trains an agent inside the resulting dream. The renderer of this section becomes the decoder that turns the world model's latent state back into pixels, closing the loop from imagined dynamics to viewable, controllable scenes.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Generative Splatting and 4D Worlds (2024-2026)</div>
+<p>
+The frontier here is moving fast on three fronts. <strong>Latent splat diffusion</strong> (the Splatter Image, LGM, and GS-LRM lines, 2024) trains feed-forward generators that emit millions of Gaussians from text or sparse views, pushing scene generation toward interactive speed. <strong>Dynamic (4D) Gaussians</strong> add per-Gaussian motion trajectories so a generated scene can move, the spatial substrate for the world simulators of <a href="section-36.6.html">Section 36.6</a>. And <strong>video-conditioned reconstruction</strong> closes the loop with the first half of this chapter: a video diffusion model (Sections 36.1 to 36.2) generates a turntable of consistent views, and a splat generator lifts those views into an explicit, editable, real-time 3D scene, a pipeline that several 2025 systems ship end to end. The signal is unmistakable: pixels, geometry, and dynamics are collapsing into one generative stack, and the next sections give that stack a controller.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> The section claims the splatting renderer is identical for reconstruction and generation, and only the prior differs. Defend this claim by listing what changes and what stays the same when you move from fitting Gaussians to one real scene (Chapter 27) to sampling Gaussians for a new scene. Why is a differentiable renderer the precondition for both?</p>
+<p><span class="exercise-type">Coding.</span> Using <code>gsplat</code> (or the simplified renderer if no GPU is available), create two small Gaussian clouds, a red cube and a blue sphere, by hand. Merge them by concatenating their parameter tensors and render the combined scene from several viewpoints. Verify view consistency, then perturb one cloud's positions and re-render to confirm that object-level editing is a tensor operation, not a re-optimization.</p>
+<p><span class="exercise-type">Analysis.</span> Compare the three generative priors (distillation, diffusion, amortized) on three axes: training-data requirement, per-scene generation time, and sample diversity. For a product that must generate one bespoke scene per user request with no 3D training corpus, which prior fits, and what is the cost you accept? For a product generating millions of scenes from a fixed catalog of styles, which fits instead?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.3.html">&#8592; Section 36.3: Text-to-3D &amp; Image-to-3D Generation</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.5.html">Section 36.5: World Models: Latent Dynamics, RSSM &amp; Learning in Imagination &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.5: Multi-Object Tracking with learned features. Tracking-by-detection, the Kalman filter and Hungarian assignment of SORT, learned re-identification embeddings in DeepSORT, and ByteTrack's low-confidence recovery that holds identities through occlusion." name="description"/>
+<title>Section 26.5: Multi-Object Tracking with Learned Features | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>Multi-Object Tracking with Learned Features</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A detector tells me there are three people in this frame. It told me the same thing last frame. My entire job, my whole reason for being, is to insist that they are the same three people. The detector could not care less. The detector has no object permanence. I am the object permanence."</p>
+<cite>A Tracker Holding On to Identities Through the Crowd</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Multi-object tracking turns a per-frame detector into a per-object timeline by answering one question every frame: which of this frame's detections is the same object as which of last frame's tracks?</strong> The dominant paradigm, tracking-by-detection, runs a detector from <a href="../module-23-object-detection/index.html">Chapter 23</a> on each frame and then solves an assignment problem to link detections across time. SORT does this with a Kalman filter to predict where each track should be and the Hungarian algorithm to match predictions to detections, the learned-free descendant of the classical trackers of <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>. DeepSORT adds a learned appearance embedding so identities survive occlusion, and ByteTrack recovers dimmed objects by matching low-confidence boxes in a second pass. This section builds the assignment loop and shows where learned features earn their place.</p>
+</div>
+
+<p>
+This final section composes the chapter's pieces into a complete video application. We have a detector (from <a href="../module-23-object-detection/index.html">Chapter 23</a>), we understand motion (from optical flow and the classical Kalman filter), and we have learned appearance features (from every backbone in Part III). Multi-object tracking, or MOT, is the task of binding these together so that each object in a video carries a stable identity across frames. The problem is fundamentally one of data association under uncertainty, and its structure, predict then match then update, mirrors the recursive state estimation you saw with the Kalman filter in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
+</p>
+
+<h2>1. Tracking-by-Detection and the Assignment Problem <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The tracking-by-detection loop is simple to state. Maintain a set of active <strong>tracks</strong>, each an object you are following with a predicted current position. For each new frame, run the detector to get a set of <strong>detections</strong>. Compute a cost for matching every track to every detection (how far apart, how dissimilar), solve for the assignment that minimizes total cost, update matched tracks with their detections, start new tracks for unmatched detections, and retire tracks that have gone unmatched for too long. The matching step is a classic <strong>linear assignment problem</strong>: given an $n \times m$ cost matrix, find the one-to-one assignment of tracks to detections with minimum total cost, solved exactly in polynomial time by the Hungarian algorithm.
+</p>
+
+<p>
+The cost matrix is where every tracker's design lives. The simplest cost is spatial: one minus the intersection-over-union (IoU) overlap between a track's predicted box and a detection's box, the same IoU you used for detection evaluation in <a href="../module-23-object-detection/index.html">Chapter 23</a>. The code below solves one frame's assignment from an IoU cost matrix using SciPy's exact solver. Figure 26.5.1 shows the full loop.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The tracking-by-detection loop: detect, predict track positions, match, update, repeat each frame">
+<style>
+.ml{font:12px sans-serif;fill:#1a1a1a;}
+.ms{font:10px sans-serif;fill:#555;}
+.mdet{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.mpred{fill:#fdeee3;stroke:#d6802b;stroke-width:1.4;}
+.mmatch{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.4;}
+.mupd{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
+.mar{stroke:#777;stroke-width:1.5;marker-end:url(#mah);fill:none;}
+.mloop{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#mah);fill:none;stroke-dasharray:4 3;}
+</style>
+<defs><marker id="mah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="mdet" x="20" y="100" width="110" height="56"/>
+<text class="ml" x="75" y="124" text-anchor="middle">detect frame</text>
+<text class="ms" x="75" y="142" text-anchor="middle">boxes + scores</text>
+<line class="mar" x1="130" y1="128" x2="168" y2="128"/>
+<rect class="mpred" x="170" y="100" width="120" height="56"/>
+<text class="ml" x="230" y="120" text-anchor="middle">predict tracks</text>
+<text class="ms" x="230" y="138" text-anchor="middle">Kalman motion</text>
+<text class="ms" x="230" y="152" text-anchor="middle">+ appearance feat.</text>
+<line class="mar" x1="290" y1="128" x2="328" y2="128"/>
+<rect class="mmatch" x="330" y="100" width="120" height="56"/>
+<text class="ml" x="390" y="120" text-anchor="middle">match</text>
+<text class="ms" x="390" y="138" text-anchor="middle">Hungarian on</text>
+<text class="ms" x="390" y="152" text-anchor="middle">cost matrix</text>
+<line class="mar" x1="450" y1="128" x2="488" y2="128"/>
+<rect class="mupd" x="490" y="100" width="120" height="56"/>
+<text class="ml" x="550" y="120" text-anchor="middle">update tracks</text>
+<text class="ms" x="550" y="138" text-anchor="middle">new / retire /</text>
+<text class="ms" x="550" y="152" text-anchor="middle">correct</text>
+<path class="mloop" d="M550,156 C550,215 230,215 230,158"/>
+<text class="ms" x="390" y="232" text-anchor="middle" fill="#8e44ad">next frame: predicted tracks become the new track set</text>
+</svg>
+<figcaption><strong>Figure 26.5.1:</strong> The tracking-by-detection loop. Each frame is detected independently; existing tracks are predicted forward (by a Kalman motion model and, in DeepSORT, an appearance feature); a cost matrix links tracks to detections; the Hungarian algorithm finds the optimal one-to-one match; tracks are updated, created, or retired. The dashed loop carries tracks into the next frame, giving objects identity over time.</figcaption>
+</figure>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+def iou(box_a, box_b):
+    """IoU of two [x1, y1, x2, y2] boxes."""
+    xa, ya = max(box_a[0], box_b[0]), max(box_a[1], box_b[1])
+    xb, yb = min(box_a[2], box_b[2]), min(box_a[3], box_b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    return inter / (area_a + area_b - inter + 1e-9)
+
+def assign(tracks, detections, iou_threshold=0.3):
+    """Hungarian assignment of tracks to detections by 1 - IoU cost."""
+    cost = np.zeros((len(tracks), len(detections)))
+    for i, t in enumerate(tracks):
+        for j, d in enumerate(detections):
+            cost[i, j] = 1.0 - iou(t, d)          # low cost = high overlap
+    rows, cols = linear_sum_assignment(cost)       # optimal one-to-one match
+    matches = [(r, c) for r, c in zip(rows, cols) if cost[r, c] <= 1 - iou_threshold]
+    return matches
+
+tracks = [[10, 10, 50, 50], [100, 100, 140, 140]]
+detections = [[102, 98, 142, 138], [12, 11, 52, 51]]    # same objects, slightly moved
+print("matches (track -> detection):", assign(tracks, detections))
+# matches (track -> detection): [(0, 1), (1, 0)]</code></pre>
+<div class="code-caption">One frame of IoU-based assignment with the Hungarian algorithm. The cost is $1 - \text{IoU}$, so the optimal assignment maximizes total overlap; the printed result correctly links each track to its slightly-moved detection even though the detections arrived in a different order.</div>
+
+<h2>2. SORT: Kalman Prediction Meets Hungarian Matching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+IoU matching alone fails the moment an object moves far between frames or a detection is briefly missed, because the predicted box no longer overlaps the true one. SORT (Simple Online and Realtime Tracking) fixes the first problem with a <strong>Kalman filter</strong> per track, the exact recursive estimator you built in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>. Each track's state holds the box position and velocity; the filter predicts where the box will be in the next frame from its motion, and IoU is computed against that prediction rather than the stale last position. After matching, the detection corrects the filter's state. This predict-correct cycle is what lets SORT follow a moving object whose detection box would otherwise drift out of overlap.
+</p>
+
+<p>
+The skeleton below shows the per-track Kalman predict-and-update wrapped around the assignment of subsection 1. It uses a constant-velocity motion model, the standard choice for SORT, and only the state-transition structure is shown; the full filter is the one from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+class KalmanBoxTrack:
+    """Constant-velocity Kalman track on box center (cx, cy, scale, ratio)."""
+    def __init__(self, box, track_id):
+        cx, cy, s, r = self._to_state(box)
+        self.x = np.array([cx, cy, s, r, 0, 0, 0])     # state + velocities
+        self.id = track_id
+        self.time_since_update = 0
+
+    @staticmethod
+    def _to_state(box):
+        x1, y1, x2, y2 = box
+        w, h = x2 - x1, y2 - y1
+        return x1 + w / 2, y1 + h / 2, w * h, w / max(h, 1e-6)
+
+    def predict(self):
+        # constant-velocity step: each position += its velocity (the motion model)
+        self.x[0] += self.x[4]   # cx += d(cx)
+        self.x[1] += self.x[5]   # cy += d(cy)
+        self.x[2] += self.x[6]   # scale += d(scale)
+        self.time_since_update += 1
+        return self.x[:4]
+
+    def update(self, box):
+        cx, cy, s, r = self._to_state(box)
+        # Kalman gain blends prediction with measurement; shown here as a simple blend
+        self.x[0], self.x[1], self.x[2], self.x[3] = cx, cy, s, r
+        self.time_since_update = 0
+
+# A real SORT pairs this with assign() each frame and manages track birth/death.
+t = KalmanBoxTrack([10, 10, 50, 50], track_id=1)
+t.predict(); t.update([12, 11, 52, 51])
+print("track 1 center:", t.x[:2])    # track 1 center: [32. 31.]</code></pre>
+<div class="code-caption">A SORT-style Kalman box track. <code>predict</code> advances the box by its estimated velocity (the motion model), and <code>update</code> corrects the state with the matched detection. Tracking IoU against the prediction, not the last seen box, is what lets SORT follow fast motion; the full Kalman gain is the recursive estimator from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Tracking Is Recursive State Estimation Plus Bookkeeping</div>
+<p>Strip away the deep learning and a tracker is two ideas you already own: a Kalman filter that maintains a belief about each object's state under uncertainty, and an assignment solver that decides which measurement updates which belief. The detector supplies measurements; the tracker supplies persistence. This is precisely the world-model intuition that <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> generalizes: an agent that understands a scene must maintain the belief that objects continue to exist when they are momentarily not observed. SORT's track-management rules (retire a track after $N$ missed frames, confirm a track after $M$ hits) are the minimal implementation of object permanence.</p>
+</div>
+
+<h2>3. DeepSORT: Learned Appearance for Occlusion <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The Kalman motion model fails under occlusion and crossing. When two people pass each other, their predicted boxes overlap, the IoU cost cannot tell them apart, and SORT frequently swaps their identities, the dreaded ID switch. The fix is to add appearance. <strong>DeepSORT</strong> runs a small re-identification network on each detection's image crop to produce an embedding vector, a learned descriptor of how the object looks, and adds the cosine distance between embeddings to the matching cost. Now two crossing pedestrians are distinguished not only by where they are predicted to be but by what they look like, and the right identity is recovered when they separate. This embedding is the learned-features arc of the whole book in miniature: the hand-crafted descriptors of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> become a learned representation, exactly as <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> argued.
+</p>
+
+<p>
+The combined cost mixes a motion term (the Mahalanobis or IoU distance from the Kalman prediction) with an appearance term (cosine distance between the detection's embedding and the track's gallery of past embeddings). The code below builds that gated cost matrix.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def cosine_distance(a, b):
+    """Cosine distance between L2-normalized embeddings, in [0, 2]."""
+    a = a / (np.linalg.norm(a) + 1e-9)
+    b = b / (np.linalg.norm(b) + 1e-9)
+    return 1.0 - float(a @ b)
+
+def deepsort_cost(track_feats, det_feats, motion_gate, lam=0.7):
+    """Blend appearance (cosine) and motion cost; gate out impossible matches.
+
+    track_feats, det_feats: lists of embedding vectors.
+    motion_gate: boolean (n_tracks, n_dets), True where motion makes the match plausible.
+    """
+    n, m = len(track_feats), len(det_feats)
+    cost = np.full((n, m), 1e5)                       # large = forbidden by default
+    for i in range(n):
+        for j in range(m):
+            if motion_gate[i, j]:                     # only score plausible pairs
+                app = cosine_distance(track_feats[i], det_feats[j])
+                cost[i, j] = lam * app                # appearance-weighted cost
+    return cost
+
+# Two tracks, two detections; track 0 looks like det 1, track 1 like det 0.
+track_feats = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+det_feats   = [np.array([0.0, 0.9]), np.array([0.9, 0.1])]
+gate = np.ones((2, 2), dtype=bool)
+print(np.round(deepsort_cost(track_feats, det_feats, gate), 3))
+# [[0.7   0.004]
+#  [0.    0.623]]   -> appearance correctly prefers track0->det1, track1->det0</code></pre>
+<div class="code-caption">The DeepSORT gated cost matrix. A motion gate first rules out matches that are geometrically impossible, then the appearance cosine distance scores the survivors. The printed costs show appearance correctly linking each track to the detection that looks like it, even when motion alone would be ambiguous, which is how DeepSORT survives crossings.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Re-Identification Fixed a Retail Counter</div>
+<p><strong>Who:</strong> a computer-vision contractor building a footfall-and-dwell analytics system for a chain of clothing stores, 2023. <strong>Situation:</strong> ceiling cameras counted shoppers and measured how long each spent in each department, which required tracking individuals across a crowded floor. <strong>Problem:</strong> their initial SORT tracker produced wildly inflated unique-visitor counts because every time two shoppers passed near a clothing rack the tracker swapped or dropped identities, spawning new track IDs and double-counting people. <strong>Decision:</strong> they switched to DeepSORT with a re-identification embedding fine-tuned on a few thousand crops of shoppers from their own stores, so the appearance term could re-link a person after the occlusion that broke the motion match. <strong>Result:</strong> ID switches fell by roughly an order of magnitude, the unique-visitor count came into line with manual audits, and dwell-time estimates became trustworthy enough to bill on. <strong>Lesson:</strong> motion prediction alone cannot survive the occlusions that crowds are made of; a learned appearance embedding is what re-binds an identity after the gap. The embedding did not need to be large or exotic, but it did need to be fine-tuned on in-domain crops, the same transfer-learning lesson as <a href="../module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<h2>4. ByteTrack and the Modern Baseline <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+ByteTrack made a deceptively simple observation. Most trackers discard low-confidence detections before matching, on the theory that they are false positives. But when an object is partially occluded, its detection score drops precisely because it is occluded, not because it is not there, and throwing it away is exactly when you lose the track. ByteTrack keeps every detection box and matches in <strong>two passes</strong>: first associate the high-confidence detections to tracks as usual, then take the tracks still unmatched after that pass and try to associate them to the <em>low</em>-confidence detections that were left over. A dimmed, half-occluded person is recovered in the second pass instead of being dropped. This single idea, with no new network, set a strong tracking baseline and is the default in most production trackers today.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>For years the community treated a low detection score as the detector politely saying "ignore me, I am probably nothing", and trackers obediently threw those boxes in the bin. ByteTrack's contribution was, in effect, to stop trusting that politeness: a faint box is often not a phantom but a real object that is half hidden behind another one, whispering rather than shouting. The whole method is a few dozen lines that amount to "before you delete the quiet detections, give them one more chance to claim an orphaned track". It is a useful reminder that in tracking, as in life, the thing too shy to announce itself loudly is sometimes exactly the one you were looking for.</p>
+</div>
+
+<pre><code class="language-python">def bytetrack_associate(tracks, dets_high, dets_low, assign_fn):
+    """Two-pass association: high-confidence first, then low-confidence recovery."""
+    # Pass 1: match tracks to confident detections.
+    m1 = assign_fn(tracks, dets_high)
+    matched_tracks = {t for t, _ in m1}
+    remaining = [t for i, t in enumerate(tracks) if i not in matched_tracks]
+
+    # Pass 2: try to recover the still-unmatched tracks with dim detections.
+    m2 = assign_fn(remaining, dets_low)
+
+    # Tracks matched in neither pass are candidates for retirement.
+    return m1, m2
+
+# With a strong detector, dets_high holds clear objects and dets_low holds the
+# occluded, low-score boxes that pass 2 uses to keep a track alive through occlusion.</code></pre>
+<div class="code-caption">The ByteTrack two-pass association. Pass one matches confident detections; pass two rescues tracks that pass one left unmatched by linking them to the low-confidence boxes other trackers discard. The low-confidence pass is the whole contribution, and it requires no extra network, only the willingness to keep dim detections around.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Detection and Tracking in One Call</div>
+<p>The from-scratch tracker above (Kalman filter, Hungarian assignment, two-pass association, optional re-identification) is several hundred lines. Ultralytics fuses a YOLO detector with ByteTrack or BoT-SORT into a single streaming call, so tracking a video is two lines:</p>
+<pre><code class="language-python">from ultralytics import YOLO
+
+model = YOLO("yolo11n.pt")                       # detector from Chapter 23
+# persist=True carries track identities across frames; tracker selects the algorithm
+results = model.track(source="street.mp4", tracker="bytetrack.yaml",
+                      persist=True, stream=True)
+for frame_result in results:
+    ids = frame_result.boxes.id                  # stable track ID per box, or None
+    boxes = frame_result.boxes.xyxy              # the detection boxes this frame</code></pre>
+<p>The wrapper runs detection, maintains the Kalman tracks, solves the assignment, and applies ByteTrack's two-pass recovery, exposing a stable <code>id</code> per object per frame. Swapping <code>tracker="botsort.yaml"</code> adds the re-identification appearance model of DeepSORT. This is the production form of everything in this section.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: End-to-End and Transformer Tracking</div>
+<p>Tracking-by-detection treats detection and association as separate stages; the frontier is to make them one learned system. TrackFormer and MOTR (2021 to 2022) extend the DETR detector of <a href="../module-23-object-detection/index.html">Chapter 23</a> with persistent <em>track queries</em>: a query that detected an object in one frame is carried forward to detect the same object in the next, so association is learned end to end with no Hungarian post-processing. The 2023 to 2025 work pushes toward unified detection, tracking, and segmentation in video (the video extensions of the Segment Anything Model from <a href="../module-24-segmentation/index.html">Chapter 24</a>, including SAM 2's promptable video object segmentation with a memory bank), where a single model both finds and follows objects through occlusion with a learned memory. The thread that runs from SORT to these models is the steady replacement of hand-tuned components, the motion model, the appearance metric, the association rule, with learned ones, the same trajectory the rest of this chapter traced for recognition and flow.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.1: Why Predict Before Matching <span class="exercise-type conceptual">Conceptual</span></div>
+<p>SORT computes IoU against the Kalman-predicted box rather than the track's last observed box. Construct a concrete two-frame example (give pixel coordinates) of a fast-moving object where matching against the last observed box would fail (zero IoU with the new detection) but matching against the motion-predicted box succeeds. Explain in two sentences why this makes the Kalman prediction essential rather than optional, and connect it to the predict-correct cycle of the Kalman filter in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.2: Build a Minimal Tracker <span class="exercise-type coding">Coding</span></div>
+<p>Combine the <code>assign</code> function from subsection 1 with a simple constant-velocity prediction (no full Kalman filter needed) into a working tracker that processes a sequence of per-frame detection lists, maintains track IDs, creates tracks for unmatched detections, and retires tracks unmatched for three frames. Run it on a synthetic sequence of two boxes moving in straight lines and crossing in the middle. Observe whether an ID switch occurs at the crossing, then add a per-detection colour-histogram "embedding" and a cosine-distance appearance term as in DeepSORT, and confirm the switch is fixed.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.5.3: When Does the Low-Confidence Pass Help <span class="exercise-type analysis">Analysis</span></div>
+<p>ByteTrack's second pass matches tracks to low-confidence detections. Using a video with crowding (or a synthetic sequence where objects periodically occlude each other and their detection scores drop), measure the number of ID switches and the number of fragmented tracks with and without the second pass at several detector confidence thresholds. Tabulate the results and write one paragraph explaining the regime in which the low-confidence pass helps most, and the regime in which it could hurt by associating genuine false positives. Connect the trade to the precision-recall thinking of <a href="../module-23-object-detection/index.html">Chapter 23</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.4.html">&#8592; Section 26.4: Deep Optical Flow: RAFT &amp; Beyond</a>
+<a href="index.html">Chapter 26</a>
+<a class="next" href="../module-27-depth-3d-neural-scenes/index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

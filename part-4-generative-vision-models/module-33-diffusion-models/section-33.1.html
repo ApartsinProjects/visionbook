@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.1: Destroying &amp; Rebuilding. The forward noising process with no learnable parameters, the closed-form jump to any noise level, and the learned reverse process that walks pure static back into an image, built from scratch in PyTorch with a small trainable denoiser." name="description"/>
+<title>Section 33.1: Destroying &amp; Rebuilding | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Destroying &amp; Rebuilding: The Forward &amp; Reverse Processes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Anyone can ruin a picture. The trick is ruining it so gently, and so predictably, that ruin becomes a road map back."</p>
+<cite>A Gaussian Noise Sample With a Plan</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Diffusion turns generation into denoising by defining two processes: a fixed forward process that drowns a real image in Gaussian noise over many small steps, and a learned reverse process that removes one step of noise at a time, so that running it from pure static produces a fresh sample.</strong> The forward process has no parameters to learn; it is a known schedule of noise injection, and its single most useful property is that you can jump from a clean image to any noise level in one shot with a closed-form formula. That shortcut is what makes training feasible: instead of simulating hundreds of steps, you sample a random step, corrupt the image to that level instantly, and train a network to predict the noise you added. This section builds both processes from the ground up and trains a small denoiser end to end on a toy dataset.</p>
+</div>
+
+<p>
+In the previous chapters you built single-pass generators: the <a href="../module-31-autoencoders-vaes/index.html">VAE decoder</a> and the <a href="../module-32-gans/index.html">GAN generator</a> each map a latent vector to an image in one forward call. Diffusion takes the opposite stance. It says that producing a good image in one step is hard, but removing a little noise from a slightly-noisy image is easy, and if you can do the easy thing reliably you can chain it into the hard thing. The plan for this section is to make that precise. We define the corruption, the forward process, with no learning at all. We derive the algebraic trick that lets us skip ahead to any noise level instantly. Then we set up the reverse process as a learned denoiser and train a working one on a two-dimensional toy distribution so you can watch noise turn into structure.
+</p>
+
+<h2>1. The Forward Process: Gradual Destruction <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Start with a clean data sample $x_0$, drawn from the data distribution we eventually want to model. The forward process defines a sequence of increasingly noisy versions $x_1, x_2, \dots, x_T$ by adding a small amount of Gaussian noise at each step. Concretely, each step takes the previous image, shrinks it slightly toward zero, and adds fresh noise:
+</p>
+
+<div class="math-block">
+$$q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(x_t;\ \sqrt{1 - \beta_t}\, x_{t-1},\ \beta_t \mathbf{I}\right)$$
+</div>
+
+<p>
+Here $\beta_t \in (0, 1)$ is the <strong>variance schedule</strong>, a small number (often growing from about $10^{-4}$ to $0.02$ across $T = 1000$ steps) that controls how much noise enters at step $t$. The mean is scaled by $\sqrt{1 - \beta_t}$ so that the signal shrinks at exactly the rate needed to keep the total variance bounded as noise accumulates; without that scaling the values would blow up. After enough steps, the original signal has been almost entirely replaced by noise, and $x_T$ is essentially a sample from a standard Gaussian, carrying no information about $x_0$ at all. This destruction is the same Gaussian-noise corruption you studied as a degradation to be removed in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>; here we add it on purpose. Figure 33.1.1 shows the whole pipeline as a chain of corruptions running one way and learned denoising running back.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Forward process adds noise left to right turning a clean image into static; reverse process denoises right to left">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10.5px sans-serif;fill:#555;}
+.dclean{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.dmid{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.dnoise{fill:#efe9e4;stroke:#8a7a6a;stroke-width:1.5;}
+.dfwd{stroke:#d6802b;stroke-width:1.7;marker-end:url(#dah);fill:none;}
+.drev{stroke:#2f9e5c;stroke-width:1.7;marker-end:url(#dahg);fill:none;}
+</style>
+<defs>
+<marker id="dah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#d6802b"/></marker>
+<marker id="dahg" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+</defs>
+<rect class="dclean" x="20" y="95" width="60" height="60"/>
+<text class="dl" x="50" y="172" text-anchor="middle">x_0</text>
+<text class="ds" x="50" y="187" text-anchor="middle">clean</text>
+<rect class="dmid" x="200" y="95" width="60" height="60"/>
+<text class="dl" x="230" y="172" text-anchor="middle">x_t-1</text>
+<rect class="dmid" x="380" y="95" width="60" height="60"/>
+<text class="dl" x="410" y="172" text-anchor="middle">x_t</text>
+<rect class="dnoise" x="630" y="95" width="60" height="60"/>
+<text class="dl" x="660" y="172" text-anchor="middle">x_T</text>
+<text class="ds" x="660" y="187" text-anchor="middle">pure noise</text>
+<text class="ds" x="140" y="118" text-anchor="middle">. . .</text>
+<text class="ds" x="535" y="118" text-anchor="middle">. . .</text>
+<line class="dfwd" x1="82" y1="110" x2="198" y2="110"/>
+<line class="dfwd" x1="262" y1="110" x2="378" y2="110"/>
+<line class="dfwd" x1="442" y1="110" x2="628" y2="110"/>
+<line class="drev" x1="198" y1="140" x2="82" y2="140"/>
+<line class="drev" x1="378" y1="140" x2="262" y2="140"/>
+<line class="drev" x1="628" y1="140" x2="442" y2="140"/>
+<text class="dl" x="360" y="40" text-anchor="middle" fill="#d6802b">forward q: add noise (fixed)</text>
+<text class="dl" x="360" y="220" text-anchor="middle" fill="#2f9e5c">reverse p_theta: denoise (learned)</text>
+</svg>
+<figcaption><strong>Figure 33.1.1:</strong> The two processes of a diffusion model. The forward process $q$ (orange, left to right) adds a small amount of Gaussian noise at each of $T$ steps until the clean image $x_0$ becomes pure static $x_T$; it has no learnable parameters. The reverse process $p_\theta$ (green, right to left) is a trained network that removes one step of noise at a time, so that starting from static and running it backward produces a new sample.</figcaption>
+</figure>
+
+<p>
+Because each step only depends on the one before it, the forward process is a <strong>Markov chain</strong>. The code below applies one forward step to a batch of images, and we use it to visualize the corruption progressing.
+</p>
+
+<pre><code class="language-python">import torch
+
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)   # linear variance schedule
+
+def forward_step(x_prev, t):
+    """One forward noising step q(x_t | x_{t-1})."""
+    beta_t = betas[t]
+    mean = (1.0 - beta_t).sqrt() * x_prev       # shrink the signal slightly
+    noise = torch.randn_like(x_prev)            # fresh Gaussian noise
+    return mean + beta_t.sqrt() * noise         # reparameterized sample
+
+x0 = torch.zeros(1, 1, 8, 8)                    # a toy "image": all zeros
+x0[..., 2:6, 2:6] = 1.0                         # a bright square in the middle
+x = x0.clone()
+for t in range(T):
+    x = forward_step(x, t)
+print("variance of x_T:", x.var().item())      # ~1.0: the signal is gone</code></pre>
+<div class="code-caption">Iterating the single-step forward process for all $T$ steps. By $x_T$ the bright square is gone and the variance has settled near one, the hallmark of a standard Gaussian. Note that nothing here is learned.</div>
+
+<h2>2. The Closed-Form Shortcut: Jump to Any Noise Level <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Running the chain one step at a time, as in the loop above, is fine for visualization but disastrous for training: to corrupt an image to step 700 you would simulate 700 steps. The decisive insight of the forward process is that you do not have to. Because each step is a linear Gaussian, the composition of many steps is also a single Gaussian, and you can write $x_t$ directly in terms of $x_0$. Define $\alpha_t = 1 - \beta_t$ and the cumulative product $\bar{\alpha}_t = \prod_{s=1}^{t} \alpha_s$. Then
+</p>
+
+<div class="math-block">
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(x_t;\ \sqrt{\bar{\alpha}_t}\, x_0,\ (1 - \bar{\alpha}_t)\mathbf{I}\right), \qquad x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I}).$$
+</div>
+
+<p>
+Read the right-hand equation carefully, because it is the single most important formula in this chapter. To get a noisy image at <em>any</em> step $t$, you take the clean image, scale it by $\sqrt{\bar{\alpha}_t}$, and add scaled noise $\epsilon$, all in one operation. The factor $\bar{\alpha}_t$ runs from near one (almost no noise) at $t = 0$ down to near zero (almost all noise) at $t = T$, so it is a clean dial on the signal-to-noise ratio. The noise $\epsilon$ is the exact thing we will train the network to predict, which is why we have written it as a single drawn variable rather than a sum of per-step noises.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why the Closed Form Changes Everything</div>
+<p>
+Without the closed form, computing a training target at step $t$ would cost $t$ sequential forward steps, and training on $T = 1000$ steps would be hopelessly slow. With it, every training iteration is: pick a random $t$, draw one $\epsilon$, build $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ in a single line, and ask the network "what was $\epsilon$?" The forward chain is never actually simulated during training. This is the difference between a clever idea and a usable one.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+
+betas = torch.linspace(1e-4, 0.02, 1000)
+alphas = 1.0 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)        # cumulative product
+
+def q_sample(x0, t, noise=None):
+    """Jump directly to x_t with the closed form. t is a (B,) long tensor."""
+    if noise is None:
+        noise = torch.randn_like(x0)
+    ab = alpha_bars[t].view(-1, 1, 1, 1)          # broadcast over image dims
+    return ab.sqrt() * x0 + (1.0 - ab).sqrt() * noise, noise
+
+x0 = torch.rand(4, 1, 8, 8)                        # batch of 4 toy images
+t = torch.tensor([10, 250, 600, 999])             # four different noise levels
+xt, eps = q_sample(x0, t)
+print(xt.shape, eps.shape)                         # torch.Size([4, 1, 8, 8]) twice</code></pre>
+<div class="code-caption">The closed-form sampler <code>q_sample</code> corrupts a whole batch to four different noise levels in one vectorized call, returning both the noisy images and the noise that produced them. This three-line function is the entire data pipeline for diffusion training.</div>
+
+<h2>3. The Reverse Process: Learned Reconstruction <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The forward process is fixed; all the modeling effort goes into reversing it. We want $q(x_{t-1} \mid x_t)$, the distribution of the slightly-less-noisy image given the noisier one. This true reverse is intractable because it depends on the whole data distribution, but a remarkable fact rescues us: when the per-step noise $\beta_t$ is small, the true reverse step is itself approximately Gaussian. So we approximate it with a learned Gaussian whose mean is produced by a neural network $\theta$ and whose variance we usually fix to a known schedule:
+</p>
+
+<div class="math-block">
+$$p_\theta(x_{t-1} \mid x_t) = \mathcal{N}\!\left(x_{t-1};\ \mu_\theta(x_t, t),\ \sigma_t^2 \mathbf{I}\right).$$
+</div>
+
+<p>
+What should the network actually output? Although it is the mean $\mu_\theta$ that the reverse step needs, it turns out to be far easier and more stable to train the network to predict the noise $\epsilon$ that was added in the forward step, then derive the mean from it algebraically. We will justify this <strong>noise-prediction</strong> choice fully in <a href="section-33.2.html">Section 33.2</a> when we work through the parameterizations; for now, accept it as the empirical winner. The network $\epsilon_\theta(x_t, t)$ takes the noisy image and the step index and outputs an estimate of the noise. The reverse step then computes the mean as
+</p>
+
+<div class="math-block">
+$$\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}}\, \epsilon_\theta(x_t, t)\right).$$
+</div>
+
+<p>
+Intuitively, this subtracts the predicted noise from the current image (rescaled appropriately) and adds a touch of fresh noise via $\sigma_t$ to keep the chain stochastic. The training objective is then almost embarrassingly simple: corrupt an image with known noise, ask the network to predict that noise, and minimize the squared error. Because diffusion runs the same network at every step, the denoiser is a single, time-conditioned model rather than a generator and a critic; there is no adversary and no balance to maintain, which is exactly why diffusion training is so much more stable than the GAN training of <a href="../module-32-gans/index.html">Chapter 32</a>.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The reason the reverse step can be Gaussian at all is a theorem from nonequilibrium thermodynamics: if a forward diffusion takes small enough steps, the reverse diffusion has the same functional form. The 2015 paper that introduced these models was literally titled "Deep Unsupervised Learning using Nonequilibrium Thermodynamics," and it sat largely ignored for five years until the 2020 DDPM paper showed the idea could beat GANs. Sometimes the field needs a while to notice a good thing.</p>
+</div>
+
+<h2>4. Training a Denoiser From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Let us assemble the pieces into a working training loop. We will use a tiny two-dimensional dataset, points arranged in two crescent moons, so that the "image" is just a 2-vector and the denoiser is a small multilayer perceptron. This strips away the U-Net machinery and lets you see the diffusion logic in fifty lines. The network takes the noisy point and the timestep (embedded as a couple of sinusoidal features) and predicts the noise. The training step uses exactly the closed-form sampler from subsection 2.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+T = 200
+betas = torch.linspace(1e-4, 0.02, T)
+alphas = 1.0 - betas
+alpha_bars = torch.cumprod(alphas, dim=0)
+
+def time_embed(t, dim=16):
+    """Sinusoidal timestep embedding, like positional encoding for time."""
+    half = dim // 2
+    freqs = torch.exp(-torch.arange(half) * (8.0 / half))
+    args = t[:, None].float() * freqs[None, :]
+    return torch.cat([args.sin(), args.cos()], dim=-1)   # (B, dim)
+
+class Denoiser(nn.Module):
+    def __init__(self, data_dim=2, hidden=128, tdim=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(data_dim + tdim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, data_dim))            # predicts epsilon
+    def forward(self, x, t):
+        h = torch.cat([x, time_embed(t)], dim=-1)
+        return self.net(h)
+
+model = Denoiser()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+def make_moons(n):                                  # toy 2D data, no sklearn needed
+    theta = torch.rand(n) * 3.14159
+    top = torch.stack([theta.cos(), theta.sin()], 1)
+    bot = torch.stack([1 - theta.cos(), 0.5 - theta.sin()], 1)
+    pts = torch.where((torch.rand(n, 1) < 0.5), top, bot)
+    return (pts + 0.03 * torch.randn(n, 2)) * 1.5
+
+for step in range(3000):
+    x0 = make_moons(256)
+    t = torch.randint(0, T, (256,))                 # random step per sample
+    ab = alpha_bars[t].unsqueeze(1)
+    noise = torch.randn_like(x0)
+    xt = ab.sqrt() * x0 + (1 - ab).sqrt() * noise   # closed-form corruption
+    pred = model(xt, t)
+    loss = ((pred - noise) ** 2).mean()             # predict the noise
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 1000 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f}")</code></pre>
+<div class="code-caption">A complete diffusion training loop on a 2D crescent-moons dataset. Each iteration draws a random timestep, corrupts the points with the closed form, and trains the MLP to predict the injected noise. Expected output shows the loss falling from roughly 1.0 to about 0.3 as the denoiser learns.</div>
+
+<p>
+Once trained, sampling runs the reverse chain: start from a pure-noise point and repeatedly apply the reverse step using the mean formula from subsection 3. The loop below generates new samples that fall on the two moons, the distribution it never saw directly but only through corrupted views.
+</p>
+
+<pre><code class="language-python">@torch.no_grad()
+def sample(model, n=512):
+    x = torch.randn(n, 2)                            # start from pure noise
+    for t in reversed(range(T)):
+        tt = torch.full((n,), t, dtype=torch.long)
+        eps = model(x, tt)                           # predicted noise
+        a, ab, b = alphas[t], alpha_bars[t], betas[t]
+        mean = (x - b / (1 - ab).sqrt() * eps) / a.sqrt()
+        x = mean + (b.sqrt() * torch.randn_like(x) if t > 0 else 0.0)
+    return x
+
+samples = sample(model)
+print("generated mean:", samples.mean(0))            # near the data's center</code></pre>
+<div class="code-caption">Ancestral sampling from the trained denoiser. Starting from Gaussian noise, the loop denoises step by step down to $t=0$; the final points reconstruct the crescent-moons distribution. Plot <code>samples</code> with matplotlib to see the two arcs emerge from static.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: diffusers Schedulers</div>
+<p>The from-scratch schedule and reverse step above are roughly forty lines of careful bookkeeping over $\alpha_t$, $\bar\alpha_t$, and $\beta_t$. The Hugging Face <code>diffusers</code> library packages all of it into a scheduler object: <code>DDPMScheduler(num_train_timesteps=1000)</code> exposes <code>add_noise(x0, noise, t)</code> (the closed-form corruption of subsection 2) and <code>step(model_output, t, x_t)</code> (the reverse step of subsection 3) as two method calls. Switching your training loop to it is a three-line change, and it handles the linear and cosine schedules, the variance choices, and the numerical edge cases at $t=0$ that are easy to get wrong by hand. The library internally maintains the precomputed $\sqrt{\bar\alpha_t}$ and $\sqrt{1-\bar\alpha_t}$ buffers so you never index a schedule incorrectly. Build it once from scratch to understand it; use the scheduler in production.</p>
+</div>
+
+<h2>5. Why Many Small Steps Beat One Big Step <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A natural objection is: if the network can predict the noise, why not predict all of it at once and jump straight from $x_T$ to $x_0$? The answer is that the noise-prediction task is only easy <em>locally</em>. At high noise levels the network can recover the coarse layout of an image (is it a face or a landscape) but cannot resolve fine detail, because the detail has been destroyed. At low noise levels the coarse structure is already present and the network only needs to sharpen edges and textures. By taking many steps, the model solves a sequence of easy problems, coarse structure first, then progressively finer detail, rather than one impossibly hard one. This coarse-to-fine emergence is the same multi-scale logic as the <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">image pyramids of Chapter 4</a>, now unrolled over time instead of resolution.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Defect-Inspection Team Picks Diffusion Over a GAN</div>
+<p><strong>Who:</strong> a three-engineer machine-vision group at a circuit-board manufacturer, late 2023. <strong>Situation:</strong> they needed synthetic images of rare solder defects to augment a tiny real dataset for a downstream <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">defect detector</a>. <strong>Problem:</strong> their first attempt used a GAN, but with only a few hundred real defect crops the GAN collapsed, producing the same three plausible-looking defects over and over, exactly the mode collapse warned about in <a href="../module-32-gans/index.html">Chapter 32</a>. The detector trained on those images learned nothing new. <strong>Decision:</strong> they switched to a small DDPM, accepting the slower sampling because they only needed to generate offline. The noise-prediction objective has no adversary to collapse, so even on a few hundred images the model covered the full variety of the defect distribution. <strong>Result:</strong> the diffusion-augmented detector's recall on held-out rare defects rose by a wide margin over the GAN-augmented one, and the team never saw mode collapse again. <strong>Lesson:</strong> when training stability and distribution coverage matter more than sampling speed, the stable single-objective training of diffusion is often the safer bet, and offline generation hides the speed cost entirely.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: How Few Steps Can You Get Away With?</div>
+<p>The "many small steps" argument explains why early diffusion models used hundreds to a thousand sampling steps, which is slow. The entire arc of <a href="section-33.4.html">Section 33.4</a> and <a href="section-33.5.html">Section 33.5</a> is about beating that. DDIM (Song et al., 2021) cut steps to roughly 20 to 50 by making the reverse deterministic; consistency models (Song et al., 2023, arXiv:2303.01469) pushed toward a single step by training the network to jump directly to the endpoint of a trajectory. By 2024, distillation methods such as Latent Consistency Models and the adversarial-distillation SDXL-Turbo and SD3-Turbo families produced near-real-time generation in one to four steps, and the rectified-flow training in Stable Diffusion 3 (Esser et al., 2024, arXiv:2403.03206) straightened the path so that fewer steps lose less quality. The frame to keep is that the many-steps formulation here is the pedagogically clean starting point; production systems aggressively compress it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.1.1: Reading the Signal-to-Noise Dial <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the closed form $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$, explain in two or three sentences what $\bar\alpha_t$ controls and why it must decrease monotonically from near one to near zero as $t$ grows. Then, for the linear schedule with $\beta_t$ from $10^{-4}$ to $0.02$ over $T=1000$, reason qualitatively about whether $\bar\alpha_t$ falls faster early or late in the schedule, and connect your answer to the claim in subsection 5 that the network learns coarse structure first.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.1.2: Visualize the Corruption <span class="exercise-type coding">Coding</span></div>
+<p>Load a single grayscale image (any 64x64 photo). Using <code>q_sample</code> from subsection 2, generate and display the noisy versions at $t \in \{0, 50, 200, 500, 999\}$ in a row with <code>matplotlib</code>. Confirm visually that recognizable structure survives at $t=200$ but is essentially gone by $t=999$. Then overlay the empirical variance of each noisy image and check that it climbs toward one, matching the theory.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.1.3: Does Step Count Matter? <span class="exercise-type analysis">Analysis</span></div>
+<p>Take the trained moons denoiser from subsection 4 and modify the sampling loop to take only every $k$-th step (so $T/k$ total steps) by skipping intermediate indices, naively rescaling the reverse step. Run $k = 1, 2, 5, 20$ and plot the generated points each time. Describe how sample quality degrades as you skip more steps, and explain in one paragraph why this naive skipping hurts, foreshadowing why the DDIM sampler of <a href="section-33.4.html">Section 33.4</a> needs a more careful update rule than just dropping steps.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 33 Index</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.2.html">Section 33.2: DDPM &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

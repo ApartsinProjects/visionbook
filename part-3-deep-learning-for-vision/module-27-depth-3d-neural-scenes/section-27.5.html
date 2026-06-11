@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.5: 3D Gaussian Splatting. Modeling a scene as millions of colored anisotropic 3D Gaussians rendered by differentiable rasterization at real-time rates: the Gaussian parameters, alpha-blended splatting, adaptive densification, and why splatting overtook NeRF." name="description"/>
+<title>Section 27.5: 3D Gaussian Splatting | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>3D Gaussian Splatting</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"NeRF asked a neural network a million questions to paint one frame. I just throw a few million colored marshmallows at the screen and let them blur into a photograph. Crude? Perhaps. But I render before you finish blinking."</p>
+<cite>A Cloud of Translucent Blobs That Insists It Is a Cathedral</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>3D Gaussian splatting represents a scene as millions of small, colored, oriented translucent blobs and renders an image by projecting each blob onto the screen and alpha-blending them, a process so simple that a GPU can rasterize it at hundreds of frames per second.</strong> Where NeRF asked a network about every point along every ray, splatting stores the scene explicitly as a set of 3D Gaussians, each carrying a position, a shape, a color, and an opacity, and optimizes those parameters directly against the photographs. It keeps NeRF's photorealism and differentiable training while discarding the per-ray network query that made NeRF slow. This section explains what a 3D Gaussian is and why it is the right primitive, how splatting renders and trains, the adaptive densification that grows detail where it is needed, and why this point-based representation overtook NeRF for many tasks within a year of its 2023 debut.</p>
+</div>
+
+<p>
+<a href="section-27.4.html">Section 27.4</a> ended on NeRF's central weakness: photorealistic, but slow, because every pixel costs dozens of network evaluations. The 2023 paper of Kerbl and colleagues found a way to keep the quality and the differentiable training while replacing the implicit network with an explicit, renderable structure. In a sense, splatting is the colored point cloud of <a href="section-27.2.html">Section 27.2</a> made differentiable, given shape and opacity, and rasterized rather than ray-marched. It is worth seeing how the same view-synthesis problem yields such a different solution.
+</p>
+
+<h2>1. The Primitive: An Anisotropic 3D Gaussian <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The scene is a collection of 3D Gaussians. Each one is a soft, ellipsoidal blob of color described by a small set of optimizable parameters: a <strong>center</strong> $\mu \in \mathbb{R}^3$ (where it sits), a <strong>covariance</strong> $\Sigma$ (its size and orientation, so it can be a sphere or a stretched ellipsoid), an <strong>opacity</strong> $\alpha$ (how solid it is), and a <strong>color</strong>, stored as spherical-harmonic coefficients so the color can vary with viewing direction (the same view-dependence NeRF achieved with the direction input). The density of one Gaussian at a point $x$ is
+</p>
+
+<div class="math-block">
+$$G(x) = \exp\!\Big(-\tfrac{1}{2}(x - \mu)^\top \Sigma^{-1} (x - \mu)\Big)$$
+</div>
+
+<p>
+A spherical Gaussian would be a fuzzy ball; the <em>anisotropic</em> covariance lets each blob stretch along a surface, so a flat wall can be tiled by a few wide, thin ellipsoids rather than many round ones. To keep $\Sigma$ a valid covariance during gradient descent, it is factored as $\Sigma = R S S^\top R^\top$ with a rotation $R$ (stored as a quaternion) and a diagonal scale $S$, so the optimizer adjusts an orientation and three axis lengths rather than a raw matrix that could drift to something non-physical. A scene needs on the order of one to several million such Gaussians.
+</p>
+
+<h2>2. Rendering by Splatting: Project, Sort, Blend <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Rendering does not march rays. Instead, each 3D Gaussian is <strong>projected</strong> ("splatted") onto the image plane, where it becomes a 2D Gaussian footprint, a soft ellipse, using the same camera projection of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. The Gaussians are sorted by depth, and for each pixel the overlapping splats are blended front to back with exactly the alpha-compositing equation you met in NeRF:
+</p>
+
+<div class="math-block">
+$$C = \sum_{i} c_i\, \alpha_i \prod_{j<i} (1 - \alpha_j)$$
+</div>
+
+<p>
+where $\alpha_i$ is the projected Gaussian's opacity at that pixel (its stored opacity times its 2D footprint value) and $c_i$ is its color. This is the discrete volume rendering of <a href="section-27.4.html">Section 27.4</a> with the integral replaced by a sorted sum over splats, and it is the operation GPUs are built to do fast. Figure 27.5.1 contrasts the two rendering models. Because projection, sorting, and blending are all differentiable, the photometric loss flows back into every Gaussian's position, shape, color, and opacity, and the whole cloud is optimized by gradient descent just like a NeRF, but with no network in the inner loop.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="NeRF versus Gaussian splatting rendering: NeRF marches rays and queries an MLP per sample, splatting projects explicit Gaussians and blends them">
+<style>
+.gl{font:12px sans-serif;fill:#1a1a1a;}
+.gs{font:10px sans-serif;fill:#555;}
+.gpanel{fill:#fafafa;stroke:#ccc;stroke-width:1;}
+.gray{stroke:#777;stroke-width:1.3;}
+.gmlp{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.gell{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.3;opacity:0.8;}
+.gscreen{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+</style>
+<rect class="gpanel" x="10" y="14" width="340" height="220"/>
+<text class="gl" x="180" y="34" text-anchor="middle">NeRF: ray march + MLP query</text>
+<polygon class="gscreen" points="40,110 40,150 70,130"/>
+<line class="gray" x1="70" y1="130" x2="300" y2="130"/>
+<circle cx="120" cy="130" r="4" fill="#2f9e5c"/><circle cx="160" cy="130" r="4" fill="#2f9e5c"/>
+<circle cx="200" cy="130" r="4" fill="#2f9e5c"/><circle cx="240" cy="130" r="4" fill="#2f9e5c"/>
+<rect class="gmlp" x="120" y="170" width="180" height="34"/>
+<text class="gs" x="210" y="192" text-anchor="middle">MLP queried at every sample (slow)</text>
+<line class="gray" x1="200" y1="134" x2="200" y2="170" stroke="#8e44ad"/>
+<rect class="gpanel" x="370" y="14" width="340" height="220"/>
+<text class="gl" x="540" y="34" text-anchor="middle">Splatting: project + blend</text>
+<ellipse class="gell" cx="450" cy="90" rx="26" ry="12" transform="rotate(20 450 90)"/>
+<ellipse class="gell" cx="490" cy="130" rx="22" ry="14" fill="#cfe8d8"/>
+<ellipse class="gell" cx="455" cy="155" rx="30" ry="10" transform="rotate(-15 455 155)"/>
+<ellipse class="gell" cx="505" cy="95" rx="18" ry="16" fill="#cfe8d8"/>
+<rect class="gscreen" x="600" y="70" width="14" height="110"/>
+<text class="gs" x="607" y="200" text-anchor="middle">screen</text>
+<line class="gray" x1="476" y1="100" x2="600" y2="100"/>
+<line class="gray" x1="476" y1="150" x2="600" y2="150"/>
+<text class="gs" x="500" y="205" text-anchor="middle">explicit Gaussians, no MLP (fast)</text>
+</svg>
+<figcaption><strong>Figure 27.5.1:</strong> Two ways to render a radiance field. NeRF (left) marches a ray and evaluates an MLP at every sample, so each pixel costs dozens of network passes. Gaussian splatting (right) projects each explicit 3D Gaussian onto the screen and alpha-blends the overlapping footprints, a rasterization the GPU does in hardware, which is why splatting renders in real time while matching NeRF's quality.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Same Loss, a Different Representation</div>
+<p>NeRF and splatting solve an identical optimization problem, minimize the photometric error between rendered and observed pixels over a set of posed images, with an identical rendering principle, front-to-back alpha compositing. They differ only in <em>what is optimized</em>: NeRF optimizes the weights of a network that is queried per point; splatting optimizes the explicit parameters of a few million Gaussians that are projected and blended. The lesson is that the representation and the renderer are separable design choices, and choosing an explicit, rasterizable primitive over an implicit, ray-queried one trades a little memory for one to two orders of magnitude in rendering speed. This is the recurring "differentiable forward model" recipe from Section 27.4 applied to rasterization instead of ray marching.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Pointillism at Three Hundred Frames per Second</div>
+<p>Seurat spent two years dabbing tiny dots onto one canvas so that, from across the room, they fused into a Sunday afternoon. Gaussian splatting does the same thing with a few million translucent ellipsoids, except it dabs them all at once, sixty times a second, and lets gradient descent pick the colors. Stand too close and the cathedral dissolves into a haze of fuzzy marshmallows; step back and it snaps into a photograph. The whole representation is a bet that, given enough blobs, blur is just detail you have not stepped far enough away from.</p>
+</div>
+
+<h2>3. Adaptive Densification: Growing Detail Where It Is Needed <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A fixed set of Gaussians cannot represent a scene well everywhere: smooth regions need few, intricate regions need many, and you do not know the right distribution in advance. Splatting solves this with <strong>adaptive density control</strong> interleaved with optimization. Initialized from the sparse point cloud that COLMAP produces (the same structure-from-motion output NeRF consumed, from <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>), the optimizer periodically inspects the gradients. Gaussians with large position gradients sit in under-reconstructed, high-detail regions and are <strong>densified</strong>: small ones are <em>cloned</em> to add coverage, large ones are <em>split</em> into two smaller ones to add resolution. Gaussians whose opacity has decayed near zero are <strong>pruned</strong>. Over training the cloud grows from the sparse COLMAP seed (often a few thousand points) to millions of well-placed Gaussians, concentrating capacity exactly where the photographs demand it. The pseudocode below sketches the optimization loop with this density control.
+</p>
+
+<pre><code class="language-python">def train_gaussian_splat(gaussians, cameras, images, iters=30000):
+    """Optimize explicit Gaussians against posed images with adaptive densification."""
+    optim = make_optimizer(gaussians)   # per-attribute learning rates (pos, scale, color...)
+    for step in range(iters):
+        cam, target = sample_view(cameras, images)
+        rendered = rasterize(gaussians, cam)            # project + sort + alpha-blend (subsec 2)
+        loss = l1(rendered, target) + ssim_term(rendered, target)  # photometric loss
+        loss.backward()
+        if step % 100 == 0 and step < 15000:
+            densify(gaussians, grad_threshold=2e-4)     # clone/split high-gradient Gaussians
+            prune(gaussians, min_opacity=0.005)         # remove near-transparent Gaussians
+        optim.step(); optim.zero_grad()
+    return gaussians   # a few million optimized 3D Gaussians, render-ready in real time</code></pre>
+<div class="code-caption">The Gaussian-splatting optimization loop. The renderer is a differentiable rasterizer, not a network; the periodic <code>densify</code> and <code>prune</code> calls grow Gaussians in under-reconstructed regions and delete transparent ones, so the model allocates capacity adaptively rather than using a fixed grid.</div>
+
+<p>
+The training objective is a blend of an L1 pixel loss and a structural-similarity (SSIM) term, the same SSIM metric introduced back in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> for measuring image quality, here repurposed as a training loss because it captures perceptual structure better than pixel error alone.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: An AR Furniture App Switches From NeRF to Splatting</div>
+<p><strong>Who:</strong> an augmented-reality team at a furniture retailer, 2024, letting customers scan their room and place virtual products inside a photorealistic reconstruction. <strong>Situation:</strong> their v1 used a NeRF backend; reconstructions looked great on a workstation. <strong>Problem:</strong> rendering the NeRF on a phone ran at two or three frames per second, far below the 30+ needed for a smooth AR experience, and the per-ray MLP query drained the battery and overheated the device. <strong>Decision:</strong> they migrated to 3D Gaussian splatting, training the splat in the cloud from the customer's scan and shipping the explicit Gaussian cloud to the phone, where a lightweight rasterizer renders it. <strong>Result:</strong> the same scan now rendered at 60 frames per second on mid-range phones, with comparable visual quality, because rasterizing explicit Gaussians is something mobile GPUs already do well. <strong>Lesson:</strong> when real-time rendering on constrained hardware is the requirement, the explicit, rasterizable representation wins decisively over the implicit one; the choice of scene representation is also a deployment decision, which is exactly the concern of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Splatfacto in Nerfstudio Trains a Splat in One Command</div>
+<p>The differentiable rasterizer, the spherical-harmonic color, the quaternion-scale covariance, and the densification schedule are all delicate to implement (the original release shipped a custom CUDA rasterizer). Nerfstudio's <code>splatfacto</code> wraps the whole method behind the same interface as its NeRF, so the only change from <a href="section-27.4.html">Section 27.4</a> is the model name:</p>
+<pre><code class="language-python"># Shell, after ns-process-data has recovered poses (same as the NeRF flow):
+#   ns-train splatfacto --data ./my_capture
+# Then export the optimized Gaussians to a standard .ply for use in a web/mobile viewer:
+#   ns-export gaussian-splat --load-config ./outputs/.../config.yml --output-dir ./splat</code></pre>
+<p>This replaces hundreds of lines of CUDA and Python (rasterization, sorting, densification, spherical harmonics) and exports to the interchange <code>.ply</code> that browser viewers and game engines consume. The gsplat library underneath is the maintained, differentiable rasterizer the whole ecosystem now builds on.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Dynamic, Compressed, and Mesh-Extracting Splats (2024-2026)</div>
+<p>Gaussian splatting moved faster than almost any recent vision idea. <strong>Dynamic splatting</strong> (4D Gaussian Splatting, Deformable 3DGS, 2024) adds a time dimension so the Gaussians move, capturing video and moving scenes, the spatiotemporal analogue of <a href="../module-26-video-understanding/index.html">Chapter 26</a>. <strong>Compression</strong> is active because a raw splat can be hundreds of megabytes; methods like Scaffold-GS, Compact-3DGS, and the 2024-2025 vector-quantized variants shrink scenes by 10 to 30 times for streaming. <strong>Mesh extraction</strong> (SuGaR, 2D Gaussian Splatting, 2024) recovers a clean triangle mesh from the splat, bridging back to the explicit surface of <a href="section-27.2.html">Section 27.2</a> for use in standard graphics pipelines. And <strong>generative splatting</strong> closes the loop with Part IV: models such as DreamGaussian and the 2024-2025 large Gaussian reconstruction models predict a full splat from text or a single image in seconds, the representation behind much of the 3D generation in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
+</div>
+
+<p>
+We now have two production-grade ways to turn photographs into a renderable 3D scene: the implicit radiance field of <a href="section-27.4.html">Section 27.4</a> and the explicit Gaussian splat of this section. Both, crucially, depend on camera poses, sensible captures, and careful cleanup, and both fail in ways that no paper figure shows. The final section steps back from the methods to the workflow that ties them together in practice. That is <a href="section-27.6.html">Section 27.6</a>.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.5.1: Splatting Is NeRF's Rendering, Rearranged <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Write down the discrete volume rendering equation from <a href="section-27.4.html">Section 27.4</a> and the alpha-compositing equation from subsection 2 of this section side by side. Identify which terms correspond, the per-sample opacity versus the per-splat opacity, the transmittance product, the color sum, and explain in a short paragraph the single structural difference: NeRF integrates over ordered samples along one ray, splatting sums over depth-sorted projected Gaussians at one pixel. Why does the second formulation map so much better onto GPU rasterization hardware?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.5.2: Train and Inspect a Splat <span class="exercise-type coding">Coding</span></div>
+<p>Using Nerfstudio's <code>splatfacto</code> on a capture of your own (or a provided dataset), train a Gaussian splat and export it to <code>.ply</code>. Load the <code>.ply</code> and report: the final number of Gaussians, the distribution of their scales (are most small or large?), and the opacity histogram. Then re-train with densification disabled (fix the Gaussian count to the initial COLMAP seed) and compare the rendered quality. Write two sentences explaining what densification bought you, referencing the high-detail regions of subsection 3.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.5.3: Memory and Speed Trade-offs <span class="exercise-type analysis">Analysis</span></div>
+<p>A splat stores per Gaussian: position (3 floats), scale (3), rotation quaternion (4), opacity (1), and color as spherical harmonics of degree 3 (48 floats for RGB). Compute the memory for a 2-million-Gaussian scene at 4 bytes per float. Compare this to a NeRF MLP of roughly 1 million parameters. Then explain the apparent paradox: splatting uses far more memory yet renders far faster than NeRF. Connect your answer to the per-ray network query of <a href="section-27.4.html">Section 27.4</a> and to the deployment trade-off in the AR furniture story, and note one situation where NeRF's smaller footprint would still be preferable.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.4.html">&#8592; Section 27.4: NeRF: Neural Radiance Fields</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="section-27.6.html">Section 27.6: Capture-to-Render Pipelines in Practice &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

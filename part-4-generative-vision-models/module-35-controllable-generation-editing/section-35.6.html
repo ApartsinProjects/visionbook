@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.6: Composing Multi-Step Editing Workflows. Chaining segmentation, spatial control, inpainting, and upscaling into a directed pipeline; managing latents and color consistency across stages; debugging where a workflow degrades by tracing each stage; and the ComfyUI node-graph tools practitioners use to author and share these pipelines." name="description"/>
+<title>Section 35.6: Composing Multi-Step Editing Workflows | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Composing Multi-Step Editing Workflows</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Segment, then control, then inpaint, then upscale, then color-match. Skip a step and you will spend the afternoon wondering why the cat has two shadows and one of them is purple."</p>
+<cite>A Pipeline That Has Learned the Order Matters</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Real production editing is rarely one model call; it is a directed pipeline of stages (segment, control, inpaint, upscale, color-match) where each stage consumes the output of the previous one, and the craft is in managing what flows between stages and finding which stage broke when the final image looks wrong.</strong> No single model does everything well: a control model fixes layout but not resolution, an inpainter edits a region but not the global color, an upscaler adds detail but cannot change content. Composing them gives a result no individual model could produce, but composition introduces its own failure modes, color drift across stages, seams between regions edited at different times, latent-versus-pixel handoff errors, and the only way to build reliable workflows is to treat the pipeline as a system you can inspect and debug stage by stage.</p>
+</div>
+
+<p>
+This chapter built a toolbox: spatial control in <a href="section-35.1.html">Section 35.1</a>, personalization in <a href="section-35.2.html">Section 35.2</a>, masked editing in <a href="section-35.3.html">Section 35.3</a>, instruction editing in <a href="section-35.4.html">Section 35.4</a>, and faithful inversion in <a href="section-35.5.html">Section 35.5</a>. This final section is about using them together. We define what a workflow graph is, work through a realistic multi-stage example in code, name the cross-stage consistency problems and how to manage them, give a debugging discipline for finding the broken stage, and end with the node-graph tools that the practitioner community uses to author and share these pipelines.
+</p>
+
+<h2>1. A Workflow Is a Directed Graph <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A multi-step edit is a directed acyclic graph: nodes are operations (a segmenter, a ControlNet generation, an inpaint, an upscaler), and edges carry data (an image, a mask, a latent, a control map). The same composability that <a href="../module-34-text-to-image/index.html">Chapter 34</a> found inside a single text-to-image system reappears at the level of whole models. Consider a common product task: take a photo of a room, replace the sofa with a different one, and deliver a clean high-resolution result. Figure 35.6.1 shows the graph.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A five-node editing workflow graph from input photo through segment, depth control, inpaint, upscale to output">
+<style>
+.g1{font:11px sans-serif;fill:#1a1a1a;}
+.g2{font:9.5px sans-serif;fill:#555;}
+.nd{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.ndi{fill:#eef0f3;stroke:#8a8f98;stroke-width:1.5;}
+.ga{stroke:#444;stroke-width:1.6;marker-end:url(#gaa);fill:none;}
+</style>
+<defs>
+<marker id="gaa" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect class="ndi" x="10" y="85" width="96" height="44"/><text class="g2" x="58" y="103" text-anchor="middle">input photo</text>
+<text class="g2" x="58" y="117" text-anchor="middle">(room)</text>
+<rect class="nd" x="142" y="85" width="96" height="44"/><text class="g2" x="190" y="103" text-anchor="middle">SAM segment</text>
+<text class="g2" x="190" y="117" text-anchor="middle">sofa mask</text>
+<rect class="nd" x="274" y="40" width="96" height="44"/><text class="g2" x="322" y="58" text-anchor="middle">depth control</text>
+<text class="g2" x="322" y="72" text-anchor="middle">(perspective)</text>
+<rect class="nd" x="274" y="130" width="96" height="44"/><text class="g2" x="322" y="148" text-anchor="middle">inpaint</text>
+<text class="g2" x="322" y="162" text-anchor="middle">new sofa</text>
+<rect class="nd" x="430" y="85" width="96" height="44"/><text class="g2" x="478" y="103" text-anchor="middle">color match</text>
+<text class="g2" x="478" y="117" text-anchor="middle">+ feather</text>
+<rect class="nd" x="562" y="85" width="96" height="44"/><text class="g2" x="610" y="103" text-anchor="middle">upscale</text>
+<text class="g2" x="610" y="117" text-anchor="middle">2x detail</text>
+<line class="ga" x1="106" y1="107" x2="140" y2="107"/>
+<path class="ga" d="M238,100 C 256,90 258,70 272,64"/>
+<line class="ga" x1="238" y1="112" x2="272" y2="148"/>
+<path class="ga" d="M370,62 C 392,72 396,90 428,100"/>
+<path class="ga" d="M370,150 C 392,138 396,118 428,112"/>
+<line class="ga" x1="526" y1="107" x2="560" y2="107"/>
+</svg>
+<figcaption><strong>Figure 35.6.1:</strong> A five-stage sofa-replacement workflow as a directed graph. SAM produces the mask, a depth ControlNet supplies correct perspective for the new sofa, the inpainter paints it into the masked region, a color-match-and-feather stage fixes the seam and tone, and an upscaler adds final resolution. Each edge carries a specific artifact (mask, depth map, edited image) to the next node.</figcaption>
+</figure>
+
+<h2>2. A Workflow in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The graph in Figure 35.6.1 is a sequence of the tools this chapter built. Written as a function, the pipeline reads top to bottom, with each stage's output named so you can inspect it. The depth map comes from a <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">monocular depth network of Chapter 27</a>, the mask from SAM, the controlled inpaint from a ControlNet inpainting pipeline, and the color match from a simple statistics transfer.
+</p>
+
+<pre><code class="language-python">import numpy as np, cv2, torch
+from PIL import Image
+
+def replace_sofa(photo, click_xy, new_prompt,
+                 segmenter, depth_model, control_inpaint, upscaler):
+    """Five-stage workflow: segment -> depth -> controlled inpaint -> color match -> upscale."""
+    img = np.asarray(photo)
+
+    # Stage 1: tight mask of the sofa from one click (Section 35.3).
+    mask = segmenter.mask_from_point(img, click_xy)
+    mask = cv2.dilate((mask * 255).astype(np.uint8), np.ones((11, 11), np.uint8))
+
+    # Stage 2: depth map for correct perspective (Chapter 27, used by ControlNet).
+    depth = depth_model(photo)                       # PIL depth image
+
+    # Stage 3: inpaint the new sofa, conditioned on depth so it sits in perspective.
+    edited = control_inpaint(prompt=new_prompt, image=photo,
+                             mask_image=Image.fromarray(mask),
+                             control_image=depth, num_inference_steps=30).images[0]
+
+    # Stage 4: match the edited region's color stats to the original, then feather.
+    edited = match_color(np.asarray(edited), img, mask)
+    edited = composite_with_feather(photo, Image.fromarray(edited),
+                                    Image.fromarray(mask), feather_px=10)
+
+    # Stage 5: upscale to delivery resolution (a diffusion or ESRGAN upscaler).
+    return upscaler(edited)
+
+def match_color(src, ref, mask):
+    """Shift the edited region's mean/std toward the original photo's, per channel."""
+    m = mask.astype(bool)
+    out = src.astype(np.float32)
+    for c in range(3):                               # align per-channel statistics
+        s, r = out[..., c][m], ref[..., c][m]
+        out[..., c][m] = (s - s.mean()) / (s.std() + 1e-6) * r.std() + r.mean()
+    return np.clip(out, 0, 255).astype(np.uint8)</code></pre>
+<div class="code-caption">The sofa-replacement workflow as one composable function. Each stage is named and produces an inspectable artifact (<code>mask</code>, <code>depth</code>, <code>edited</code>), which is exactly what makes the pipeline debuggable in subsection 4. The <code>composite_with_feather</code> helper is the one from <a href="section-35.3.html">Section 35.3</a>.</div>
+
+<h2>3. Cross-Stage Consistency <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Three consistency problems recur whenever you chain generative stages, and each has a standard remedy. <strong>Color drift</strong>: every diffusion or VAE pass shifts color and contrast slightly, so after several stages the edited region no longer matches the original photo's tone. The remedy is an explicit color-match step (the <code>match_color</code> above transfers per-channel mean and standard deviation, the histogram-statistics idea from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>), or working in latent space as long as possible and decoding once at the end. <strong>Resolution mismatch</strong>: stages often run at different resolutions (control at 512, upscale to 2048), and naive resizing blurs masks and edges; keep masks at full resolution and resize only the latents the model needs. <strong>Latent-versus-pixel handoff</strong>: passing a decoded image between stages incurs a VAE round trip each time, accumulating loss, so high-quality pipelines keep the latent across compatible stages and decode only when a stage genuinely needs pixels (such as segmentation).
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Decode Late, Mask at Full Resolution</div>
+<p>
+The two cheapest wins in any multi-stage workflow are: stay in latent space until the last possible moment (each VAE decode/encode round trip loses a little detail and shifts color, so doing it five times instead of once visibly degrades the result), and keep every mask at the original pixel resolution (downscaling a mask to the latent grid and back blurs the edit boundary into a smear). These two habits prevent the majority of "the composite looks soft and slightly off-color" complaints before they happen.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The epigraph's purple second shadow is not a joke at the model's expense; it is a genuine failure signature. Chain an inpaint that invents its own lighting onto an upscaler that hallucinates detail onto a color-match step pointed at the wrong reference, and the new object arrives lit from a direction nothing else in the scene agrees with, casting a shadow the original photo never had. Seasoned pipeline builders develop a sixth sense for these tells: doubled shadows mean a lighting mismatch upstream, a faint rectangle around an edit means a feather that was too narrow, and an oddly crisp object in a soft photo means the upscaler ran after the inpaint instead of on the whole frame. The bug is almost never in the stage you are looking at.</p>
+</div>
+
+<h2>4. Debugging: Find the Stage That Broke <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+When a five-stage workflow produces a bad final image, the worst thing you can do is tweak the final stage. The discipline is to <strong>trace the pipeline stage by stage and inspect the intermediate artifact at each edge</strong>, exactly as you would debug any multi-stage system. Save and view the mask: is it tight and correct, or did SAM grab the wrong object? View the depth map: is the perspective sane? View the raw inpaint before color-match and feathering: is the new content right but the color off (a stage-4 problem) or is the content itself wrong (a stage-3 problem)? The first stage whose intermediate artifact is wrong is the bug; everything downstream of it is operating on bad input and is not the root cause.
+</p>
+
+<pre><code class="language-python">def replace_sofa_debug(photo, click_xy, new_prompt, **stages):
+    """Same workflow, but dump every intermediate so the broken stage is visible."""
+    img = np.asarray(photo)
+    mask = stages["segmenter"].mask_from_point(img, click_xy)
+    Image.fromarray((mask * 255).astype(np.uint8)).save("dbg_1_mask.png")    # check tightness
+    depth = stages["depth_model"](photo)
+    depth.save("dbg_2_depth.png")                                            # check perspective
+    edited = stages["control_inpaint"](prompt=new_prompt, image=photo,
+        mask_image=Image.fromarray((mask * 255).astype(np.uint8)),
+        control_image=depth, num_inference_steps=30).images[0]
+    edited.save("dbg_3_inpaint.png")     # is content right but color/seam wrong, or content wrong?
+    # Inspect dbg_1..dbg_3 in order; the first wrong one is the bug.
+    return edited</code></pre>
+<div class="code-caption">Instrumenting the workflow to dump each intermediate. Viewing <code>dbg_1_mask.png</code>, <code>dbg_2_depth.png</code>, and <code>dbg_3_inpaint.png</code> in order localizes the failure to a single stage; a wrong mask explains every downstream symptom, so there is no point tuning the upscaler until the mask is right.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: An Agency Standardizes Its Edit Pipeline</div>
+<p><strong>Who:</strong> a creative agency producing dozens of retouched product and lifestyle images per day, 2024. <strong>Situation:</strong> different artists used different ad-hoc sequences of tools, and quality and turnaround varied wildly; a junior artist's edit might have a visible seam a senior one would have caught. <strong>Problem:</strong> the knowledge of "segment first, color-match before upscale, never decode twice" lived in a few people's heads, and bad outputs were debugged by random tweaking. <strong>Decision:</strong> they encoded the standard workflow as a shared ComfyUI graph (subsection 5) with the stages of subsection 2 as fixed nodes, plus a debug branch that exported every intermediate. New artists loaded the graph, changed only the prompt and the mask click, and any bad output was diagnosed by walking the saved intermediates. <strong>Result:</strong> consistent quality across the team, turnaround halved, and onboarding that took days instead of weeks because the pipeline was the documentation. <strong>Lesson:</strong> a workflow captured as an inspectable graph is both a productivity tool and an institutional memory; the order and the handoffs that experts know implicitly become explicit, shareable, and debuggable.</p>
+</div>
+
+<h2>5. Authoring Workflows: Node Graphs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Writing every workflow as Python is fine for engineers but slow to iterate and hard to share with artists. The practitioner community converged on <strong>node-graph editors</strong>, above all <a href="https://github.com/comfyanonymous/ComfyUI" target="_blank" rel="noopener">ComfyUI</a>, which expose exactly the directed-graph model of subsection 1 as a visual canvas. Each node is an operation (load model, encode prompt, apply ControlNet, sample, VAE decode, upscale), each wire carries a typed artifact (latent, image, mask, conditioning), and the graph runs only the nodes whose inputs changed, so iterating on the last stage does not recompute the first. The graph format is shareable as a single file, which is why community workflows for "consistent character," "product relighting," or "high-res inpaint" circulate as downloadable graphs rather than code.
+</p>
+
+<p>
+The conceptual payoff is that the node graph makes the data flow, and therefore the consistency problems of subsection 3, visible. You can see where a latent is decoded to pixels and re-encoded (a round-trip you might eliminate), where a mask is resized, and where two branches merge. The mental model is the same one this whole chapter has used: control is a stack of composable operations, and understanding the seams between them is what lets you build, predict, and fix.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: ComfyUI for Iteration, diffusers for Deployment</div>
+<p>The two ecosystems play complementary roles. Prototype and iterate in <strong>ComfyUI</strong>: the visual graph lets you rewire stages, swap a ControlNet, or insert a color-match node in seconds, and its caching means only changed nodes recompute. Once the workflow is fixed, port it to a <strong>diffusers</strong> Python pipeline like subsection 2 for programmatic deployment, batching, and integration into a service, where you want code, not a canvas. Many teams export the validated ComfyUI graph and translate its nodes one-to-one into diffusers calls. The graph is the design artifact; the Python pipeline is the production artifact.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Collapsing the Pipeline Into One Model</div>
+<p>The multi-stage workflow exists because no single 2023-era model could do everything. The 2024 to 2025 frontier is shrinking the graph. Unified editing models and the in-context editors of <a href="section-35.4.html">Section 35.4</a> (FLUX.1 Kontext, 2025, arXiv:2506.15742) absorb several stages, segmentation, control, masked editing, into one conditioned pass, so "replace the sofa and keep the perspective" becomes a single instruction with no explicit mask or depth node. Agentic systems go further, using a multimodal model to <em>plan</em> the workflow: it decides which tools to call in what order, runs them, inspects the result, and retries, automating the very debugging discipline of subsection 4. The directed-graph mental model stays essential, because even when a model or an agent composes the stages internally, reasoning about where a result degraded still means reasoning about the pipeline of operations that produced it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.1: Order the Stages <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For the sofa-replacement task, explain why each ordering constraint holds: why segmentation must precede inpainting, why color-matching must come after inpainting but before upscaling, and why upscaling should be last. Then give one example of a wrong ordering and predict the specific artifact it would produce (for instance, upscaling before inpainting), connecting each to a consistency problem from subsection 3.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.2: Build and Instrument a Two-Edit Workflow <span class="exercise-type coding">Coding</span></div>
+<p>Compose a workflow that makes two edits to one photo: replace an object (Section 35.3) and then change the overall season with an instruction edit (Section 35.4). Save every intermediate as in <code>replace_sofa_debug</code>. Run it, then deliberately introduce a bug (for example, feed an un-dilated mask) and demonstrate that walking the saved intermediates localizes the failure to the masking stage rather than the final instruction edit. Report which intermediate revealed the bug.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.6.3: Count the VAE Round Trips <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a four-stage latent-diffusion workflow (control generation, inpaint, second inpaint, upscale) and count how many times the image is decoded to pixels and re-encoded if each stage is implemented independently versus if latents are kept across compatible stages and decoded once. Estimate the qualitative effect on detail and color of the extra round trips, referencing the VAE reconstruction loss from <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>, and recommend where in the graph the single decode should happen.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-35.5.html">&#8592; Section 35.5: Real-Image Inversion</a>
+<a href="index.html">Chapter 35</a>
+<a class="next" href="../module-36-video-3d-world-generation/index.html">Chapter 36: Video, 3D Generation &amp; World Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

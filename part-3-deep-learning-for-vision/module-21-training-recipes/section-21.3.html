@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.3: Transfer Learning & Fine-Tuning Strategies. Feature extraction versus fine-tuning, what to freeze and what to unfreeze, discriminative layer-wise learning rates, gradual unfreezing, and a decision tree that picks a transfer strategy from your data size and domain." name="description"/>
+<title>Section 21.3: Transfer Learning &amp; Fine-Tuning Strategies | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Transfer Learning &amp; Fine-Tuning Strategies</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I spent a million images learning what an edge is, what a texture is, what a wheel is. You have four hundred photos of your specific kind of bird. Please do not ask me to forget the wheel. Just let me adjust the last few opinions."</p>
+<cite>A Pretrained Backbone Pleading for Its Early Layers</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost no real vision project trains from scratch; you start from a backbone pretrained on a large dataset and adapt it, and the three decisions that matter are what to freeze, what to fine-tune, and how to set the learning rates so you improve the features without destroying them.</strong> Transfer learning works because the early layers of a vision network learn general-purpose features (edges, textures, simple shapes) that are useful for almost any visual task, while only the late layers are specialized to the original classes. This section turns that observation into a workflow: feature extraction for tiny datasets, full fine-tuning for larger ones, discriminative learning rates so early and late layers learn at different speeds, and a decision tree that picks the right strategy from your data size and how far your domain sits from ImageNet.</p>
+</div>
+
+<p>
+This is the most immediately useful section in the chapter for a working engineer. You have already used pretrained weights in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> for inference; here we adapt them to a new task. The premise is that the features a network learned on ImageNet's million images are a far better starting point than random initialization, even for a task that looks nothing like ImageNet. The art is in adapting those features without wrecking them, and that art reduces to a small number of well-understood choices, which this section makes explicit. Transfer learning is the same idea that, scaled up, becomes foundation-model fine-tuning in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and LoRA adapters for generators in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>.
+</p>
+
+<h2>1. Why Transfer Works: General Early, Specific Late <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The empirical foundation of transfer learning is a layered structure in what a network learns. The first convolutional layer of almost any trained vision model learns oriented edge and color-blob detectors that look strikingly like the Gabor filters and Sobel kernels of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, an arc we flagged when we noted that learned first-layer filters resemble classical edge detectors. Middle layers compose these into textures and parts. Only the final layers assemble parts into the specific categories of the training task. This gradient from general to specific is exactly why transfer is possible: the general layers are reusable, and only the specific layers need replacing.
+</p>
+
+<p>
+Figure 21.3.1 makes the consequence concrete. The closer your task is to ImageNet and the more data you have, the more of the network you should be willing to adapt; the more your task differs or the less data you have, the more you should keep frozen and reuse.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Network depth from general reusable features to task-specific features">
+<style>
+.t{font:12px sans-serif;fill:#1a1a1a;}
+.s{font:10px sans-serif;fill:#555;}
+.bk{font:11px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.gen{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.mid{fill:#eef6e9;stroke:#7aa83f;stroke-width:1.5;}
+.spc{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.ar{stroke:#777;stroke-width:1.5;marker-end:url(#a4);fill:none;}
+</style>
+<defs><marker id="a4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="gen" x="30" y="70" width="120" height="70" rx="5"/>
+<text class="bk" x="90" y="100" text-anchor="middle">Early layers</text>
+<text class="s" x="90" y="120" text-anchor="middle">edges, textures</text>
+<line class="ar" x1="152" y1="105" x2="186" y2="105"/>
+<rect class="mid" x="188" y="70" width="120" height="70" rx="5"/>
+<text class="bk" x="248" y="100" text-anchor="middle">Middle layers</text>
+<text class="s" x="248" y="120" text-anchor="middle">parts, motifs</text>
+<line class="ar" x1="310" y1="105" x2="344" y2="105"/>
+<rect class="spc" x="346" y="70" width="120" height="70" rx="5"/>
+<text class="bk" x="406" y="100" text-anchor="middle">Late layers</text>
+<text class="s" x="406" y="120" text-anchor="middle">whole objects</text>
+<line class="ar" x1="468" y1="105" x2="502" y2="105"/>
+<rect class="spc" x="504" y="70" width="120" height="70" rx="5"/>
+<text class="bk" x="564" y="100" text-anchor="middle">Classifier head</text>
+<text class="s" x="564" y="120" text-anchor="middle">your classes</text>
+<text class="t" x="90" y="175" text-anchor="middle">most reusable</text>
+<text class="t" x="564" y="175" text-anchor="middle">most task-specific</text>
+<text class="s" x="360" y="205" text-anchor="middle">Freeze from the left, fine-tune from the right. How far the boundary moves depends on data size and domain gap.</text>
+</svg>
+<figcaption><strong>Figure 21.3.1:</strong> The general-to-specific gradient through network depth. Early layers learn reusable low-level features, late layers learn task-specific concepts, and the classifier head is always replaced. Transfer strategies differ only in where they draw the freeze-versus-fine-tune boundary.</figcaption>
+</figure>
+
+<h2>2. Two Core Strategies: Feature Extraction and Fine-Tuning <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The two endpoints of the strategy spectrum are <strong>feature extraction</strong> and <strong>full fine-tuning</strong>. In feature extraction you freeze the entire pretrained backbone, treat it as a fixed feature computer, and train only a new classifier head on top. This is fast, needs little data, and cannot overfit much because almost no parameters are learning. In full fine-tuning you replace the head and then continue training the whole network at a small learning rate, letting every layer adjust to the new task. This needs more data and compute but reaches higher accuracy when the new task differs meaningfully from the pretraining task. The first step in both is identical and is the one beginners most often get wrong: replace the head, because the pretrained final layer outputs the original number of classes, not yours.
+</p>
+
+<pre><code class="language-python">import torch.nn as nn
+from torchvision.models import resnet50, ResNet50_Weights
+
+def build_transfer_model(num_classes, mode="feature_extract"):
+    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+    if mode == "feature_extract":
+        for p in model.parameters():        # freeze the whole backbone
+            p.requires_grad = False
+    # Replace the 1000-class head with a fresh head for OUR classes.
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)   # new head is trainable
+    return model
+
+m = build_transfer_model(num_classes=37, mode="feature_extract")
+trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+total = sum(p.numel() for p in m.parameters())
+print(f"trainable {trainable:,} of {total:,}")
+# Expected: trainable 75,813 of 23,583,621   (only the new head learns)</code></pre>
+<div class="code-caption">Feature extraction in practice: freeze the backbone, swap the head. Only about 76k of 23.6M parameters update, so this trains fast and resists overfitting even on a few hundred images.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Head Is Always New, the Body Is a Choice</div>
+<p>Two things are non-negotiable in transfer learning, and one is a decision. Non-negotiable: you always replace the classifier head, because it outputs the wrong number of classes, and you always match the pretrained preprocessing from <a href="section-21.1.html">Section 21.1</a>. The decision is how much of the body to unfreeze, and that is what the rest of this section is about. A useful default progression is to start with feature extraction (head only), confirm the pipeline works, then unfreeze and fine-tune for the accuracy gain if your data supports it.</p>
+</div>
+
+<h2>3. Discriminative Learning Rates and Gradual Unfreezing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Full fine-tuning has a hidden danger. If you fine-tune the whole network at a single learning rate, the freshly-initialized head produces large, noisy gradients in its first steps, and those gradients flow back and disturb the carefully-learned early features before the head has stabilized. Two techniques, both popularized by the fastai practitioners, prevent this. <strong>Discriminative (layer-wise) learning rates</strong> assign smaller learning rates to earlier layers and larger ones to later layers, so the general early features change slowly while the specific late layers adapt quickly. A common pattern is a geometric decay, where each earlier group's learning rate is a fixed fraction (say one third) of the group after it.
+</p>
+
+<p>
+<strong>Gradual unfreezing</strong> is the temporal version of the same idea: train the new head alone for an epoch or two so it stabilizes, then unfreeze the next block back and continue, progressively thawing toward the input. Both techniques share one goal, protect the valuable early features from the chaos of an untrained head. The code below shows discriminative learning rates via parameter groups, the mechanism PyTorch optimizers provide for exactly this.
+</p>
+
+<pre><code class="language-python">import torch
+
+def make_param_groups(model, base_lr=1e-3, decay=0.3):
+    """Earlier ResNet stages get geometrically smaller learning rates."""
+    stages = [model.conv1, model.layer1, model.layer2,
+              model.layer3, model.layer4, model.fc]
+    groups = []
+    n = len(stages)
+    for i, stage in enumerate(stages):
+        # last stage (head) gets base_lr; each earlier stage is `decay` times smaller
+        lr = base_lr * (decay ** (n - 1 - i))
+        groups.append({"params": stage.parameters(), "lr": lr})
+    return groups
+
+model = build_transfer_model(num_classes=37, mode="finetune")
+for p in model.parameters():
+    p.requires_grad = True                        # full fine-tune
+opt = torch.optim.AdamW(make_param_groups(model, base_lr=1e-3))
+for g in opt.param_groups:
+    print(f"lr = {g['lr']:.2e}")
+# Expected: lr = 2.43e-06 / 8.10e-06 / 2.70e-05 / 9.00e-05 / 3.00e-04 / 1.00e-03</code></pre>
+<div class="code-caption">Discriminative learning rates as optimizer parameter groups. The head learns at $10^{-3}$ while the first convolution learns roughly four hundred times slower, protecting the general edge and texture filters from the head's early noise.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The term "catastrophic forgetting" is the field's gloriously dramatic name for what happens when you fine-tune too aggressively: the network, asked to learn your 400 birds, cheerfully overwrites the million-image education it took weeks to acquire and forgets what an edge looks like. It is the deep-learning equivalent of cramming for one exam and walking out unable to remember your own phone number. Discriminative learning rates and gradual unfreezing exist precisely so the backbone keeps its hard-won general knowledge while it picks up the new specifics.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: 400 Images, One Afternoon, Production Accuracy</div>
+<p><strong>Who:</strong> a small e-commerce team needing to classify product photos into 37 fine-grained furniture categories, 2025. <strong>Situation:</strong> they had only about 400 labeled images, roughly a dozen per class, and no budget for large-scale annotation. <strong>Problem:</strong> training a ResNet-50 from scratch on 400 images produced a model barely above chance, badly overfit within a few epochs. <strong>Decision:</strong> they switched to transfer learning. First feature extraction (frozen backbone, new head) reached usable accuracy in minutes; then full fine-tuning with discriminative learning rates ($10^{-3}$ on the head decaying to $10^{-6}$ on the stem) lifted it further. They applied the augmentation of <a href="section-21.2.html">Section 21.2</a> to stretch the tiny dataset. <strong>Result:</strong> a model good enough to deploy, trained in an afternoon on a single GPU, from 400 images. <strong>Lesson:</strong> for small datasets, transfer learning is not an optimization, it is the only thing that works. The million images the backbone already saw are worth far more than the 400 you can label, so reuse them and adapt gently.</p>
+</div>
+
+<h2>4. A Decision Tree for Picking a Strategy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The choice among feature extraction, partial fine-tuning, and full fine-tuning is governed by two axes: how much labeled data you have, and how far your domain sits from the pretraining domain. The four quadrants give a clean rule of thumb, summarized in Table 21.3.1. With little data and a similar domain, freeze the backbone and train only the head, because you cannot afford to fit many parameters and the features already fit. With lots of data and a distant domain, fine-tune everything or even consider training from scratch, because you have the data to reshape the features and they need reshaping. The two mixed quadrants call for partial fine-tuning, where you thaw the later blocks and keep the early ones frozen.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 21.3.1:</strong> <em>Choosing a transfer strategy from data size and domain gap.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col"></th>
+<th scope="col">Similar domain (close to ImageNet)</th>
+<th scope="col">Distant domain (medical, satellite, microscopy)</th>
+</tr>
+</thead>
+<tr>
+<td><strong>Small data</strong> (hundreds)</td>
+<td>Feature extraction: freeze backbone, train head only</td>
+<td>Partial fine-tune: thaw later blocks, heavy augmentation</td>
+</tr>
+<tr>
+<td><strong>Large data</strong> (tens of thousands+)</td>
+<td>Fine-tune all, discriminative learning rates</td>
+<td>Fine-tune all (or from scratch if data is huge and very distant)</td>
+</tr>
+</table>
+</div>
+
+<p>
+Two practical notes refine the table. First, batch-normalization layers (from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>) hold running statistics; when you freeze a backbone for feature extraction, keep those layers in evaluation mode so they do not update their statistics on your small dataset. Second, "domain gap" is the dominant factor for distant domains like medical imaging or satellite imagery, where even general edge features transfer somewhat but the textures and parts are unfamiliar, which is why the distant quadrants lean toward more fine-tuning. The decision tree is a starting point; always confirm by measuring on a held-out validation set.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: timm Backbones with a Built-In Head Swap</div>
+<p>Manually slicing a torchvision model's <code>.fc</code> works but differs per architecture (it is <code>.classifier</code> on others, a list on yet others). The timm library standardizes head replacement and frozen feature extraction across hundreds of backbones with one factory call:</p>
+<pre><code class="language-python">import timm
+# num_classes swaps the head automatically for ANY of ~1000 architectures.
+model = timm.create_model("convnext_tiny", pretrained=True, num_classes=37)
+
+# Feature-extraction mode: a pooled feature vector, no head, in one flag.
+feat = timm.create_model("convnext_tiny", pretrained=True,
+                         num_classes=0, global_pool="avg")
+# data_config gives the EXACT preprocessing for this checkpoint:
+cfg = timm.data.resolve_data_config({}, model=model)
+transform = timm.data.create_transform(**cfg)</code></pre>
+<p>timm handles the architecture-specific head surgery, exposes a uniform <code>num_classes</code> argument, and ships the matching preprocessing per checkpoint via <code>resolve_data_config</code>, eliminating both the per-model head wiring and the preprocessing-mismatch failure mode of <a href="section-21.1.html">Section 21.1</a>. This is the production path for the transfer workflow.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Parameter-Efficient Fine-Tuning</div>
+<p>As backbones grew into the hundreds of millions and billions of parameters (the foundation models of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>), full fine-tuning became expensive to train and store, one full copy of the model per task. The 2021-2026 answer is parameter-efficient fine-tuning (PEFT). LoRA (Low-Rank Adaptation) freezes the entire backbone and learns only small low-rank update matrices, often under 1% of the parameters, achieving accuracy close to full fine-tuning at a fraction of the cost. Visual prompt tuning and adapter modules pursue the same goal for vision transformers. PEFT is now the default for adapting large models, and it reappears directly in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>, where LoRA is how you teach a giant text-to-image model a new style or subject from a handful of images. The discriminative-learning-rate intuition of subsection 3, change the specialized parts a lot and the general parts a little, is the conceptual ancestor of these methods.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.1: Place Your Project on the Tree <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, name the recommended strategy from Table 21.3.1 and justify it in two sentences: (a) 50,000 photos of everyday objects from web images, (b) 300 grayscale microscopy images of cell types, (c) 2,000 satellite tiles for land-use classification, (d) 5 million product photos for a retail catalog. For each, also state what you would do with the batch-normalization layers and why, referring to <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.2: Feature Extraction vs Fine-Tuning, Measured <span class="exercise-type coding">Coding</span></div>
+<p>Take a pretrained ResNet-50 and a small dataset (for example the Oxford Pets or Flowers-102 dataset, both in torchvision). Train three models with identical augmentation and schedule: feature extraction (frozen backbone), full fine-tuning at a single learning rate, and full fine-tuning with the discriminative learning rates from subsection 3. Report final validation accuracy and training time for each. Confirm that discriminative learning rates match or beat the single-rate fine-tune while disturbing the early features less.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.3: Visualize What the First Layer Learned <span class="exercise-type analysis">Analysis</span></div>
+<p>Load a pretrained ResNet-50 and extract the weights of its first convolution (<code>model.conv1.weight</code>, shape $64 \times 3 \times 7 \times 7$). Visualize all 64 filters as small RGB images. Identify oriented edges, color-opponent blobs, and frequency-selective patterns, and compare them to the Gabor and Sobel kernels of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. Write a paragraph arguing, from what you see, why these specific filters are safe to freeze and reuse across almost any visual task.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.2.html">&#8592; Section 21.2: Data Augmentation</a>
+<a href="index.html">Chapter 21</a>
+<a class="next" href="section-21.4.html">Section 21.4: Regularization &amp; Schedules &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

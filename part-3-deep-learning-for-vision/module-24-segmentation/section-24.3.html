@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.3: Panoptic Segmentation: Unifying Things &amp; Stuff. Labeling every pixel with both a class and, for countable things, an instance identity; the things-versus-stuff distinction, how semantic and instance predictions merge without overlap, and the panoptic quality metric that scores recognition and segmentation in one number." name="description"/>
+<title>Section 24.3: Panoptic Segmentation: Unifying Things &amp; Stuff | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a></div>
+<h1>Panoptic Segmentation: Unifying Things &amp; Stuff</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Semantic segmentation labeled the sky and forgot the birds. Instance segmentation counted the birds and ignored the sky. Panoptic segmentation, finally, labeled every last pixel and could still tell me there were exactly three birds. It is the only one I trust to describe a whole scene."</p>
+<cite>A Scene Parser With No Pixels Left Behind</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Panoptic segmentation labels every pixel in an image with exactly one class and, for countable object categories, one instance identity, unifying the semantic and instance views into a single non-overlapping description of the whole scene.</strong> The conceptual key is the split between "things," countable objects like people and cars that have instances, and "stuff," amorphous regions like sky, road, and grass that do not. Semantic segmentation handles stuff well but cannot count things; instance segmentation counts things but ignores stuff and allows overlapping masks. Panoptic demands both at once with no pixel unlabeled and no pixel claimed twice, and it brings a single metric, panoptic quality, that judges how well you did at recognizing and at delineating, together.</p>
+</div>
+
+<p>
+By now you have two complementary tools. <a href="section-24.1.html">Section 24.1</a> gives a class to every pixel but no sense of separate objects; <a href="section-24.2.html">Section 24.2</a> gives a separate mask to every object but says nothing about the background and is happy to let masks overlap. Neither alone produces a complete scene description. A self-driving stack, a robot mapping a room, or a system captioning a photo wants both: where is the drivable road (stuff), and exactly which and how many pedestrians are on it (things), with every pixel accounted for. This complete-partition goal echoes the <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">classical region-partitioning of Chapter 11</a>, where watershed and graph cuts carved an image into non-overlapping regions by hand-designed energy rather than learned classes. Panoptic segmentation, defined by Kirillov and colleagues in 2019, is the task that demands this complete answer.
+</p>
+
+<h2>1. Things, Stuff, and the Panoptic Output Format <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The vocabulary matters because it shapes the task. <strong>Things</strong> are categories whose instances you can count and point to: person, car, dog, bicycle. <strong>Stuff</strong> is categories with no natural instances, where counting makes no sense: sky, road, vegetation, water, wall. The same scene contains both, and the panoptic task treats them by one rule. Every pixel receives a pair $(c, k)$: a class label $c$, and an instance id $k$. For thing classes, $k$ distinguishes the individual objects (car 1, car 2). For stuff classes, $k$ is ignored, all pixels of "sky" share one region. The hard constraint is that the assignment is a <strong>partition</strong>: every pixel gets exactly one pair, so the segments are mutually exclusive and collectively exhaustive. Figure 24.3.1 shows how panoptic sits between the two tasks you know.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of semantic, instance, and panoptic segmentation on the same scene with two people and sky and road">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10px sans-serif;fill:#555;}
+.ptitle{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.psky{fill:#cfe6f7;stroke:#4a8fc0;stroke-width:1;}
+.proad{fill:#d9d2c5;stroke:#9c8f78;stroke-width:1;}
+.pp1{fill:#f3c6c6;stroke:#c0392b;stroke-width:1.5;}
+.pp2{fill:#f6e1b8;stroke:#c79100;stroke-width:1.5;}
+.ppall{fill:#e2c6f3;stroke:#8e44ad;stroke-width:1.5;}
+</style>
+<text class="ptitle" x="120" y="26" text-anchor="middle">Semantic</text>
+<rect class="psky" x="40" y="40" width="160" height="60"/>
+<rect class="proad" x="40" y="160" width="160" height="60"/>
+<rect class="ppall" x="70" y="100" width="100" height="60"/>
+<text class="ps" x="120" y="135" text-anchor="middle">person (merged)</text>
+<text class="ps" x="120" y="55" text-anchor="middle">sky</text>
+<text class="ps" x="120" y="195" text-anchor="middle">road</text>
+<text class="ps" x="120" y="245" text-anchor="middle">classes only, things merge</text>
+
+<text class="ptitle" x="360" y="26" text-anchor="middle">Instance</text>
+<rect x="280" y="40" width="160" height="180" fill="#f5f5f5" stroke="#ccc"/>
+<rect class="pp1" x="300" y="100" width="55" height="60"/>
+<rect class="pp2" x="365" y="100" width="55" height="60"/>
+<text class="ps" x="327" y="135" text-anchor="middle">person 1</text>
+<text class="ps" x="392" y="135" text-anchor="middle">person 2</text>
+<text class="ps" x="360" y="245" text-anchor="middle">things counted, no stuff</text>
+
+<text class="ptitle" x="600" y="26" text-anchor="middle">Panoptic</text>
+<rect class="psky" x="520" y="40" width="160" height="60"/>
+<rect class="proad" x="520" y="160" width="160" height="60"/>
+<rect class="pp1" x="540" y="100" width="55" height="60"/>
+<rect class="pp2" x="605" y="100" width="55" height="60"/>
+<text class="ps" x="567" y="135" text-anchor="middle">p 1</text>
+<text class="ps" x="632" y="135" text-anchor="middle">p 2</text>
+<text class="ps" x="600" y="55" text-anchor="middle">sky</text>
+<text class="ps" x="600" y="195" text-anchor="middle">road</text>
+<text class="ps" x="600" y="245" text-anchor="middle">every pixel, things + stuff</text>
+</svg>
+<figcaption><strong>Figure 24.3.1:</strong> The three views of the same scene. Semantic segmentation (left) labels classes but merges the two people into one region. Instance segmentation (center) separates the things but ignores sky and road. Panoptic segmentation (right) does both: every pixel carries a class, things keep distinct instance identities (p 1, p 2), stuff is labeled as single regions, and nothing is left blank or claimed twice.</figcaption>
+</figure>
+
+<p>
+That partition constraint is exactly what neither earlier task enforces. Instance masks from Mask R-CNN can overlap, two boxes both claiming a pixel, and they leave the background unlabeled. Producing a valid panoptic map therefore requires a merge step that resolves conflicts and fills the gaps, which is the subject of subsection 2.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The cleanest test for "thing versus stuff" is a grammar test, not a vision test: if the plural sounds natural with a number in front of it (three cars, two dogs), it is a thing; if it does not (three skies? two grasses?), it is stuff. The word "panoptic" itself is borrowed from Bentham's 18th-century Panopticon, the prison designed so a single guard could watch every cell at once. Fitting: a panoptic segmenter is the one model from which no pixel can hide. The mnemonic to keep: <em>things you can count, stuff you can only point at</em>.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Partition, Two Question Types</div>
+<p>Panoptic segmentation is not a third, unrelated task; it is the constraint that the answers to "what class" (everywhere) and "which instance" (for things) be a single consistent partition of the image. The deep payoff is that this constraint is what later let a single architecture, the mask transformers of <a href="section-24.4.html">Section 24.4</a>, do all three tasks at once: if your model predicts a set of non-overlapping masks each with a class, then reading it as semantic, instance, or panoptic output is just a matter of how you group and report the masks. The partition view turned three research communities into one.</p>
+</div>
+
+<h2>2. Merging Semantic and Instance Predictions <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The first panoptic systems were built by combining the two networks you already have: a semantic segmenter for stuff and an instance segmenter (Mask R-CNN) for things, with a heuristic merge that turns their outputs into a clean partition. The merge resolves three kinds of conflict. First, overlapping instance masks: sort instances by confidence and paint them in order, so a higher-confidence object wins any contested pixel. Second, thing-versus-stuff conflict: where an instance mask and a semantic stuff region disagree, the thing instance takes precedence (a person standing on the road is person, not road). Third, gaps: any pixel left unlabeled after instances are painted falls back to the semantic prediction, and very small stuff regions below a threshold are discarded as noise. The code below implements this canonical merge.
+</p>
+
+<pre><code class="language-python">import torch
+
+def merge_to_panoptic(sem_logits, inst_masks, inst_labels, inst_scores,
+                      stuff_classes, score_thr=0.5, area_thr=64):
+    """Combine a semantic map and instance masks into a non-overlapping panoptic map.
+    Returns (class_map, instance_id_map): two HxW integer tensors.
+    """
+    H, W = sem_logits.shape[-2:]
+    sem = sem_logits.argmax(0)                      # (H, W) semantic class per pixel
+    class_map = torch.full((H, W), -1, dtype=torch.long)   # -1 = not yet assigned
+    id_map    = torch.zeros((H, W), dtype=torch.long)
+    next_id = 1
+
+    # 1) Paint instances (things) in order of decreasing confidence.
+    order = inst_scores.argsort(descending=True)
+    for i in order:
+        if inst_scores[i] < score_thr:
+            continue
+        m = (inst_masks[i] > 0.5) & (class_map == -1)  # only claim unassigned pixels
+        if m.sum() < area_thr:
+            continue                                   # drop tiny fragments
+        class_map[m] = inst_labels[i]
+        id_map[m] = next_id
+        next_id += 1
+
+    # 2) Fill remaining pixels with stuff from the semantic map.
+    unassigned = class_map == -1
+    for c in stuff_classes:
+        sel = unassigned & (sem == c)
+        class_map[sel] = c                             # stuff: shared id 0
+    return class_map, id_map
+
+# Toy run with dummy tensors.
+sem_logits = torch.randn(20, 64, 64)                   # 20-class semantic logits
+inst_masks  = torch.rand(3, 64, 64)                    # 3 instance soft masks
+out_c, out_id = merge_to_panoptic(sem_logits, inst_masks,
+                                  torch.tensor([1, 1, 5]),     # two people, one car
+                                  torch.tensor([0.9, 0.8, 0.6]),
+                                  stuff_classes=[10, 11, 12])
+print(out_c.shape, "unique instances:", out_id.unique().numel() - 1)</code></pre>
+<div class="code-caption">The canonical panoptic merge. Instances are painted by descending confidence onto unclaimed pixels only (guaranteeing no overlap), tiny fragments are dropped, and stuff classes fill the gaps. The result is a valid partition: one class and one instance id per pixel.</div>
+
+<p>
+This two-network-plus-merge approach works but is clumsy: two models to train, two sets of features, and a hand-tuned heuristic gluing them. The field's response was end-to-end panoptic networks. Panoptic FPN shares one backbone between a semantic head and an instance head; Panoptic-DeepLab uses a single bottom-up design with class and instance-center predictions. These reduced the redundancy, but the cleanest answer came from the mask transformers of <a href="section-24.4.html">Section 24.4</a>, which predict the non-overlapping mask set directly and make the merge step disappear.
+</p>
+
+<h2>3. Panoptic Quality: One Number for Two Jobs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A panoptic predictor can fail in two distinct ways: it can mislabel or miss a segment (a recognition error), or it can label the right segment with a sloppy boundary (a segmentation error). The <strong>panoptic quality</strong> (PQ) metric scores both in a single value. For each class, a predicted segment and a ground-truth segment are <em>matched</em> if their Intersection-over-Union (IoU, the same overlap measure from <a href="../module-23-object-detection/index.html">Chapter 23</a>) exceeds 0.5. Because a strict-majority overlap can match at most one prediction to one truth, this matching is unique. PQ then combines the average IoU of the matched pairs with the precision and recall of the matching itself:
+</p>
+
+<div class="math-block">
+$$\text{PQ} = \underbrace{\frac{\sum_{(p,g) \in TP} \text{IoU}(p, g)}{|TP|}}_{\text{Segmentation Quality (SQ)}} \times \underbrace{\frac{|TP|}{|TP| + \tfrac{1}{2}|FP| + \tfrac{1}{2}|FN|}}_{\text{Recognition Quality (RQ)}}$$
+</div>
+
+<p>
+The decomposition is the metric's gift. <strong>SQ</strong> (segmentation quality) is the mean IoU over correctly matched segments: how tight are your boundaries when you do find a segment? <strong>RQ</strong> (recognition quality) is an F1-style score over the matches: how well do you find and not hallucinate segments? Their product, PQ, is high only when you both find segments and delineate them well, and reading SQ and RQ separately tells you which of the two failure modes is hurting you. The metric is computed per class and averaged, and the literature usually also reports it split as $\text{PQ}^{\text{Th}}$ over thing classes and $\text{PQ}^{\text{St}}$ over stuff classes. Figure 24.3.2 makes the two factors concrete.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Panoptic quality decomposed into recognition quality from matching counts and segmentation quality from IoU of matched segments">
+<style>
+.ql{font:12px sans-serif;fill:#1a1a1a;}
+.qs{font:10px sans-serif;fill:#555;}
+.qb{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.qtp{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.qfp{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.qfn{fill:#fbe3e3;stroke:#c0392b;stroke-width:1.5;}
+.qar{stroke:#777;stroke-width:1.5;marker-end:url(#qah);fill:none;}
+</style>
+<defs><marker id="qah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="qb" x="160" y="30" text-anchor="middle">Match segments at IoU &gt; 0.5</text>
+<rect class="qtp" x="40" y="50" width="90" height="36"/><text class="qs" x="85" y="73" text-anchor="middle">TP (matched)</text>
+<rect class="qfp" x="40" y="96" width="90" height="36"/><text class="qs" x="85" y="119" text-anchor="middle">FP (extra pred)</text>
+<rect class="qfn" x="40" y="142" width="90" height="36"/><text class="qs" x="85" y="165" text-anchor="middle">FN (missed gt)</text>
+<line class="qar" x1="135" y1="68" x2="200" y2="100"/>
+<line class="qar" x1="135" y1="114" x2="200" y2="110"/>
+<line class="qar" x1="135" y1="160" x2="200" y2="120"/>
+<rect class="qfp" x="205" y="92" width="150" height="44"/>
+<text class="ql" x="280" y="112" text-anchor="middle">RQ = TP /</text>
+<text class="ql" x="280" y="128" text-anchor="middle">(TP + .5FP + .5FN)</text>
+<rect class="qtp" x="205" y="160" width="150" height="40"/>
+<text class="ql" x="280" y="184" text-anchor="middle">SQ = mean IoU of TP</text>
+<line class="qar" x1="355" y1="114" x2="430" y2="124"/>
+<line class="qar" x1="355" y1="180" x2="430" y2="134"/>
+<rect x="435" y="104" width="120" height="50" fill="#f3e8fb" stroke="#8e44ad" stroke-width="2"/>
+<text class="qb" x="495" y="125" text-anchor="middle">PQ = SQ x RQ</text>
+<text class="qs" x="495" y="143" text-anchor="middle">one number</text>
+</svg>
+<figcaption><strong>Figure 24.3.2:</strong> How panoptic quality is built. Segments are first matched at IoU greater than 0.5, splitting predictions into true positives, false positives, and false negatives. Recognition quality (RQ) is an F1-style score over those counts; segmentation quality (SQ) is the mean IoU of the matched pairs. PQ is their product, so a model must both recognize and delineate well to score highly.</figcaption>
+</figure>
+
+<p>
+The IoU at the core of PQ is the same generalization of the metric you will formalize fully in <a href="section-24.6.html">Section 24.6</a>, and it connects all the way back to the overlap and matching ideas you first met in the <a href="../module-23-object-detection/index.html">detection evaluation of Chapter 23</a>. The minimal IoU helper below is the workhorse behind any PQ implementation.
+</p>
+
+<pre><code class="language-python">import torch
+
+def mask_iou(pred_mask, gt_mask):
+    """IoU between two boolean HxW masks: intersection over union of set pixels."""
+    inter = (pred_mask & gt_mask).sum().float()
+    union = (pred_mask | gt_mask).sum().float()
+    return (inter / union).item() if union > 0 else 0.0
+
+a = torch.zeros(8, 8, dtype=torch.bool); a[2:6, 2:6] = True   # 4x4 square
+b = torch.zeros(8, 8, dtype=torch.bool); b[3:7, 3:7] = True   # shifted 4x4 square
+print(f"IoU = {mask_iou(a, b):.3f}")   # IoU = 0.391  (9 overlap / 23 union)</code></pre>
+<div class="code-caption">Mask IoU, the matching criterion at the heart of panoptic quality. Two 4x4 squares offset by one pixel overlap in a 3x3 region (9 pixels) and union to 23, giving IoU 0.39, below the 0.5 panoptic match threshold, so this pair would not count as a true positive.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Reading PQ on an Autonomous-Driving Benchmark</div>
+<p><strong>Who:</strong> a perception team at an autonomous-vehicle company evaluating two candidate panoptic models on Cityscapes, 2024. <strong>Situation:</strong> model A reported PQ 61.2 and model B reported PQ 60.8, so the program manager wanted to ship model A. <strong>Problem:</strong> the gap was within the noise of a few annotation disagreements, and a single PQ number hid where each model actually differed. <strong>Decision:</strong> the team looked at the SQ and RQ decomposition and the thing-versus-stuff split. Model A had higher SQ (sharper boundaries) but lower RQ on small thing classes; model B caught more distant pedestrians and cyclists (higher thing RQ) at the cost of slightly looser boundaries. <strong>Result:</strong> for a driving system, missing a distant pedestrian is far more dangerous than a one-pixel-loose curb, so they shipped model B despite its marginally lower headline PQ, and added the small-object RQ as a tracked metric. <strong>Lesson:</strong> the headline PQ is a starting point, not a verdict. The SQ-RQ decomposition and the thing-stuff split tell you which failure mode each model has, and the right choice depends on which failure your application cannot tolerate. Always read the components, not just the product.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PQ Without Reimplementing the Matching</div>
+<p>The greedy IoU matching, the per-class accumulation of true positives, false positives, and false negatives, and the void-region handling are fiddly to get exactly right. The reference implementation is maintained by the COCO panoptic API, and modern toolkits wrap it:</p>
+<pre><code class="language-python"># Using the official panopticapi evaluation (pip install git+https://github.com/cocodataset/panopticapi)
+from panopticapi.evaluation import pq_compute
+
+# Inputs are panoptic PNGs (id-encoded) plus matching JSON in COCO panoptic format.
+results = pq_compute(gt_json_file="gt_panoptic.json",
+                     pred_json_file="pred_panoptic.json",
+                     gt_folder="gt_png/", pred_folder="pred_png/")
+# results["All"], results["Things"], results["Stuff"] each give PQ, SQ, RQ.
+print(results["All"]["pq"], results["Things"]["pq"], results["Stuff"]["pq"])</code></pre>
+<div class="code-caption">Scoring panoptic quality with the official <code>panopticapi</code> evaluator: it consumes id-encoded panoptic PNGs plus COCO-format JSON and returns PQ, SQ, and RQ split into All, Things, and Stuff, matching the leaderboard protocol exactly.</div>
+<p>This replaces roughly 150 lines of careful matching-and-accumulation code with one call, and it guarantees you are scoring exactly as the leaderboards do, including the subtle void-pixel rules. Hugging Face's <code>evaluate</code> library and Detectron2 both expose the same evaluator. Implement IoU yourself to understand it; never hand-roll the full PQ accumulator for a paper number.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Universal and Open-Vocabulary Panoptic Segmentation</div>
+<p>The two-network-plus-merge design of subsection 2 is now historical. Since 2022, universal architectures, Mask2Former (<a href="section-24.4.html">Section 24.4</a>) and OneFormer (2023), produce panoptic, instance, and semantic outputs from one trained model and one set of weights, setting state-of-the-art PQ on Cityscapes, COCO, and ADE20K simultaneously. The 2024-2025 frontier is open-vocabulary panoptic segmentation: methods like FC-CLIP and the open-vocabulary extensions of the SAM family (<a href="section-24.5.html">Section 24.5</a>) partition a scene into things and stuff drawn from arbitrary text-named categories, never seen during training, by leaning on the CLIP text-image embedding space you will meet in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. The panoptic task is increasingly served not by a task-specific model but by prompting a foundation model with the classes you happen to care about today.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.1: Classify Each Category <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each category, decide whether it is a "thing" or "stuff" in the panoptic sense, and justify with the countability test from subsection 1: sky, traffic light, river, person, sand, kite, ceiling, bottle. Then describe one genuinely ambiguous category (for example, a forest versus individual trees) and explain how the dataset's annotation policy, not nature, ultimately decides which it is.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.2: Implement the Conflict Merge <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>merge_to_panoptic</code> function from subsection 2 so that, in addition to its current behavior, it returns the number of instance pixels that were <em>suppressed</em> because they collided with a higher-confidence instance. Construct a synthetic case with three overlapping instance masks of decreasing confidence and verify that the suppression count is non-zero. Write one paragraph on why painting in confidence order, rather than, say, area order, is the sensible default, and when you might prefer a different ordering.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.3.3: When SQ and RQ Disagree <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct two hypothetical models on a 10-image set. Model X matches every ground-truth segment but always with IoU around 0.55 (loose boundaries). Model Y matches only 60 percent of segments but those it matches have IoU around 0.95 (tight boundaries, low recall). Using the PQ formula from subsection 3, compute the approximate PQ, SQ, and RQ for each, and write a paragraph explaining which model you would choose for (a) a photo-editing cutout tool and (b) a pedestrian-counting safety system, connecting your choice to the SQ-RQ trade-off and the driving example in subsection 3.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.2.html">&#8592; Section 24.2: Instance Segmentation: Mask R-CNN</a>
+<a href="index.html">Chapter 24</a>
+<a class="next" href="section-24.4.html">Section 24.4: Transformer Segmenters: SegFormer &amp; Mask2Former &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

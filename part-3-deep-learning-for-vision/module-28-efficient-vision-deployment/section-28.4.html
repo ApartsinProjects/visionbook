@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.4: Serving Vision Models. Productionizing a vision model behind an API: the throughput-versus-latency trade, dynamic batching that amortizes GPU overhead, concurrency and model instances, and the inference servers (Triton, TorchServe, Ray Serve) that orchestrate it under real traffic." name="description"/>
+<title>Section 28.4: Serving Vision Models: Batching, Throughput &amp; Latency | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a></div>
+<h1>Serving Vision Models: Batching, Throughput &amp; Latency</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Alone, I answer each request the instant it arrives, and waste most of the GPU doing it. Made to wait ten milliseconds and gather a crowd, I serve thirty at once and the GPU finally earns its keep. Patience, it turns out, is a throughput strategy."</p>
+<cite>A Vision Model Learning to Batch</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Serving a vision model well is the art of trading a little latency for a lot of throughput, because a GPU is fast at large batches and wasteful at single requests, and real traffic arrives one request at a time.</strong> A model behind an API faces a different problem from one on a device: many clients, unpredictable arrival times, and a cost measured in dollars per thousand inferences. The central technique is dynamic batching, holding requests for a few milliseconds to gather a batch the GPU can run efficiently, and the central tension is the throughput-versus-latency trade that every serving decision navigates. This section builds the mental model, derives the batching trade quantitatively, and surveys the inference servers (Triton, TorchServe, Ray Serve) that implement it so you do not have to.</p>
+</div>
+
+<p>
+The previous three sections shrank a model and got it running fast on a single device. Serving asks a different question: given that single fast model, whether a detector from <a href="../module-23-object-detection/index.html">Chapter 23</a>, a segmentation network from <a href="../module-24-segmentation/index.html">Chapter 24</a>, or a foundation backbone from <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, how do you answer thousands of requests a second, from many clients, within a latency target, at the lowest cost? The answer is rarely "make the model faster"; it is "use the hardware efficiently across many requests at once." A modern GPU running a vision model at batch size 1 may sit at single-digit-percent utilization, because the fixed overhead of launching the work dwarfs the work itself for one image. The requests themselves are decoded frames from the camera and sensor pipeline of <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, arriving from many clients at once rather than as the neat tensor batches training assumed. Serving is about closing that gap, and the closer is batching. This section is the cloud counterpart to the edge of <a href="section-28.3.html">Section 28.3</a>, and it is where a deployed vision system meets real traffic.
+</p>
+
+<h2>1. Throughput Versus Latency <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Two numbers describe a serving system, and they are not the same. <strong>Latency</strong> is how long one request waits for its answer, the number a user feels. <strong>Throughput</strong> is how many requests the system completes per second, the number that sets your hardware bill. They pull in opposite directions. The lowest latency comes from running each request the instant it arrives, alone; the highest throughput comes from gathering many requests into a large batch and running them together, which makes each individual request wait. Serving is choosing where on that curve to sit, and the choice is driven by the product's latency target.
+</p>
+
+<p>
+The reason a batch helps is that GPU work has large fixed overhead. Launching a kernel, transferring data, and the per-call bookkeeping cost roughly the same whether the batch is one image or thirty-two; the marginal cost of each additional image in the batch is small until the GPU's compute units saturate. So the time to process a batch of size $B$ is well modeled as a fixed cost plus a per-image cost:
+</p>
+
+<div class="math-block">
+$$t(B) = t_{\text{fixed}} + B \cdot t_{\text{per-image}}, \qquad \text{throughput} = \frac{B}{t(B)}$$
+</div>
+
+<p>
+Because $t_{\text{fixed}}$ is amortized across the whole batch, throughput $B / t(B)$ rises steeply with batch size at first, then saturates once the GPU is compute-bound. Per-request latency, meanwhile, grows: a request in a batch of 32 waits for all 32 to finish. Figure 28.4.1 plots both, and the gap between them is the entire serving design space.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="As batch size grows throughput rises and saturates while per-request latency rises steadily">
+<style>
+.s4ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.s4lbl{font:11.5px sans-serif;fill:#1a1a1a;}
+.s4sm{font:10px sans-serif;fill:#666;}
+.s4ax{stroke:#888;stroke-width:1.3;}
+.s4tp{stroke:#3a9d52;stroke-width:2.4;fill:none;}
+.s4lat{stroke:#d6802b;stroke-width:2.4;fill:none;}
+.s4band{fill:#e7f1fb;opacity:0.5;}
+</style>
+<text class="s4ttl" x="360" y="22" text-anchor="middle">Batch size trades latency for throughput</text>
+<line class="s4ax" x1="80" y1="250" x2="640" y2="250"/>
+<line class="s4ax" x1="80" y1="250" x2="80" y2="50"/>
+<text class="s4sm" x="360" y="280" text-anchor="middle">batch size B</text>
+<text class="s4sm" x="40" y="155" text-anchor="middle" transform="rotate(-90 40 155)">value</text>
+<rect class="s4band" x="150" y="50" width="120" height="200"/>
+<text class="s4sm" x="210" y="44" text-anchor="middle">useful operating band</text>
+<!-- throughput: rises then saturates -->
+<path class="s4tp" d="M80,238 C160,150 260,95 400,82 C520,76 600,74 640,73"/>
+<text class="s4lbl" x="470" y="70" fill="#3a9d52">throughput (saturates)</text>
+<!-- latency: roughly linear rise -->
+<path class="s4lat" d="M80,236 C200,212 360,176 640,96"/>
+<text class="s4lbl" x="500" y="118" fill="#d6802b">per-request latency (rises)</text>
+<text class="s4sm" x="210" y="232" text-anchor="middle">most throughput,</text>
+<text class="s4sm" x="210" y="246" text-anchor="middle">acceptable latency</text>
+</svg>
+<figcaption><strong>Figure 28.4.1:</strong> The throughput-versus-latency trade as batch size grows. Throughput (green) rises steeply as the fixed GPU overhead is amortized, then saturates once the GPU is compute-bound. Per-request latency (orange) rises roughly linearly because each request waits for its whole batch. The useful operating band (blue) is the largest batch whose latency still meets the target; beyond it you pay latency for throughput you cannot use.</figcaption>
+</figure>
+
+<p>
+The code below measures this curve directly for a real model, so the abstract figure becomes concrete numbers on your hardware.
+</p>
+
+<pre><code class="language-python">import torch, time
+from torchvision.models import resnet50, ResNet50_Weights
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = resnet50(weights=ResNet50_Weights.DEFAULT).eval().to(device)
+
+@torch.no_grad()
+def time_batch(batch_size, iters=50):
+    x = torch.randn(batch_size, 3, 224, 224, device=device)
+    for _ in range(5):                      # warmup (autotune, allocate)
+        model(x)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        model(x)
+    if device == "cuda":
+        torch.cuda.synchronize()            # GPU is async; sync before timing
+    total = time.perf_counter() - t0
+    per_batch_ms = total / iters * 1e3
+    throughput = batch_size * iters / total
+    return per_batch_ms, throughput
+
+for B in [1, 4, 16, 64]:
+    ms, tput = time_batch(B)
+    print(f"B={B:>3}  batch={ms:6.1f} ms  per-image={ms/B:5.2f} ms  {tput:7.0f} img/s")
+# B=  1  batch=   6.2 ms  per-image= 6.20 ms      161 img/s
+# B=  4  batch=   9.1 ms  per-image= 2.28 ms      440 img/s
+# B= 16  batch=  21.0 ms  per-image= 1.31 ms      762 img/s
+# B= 64  batch=  74.0 ms  per-image= 1.16 ms      865 img/s</code></pre>
+<div class="code-caption">Measuring the latency-throughput curve of a ResNet-50. Note the <code>torch.cuda.synchronize()</code> before timing, GPU work is asynchronous, and forgetting to synchronize is the most common benchmarking bug, producing impossibly fast numbers. Per-image time falls from 6.2 ms at batch 1 to 1.16 ms at batch 64 (a $5\times$ efficiency gain) while per-batch latency rises to 74 ms; the right batch size is the largest whose latency fits the target.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Latency Budget Sets the Batch Size, Not the Other Way Around</div>
+<p>The instinct is to pick a batch size for maximum throughput and accept whatever latency results. Production works backward. The product specifies a latency target (say, 50 ms at the 99th percentile), and that target, minus the network and queuing overhead, is the latency budget for inference. The right batch size is the largest one whose batch-processing time fits inside that budget, because that is the most throughput you can buy without breaking the promise to the user. Picking the batch first and the latency second is how teams ship systems that are cheap and too slow, or fast and needlessly expensive. Start from the budget, as Figure 28.4.1's operating band shows.</p>
+</div>
+
+<h2>2. Dynamic Batching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+There is a problem with batching: real requests do not arrive in batches. They arrive one at a time, at unpredictable moments. To batch them you must either make clients send batches (rarely possible) or have the server gather individual requests into a batch on the fly. The latter is <strong>dynamic batching</strong> (sometimes server-side or adaptive batching), and it is the single most important serving technique for vision models. The server maintains a short queue: when a request arrives, it waits up to a small <em>maximum delay</em> (a few milliseconds) for more requests to join, then runs whatever has accumulated as one batch, up to a maximum batch size. The two knobs, max delay and max batch size, place the system on the curve of Figure 28.4.1.
+</p>
+
+<p>
+The trade is direct. A longer max delay gathers larger batches (higher throughput) at the cost of making early-arriving requests wait (higher latency). A shorter delay keeps latency low but, under light traffic, runs small inefficient batches. Crucially, the delay is a ceiling, not a fixed wait: under heavy traffic the batch fills before the delay elapses and runs immediately, so dynamic batching costs latency only when traffic is light enough that the GPU has spare capacity anyway. The sketch below implements the core loop to make the mechanism concrete; production servers do this in optimized native code.
+</p>
+
+<pre><code class="language-python">import asyncio, torch
+
+class DynamicBatcher:
+    """Gather individual async requests into a batch, bounded by delay and size."""
+    def __init__(self, model, max_batch=32, max_delay_ms=5.0):
+        self.model = model
+        self.max_batch = max_batch
+        self.max_delay = max_delay_ms / 1000.0
+        self.queue = asyncio.Queue()
+        asyncio.create_task(self._run_loop())
+
+    async def infer(self, image_tensor):
+        fut = asyncio.get_event_loop().create_future()
+        await self.queue.put((image_tensor, fut))   # enqueue request + its result future
+        return await fut                            # caller awaits its own answer
+
+    async def _run_loop(self):
+        while True:
+            item, fut = await self.queue.get()       # block until at least one request
+            batch, futs = [item], [fut]
+            deadline = asyncio.get_event_loop().time() + self.max_delay
+            # Gather more until the batch is full OR the delay window closes.
+            while len(batch) &lt; self.max_batch:
+                timeout = deadline - asyncio.get_event_loop().time()
+                if timeout &lt;= 0:
+                    break
+                try:
+                    item, fut = await asyncio.wait_for(self.queue.get(), timeout)
+                    batch.append(item); futs.append(fut)
+                except asyncio.TimeoutError:
+                    break
+            # One batched forward pass for the whole gathered group.
+            with torch.no_grad():
+                out = self.model(torch.stack(batch))
+            for i, f in enumerate(futs):             # hand each caller its slice
+                f.set_result(out[i])</code></pre>
+<div class="code-caption">A minimal dynamic batcher. Each request enqueues itself and awaits a future; the run loop gathers requests until the batch is full or the <code>max_delay</code> window closes, runs one batched forward pass, and resolves each caller's future with its own output. The <code>max_batch</code> and <code>max_delay_ms</code> knobs place the server on the latency-throughput curve; under heavy load the batch fills first and the delay never binds.</div>
+
+<h2>3. Concurrency and Model Instances <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Batching fills one model's batch; concurrency runs several batches in flight. There are two complementary levers. <strong>Multiple model instances</strong> on one GPU let a second batch start computing while the first is still finishing, hiding the gaps (data transfer, kernel launch) where a single instance would leave the GPU idle; this works as long as the instances fit in GPU memory together, which is where the compressed weights of <a href="section-28.1.html">Section 28.1</a> pay off twice (a smaller model means more instances per GPU). Whether the backbone is a ResNet from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> or a Vision Transformer from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, the memory footprint per instance sets the concurrency ceiling. <strong>Multiple GPUs or replicas</strong> scale horizontally, with a load balancer spreading requests, the standard answer when one GPU's throughput is not enough. A serving system is therefore a small pipeline: a queue feeds a dynamic batcher, which feeds one or more model instances, which may be replicated across GPUs. Figure 28.4.2 shows the arrangement.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Incoming requests enter a queue feed a dynamic batcher then run on multiple model instances across GPUs">
+<style>
+.c4ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.c4lbl{font:11px sans-serif;fill:#1a1a1a;}
+.c4sm{font:10px sans-serif;fill:#666;}
+.c4req{fill:#fdeede;stroke:#d6802b;stroke-width:1.1;}
+.c4q{fill:#fff3da;stroke:#d6a52b;stroke-width:1.3;}
+.c4batch{fill:#e7f1fb;stroke:#2c6fb5;stroke-width:1.4;}
+.c4gpu{fill:#e9f6ec;stroke:#3a9d52;stroke-width:1.4;}
+.c4ar{stroke:#888;stroke-width:1.5;marker-end:url(#c4a);fill:none;}
+</style>
+<defs><marker id="c4a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+<text class="c4ttl" x="360" y="22" text-anchor="middle">A vision serving pipeline</text>
+<!-- requests -->
+<rect class="c4req" x="30" y="70" width="22" height="22"/><rect class="c4req" x="30" y="100" width="22" height="22"/><rect class="c4req" x="30" y="130" width="22" height="22"/><rect class="c4req" x="30" y="160" width="22" height="22"/>
+<text class="c4sm" x="41" y="200" text-anchor="middle">requests</text>
+<text class="c4sm" x="41" y="214" text-anchor="middle">(one at a time)</text>
+<line class="c4ar" x1="54" y1="125" x2="100" y2="125"/>
+<!-- queue -->
+<rect class="c4q" x="102" y="95" width="90" height="60" rx="5"/>
+<text class="c4lbl" x="147" y="122" text-anchor="middle">queue</text>
+<text class="c4sm" x="147" y="140" text-anchor="middle">+ batcher</text>
+<line class="c4ar" x1="192" y1="125" x2="240" y2="125"/>
+<!-- batch -->
+<rect class="c4batch" x="242" y="95" width="110" height="60" rx="5"/>
+<text class="c4lbl" x="297" y="120" text-anchor="middle">dynamic batch</text>
+<text class="c4sm" x="297" y="138" text-anchor="middle">B images, one tensor</text>
+<line class="c4ar" x1="352" y1="110" x2="430" y2="85"/>
+<line class="c4ar" x1="352" y1="140" x2="430" y2="175"/>
+<!-- gpu instances -->
+<rect class="c4gpu" x="432" y="55" width="240" height="56" rx="5"/>
+<text class="c4lbl" x="552" y="79" text-anchor="middle">GPU 0: instances A, B</text>
+<text class="c4sm" x="552" y="97" text-anchor="middle">two batches in flight, GPU stays busy</text>
+<rect class="c4gpu" x="432" y="150" width="240" height="56" rx="5"/>
+<text class="c4lbl" x="552" y="174" text-anchor="middle">GPU 1: replica</text>
+<text class="c4sm" x="552" y="192" text-anchor="middle">horizontal scale-out under load</text>
+</svg>
+<figcaption><strong>Figure 28.4.2:</strong> A vision serving pipeline. Individual requests enter a queue where the dynamic batcher of subsection 2 gathers them into a batch tensor. The batch runs on one of several model instances; multiple instances per GPU keep the device busy across kernel-launch and transfer gaps, and replicas across GPUs scale throughput horizontally under load.</figcaption>
+</figure>
+
+<h2>4. Inference Servers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+You could build the pipeline above yourself, and the sketch in subsection 2 shows it is not conceptually hard, but production-grade serving has many sharp edges: health checks, metrics, model versioning, multi-model hosting, GPU memory management, request timeouts, and graceful overload handling. Inference servers package all of it. Three are common for vision. <strong>NVIDIA Triton</strong> is the most capable: it hosts models from any framework (TensorRT, ONNX, PyTorch) with built-in dynamic batching, concurrent instances, and a model-ensemble feature that chains preprocessing, inference, and postprocessing on the server. <strong>TorchServe</strong> is the PyTorch-native option, simpler to start with and tightly integrated with the PyTorch ecosystem. <strong>Ray Serve</strong> is a Python-first framework for composing models into pipelines and scaling them across a cluster, strong when serving is part of a larger Python application. For Triton, the entire dynamic-batching configuration is declarative.
+</p>
+
+<pre><code class="language-python"># Triton model configuration (config.pbtxt) for a TensorRT vision model.
+# This declarative config replaces the hand-written batcher of subsection 2.
+config = """
+name: "resnet50_trt"
+platform: "tensorrt_plan"
+max_batch_size: 32              # ceiling on the dynamic batch
+input  [ { name: "input"  data_type: TYPE_FP16 dims: [3, 224, 224] } ]
+output [ { name: "logits" data_type: TYPE_FP16 dims: [1000] } ]
+
+dynamic_batching {              # Triton gathers requests into batches itself
+  preferred_batch_size: [ 8, 16, 32 ]    # batch shapes the engine is tuned for
+  max_queue_delay_microseconds: 5000     # wait up to 5 ms to fill a batch
+}
+
+instance_group [               # run two model instances on each GPU
+  { count: 2  kind: KIND_GPU }
+]
+"""
+# Drop this file beside the engine in the model repository and start Triton:
+#   tritonserver --model-repository=/models
+# Triton now serves resnet50_trt over HTTP and gRPC with batching + concurrency.
+print("Triton config defines batching and concurrency declaratively")</code></pre>
+<div class="code-caption">A Triton <code>config.pbtxt</code> for a TensorRT vision model. The <code>dynamic_batching</code> block declares exactly the queue-and-delay logic the Python sketch implemented by hand, and <code>instance_group</code> runs two concurrent instances per GPU. <code>preferred_batch_size</code> lists the batch shapes the TensorRT engine was tuned for in <a href="section-28.2.html">Section 28.2</a>, closing the loop with the optimization-profile lesson from there.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Served Endpoint in a Few Lines</div>
+<p>For a single PyTorch model, you do not need the full Triton apparatus to get batching and an HTTP endpoint. Ray Serve gives you both with a decorator:</p>
+<pre><code class="language-python">from ray import serve
+import torch
+from torchvision.models import resnet50, ResNet50_Weights
+
+@serve.deployment(num_replicas=2, ray_actor_options={"num_gpus": 1})
+class Classifier:
+    def __init__(self):
+        self.model = resnet50(weights=ResNet50_Weights.DEFAULT).eval().cuda()
+
+    @serve.batch(max_batch_size=32, batch_wait_timeout_s=0.005)   # dynamic batching
+    async def __call__(self, images: list) -> list:
+        batch = torch.stack(images).cuda()
+        with torch.no_grad():
+            out = self.model(batch)
+        return list(out.cpu())
+
+serve.run(Classifier.bind())     # now serving on http://localhost:8000</code></pre>
+<p>The <code>@serve.batch</code> decorator alone provides the entire dynamic batcher from subsection 2, and <code>num_replicas</code> handles concurrency. The roughly forty lines of async queue logic collapse to two decorator arguments, and you inherit health checks, metrics, and autoscaling for free.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Content-Moderation Queue That Fell Over</div>
+<p>A social platform served an image content-moderation classifier behind an API, sized for its average traffic of 800 images per second on a small GPU fleet with no dynamic batching, each request run alone. It worked until a viral event tripled the upload rate within minutes. With each request running at batch size 1, the GPUs were already near their inefficient ceiling at normal load, so the surge had nowhere to go: the request queue grew without bound, latency climbed past the timeout, and uploads started failing the moderation check and getting blocked, exactly when moderation mattered most. The post-incident fix was not more GPUs first; it was dynamic batching. Enabling a 10 ms max-delay batcher with a max batch of 32 raised the per-GPU throughput from about 160 to over 800 images per second on the same hardware, a fivefold headroom gain that absorbed the surge, and only then did they add two replicas for safety margin. The lesson: serving at batch size 1 leaves four-fifths of the GPU on the table, and the cheapest capacity is the throughput you are already paying for but not using. Dynamic batching is the first lever, not the last resort.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Disaggregated and Multimodal Serving (2024-2026)</div>
+<p>Serving research in 2024-2026 has been driven by large generative and multimodal models, and the techniques are flowing back to vision. Continuous (in-flight) batching, pioneered for large language model serving in vLLM and now standard, batches at the level of individual computation steps rather than whole requests, and the 2024-onward vision-language serving stacks adopt it for the autoregressive parts of multimodal models. Disaggregated serving splits a model's stages across different hardware pools, an idea reaching vision pipelines that pair a heavy encoder with many light decoders. On the throughput frontier, the FP8 and FP4 engines of <a href="section-28.2.html">Section 28.2</a> roughly double serving density per GPU, and speculative and cascade serving (a cheap model handles easy inputs, escalating only hard ones to an expensive model) cut average cost by routing on difficulty. For pure vision classification and detection, dynamic batching remains the dominant lever; the frontier matters most as these models increasingly ship inside multimodal systems.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Dynamic batching is the rare optimization where making each request wait makes every request faster. The first image into an empty queue volunteers to be slightly late so that the next thirty-one can ride along on the same GPU launch it was going to pay for anyway. Under heavy load the irony deepens: the busier the server gets, the less anyone waits, because the batch fills before the delay window even opens, so the "patience tax" is charged only when the GPU has nothing better to do. A signature phrase for the whole section: <em>the latency budget picks the batch size; the batch size never picks itself.</em></p>
+</div>
+
+<h2>5. Summary and the Road to Monitoring</h2>
+
+<p>
+Serving trades latency for throughput. A GPU is inefficient at batch size 1 because fixed overhead dominates, and efficient at large batches because that overhead amortizes; the time-per-batch model $t(B) = t_{\text{fixed}} + B \cdot t_{\text{per-image}}$ captures why. Dynamic batching gathers individual requests into efficient batches with two knobs, max delay and max batch size, that place the system on the latency-throughput curve, and it costs latency only when traffic is light. Concurrency adds throughput through multiple model instances per GPU and replicas across GPUs. Inference servers (Triton, TorchServe, Ray Serve) implement all of it declaratively, with the operational machinery a production endpoint needs. The latency budget, not the throughput appetite, sets the batch size. But even a perfectly served model degrades over time as the world drifts away from its training data, silently and without raising an error. <a href="section-28.5.html">Section 28.5</a> closes the chapter by building the monitoring and continual-improvement loop that catches that decay before users do.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.1: When Batching Does Not Help <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Dynamic batching amortizes fixed GPU overhead across a batch. Describe two situations where it provides little or no benefit: one where the model or hardware makes the fixed overhead negligible relative to per-image compute, and one where the traffic pattern prevents batches from forming. For each, explain in two or three sentences why batching fails to help and what you would do instead. Connect the first case to the per-image-time numbers in the subsection 1 benchmark.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.2: Measure and Fit the Batch Model <span class="exercise-type coding">Coding</span></div>
+<p>Run the subsection 1 benchmark on a model of your choice across batch sizes 1, 2, 4, 8, 16, 32, and 64, recording per-batch latency and throughput. Fit the linear model $t(B) = t_{\text{fixed}} + B \cdot t_{\text{per-image}}$ to your latency measurements and report the two fitted parameters. Then, given a latency budget of 30 ms for inference, compute the maximum batch size that fits and the throughput it delivers. Write one paragraph on how well the linear model fits and where it breaks down (it should curve once the GPU saturates), connecting the deviation to Figure 28.4.1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.4.3: Tune the Batcher to a Service-Level Objective <span class="exercise-type analysis">Analysis</span></div>
+<p>You serve a detector with a service-level objective of 50 ms at the 99th-percentile latency, and your single GPU processes a batch of 16 in 20 ms (fixed cost 4 ms, 1 ms per image). Traffic averages 500 requests per second but is bursty. Reason about how to set the dynamic-batching max-delay and max-batch knobs to meet the objective: estimate the queuing delay a request can tolerate, the batch size the GPU can clear in time, and whether one GPU suffices or you need a second instance. Justify your chosen knob values and replica count with the numbers, and state what you would monitor in production to confirm the objective is met, anticipating <a href="section-28.5.html">Section 28.5</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-28.3.html">&#8592; Section 28.3: Edge &amp; Mobile Vision</a>
+<a href="index.html">Chapter 28</a>
+<a class="next" href="section-28.5.html">Section 28.5: Monitoring, Drift &amp; Continual Improvement &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

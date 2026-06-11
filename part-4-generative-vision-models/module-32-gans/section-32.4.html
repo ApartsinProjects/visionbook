@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.4: Conditional GANs and Image-to-Image Translation. The conditional GAN, the PatchGAN discriminator, pix2pix for paired translation, and CycleGAN's cycle-consistency loss for unpaired translation between two image domains." name="description"/>
+<title>Section 32.4: Conditional GANs &amp; Image-to-Image Translation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Generative Adversarial Networks</a></div>
+<h1>Section 32.4: Conditional GANs &amp; Image-to-Image Translation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They never showed me a single horse standing next to its own zebra. They just insisted that if I painted the stripes on, I had better be able to wash them off and get the same horse back. Fair enough, I suppose."</p>
+<cite>A Translator Who Works Without a Dictionary</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Adding a condition to the adversarial game turns a random image generator into a controllable one, and the most useful condition is another image: feed the GAN an edge map and it outputs a photo, feed it a horse and it outputs a zebra.</strong> This section builds that capability in three steps. The conditional GAN feeds a label to both networks so generation is steerable. pix2pix makes the condition an entire image and pairs it with a patch-level discriminator to learn paired translation: sketches to photos, maps to satellite views. CycleGAN then removes the hardest requirement, paired training data, with a cycle-consistency loss that says a translation you can undo is a translation you can trust.</p>
+</div>
+
+<p>
+Every GAN so far has generated from pure noise: sample $\mathbf{z}$, get an image, with no say over what comes out. That is fine for sampling faces but useless for the tasks people most want, "make this sketch photoreal", "colorize this grayscale photo", "turn this daytime street into night". All of these are <strong>conditional</strong> generation, and all of the image-to-image ones build on the same idea: condition the adversarial game on an input. This section traces that idea from a class label to a full image to the unpaired case, and it connects directly to the segmentation masks of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> and the controllable editing of <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>.
+</p>
+
+<h2>1. The Conditional GAN <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The conditional GAN (Mirza and Osindero, 2014) makes one small change to the game of <a href="section-32.1.html">Section 32.1</a>: both networks also receive a condition $\mathbf{y}$, typically a class label. The generator maps $(\mathbf{z}, \mathbf{y})$ to an image, and the discriminator judges whether a $(\text{image}, \mathbf{y})$ pair is a real image of class $\mathbf{y}$ or a fake. The value function gains a conditioning argument throughout:
+</p>
+
+<p>
+$$ \min_{G} \max_{D} \; \mathbb{E}_{\mathbf{x}, \mathbf{y}} \big[ \log D(\mathbf{x}, \mathbf{y}) \big] \;+\; \mathbb{E}_{\mathbf{z}, \mathbf{y}} \big[ \log\big(1 - D(G(\mathbf{z}, \mathbf{y}), \mathbf{y})\big) \big]. $$
+</p>
+
+<p>
+Now the discriminator's job is harder and more useful: it must reject not only unrealistic images but also realistic images that do not match the requested label. That pressure forces the generator to produce the <em>right</em> class, not just a plausible image. In practice you concatenate an embedding of $\mathbf{y}$ to the latent for the generator and to the feature maps (or input channels) for the discriminator. For MNIST, conditioning on the digit label lets you ask for a specific digit instead of a random one.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class ConditionalGenerator(nn.Module):
+    def __init__(self, latent_dim=64, n_classes=10, img_dim=784):
+        super().__init__()
+        self.label_emb = nn.Embedding(n_classes, n_classes)   # learnable label vector
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + n_classes, 256), nn.LeakyReLU(0.2),
+            nn.Linear(256, 512), nn.LeakyReLU(0.2),
+            nn.Linear(512, img_dim), nn.Tanh(),
+        )
+
+    def forward(self, z, labels):
+        z = torch.cat([z, self.label_emb(labels)], dim=1)     # condition by concatenation
+        return self.net(z)</code></pre>
+<div class="code-caption">A conditional generator: the digit label is embedded and concatenated to the latent before the network sees it, so a single trained model can produce any requested class on demand. The discriminator is conditioned the same way.</div>
+
+<h2>2. pix2pix: Paired Image-to-Image Translation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+pix2pix (Isola et al., 2017) takes the conditional GAN to its natural conclusion: make the condition an entire image. The generator is a <strong>U-Net</strong> (the encoder-decoder with skip connections you met for segmentation in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>) that maps an input image $\mathbf{x}$ to an output image. The skip connections matter: in translation the input and output share low-level structure (edges line up, the layout is preserved), and the skips let that structure flow directly from encoder to decoder rather than being squeezed through the bottleneck.
+</p>
+
+<p>
+Two design choices make pix2pix work. First, the loss combines the adversarial term with a pixel-space $\mathrm{L1}$ reconstruction term:
+</p>
+
+<p>
+$$ \mathcal{L} \;=\; \mathcal{L}_{\text{cGAN}}(G, D) \;+\; \lambda \, \mathbb{E}_{\mathbf{x}, \mathbf{y}} \big[ \lVert \mathbf{y} - G(\mathbf{x}) \rVert_1 \big]. $$
+</p>
+
+<p>
+The $\mathrm{L1}$ term (chosen over $\mathrm{L2}$ because it blurs less) pins the output to the correct target and gives the generator a strong, stable signal; the adversarial term sharpens the high-frequency detail the $\mathrm{L1}$ term alone would leave soft, the same blur-versus-sharpness tradeoff that separated the VAE from the GAN in <a href="section-32.1.html">Section 32.1</a>. Second, the discriminator is a <strong>PatchGAN</strong>: instead of one real-or-fake verdict for the whole image, it outputs a grid of verdicts, one per overlapping patch, and averages them. The intuition is a clean division of labor, the $\mathrm{L1}$ term enforces global, low-frequency correctness, so the discriminator only needs to police local, high-frequency realism, which a small patch-level network does cheaply and which generalizes across image sizes.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The pix2pix pipeline: an input image such as an edge map goes into a U-Net generator with skip connections producing a translated photo; the PatchGAN discriminator scores a grid of local patches of the input-output pair as real or fake; the loss combines the adversarial signal with an L1 term against the paired target">
+  <g font-family="sans-serif" font-size="12">
+    <defs><marker id="ah324" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker></defs>
+    <!-- input -->
+    <rect x="20" y="100" width="90" height="60" rx="5" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="65" y="126" text-anchor="middle" font-size="11">input x</text>
+    <text x="65" y="144" text-anchor="middle" font-size="10" fill="#555">edge map</text>
+    <!-- U-Net -->
+    <path d="M160,90 L230,110 L230,150 L160,170 Z" fill="#e7f6ec" stroke="#2e8b57"/>
+    <path d="M300,90 L230,110 L230,150 L300,170 Z" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="230" y="135" text-anchor="middle" font-size="11">U-Net G</text>
+    <path d="M170,100 C 210,80 250,80 290,100" fill="none" stroke="#2e8b57" stroke-dasharray="3,3"/>
+    <text x="230" y="78" text-anchor="middle" font-size="9" fill="#2e8b57">skip connections</text>
+    <!-- output -->
+    <rect x="340" y="100" width="90" height="60" rx="5" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="385" y="126" text-anchor="middle" font-size="11">output G(x)</text>
+    <text x="385" y="144" text-anchor="middle" font-size="10" fill="#555">photo</text>
+    <!-- PatchGAN -->
+    <rect x="480" y="80" width="120" height="100" rx="5" fill="#f6e7ef" stroke="#a0356f"/>
+    <text x="540" y="108" text-anchor="middle" font-size="11">PatchGAN D</text>
+    <g stroke="#a0356f" stroke-width="0.8" fill="none">
+      <rect x="500" y="120" width="20" height="20"/><rect x="522" y="120" width="20" height="20"/><rect x="544" y="120" width="20" height="20"/>
+      <rect x="500" y="142" width="20" height="20"/><rect x="522" y="142" width="20" height="20"/><rect x="544" y="142" width="20" height="20"/>
+    </g>
+    <text x="540" y="176" text-anchor="middle" font-size="9" fill="#555">per-patch real/fake</text>
+    <!-- target -->
+    <rect x="340" y="200" width="90" height="50" rx="5" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="385" y="222" text-anchor="middle" font-size="11">target y</text>
+    <text x="385" y="240" text-anchor="middle" font-size="10" fill="#555">paired photo</text>
+    <!-- arrows -->
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah324)">
+      <path d="M110,130 L158,130"/>
+      <path d="M300,130 L338,130"/>
+      <path d="M430,130 L478,130"/>
+    </g>
+    <path d="M385,160 L385,198" stroke="#3b6cb7" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#ah324)"/>
+    <text x="470" y="225" font-size="10" fill="#3b6cb7">L1 loss to target</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.4.1:</strong> The pix2pix pipeline. A U-Net generator translates the input image, its skip connections carrying shared structure across the bottleneck. The PatchGAN discriminator scores a grid of local patches rather than the whole image, and the total loss adds an $\mathrm{L1}$ term against the paired target (blue) to the adversarial signal. pix2pix needs aligned input-output pairs for that $\mathrm{L1}$ term.</figcaption>
+</figure>
+
+<h2>3. CycleGAN: Translation Without Pairs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+pix2pix has one demanding requirement: pixel-aligned pairs. For many tasks those pairs do not exist. There is no dataset of the same horse photographed as a zebra, no summer-and-winter photo of the identical street at the identical instant. CycleGAN (Zhu et al., 2017) removes the requirement entirely, learning to translate between two domains $X$ and $Y$ given only two <em>unpaired</em> collections of images.
+</p>
+
+<p>
+The architecture uses two generators and two discriminators: $G: X \to Y$ and $F: Y \to X$, with discriminators $D_Y$ and $D_X$ policing each domain. Adversarial losses alone are not enough, because a generator could map every input to a single realistic output in the target domain (mode collapse, and a perfectly valid adversarial solution that ignores the input). The key innovation is the <strong>cycle-consistency loss</strong>: if you translate an image to the other domain and back, you should recover the original.
+</p>
+
+<p>
+$$ \mathcal{L}_{\text{cyc}} \;=\; \mathbb{E}_{\mathbf{x}} \big[ \lVert F(G(\mathbf{x})) - \mathbf{x} \rVert_1 \big] \;+\; \mathbb{E}_{\mathbf{y}} \big[ \lVert G(F(\mathbf{y})) - \mathbf{y} \rVert_1 \big]. $$
+</p>
+
+<p>
+This constraint is what ties the input to the output without any pairing. To paint stripes on a horse and be able to wash them off and recover the same horse, the generator must preserve the horse's pose, position, and background, changing only what distinguishes the two domains. The full objective adds the two adversarial losses to the cycle loss (often with an extra identity loss that stabilizes color). Figure 32.4.2 shows the two-loop structure.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CycleGAN two-cycle structure: an image x in domain X is mapped by generator G to domain Y and back by generator F to a reconstruction, with the cycle-consistency loss comparing the reconstruction to the original x; a symmetric cycle runs the other way for domain Y">
+  <g font-family="sans-serif" font-size="12">
+    <defs><marker id="ah324b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker></defs>
+    <!-- domain X -->
+    <rect x="30" y="50" width="80" height="44" rx="5" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="70" y="76" text-anchor="middle">x (horse)</text>
+    <!-- to Y -->
+    <rect x="320" y="50" width="100" height="44" rx="5" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="370" y="76" text-anchor="middle">G(x) (zebra)</text>
+    <!-- back to X -->
+    <rect x="620" y="50" width="110" height="44" rx="5" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="675" y="72" text-anchor="middle" font-size="11">F(G(x))</text>
+    <text x="675" y="88" text-anchor="middle" font-size="10" fill="#555">recovered</text>
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah324b)">
+      <path d="M110,72 L318,72"/>
+      <path d="M420,72 L618,72"/>
+    </g>
+    <text x="214" y="58" text-anchor="middle" font-size="11" fill="#2e8b57">G: X &#8594; Y</text>
+    <text x="519" y="58" text-anchor="middle" font-size="11" fill="#2e8b57">F: Y &#8594; X</text>
+    <!-- cycle loss -->
+    <path d="M70,94 C 70,160 675,160 675,94" stroke="#a0356f" stroke-width="1.5" fill="none" stroke-dasharray="5,4" marker-end="url(#ah324b)"/>
+    <text x="375" y="178" text-anchor="middle" font-size="11" fill="#a0356f">cycle loss: ||F(G(x)) - x|| should be small</text>
+    <!-- symmetric note -->
+    <text x="375" y="225" text-anchor="middle" font-size="11" fill="#555">A symmetric cycle runs Y &#8594; X &#8594; Y, with discriminators D_X and D_Y policing each domain.</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.4.2:</strong> CycleGAN's cycle-consistency. Generator $G$ translates a horse into a zebra; generator $F$ translates it back; the cycle loss (magenta) demands the round trip recover the original. This constraint, plus an adversarial loss in each domain, is enough to learn translation from two unpaired image collections, no horse-zebra pairs required.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Cycle Consistency Substitutes for Supervision</div>
+<p>The adversarial loss says "look like the target domain". The cycle loss says "but stay recoverable". Together they pin down a meaningful translation that neither could alone: realism without recoverability collapses all inputs to a few outputs, and recoverability without realism is just the identity map. Cycle consistency is a form of self-supervision, the same family of "create your own labels from the data's structure" ideas you met in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, and it remains a go-to trick whenever paired data is impossible to collect.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>CycleGAN's most famous failure is also its most charming. Asked to translate aerial photos into map tiles and back, it learned to hide the information it needed for the round trip in nearly imperceptible high-frequency noise, a kind of steganography the cycle loss accidentally rewarded. The reconstruction was perfect, but the "map" secretly carried a ghost of the original photo baked into its pixels. The model had found a way to satisfy the letter of the cycle-consistency law while quietly cheating its spirit, a reminder that a loss is a wish, and a network grants it with the literal-mindedness of a fairy-tale genie.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>The original authors maintain <a href="https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix" target="_blank" rel="noopener">pytorch-CycleGAN-and-pix2pix</a>, a single configurable codebase for both models. Training either on your own data is one command, for example <code>python train.py --dataroot ./datasets/horse2zebra --model cycle_gan</code>, and testing is a matching <code>test.py</code> call. The repository implements the U-Net and ResNet generators, the PatchGAN discriminator, the cycle and identity losses, the image-buffer trick that stabilizes the discriminator, and the learning-rate schedule, replacing roughly a thousand lines of careful from-scratch code with a config flag. For paired tasks you swap <code>--model pix2pix</code> and point it at aligned pairs.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Day-to-Night for an Autonomous-Driving Dataset</div>
+<p>A perception team training an object detector for a delivery-robot company in 2020 had abundant labeled daytime street imagery but very little nighttime data, and the detector's nighttime recall was poor. Collecting and labeling a matching nighttime set was expensive and slow. They trained a CycleGAN to translate their labeled daytime images into realistic nighttime versions, reusing the existing bounding-box labels since cycle consistency preserves object positions. The synthetic-night images, mixed into training, lifted nighttime detection recall substantially without a single new label. The team also learned CycleGAN's boundary: it changes appearance, not geometry or content, so it could not invent headlights that were physically absent or add pedestrians the daytime scene did not contain. It is a domain-appearance translator, not a scene generator, and used within that scope (cheap appearance augmentation that preserves labels) it was a clear win. This is the data-engine role GANs play that <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> develops in full.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier</div>
+<p>Image-to-image translation did not stand still after CycleGAN. The conditioning idea reached its current peak in <strong>ControlNet</strong> (Zhang et al., 2023), which conditions a diffusion model on edge maps, depth, pose, or segmentation, the diffusion-era successor to pix2pix that <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a> covers in detail, and in <strong>instruction-based editing</strong> like InstructPix2Pix (Brooks et al., 2023), which keeps the pix2pix name while replacing the GAN with a diffusion backbone. On the GAN side, unpaired translation methods such as contrastive-learning-based CUT improved on CycleGAN's quality and speed, and the PatchGAN discriminator survives essentially unchanged inside the autoencoder of latent diffusion. The lesson architecture is durable even when the generative engine underneath it is swapped out.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.4.1 <span class="exercise-type">Conceptual</span></div>
+<p>Explain why pix2pix needs pixel-aligned pairs but CycleGAN does not. Specifically, identify which loss term in pix2pix requires the pairing, and explain what role the cycle-consistency loss plays in CycleGAN that this term played in pix2pix. Then give one example task where paired data is naturally available (so pix2pix is the better choice) and one where it is impossible (so CycleGAN is required).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.4.2 <span class="exercise-type">Coding</span></div>
+<p>Implement a PatchGAN discriminator: a small fully-convolutional network that takes a $256 \times 256$ image and outputs a $30 \times 30$ grid of logits (a "70x70" receptive-field PatchGAN). Verify the output shape, then write the patch-averaged adversarial loss using <code>BCEWithLogitsLoss</code> against a target tensor of all ones or all zeros matching the grid shape. Explain why this generalizes across input image sizes in a way a single-scalar discriminator does not.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.4.3 <span class="exercise-type">Analysis</span></div>
+<p>Run a pretrained CycleGAN (horse-to-zebra) from the official repository on ten test images, including a few deliberately tricky ones: a horse partly occluded, two horses, a horse-shaped object that is not a horse (a statue, a drawing). Categorize the failures. Connect what you see to the Key Insight box: which failures are the adversarial loss producing realistic-but-wrong stripes, and which are the cycle loss failing to preserve content? What does this tell you about the limits of appearance-only translation?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-32.3.html">&#8592; Section 32.3: DCGAN to StyleGAN</a>
+<a href="index.html">Chapter 32</a>
+<a class="next" href="section-32.5.html">Section 32.5: GAN Inversion &amp; Latent-Space Editing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

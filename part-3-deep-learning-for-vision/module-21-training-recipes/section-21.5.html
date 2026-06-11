@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.5: Class Imbalance, Label Noise & Real-World Data. Long-tailed class distributions, class-balanced and focal losses, resampling strategies, the reality of label noise even in ImageNet, and noise-robust training that stops a model memorizing wrong labels." name="description"/>
+<title>Section 21.5: Class Imbalance, Label Noise &amp; Real-World Data | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Class Imbalance, Label Noise &amp; Real-World Data</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Ninety-nine times out of a hundred the part was fine, so I learned to say fine and was right ninety-nine percent of the time. They were furious. The whole point, they said, was the hundredth part. Nobody mentioned this during training."</p>
+<cite>A Defect Detector That Optimized the Wrong Thing</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Benchmark datasets are clean and balanced; the data you actually get is neither, and the two dominant pathologies, severe class imbalance and wrong labels, will quietly defeat a model trained as if the data were perfect.</strong> When one class outnumbers another a thousand to one, plain accuracy and plain cross-entropy push the model to ignore the rare class, which is usually the class you care about. When a fraction of your labels are simply incorrect (and a fraction always is, even in ImageNet), a high-capacity network will dutifully memorize the mistakes. This section gives you the tools for both: class-balanced and focal losses and resampling for imbalance, and noise-robust training plus the right metrics for label noise.</p>
+</div>
+
+<p>
+The previous four sections assumed something close to the clean, balanced benchmark world of <a href="section-21.1.html">Section 21.1</a>. Real projects rarely live there. A medical screening set has far more healthy than diseased scans; a manufacturing line produces vastly more good parts than defective ones; a wildlife camera trap captures common species constantly and the endangered one almost never. And in every dataset, some labels are wrong, because annotation is done by tired humans under time pressure. This section is about training well anyway. It connects back to the noise models of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>, where noise corrupted pixels; here it corrupts labels.
+</p>
+
+<h2>1. The Imbalance Problem and Why Accuracy Lies <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Consider a defect detector where 99% of parts are good. A model that predicts "good" for everything achieves 99% accuracy while being completely useless, because it never catches a single defect, the one thing it exists to do. This is why accuracy is the wrong metric under imbalance. Cross-entropy has the same blind spot: summed over a batch that is 99% good parts, the loss is dominated by the easy majority class, so the gradient mostly teaches the model to be even more confident about good parts and barely registers the rare defects. The model converges to the trivial majority predictor because that is what the loss rewards.
+</p>
+
+<p>
+The first fix is the metric. Under imbalance you measure precision, recall, and their harmonic mean the F1 score, per class, or you summarize with balanced accuracy (the average of per-class recalls) or the area under the precision-recall curve. These reward catching the rare class. Choosing the right metric is not a cosmetic decision; it determines what "good" even means, and it sets the threshold tuning you will revisit when per-pixel logits get thresholded in the segmentation of <a href="../module-24-segmentation/index.html">Chapter 24</a>. The metric evolution from PSNR in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> through IoU and mAP runs straight through this choice.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Pick the Metric Before the Loss</div>
+<p>Under imbalance, decide what success means before you touch the training loss. If catching every defect matters more than the occasional false alarm, optimize recall; if a false alarm is expensive, balance precision against it with the F1 score or a cost-weighted metric. Report per-class numbers, never a single pooled accuracy, because pooled accuracy on imbalanced data is the number that lets a useless model look excellent. Once the metric reflects the real goal, the loss and sampling fixes below have a target to aim at.</p>
+</div>
+
+<h2>2. Loss-Level Fixes: Class Weights and Focal Loss <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The simplest loss-level fix is <strong>class weighting</strong>: multiply each class's contribution to the loss by a weight inversely related to its frequency, so a rare-class mistake costs more than a common-class mistake. A refinement, the class-balanced loss, weights by the "effective number" of samples rather than the raw inverse frequency, which behaves better when counts vary by orders of magnitude. A more surgical tool is <strong>focal loss</strong>, designed for the extreme imbalance of object detection. It multiplies the standard cross-entropy by a factor $(1 - p_t)^\gamma$, where $p_t$ is the model's predicted probability for the true class. Easy examples (high $p_t$) get their loss driven toward zero, so the gradient is dominated by the hard and usually rare cases.
+</p>
+
+<p>
+Figure 21.5.1 shows how the focal factor reshapes the loss: well-classified easy examples are suppressed so the model stops spending capacity on what it already knows and focuses on the hard tail.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Focal loss compared to cross-entropy as a function of predicted probability">
+<style>
+.ax{stroke:#999;stroke-width:1.2;}
+.ce{stroke:#c0392b;stroke-width:2.5;fill:none;}
+.fl{stroke:#2c6fb5;stroke-width:2.5;fill:none;}
+.lbl{font:12px sans-serif;fill:#1a1a1a;}
+.sm{font:10px sans-serif;fill:#555;}
+</style>
+<line class="ax" x1="70" y1="200" x2="680" y2="200"/>
+<line class="ax" x1="70" y1="40" x2="70" y2="200"/>
+<text class="lbl" x="375" y="235" text-anchor="middle">predicted probability of true class  p_t</text>
+<text class="lbl" x="24" y="120" transform="rotate(-90 24 120)" text-anchor="middle">loss</text>
+<!-- cross-entropy: -log(p), from (70,45) high to (680,200) low -->
+<path class="ce" d="M75,48 C150,95 260,150 380,178 C480,195 590,199 678,200"/>
+<!-- focal loss: cross-entropy * (1-p)^2, much flatter early, near zero by mid -->
+<path class="fl" d="M75,90 C160,150 250,185 360,196 C470,200 590,200 678,200"/>
+<text class="sm" x="120" y="40" fill="#c0392b">cross-entropy</text>
+<text class="sm" x="170" y="135" fill="#2c6fb5">focal loss (gamma = 2)</text>
+<text class="sm" x="560" y="185" text-anchor="middle">easy examples:</text>
+<text class="sm" x="560" y="200" text-anchor="middle">focal loss near 0</text>
+<line class="ax" x1="70" y1="200" x2="70" y2="205"/>
+<text class="sm" x="70" y="218" text-anchor="middle">0</text>
+<text class="sm" x="678" y="218" text-anchor="middle">1</text>
+</svg>
+<figcaption><strong>Figure 21.5.1:</strong> Focal loss versus cross-entropy as a function of the model's confidence in the correct class. The focal modulating factor $(1 - p_t)^\gamma$ pulls the loss of confidently-correct (easy) examples toward zero, so the gradient is dominated by hard examples, which under imbalance are mostly the rare class.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def focal_loss(logits, targets, gamma=2.0, alpha=None):
+    """Multi-class focal loss: down-weights easy (confident) examples."""
+    log_p = F.log_softmax(logits, dim=1)
+    log_pt = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)   # log prob of true class
+    pt = log_pt.exp()
+    loss = -((1 - pt) ** gamma) * log_pt                        # the focal factor
+    if alpha is not None:                                       # optional per-class weight
+        loss = alpha[targets] * loss
+    return loss.mean()
+
+logits = torch.randn(8, 3); targets = torch.randint(0, 3, (8,))
+print("CE   :", F.cross_entropy(logits, targets).item())
+print("focal:", focal_loss(logits, targets, gamma=2.0).item())
+# focal loss is smaller because confidently-correct examples contribute almost nothing</code></pre>
+<div class="code-caption">Focal loss in a few lines. The $(1 - p_t)^\gamma$ factor shrinks the contribution of easy examples; with $\gamma = 0$ it reduces exactly to cross-entropy, so $\gamma$ tunes how aggressively the easy majority is suppressed.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>A weather forecaster in a desert who predicts "no rain" every single day will be correct well over 99% of the time, which is also exactly how a 99.7%-accurate defect detector that has never once flagged a defect achieves its impressive-looking number. The statistics community has called this the "accuracy paradox" for decades; deep learning simply rediscovered it the hard way, one useless high-accuracy model at a time. The forecaster and the detector share a motto: being right about the boring case is not the same as being useful.</p>
+</div>
+
+<h2>3. Data-Level Fixes: Resampling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Instead of (or alongside) reweighting the loss, you can rebalance the data the model sees. <strong>Oversampling</strong> draws rare-class examples more often, so each batch is closer to balanced; PyTorch's <code>WeightedRandomSampler</code> does this cleanly by assigning each sample a draw probability inversely proportional to its class frequency. <strong>Undersampling</strong> discards majority-class examples to match the minority, which is simpler but throws away data. A middle path that often works best pairs modest oversampling with the augmentation of <a href="section-21.2.html">Section 21.2</a>, so the repeated rare-class examples are not identical copies (which would just be memorized) but varied views. The decoupling insight from recent long-tailed-recognition research is worth knowing: it is often best to train the feature backbone on the natural imbalanced distribution and only rebalance when training the final classifier.
+</p>
+
+<pre><code class="language-python">import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+labels = torch.tensor([0]*990 + [1]*10)          # 99:1 imbalance
+class_count = torch.bincount(labels).float()
+sample_weight = (1.0 / class_count)[labels]      # rare class -> high draw weight
+sampler = WeightedRandomSampler(sample_weight,
+                                num_samples=len(labels), replacement=True)
+loader = DataLoader(dataset, batch_size=64, sampler=sampler)
+# Each batch now sees roughly balanced classes despite the 99:1 raw ratio.
+# Pair with augmentation so oversampled rare examples are varied, not duplicated.</code></pre>
+<div class="code-caption">Oversampling the rare class with <code>WeightedRandomSampler</code>. Draw probabilities are inversely proportional to class frequency, so a 99:1 dataset yields roughly balanced batches without discarding any majority data.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 0.3% Defect Class</div>
+<p><strong>Who:</strong> a quality-control team at a circuit-board factory, 2025. <strong>Situation:</strong> their defect dataset was 99.7% good boards and 0.3% defective, and their first model reported 99.7% accuracy. <strong>Problem:</strong> on inspection, the model flagged zero defects; it had learned the majority predictor, exactly the failure of subsection 1. <strong>Decision:</strong> they made three changes together: switched the reported metric to per-class recall and precision, replaced cross-entropy with focal loss at $\gamma = 2$, and added <code>WeightedRandomSampler</code> oversampling combined with heavy augmentation of the defect images. <strong>Result:</strong> defect recall rose from 0% to over 85% at an acceptable false-alarm rate, and crucially the team could now see and tune that tradeoff because the metric exposed it. <strong>Lesson:</strong> imbalance is rarely fixed by one lever. The metric reveals the problem, the loss reshapes the gradient, and resampling reshapes the data; used together they convert a useless 99.7%-accurate model into a deployable one.</p>
+</div>
+
+<h2>4. Label Noise: Even ImageNet Is Wrong Sometimes <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Every real dataset contains wrong labels, and so do the benchmarks. As noted in <a href="section-21.1.html">Section 21.1</a>, confident-learning analyses estimate roughly a 6% label-error rate in the ImageNet validation set and similar rates across CIFAR and others, errors large enough to reorder model leaderboards. The danger is that a high-capacity network, given enough epochs, will memorize even random labels, so it happily fits your mistakes. The empirical pattern that makes this tractable is that networks tend to learn the clean, consistent majority pattern first and only memorize the noisy minority later in training. That ordering is the lever for almost every noise-robust method.
+</p>
+
+<p>
+Several techniques exploit it. <strong>Early stopping</strong> halts training before the memorization phase, a free first defense. <strong>Robust losses</strong> like the generalized cross-entropy or symmetric cross-entropy bound the loss a single mislabeled example can contribute, so one wrong label cannot dominate the gradient. <strong>Co-teaching</strong> trains two networks that each select the small-loss (probably-clean) examples for the other, since clean examples have low loss in the early-learning phase. <strong>Confident learning</strong> (the cleanlab approach) estimates which labels are likely wrong from the model's own predictions and lets you remove or relabel them. Label smoothing from <a href="section-21.4.html">Section 21.4</a> also helps modestly, since softened targets reduce how hard the model chases any single label.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Find Mislabeled Data with cleanlab</div>
+<p>Implementing confident learning by hand (estimating the noise transition matrix, ranking label-quality scores) is a substantial amount of careful code. The cleanlab library does it from cross-validated predictions in a few lines:</p>
+<pre><code class="language-python">from cleanlab.filter import find_label_issues
+import numpy as np
+
+# pred_probs: (N, K) cross-validated predicted probabilities; labels: (N,) given labels
+issue_idx = find_label_issues(
+    labels=labels, pred_probs=pred_probs,
+    return_indices_ranked_by="self_confidence",   # worst-looking labels first
+)
+print(f"{len(issue_idx)} of {len(labels)} labels flagged as likely errors")
+# Inspect the top-ranked issues by eye, then relabel or drop them and retrain.</code></pre>
+<p>cleanlab handles the noise-rate estimation, the joint-distribution math, and the ranking, turning a research paper's method into one function call. The output is a ranked list of suspicious examples to review by hand, which is the highest-leverage data-cleaning step on a mature, imbalanced dataset, and a concrete instance of the data-centric mindset from <a href="section-21.1.html">Section 21.1</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learning From Noisy Web-Scale Data</div>
+<p>The foundation models of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and the text-to-image systems of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a> are trained on billions of noisy, weakly-labeled image-text pairs scraped from the web, where careful per-example labeling is impossible. The 2022-2026 frontier is making that noise an asset rather than a liability: data-filtering networks that score and keep only high-quality pairs (the DataComp benchmark formalized this as a competition), caption rewriting where a model rewrites noisy alt-text into cleaner descriptions, and noise-aware contrastive objectives that tolerate mismatched pairs. The lesson scales the one in this section: at small scale you clean labels with cleanlab; at web scale you build learned filters that clean the stream automatically. Either way, treating data quality as a first-class engineering problem, not a fixed input, is what separates strong systems from fragile ones.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.1: Why the Majority Predictor Wins <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For a binary problem with a 95:5 class split and plain cross-entropy, argue quantitatively why the gradient at initialization pushes the model toward predicting the majority class. Then explain how (a) class weighting and (b) focal loss each change the per-example loss contributions to counteract this. Finally, state which of the two you would prefer if the minority class were not only rare but also genuinely harder to classify, and why.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.2: Inject Noise, Measure Memorization <span class="exercise-type coding">Coding</span></div>
+<p>Take CIFAR-10 and corrupt 20% of the training labels by reassigning them uniformly at random. Train a network for many epochs, tracking both training accuracy and clean-test accuracy each epoch. You should see test accuracy rise, peak, and then fall as the network begins memorizing the noisy labels. Mark the peak, and use it to justify the early-stopping defense from subsection 4. Then re-run with label smoothing at $\epsilon = 0.1$ and report whether the peak is higher or the decline gentler.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.5.3: Audit a Benchmark for Label Errors <span class="exercise-type analysis">Analysis</span></div>
+<p>Train a model on a standard dataset with cross-validation to obtain out-of-fold predicted probabilities, then run <code>cleanlab.filter.find_label_issues</code> on them. Inspect the 20 highest-ranked suspected errors by displaying the images alongside their given labels. Categorize each as a genuine error, an ambiguous or multi-object image, or a false alarm. Report the proportions and write a short paragraph on what this implies for trusting a single test-set accuracy number, tying back to the leakage-flatters-you discussion of <a href="section-21.1.html">Section 21.1</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.4.html">&#8592; Section 21.4: Regularization &amp; Schedules</a>
+<a href="index.html">Chapter 21</a>
+<a class="next" href="section-21.6.html">Section 21.6: Debugging Training &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

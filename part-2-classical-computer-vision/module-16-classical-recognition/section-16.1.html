@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.1: Template Matching &amp; Its Limits. Recognition by direct pixel comparison, sum of squared differences and normalized cross-correlation, multi-scale search, where templates still win in industry, and the brittleness that motivates feature-based recognition." name="description"/>
+<title>Section 16.1: Template Matching &amp; Its Limits | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Classical Recognition Pipelines</a></div>
+<h1>Template Matching &amp; Its Limits</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I am very good at recognizing this exact cat, at this exact size, in this exact light, from this exact angle. For any other cat, please file a separate request."</p>
+<cite>An Overly Literal Template</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The simplest possible recognizer compares pixels to pixels, and the precise way it fails is the blueprint for everything that replaces it.</strong> Template matching slides a stored patch over an image and reports where the pixels agree best. It needs no training, no features, no abstraction, and on a controlled factory line it is unbeatable. The instant the world adds a degree of rotation, a notch of brightness, or a slightly different instance of the object, the agreement collapses. This section makes the method precise (the two matching scores that matter, why one is robust to lighting and the other is not, how to search across scale) and then dissects the brittleness. Every later section in this chapter, and the learned features of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, is an answer to a weakness you will see here in its purest form.</p>
+</div>
+
+<p>
+This chapter opens the recognition half of classical vision, and it is fitting to start where the field itself started: by asking whether an object is present simply because its pixels are present. In the previous chapter we tracked brightness patterns through time (<a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>); now we ask a static question of a single frame. Is the target here, and if so, where? Template matching answers with the most direct measurement imaginable, a pixel-by-pixel comparison, and the value of studying it is not that you will use it for hard recognition (you will not) but that its failure modes name the problems the rest of the chapter solves.
+</p>
+
+<h2>1. The Idea: Recognition as Pixel Comparison <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>template</strong> is a small image $T$ of the thing you want to find: a logo, a part, a face cropped tight. A larger image $I$ may or may not contain it. Template matching places $T$ at every possible position $(x, y)$ in $I$, scores how well the underlying patch resembles $T$, and reports the position with the best score. The whole method is one loop over positions and one scoring function inside it. The only real decision is which scoring function, and that decision turns out to carry most of the method's behavior.
+</p>
+<p>
+The most intuitive score is the <strong>sum of squared differences</strong> (SSD): subtract the template from the patch pixel by pixel, square, and sum. Writing the patch of $I$ anchored at $(x, y)$ as $I_{x,y}$,
+</p>
+<p>
+$$ \text{SSD}(x, y) \;=\; \sum_{u, v} \big( I(x + u,\, y + v) - T(u, v) \big)^2 . $$
+</p>
+<p>
+A perfect match gives zero; the more the patch differs, the larger the score. SSD is fast and obvious, and it has one fatal weakness that the next subsection fixes: it measures absolute brightness, so a correctly aligned but slightly brighter copy of the template scores terribly. Before fixing that, it helps to see what the search actually produces. The code below slides a template across an image and visualizes the score surface, the field that template matching is implicitly hill-climbing.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+scene = cv2.imread("circuit_board.png", cv2.IMREAD_GRAYSCALE).astype(np.float32)
+template = cv2.imread("component.png", cv2.IMREAD_GRAYSCALE).astype(np.float32)
+th, tw = template.shape
+
+# SSD by hand over every valid top-left position.
+H, W = scene.shape
+ssd = np.zeros((H - th + 1, W - tw + 1), dtype=np.float32)
+for y in range(ssd.shape[0]):
+    for x in range(ssd.shape[1]):
+        patch = scene[y:y + th, x:x + tw]
+        diff = patch - template
+        ssd[y, x] = np.sum(diff * diff)
+
+y_best, x_best = np.unravel_index(np.argmin(ssd), ssd.shape)  # SSD: lower is better
+print(f"best match at (x={x_best}, y={y_best}), SSD={ssd[y_best, x_best]:.0f}")
+# best match at (x=412, y=188), SSD=20374</code></pre>
+<div class="code-caption">A hand-written SSD search: the double loop scores every placement of the template and the minimum locates the match. The explicit loop is slow but shows exactly what the one-line library call later replaces.</div>
+
+<p>
+The score array <code>ssd</code> is itself an image, one value per candidate position, and its global minimum is the reported detection. Run it and the loop is visibly the bottleneck: an order of $H \cdot W \cdot t_h \cdot t_w$ multiply-adds. The library shortcut at the end of this section collapses both the loop and the scoring into a single vectorized call, but first we must repair the brightness problem, because the fix changes the scoring function itself.
+</p>
+
+<h2>2. Normalized Cross-Correlation: Surviving Brightness <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SSD conflates two different kinds of difference: difference in pattern (the thing we care about) and difference in overall brightness (the thing we usually do not). Recall from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> that adding a constant to every pixel and scaling every pixel by a constant are exactly the affine intensity changes that auto-exposure and gain control introduce. We want a score that ignores both. The answer is <strong>normalized cross-correlation</strong> (NCC), which subtracts each region's own mean and divides by its own standard deviation before comparing. Let $\bar T$ and $\bar I_{x,y}$ be the means of the template and the patch:
+</p>
+<p>
+$$ \text{NCC}(x, y) \;=\; \frac{\displaystyle\sum_{u,v} \big( I(x+u, y+v) - \bar I_{x,y} \big)\big( T(u,v) - \bar T \big)}{\sqrt{\displaystyle\sum_{u,v}\big( I(x+u, y+v) - \bar I_{x,y} \big)^2}\,\sqrt{\displaystyle\sum_{u,v}\big( T(u,v) - \bar T \big)^2}} . $$
+</p>
+<p>
+The numerator is a dot product of the two mean-removed patches; the denominator normalizes both to unit length. NCC is therefore the cosine of the angle between the template and the patch viewed as vectors, and it lives in $[-1, 1]$: a value of $1$ is a perfect match up to any brightness offset and any positive contrast scaling, $0$ is uncorrelated, and $-1$ is a perfect photographic negative. Subtracting the mean buys invariance to additive lighting changes; dividing by the standard deviation buys invariance to multiplicative ones. That single normalization is why NCC, not SSD, is the score that ships in production template matchers.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Match Score Is a Choice of Invariance</div>
+<p>SSD says two patches match when their raw pixels are close. NCC says they match when their mean-removed, contrast-normalized pixels point the same direction. Neither is "more correct"; each declares which transformations it agrees to ignore. SSD ignores nothing and so breaks under lighting; NCC ignores affine intensity changes and so survives them, but it still breaks under rotation, scale, and a different instance of the object. Every recognition method in this book can be read this way: as a statement about which changes leave the answer unchanged. The history of recognition is the history of widening that set of ignored changes, from "none" (SSD) to "affine intensity" (NCC) to "viewpoint and instance" (the learned features of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>).</p>
+</div>
+
+<p>
+Figure 16.1.1 makes the difference concrete. The same template is matched against a patch that is identical in pattern but uniformly brighter. SSD reports a large (bad) score because every pixel differs by the brightness offset; NCC reports near $1$ because the offset vanishes when each region is centered on its own mean.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A template and a brighter copy of the same pattern. SSD reports a large mismatch driven entirely by the brightness offset, while normalized cross-correlation reports a near-perfect match because each region is centered on its own mean.">
+  <text x="130" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Template T</text>
+  <rect x="70" y="48" width="120" height="120" fill="#7f8c8d" stroke="#5a626c" stroke-width="1.5"/>
+  <rect x="70" y="48" width="60" height="60" fill="#34495e"/>
+  <rect x="130" y="108" width="60" height="60" fill="#34495e"/>
+  <text x="130" y="190" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">mean brightness ~ 100</text>
+
+  <text x="390" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Patch (same pattern, +60 brightness)</text>
+  <rect x="330" y="48" width="120" height="120" fill="#bdc3c7" stroke="#5a626c" stroke-width="1.5"/>
+  <rect x="330" y="48" width="60" height="60" fill="#7f8c8d"/>
+  <rect x="390" y="108" width="60" height="60" fill="#7f8c8d"/>
+  <text x="390" y="190" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">mean brightness ~ 160</text>
+
+  <line x1="200" y1="108" x2="320" y2="108" stroke="#aab7b8" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <rect x="510" y="60" width="230" height="46" rx="6" fill="#fdecea" stroke="#c0392b" stroke-width="1.5"/>
+  <text x="625" y="80" font-family="sans-serif" font-size="13" font-weight="bold" fill="#c0392b" text-anchor="middle">SSD = large</text>
+  <text x="625" y="98" font-family="sans-serif" font-size="11.5" fill="#c0392b" text-anchor="middle">every pixel off by ~60</text>
+
+  <rect x="510" y="128" width="230" height="46" rx="6" fill="#eafaf1" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="625" y="148" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449" text-anchor="middle">NCC &#8776; 1.00</text>
+  <text x="625" y="166" font-family="sans-serif" font-size="11.5" fill="#1e8449" text-anchor="middle">offset removed by mean subtraction</text>
+
+  <text x="390" y="250" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle">Same shape, different exposure: SSD cannot tell the difference from a real mismatch; NCC can.</text>
+</svg>
+<figcaption><strong>Figure 16.1.1</strong>: Why normalization matters. The patch on the right is the template plus a uniform brightness offset, the kind auto-exposure produces between frames. SSD sums that offset over every pixel and declares a poor match; NCC subtracts each region's own mean first, so the offset disappears and the score returns to nearly $1$.</figcaption>
+</figure>
+
+<p>
+OpenCV exposes both scores, plus a zero-mean SSD and a coefficient form, through one function. The code below runs NCC across the whole scene and locates the peak, the production-grade equivalent of the hand-written loop above.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+scene = cv2.imread("circuit_board.png", cv2.IMREAD_GRAYSCALE)
+template = cv2.imread("component.png", cv2.IMREAD_GRAYSCALE)
+th, tw = template.shape
+
+# TM_CCOEFF_NORMED is normalized cross-correlation on mean-removed patches.
+result = cv2.matchTemplate(scene, template, cv2.TM_CCOEFF_NORMED)
+min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)  # NCC: higher is better
+
+print(f"peak NCC = {max_val:.3f} at {max_loc}")
+top_left = max_loc
+bottom_right = (top_left[0] + tw, top_left[1] + th)
+# Accept the detection only if the peak clears a confidence threshold.
+if max_val &gt; 0.8:
+    print("component found")
+else:
+    print("no confident match")
+# peak NCC = 0.961 at (412, 188)
+# component found</code></pre>
+<div class="code-caption">Normalized cross-correlation through OpenCV's <code>matchTemplate</code>: <code>TM_CCOEFF_NORMED</code> implements the mean-removed, contrast-normalized score, and <code>minMaxLoc</code> reads off the peak. The <code>0.8</code> threshold is the accept/reject decision every template matcher must make.</div>
+
+<h2>3. Searching Across Scale <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A template has exactly one size. If the object in the scene is larger or smaller than the stored patch, even a perfect-instance match scores poorly, because corresponding pixels no longer line up. The fix is to search over scale as well as position: resize either the template or the scene across a range of factors and keep the best score over all of them. This is the <strong>image pyramid</strong> of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> applied to recognition, and it is the same coarse-to-fine machinery that the sliding-window detectors of <a href="section-16.3.html">Section 16.3</a> and <a href="section-16.4.html">Section 16.4</a> will lean on. Figure 16.1.2 shows the structure: one template, many scaled copies of the scene, one score surface per scale, and a single global maximum chosen across the stack.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A multi-scale template search. The scene is resized to several scales forming a pyramid; the fixed-size template is matched at each scale, producing one score map per level, and the global maximum across all levels is the detection.">
+  <text x="150" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Scene pyramid</text>
+  <rect x="60" y="42" width="180" height="120" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="150" y="106" font-family="sans-serif" font-size="11" fill="#2471a3" text-anchor="middle">scale 1.00</text>
+  <rect x="80" y="178" width="140" height="94" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="150" y="228" font-family="sans-serif" font-size="11" fill="#2471a3" text-anchor="middle">scale 0.78</text>
+  <rect x="98" y="286" width="104" height="22" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="150" y="301" font-family="sans-serif" font-size="10" fill="#2471a3" text-anchor="middle">scale 0.61</text>
+
+  <rect x="300" y="92" width="56" height="56" fill="#f9e79f" stroke="#b9770e" stroke-width="1.6"/>
+  <text x="328" y="124" font-family="sans-serif" font-size="11" fill="#7e5109" text-anchor="middle">T</text>
+  <text x="328" y="166" font-family="sans-serif" font-size="11" fill="#7e5109" text-anchor="middle">fixed-size</text>
+  <text x="328" y="180" font-family="sans-serif" font-size="11" fill="#7e5109" text-anchor="middle">template</text>
+
+  <line x1="360" y1="120" x2="430" y2="100" stroke="#7f8c8d" stroke-width="1.4"/>
+  <line x1="360" y1="120" x2="430" y2="200" stroke="#7f8c8d" stroke-width="1.4"/>
+  <line x1="360" y1="120" x2="430" y2="290" stroke="#7f8c8d" stroke-width="1.4"/>
+
+  <text x="525" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Score map per scale</text>
+  <rect x="450" y="64" width="150" height="74" fill="#fef9e7" stroke="#aab7b8" stroke-width="1.2"/>
+  <circle cx="540" cy="100" r="9" fill="#1e8449"/>
+  <text x="608" y="104" font-family="sans-serif" font-size="11.5" fill="#1e8449">peak 0.96</text>
+  <rect x="450" y="166" width="150" height="56" fill="#fef9e7" stroke="#aab7b8" stroke-width="1.2"/>
+  <circle cx="520" cy="194" r="6" fill="#e67e22"/>
+  <text x="608" y="198" font-family="sans-serif" font-size="11.5" fill="#b9770e">peak 0.71</text>
+  <rect x="450" y="262" width="150" height="40" fill="#fef9e7" stroke="#aab7b8" stroke-width="1.2"/>
+  <circle cx="515" cy="282" r="4" fill="#c0392b"/>
+  <text x="608" y="286" font-family="sans-serif" font-size="11.5" fill="#c0392b">peak 0.58</text>
+
+  <rect x="648" y="78" width="118" height="48" rx="6" fill="#eafaf1" stroke="#1e8449" stroke-width="1.6"/>
+  <text x="707" y="98" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#1e8449" text-anchor="middle">argmax over</text>
+  <text x="707" y="114" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#1e8449" text-anchor="middle">all scales</text>
+</svg>
+<figcaption><strong>Figure 16.1.2</strong>: Multi-scale template matching. The scene is rescaled to form a pyramid while the template stays one size; each level yields its own score map, and the detection is the single highest peak across the entire stack. Adding scale to the search is cheap; adding rotation, as the text explains, multiplies the cost again.</figcaption>
+</figure>
+
+<p>
+The code that realizes Figure 16.1.2 wraps the single-scale match in a loop over scale factors and tracks the best result globally.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+scene = cv2.imread("scene.png", cv2.IMREAD_GRAYSCALE)
+template = cv2.imread("logo.png", cv2.IMREAD_GRAYSCALE)
+th, tw = template.shape
+
+best = {"score": -1.0, "loc": None, "scale": None}
+for scale in np.linspace(1.0, 0.4, 12):           # shrink the scene, keep T fixed
+    resized = cv2.resize(scene, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    if resized.shape[0] &lt; th or resized.shape[1] &lt; tw:
+        break                                      # template no longer fits
+    res = cv2.matchTemplate(resized, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val &gt; best["score"]:
+        best.update(score=max_val, loc=max_loc, scale=scale)
+
+# Map the location back to the original (full-resolution) scene coordinates.
+sx, sy = best["loc"]
+orig = (int(sx / best["scale"]), int(sy / best["scale"]))
+print(f"best score {best['score']:.3f} at scale {best['scale']:.2f}, scene xy {orig}")
+# best score 0.934 at scale 0.71, scene xy (588, 264)</code></pre>
+<div class="code-caption">Coarse-to-fine template search over a scale pyramid: each level runs one NCC pass, the global best wins, and the final location is divided by its scale factor to return to original-image coordinates.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Cost of Every New Invariance</div>
+<p>Scale invariance cost us a factor of about twelve in this example. Adding rotation invariance the same brute-force way (one match per discrete angle) multiplies again: thirty-six orientations make it 432 passes. Adding small affine warps multiplies once more. This combinatorial blowup is precisely why the field abandoned "search every pose" in favor of features that are invariant by construction. SIFT (<a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>) computes one descriptor that is already scale and rotation invariant, replacing the entire pose loop with a single representation. Template matching's exponential pose search is the problem; invariant features are the answer.</p>
+</div>
+
+<h2>4. Where Template Matching Still Wins <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+None of this section's criticism means template matching is obsolete. In environments where the imaging conditions are pinned down, it is often the right tool precisely because it needs no training data and behaves predictably. Industrial machine vision is the heartland: a fixed camera, controlled lighting, and a part presented at a known orientation make the template's missing invariances irrelevant, because nothing in the scene varies anyway. Printed-circuit-board inspection, fiducial alignment, optical character verification on labels, and gauge reading all run on normalized cross-correlation today, and they run fast and certifiably. The lesson is not "templates are bad" but "templates are local": they recognize a specific appearance under specific conditions, and when you can guarantee those conditions, that specificity becomes a feature.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Alignment Mark That Saved a Production Line</div>
+<p><strong>Who &amp; situation:</strong> a contract electronics manufacturer running a surface-mount placement line, where a robot must drop tiny components onto pads with sub-pixel accuracy. Each board carries small printed fiducial crosses for the machine to align against. <strong>Problem:</strong> the team's first instinct was a learned keypoint detector, but it was overkill, needed labeled data they did not have, and gave non-deterministic results that the quality auditors refused to certify. <strong>Decision:</strong> they replaced it with a single normalized-cross-correlation match against a clean image of the fiducial cross, searching a small window around the nominal position only, with a fixed accept threshold of $0.9$ and sub-pixel peak refinement by fitting a parabola to the NCC surface around the maximum. <strong>Result:</strong> alignment error dropped below a quarter pixel, the cycle time fell because the search window was tiny, and the auditors signed off because the method was deterministic and explainable. <strong>Lesson:</strong> when lighting, pose, and instance are all controlled, the missing invariances stop being weaknesses, and template matching's simplicity and determinism become exactly what a regulated process needs.</p>
+</div>
+
+<h2>5. The Five Weaknesses That Define the Chapter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Take template matching out of the controlled environment and it breaks in five characteristic ways, each of which names a problem the rest of this chapter (and Part III) attacks. First, <strong>intensity</strong>: SSD breaks under any lighting change, which NCC partly repairs, but neither survives colored light or shadows. Second, <strong>geometry</strong>: rotation, scale, and viewpoint all misalign pixels, and we just saw that searching over poses is exponentially expensive. Third, <strong>intra-class variation</strong>: a template of one chair cannot find a different chair, because recognition by appearance does not generalize across instances of a category. Fourth, <strong>deformation</strong>: a person bending or a face smiling moves pixels non-rigidly, and no single rigid template covers the range, which is exactly the gap that <a href="section-16.5.html">deformable part models</a> in Section 16.5 set out to fill. Fifth, <strong>clutter and occlusion</strong>: a partially hidden object presents only some of its pixels, and a whole-template score punishes the missing ones.
+</p>
+<p>
+The unifying diagnosis is that <strong>pixels are the wrong representation</strong>. They are not invariant to anything, they do not generalize across instances, and they do not degrade gracefully. The fix that organizes the next four sections is to replace raw pixels with engineered features chosen to be robust to some of these variations: quantized local descriptors in <a href="section-16.2.html">Section 16.2</a>, oriented-gradient histograms in <a href="section-16.3.html">Section 16.3</a>, and brightness-contrast features in <a href="section-16.4.html">Section 16.4</a>. Each buys back some invariance that templates lack, at the cost of a feature you had to design. That cost, the human labor of feature design, is itself the weakness that <a href="section-16.6.html">Section 16.6</a> identifies as the paradigm's ceiling.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Template Matching, Reborn on Learned Features</div>
+<p>Template matching never died; it moved up a level of abstraction. Modern visual-prompt detectors match a template not in pixel space but in the embedding space of a foundation model, where a single example of an object can be matched against any image robustly to pose and lighting because the embedding already encodes those invariances. T-Rex2 (Jiang et al., ECCV 2024, arXiv:2403.14610) detects arbitrary objects from one visual example by correlating its features against an image, the direct descendant of the NCC peak search in this section but operating on representations that solve the five weaknesses by construction. CLIP-based open-vocabulary detectors play the same game with text "templates," and few-shot counting models like Counting-DETR match a handful of exemplar boxes against a crowded scene. The geometry of this section, slide a query, find the peak, accept above a threshold, is unchanged; only the space in which the comparison happens has been upgraded from pixels to the learned features of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and the CLIP embeddings of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Search in One Line</div>
+<p>The hand-written SSD loop in Section 1 is roughly fifteen lines and runs in pure Python at a snail's pace. OpenCV's <code>matchTemplate</code> replaces it with a single vectorized, SIMD-accelerated call that computes the entire score surface for any of six matching metrics. Internally it uses the convolution theorem from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>: the cross-correlation numerator is evaluated as a multiplication in the frequency domain, turning the naive $O(H W t_h t_w)$ cost into roughly $O(H W \log(H W))$, which is why a full NCC scan of a megapixel image finishes in milliseconds.</p>
+<pre><code class="language-python">import cv2
+# One call replaces the entire double loop AND chooses the score metric.
+result = cv2.matchTemplate(scene, template, cv2.TM_CCOEFF_NORMED)
+_, score, _, loc = cv2.minMaxLoc(result)   # peak NCC and its (x, y) location</code></pre>
+<div class="code-caption">The production form: <code>matchTemplate</code> computes every position's score via FFT-based correlation and <code>minMaxLoc</code> reads off the detection, collapsing fifteen lines of Python loop into one accelerated call.</div>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.1: Which Invariance Does Each Score Buy? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each transformation applied to a patch that otherwise matches the template, state whether SSD, NCC, or neither still reports a strong match, and explain in one sentence why: (a) add $40$ to every pixel; (b) multiply every pixel by $1.3$; (c) rotate the patch by $15$ degrees; (d) invert the patch to its photographic negative; (e) replace half the patch with a different object (occlusion). Then propose which of the five weaknesses from Section 5 each transformation exercises.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.2: Building and Reading the Score Surface <span class="exercise-type coding">Coding</span></div>
+<p>Take any image, crop a small distinctive patch as a template, and run <code>cv2.matchTemplate</code> with all six methods (<code>TM_SQDIFF</code>, <code>TM_SQDIFF_NORMED</code>, <code>TM_CCORR</code>, <code>TM_CCORR_NORMED</code>, <code>TM_CCOEFF</code>, <code>TM_CCOEFF_NORMED</code>). Display each score surface as a heatmap and mark the detected location. Then brighten the whole image by adding a constant and re-run all six. Which methods move their peak, and which hold? Confirm empirically that the un-normalized methods drift and the normalized ones do not, and write one sentence linking the result to the formula for each score.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.1.3: The Cost of Pose Search <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend the multi-scale matcher to also search over rotation by rotating the template through a set of angles before each match. Time the full search as you increase the number of scales and angles, and tabulate wall-clock time against the number of poses. Fit the trend and estimate how long an exhaustive search over $12$ scales, $36$ rotations, and a small set of shears would take on a $1$-megapixel image. Use the result to argue, in a short paragraph, why invariant features (Chapter 10) replaced exhaustive pose search rather than merely accelerating it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 16 Overview</a>
+<a href="index.html">Chapter 16</a>
+<a class="next" href="section-16.2.html">Section 16.2: Bag of Visual Words &amp; Spatial Pyramids &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

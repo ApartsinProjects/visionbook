@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.4: Instruction-Based Editing with diffusion models. How InstructPix2Pix builds a synthetic instruction dataset with a language model and Prompt-to-Prompt, conditions on both an instruction and an input image, uses dual classifier-free guidance scales to trade instruction-following against image preservation, and the modern instruction-editing landscape through 2025." name="description"/>
+<title>Section 35.4: Instruction-Based Editing | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Instruction-Based Editing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You said 'make it winter.' Not which winter, not how much snow, not whether the dog keeps his hat. I made a decision. The dog keeps his hat."</p>
+<cite>An Instruction-Following Editor With Opinions</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Instruction-based editing replaces "describe the image you want" with "describe the change you want": you give a model an image and a command like "make it snow" or "turn the cat into a tiger," and it applies the edit while keeping the rest of the image intact, with no mask and no description of the unchanged parts.</strong> The central trick of InstructPix2Pix is data: there is no natural dataset of (instruction, before-image, after-image) triples, so the authors generated one synthetically by pairing a language model that invents edit instructions with the Prompt-to-Prompt editing of <a href="section-35.5.html">Section 35.5</a> to produce the before and after images. Once that dataset exists, training is ordinary conditional diffusion. At inference, two separate guidance scales (one for the instruction, one for the input image) let you dial the balance between obeying the command and preserving the original.</p>
+</div>
+
+<p>
+The editing methods so far each demand something extra from you: ControlNet wants a structural map, personalization wants training images, inpainting wants a mask. Instruction editing asks only for a sentence. That convenience is bought by a clever data-generation pipeline and a dual-conditioning inference scheme, and this section unpacks both. We then survey how the idea matured from the 2023 InstructPix2Pix into the strong general editors of 2024 and 2025.
+</p>
+
+<h2>1. The Data Problem and Its Synthetic Solution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To train a model that takes (image, instruction) and produces an edited image, you need examples: an original image, an instruction, and the correct edited result. No such dataset exists at scale in the wild. InstructPix2Pix manufactures one in two stages, illustrated in Figure 35.4.1. First, a large language model (GPT-3, in the original) is given a caption and asked to invent a plausible edit instruction and the caption of the edited image. Starting from "photograph of a girl riding a horse," it might produce the instruction "have her ride a dragon" and the edited caption "photograph of a girl riding a dragon." Second, the original and edited captions are turned into a matched pair of images using <strong>Prompt-to-Prompt</strong> (the cross-attention-sharing method of <a href="section-35.5.html">Section 35.5</a>), which generates two images that differ only in the changed concept while keeping composition, pose, and background nearly identical.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-stage synthetic data pipeline: a language model invents instructions and captions, then Prompt-to-Prompt renders matched before and after images">
+<style>
+.i1{font:12px sans-serif;fill:#1a1a1a;}
+.i2{font:10px sans-serif;fill:#555;}
+.llm{fill:#f3eafe;stroke:#7d4fc4;stroke-width:1.5;}
+.p2p{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.dat{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.5;}
+.ia{stroke:#444;stroke-width:1.6;marker-end:url(#iaa);fill:none;}
+</style>
+<defs>
+<marker id="iaa" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect class="i1" x="20" y="105" width="120" height="40" fill="#f7f7f9" stroke="#bbb"/><text class="i2" x="80" y="122" text-anchor="middle">caption</text>
+<text class="i2" x="80" y="137" text-anchor="middle">"girl on a horse"</text>
+<rect class="llm" x="200" y="95" width="140" height="60"/><text class="i2" x="270" y="116" text-anchor="middle">Language model</text>
+<text class="i2" x="270" y="131" text-anchor="middle">invents instruction</text>
+<text class="i2" x="270" y="146" text-anchor="middle">+ edited caption</text>
+<rect class="p2p" x="400" y="95" width="140" height="60"/><text class="i2" x="470" y="116" text-anchor="middle">Prompt-to-Prompt</text>
+<text class="i2" x="470" y="131" text-anchor="middle">renders matched</text>
+<text class="i2" x="470" y="146" text-anchor="middle">before + after</text>
+<rect class="dat" x="600" y="95" width="100" height="60"/><text class="i2" x="650" y="120" text-anchor="middle">triple:</text>
+<text class="i2" x="650" y="135" text-anchor="middle">(instr,</text>
+<text class="i2" x="650" y="150" text-anchor="middle">before, after)</text>
+<line class="ia" x1="140" y1="125" x2="198" y2="125"/>
+<line class="ia" x1="340" y1="125" x2="398" y2="125"/>
+<line class="ia" x1="540" y1="125" x2="598" y2="125"/>
+<text class="i2" x="360" y="40" text-anchor="middle">millions of synthetic triples &#8594; train an instruction-conditioned diffusion model</text>
+</svg>
+<figcaption><strong>Figure 35.4.1:</strong> The InstructPix2Pix data pipeline. A language model turns a caption into an edit instruction plus an edited caption; Prompt-to-Prompt renders a before/after image pair that differs only in the edited concept. The resulting triples train an ordinary conditional diffusion model to apply instructions directly.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Bottleneck Was Data, Not Architecture</div>
+<p>
+InstructPix2Pix uses a nearly standard conditional diffusion model. Its contribution is almost entirely the data-generation recipe. This is a recurring lesson in modern generative vision (DALL-E 3 made the same point about captions in <a href="../module-34-text-to-image/index.html">Chapter 34</a>): once you can synthesize the right supervision, a conventional architecture trained on it does the job. When you face a task with no natural dataset, ask whether existing generative models can be composed to manufacture one before you reach for a novel architecture.
+</p>
+</div>
+
+<h2>2. Conditioning on Both Image and Instruction <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The trained model is conditioned on two things at once: the input image $c_I$ (encoded to latents and concatenated to the U-Net input channels, much like the inpainting U-Net of <a href="section-35.3.html">Section 35.3</a>) and the text instruction $c_T$ (through cross-attention, as in <a href="../module-34-text-to-image/index.html">Chapter 34</a>). The interesting part is inference. Recall classifier-free guidance from <a href="../module-33-diffusion-models/index.html">Chapter 33</a>: you extrapolate from the unconditional prediction toward the conditional one to strengthen the conditioning. With two conditions, InstructPix2Pix uses <strong>two guidance scales</strong>, one that pushes toward following the instruction and one that pushes toward preserving the input image. The score estimate combines three forward passes:
+</p>
+
+<div class="math-block">
+$$\tilde{\epsilon}_\theta(z_t, c_I, c_T) = \epsilon_\theta(z_t, \varnothing, \varnothing) + s_I\big[\epsilon_\theta(z_t, c_I, \varnothing) - \epsilon_\theta(z_t, \varnothing, \varnothing)\big] + s_T\big[\epsilon_\theta(z_t, c_I, c_T) - \epsilon_\theta(z_t, c_I, \varnothing)\big].$$
+</div>
+
+<p>
+The image guidance scale $s_I$ controls how much the output resembles the original; the text guidance scale $s_T$ controls how strongly the instruction is applied. Raising $s_T$ makes the edit more aggressive but risks changing parts you wanted preserved; raising $s_I$ keeps the image faithful but can suppress the edit. Tuning the pair is the core skill of using these models, and the right balance depends on the edit: a global style change tolerates a low $s_I$, while a small local change ("add a hat") wants a high $s_I$ to protect everything else.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionInstructPix2PixPipeline
+from diffusers.utils import load_image
+
+pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+    "timbrooks/instruct-pix2pix", torch_dtype=torch.float16).to("cuda")
+
+image = load_image("photo.png")
+edited = pipe(
+    "make it look like a snowy winter scene",
+    image=image,
+    num_inference_steps=30,
+    guidance_scale=7.5,            # s_T: how strongly to apply the instruction
+    image_guidance_scale=1.5,      # s_I: how strongly to preserve the input image
+).images[0]
+edited.save("winter.png")</code></pre>
+<div class="code-caption">InstructPix2Pix in diffusers. The two guidance scales are exposed as <code>guidance_scale</code> (instruction strength) and <code>image_guidance_scale</code> (preservation strength). Raising the latter toward 2.0 keeps more of the original; lowering it lets the edit reshape the scene.</div>
+
+<h2>3. Why Preservation Is the Hard Part <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The defining challenge of instruction editing is the same preservation problem that runs through this whole chapter, now without a mask to enforce it. Inpainting could <em>guarantee</em> the unmasked region by construction; instruction editing has no such guarantee, because the model is free to change every pixel and only the training data and the image guidance scale discourage it. This is why instruction edits sometimes subtly alter a face, shift colors globally, or lose fine detail even when the instruction was local. The image guidance scale is a soft constraint, not a hard one. For edits that must preserve identity or specific regions exactly, practitioners still combine instruction editing with the masked methods of <a href="section-35.3.html">Section 35.3</a> or the inversion-based faithful editing of <a href="section-35.5.html">Section 35.5</a>, applying the instruction only where it is allowed to act.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>An instruction editor takes you at your word, which is funnier than it sounds. Ask InstructPix2Pix to "make her happy" and it may repaint the whole face; ask it to "add fireworks" and you might get fireworks reflected in the subject's eyes, on their shirt, and in a puddle that was not there before, because the model has no notion of "just the sky." The early demos that went viral were mostly the over-eager edits: "turn it into a Van Gogh" applied with such enthusiasm that the cat dissolved into brushstrokes. The dual guidance scales of subsection 2 are, in a real sense, the volume knob for the model's literal-mindedness.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Marketing Tool Ships "Edit by Typing"</div>
+<p><strong>Who:</strong> a small SaaS company building a self-serve creative tool for social-media marketers, 2024. <strong>Situation:</strong> their non-designer users wanted to tweak stock and uploaded photos ("warmer lighting," "add a festive feel," "make the background a beach") without learning masks or layers. <strong>Problem:</strong> a mask-based editor was too complex for the audience, but plain text-to-image could not edit an <em>existing</em> brand photo. <strong>Decision:</strong> they shipped an InstructPix2Pix backend with the two guidance scales surfaced as two friendly sliders, "how big a change" and "how close to the original," defaulting to a high image-guidance value so edits stayed conservative. They added a fallback: if the user's instruction named an object, they routed it through Grounded-SAM and inpainting from <a href="section-35.3.html">Section 35.3</a> for a hard-masked edit instead. <strong>Result:</strong> most edits succeeded with one sentence, and the masked fallback caught the cases where global instruction editing drifted. <strong>Lesson:</strong> instruction editing is the right default for ease of use, but a preservation-critical product needs a masked path underneath for the edits where "mostly preserved" is not good enough.</p>
+</div>
+
+<h2>4. The Modern Editing Landscape <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+InstructPix2Pix (2023) opened the category; the years since sharpened it. <strong>MagicBrush</strong> (NeurIPS 2023) fine-tuned on a manually-annotated dataset of real edits, fixing many of the artifacts that the fully-synthetic data introduced. <strong>InstructDiffusion</strong> and the broader unified-editing line framed many vision tasks (editing, segmentation, keypoint detection) as instruction-following under one model. By 2025, the strongest editors fold editing into large multimodal or flow-matching models: <strong>FLUX.1 Kontext</strong> (2025, arXiv:2506.15742) takes a reference image and an instruction and edits in a single flow-matching pass with strong subject and character consistency, and the image-output modes of frontier multimodal models edit by simply being told what to change in a conversation. The arc is toward editing as a native capability of a general model rather than a specialized pipeline, though the dual-guidance and preservation lessons here remain the right mental model for what the model is balancing internally.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: One Pipeline Class, Many Editors</div>
+<p>Reproducing instruction editing from scratch means building the synthetic-data pipeline (a language model plus Prompt-to-Prompt rendering of millions of pairs), then training a dual-conditioned model, weeks of work and significant compute. In practice you load a pretrained editor: <code>StableDiffusionInstructPix2PixPipeline.from_pretrained("timbrooks/instruct-pix2pix")</code> for the classic model, or the equivalent pipeline classes for MagicBrush-tuned and newer checkpoints. The diffusers pipeline handles the dual-guidance three-pass score combination of subsection 2 internally; you supply an image, an instruction, and the two scales. Understand the data recipe and the guidance math; reach for the pretrained pipeline to actually edit.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Editing as Conversation</div>
+<p>The newest direction collapses the distinction between generation and editing. In-context editing models like FLUX.1 Kontext (2025) and the native image editing in large multimodal systems treat an edit as another turn in a multimodal exchange: you show an image, say what to change, see the result, and refine, all without masks, control maps, or per-edit training. These systems internalize the preservation problem (they are trained to change only what is mentioned) and chain edits while holding identity stable across turns, the multi-step consistency that <a href="section-35.6.html">Section 35.6</a> otherwise has to engineer by hand. The open question they raise is evaluation: how do you measure whether an edit changed exactly what was asked and nothing more? That question is the subject of <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.4.1: Read the Dual Guidance <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In the three-pass score formula of subsection 2, identify which difference term is scaled by $s_T$ and which by $s_I$, and state in words what each term pushes the generation toward. Then predict the qualitative result of setting $s_I$ very high and $s_T$ very low, and the opposite, and explain why the first barely edits while the second can change parts of the image you did not mention.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.4.2: Sweep Both Scales <span class="exercise-type coding">Coding</span></div>
+<p>Using the InstructPix2Pix code in subsection 2 on a single photo and instruction (for example "make it autumn"), generate a grid that varies <code>image_guidance_scale</code> over $\{1.0, 1.5, 2.0\}$ across columns and <code>guidance_scale</code> over $\{5, 7.5, 10\}$ across rows. Identify the cell that best applies the edit while preserving the subject, and describe the failure modes in the corners (too little edit, too much drift).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.4.3: When Does Instruction Editing Fail Preservation? <span class="exercise-type analysis">Analysis</span></div>
+<p>Run an identity-sensitive instruction edit (for example "add sunglasses" on a portrait) and inspect whether the person's face changes. Explain, using the fact that instruction editing has no mask and only a soft image-guidance constraint, why local edits can leak into global changes. Then describe how you would combine the masked object replacement of <a href="section-35.3.html">Section 35.3</a> with this instruction to guarantee the face is untouched, and what you give up by doing so.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-35.3.html">&#8592; Section 35.3: Inpainting &amp; Outpainting</a>
+<a href="index.html">Chapter 35</a>
+<a class="next" href="section-35.5.html">Section 35.5: Real-Image Inversion &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

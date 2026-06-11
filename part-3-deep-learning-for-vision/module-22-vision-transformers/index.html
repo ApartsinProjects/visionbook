@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 22: Vision Transformers. Treat an image as a sequence of patches and let the transformer take over: self-attention in the vision setting, the ViT patch-embedding recipe, the data-efficient training that made ViTs practical, hierarchical designs like Swin, and the honest comparison of CNNs versus transformers on inductive bias, scale, and hybrids." name="description"/>
+<title>Chapter 22: Vision Transformers | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Vision Transformers</a></div>
+<h1>Chapter 22: Vision Transformers</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"For thirty years they told me a pixel only cared about its neighbors. Then someone cut me into sixteen-by-sixteen squares, lined them up like words, and asked every square what it thought of every other square. Turns out the corner had opinions about the sky all along."</p>
+<cite>A Mildly Overfit Vision Transformer</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Vision Transformer treats an image not as a grid to be convolved but as a short sequence of patches, and it lets self-attention learn which patches should talk to which, replacing the hard-wired locality of the convolution with a global mixing operation that is learned from data.</strong> This trade buys you a representation that can relate the top-left corner to the bottom-right one in a single layer, and that scales remarkably well when you have enough data. It costs you the convolution's built-in assumptions about locality and translation, the very inductive biases that let CNNs learn from modest datasets. The whole chapter is about when that trade is worth it. We build the attention block in the vision setting, turn an image into a sequence with the patch-embedding recipe, learn the augmentation and distillation tricks that made ViTs trainable without a private hundred-million-image dataset, study the hierarchical designs that brought back some of the convolution's efficiency, and finish with an honest, evidence-based comparison of CNNs and transformers and the hybrids that now win most benchmarks.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+For four chapters you have built vision around the convolution. <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> made the kernel learnable; <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> stacked kernels into ResNet, Inception, and ConvNeXt; <a href="../module-21-training-recipes/index.html">Chapter 21</a> taught you to train any of them well. Every one of those designs bakes in two assumptions that turn out to be choices, not laws of nature: that a feature depends mostly on its local neighborhood, and that a feature detector useful in one place is useful everywhere. Those assumptions are exactly why CNNs learn so efficiently. They are also a ceiling. A convolution cannot, in one layer, relate a hand to the racket it is holding on the far side of the frame; it must build that relationship slowly, layer by layer, as the receptive field grows. The Vision Transformer asks a different question: what if we let the network decide, per image and per layer, which regions should influence which, with no locality assumption at all?
+</p>
+<p>
+The answer arrived from an unlikely direction. The transformer was built for language, where a sentence is already a sequence of tokens and attention relates every word to every other word. The 2020 ViT paper made one audacious move: chop the image into fixed-size patches, flatten each patch into a vector, and feed the resulting sequence of "visual words" into a standard transformer encoder, almost unchanged from the language version. With enough data the result matched or beat the best CNNs. <a href="section-22.1.html">Section 22.1</a> builds the engine: scaled dot-product attention, multi-head attention, and the full transformer block, in the vision setting and from scratch, so the rest of the chapter rests on mechanics you have implemented rather than imported.
+</p>
+<p>
+<a href="section-22.2.html">Section 22.2</a> is the heart of the chapter: the ViT architecture itself. You will see exactly how an image becomes a sequence (the patch embedding, which we will recognize as a strided convolution in disguise), why a learnable class token and positional embeddings are needed, and how the encoder stack and classification head finish the job. <a href="section-22.3.html">Section 22.3</a> confronts the original ViT's dirty secret: it needed roughly 300 million images to shine, far more than most teams will ever have. DeiT showed how strong augmentation and a clever distillation token let a ViT train to competitive accuracy on plain ImageNet, on a single machine, in a few days. This is the section that turned ViTs from a curiosity into a tool.
+</p>
+<p>
+<a href="section-22.4.html">Section 22.4</a> brings back structure. The plain ViT keeps the same resolution and the same global attention at every layer, which is both wasteful and ill-suited to dense tasks like detection and segmentation. Swin Transformer and the pyramid family reintroduce the multi-scale hierarchy of the image pyramids from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> and the feature hierarchies of <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, computing attention in local windows and shifting those windows between layers to recover global reach at near-linear cost. <a href="section-22.5.html">Section 22.5</a> closes the chapter with the comparison the whole part has been building toward: inductive bias versus scale, where the crossover sits, and why the architectures that dominate in 2024 to 2026 are neither pure CNN nor pure transformer but deliberate hybrids.
+</p>
+<p>
+The unifying thread is attention itself, and it does not stop here. The self-attention you build in <a href="section-22.1.html">Section 22.1</a> becomes the mask-transformer decoder of <a href="../module-24-segmentation/index.html">Chapter 24</a>, the temporal attention of video models in <a href="../module-26-video-understanding/index.html">Chapter 26</a>, and, most consequentially, the cross-attention that lets a text prompt condition an image generator in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> and <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. Learn the patch-and-attend pattern well here, because you will meet it, lightly disguised, for the rest of the book.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a> for the tensor mechanics, layer normalization, residual connections, and training loop this chapter assembles into a transformer. <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a> is essential, because the central argument of the chapter is a contrast with the convolution's inductive biases, and because the patch embedding turns out to be a convolution. <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures</a> supplies the ResNet and ConvNeXt baselines that ViTs are measured against, and <a href="../module-21-training-recipes/index.html">Chapter 21: Training Recipes</a> supplies the augmentation, schedule, and regularization that ViTs depend on even more heavily than CNNs do. Comfort with matrix multiplication, the softmax function, and the dot product as a similarity measure (linear algebra you have used since <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>) makes the attention derivation in Section 22.1 concrete rather than abstract.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">22.1</span>
+<a href="section-22.1.html"><span class="section-title">Attention &amp; the Transformer Block, Vision Edition</span></a>
+<span class="section-desc">Scaled dot-product attention from the dot product up, multi-head attention, the full pre-norm transformer block with residuals and an MLP, and why this global mixing operation differs fundamentally from a convolution. Built from scratch in PyTorch.</span>
+</li>
+<li>
+<span class="section-num">22.2</span>
+<a href="section-22.2.html"><span class="section-title">ViT: Images as Sequences of Patches</span></a>
+<span class="section-desc">The patch embedding (a strided convolution in disguise), the learnable class token, positional embeddings, the encoder stack, and the classification head, assembled into a complete, runnable Vision Transformer that matches the published topology.</span>
+</li>
+<li>
+<span class="section-num">22.3</span>
+<a href="section-22.3.html"><span class="section-title">Data-Efficient Training: DeiT &amp; Augmentation for ViTs</span></a>
+<span class="section-desc">Why the original ViT needed 300 million images, and how DeiT's heavy augmentation, regularization, and distillation token brought competitive accuracy down to plain ImageNet on a single node. The recipe that made ViTs usable.</span>
+</li>
+<li>
+<span class="section-num">22.4</span>
+<a href="section-22.4.html"><span class="section-title">Hierarchical Designs: Swin &amp; Pyramid Transformers</span></a>
+<span class="section-desc">Window attention and shifted windows that recover global reach at near-linear cost, patch merging that builds a feature pyramid, and why hierarchical transformers became the default backbone for detection and segmentation.</span>
+</li>
+<li>
+<span class="section-num">22.5</span>
+<a href="section-22.5.html"><span class="section-title">CNNs vs ViTs: Inductive Bias, Scale &amp; Hybrids</span></a>
+<span class="section-desc">The honest comparison: what inductive bias buys you, where the data-scale crossover sits, what ViTs and CNNs each see differently, and why the winning 2024 to 2026 architectures are hybrids rather than purists.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+With attention and the patch-and-attend recipe in hand, you are ready to see the transformer leave classification behind and take over the rest of computer vision. <a href="../module-23-object-detection/index.html">Chapter 23: Object Detection</a> is the immediate sequel: the DETR family reframes detection as set prediction with a transformer decoder, dropping the hand-designed anchors and non-maximum suppression of classical detectors, and the hierarchical backbones of <a href="section-22.4.html">Section 22.4</a> are exactly what modern detectors sit on top of. From there the attention thread runs through <a href="../module-24-segmentation/index.html">Chapter 24</a>, where mask transformers and the Segment Anything Model turn pixels into promptable masks, through video transformers in <a href="../module-26-video-understanding/index.html">Chapter 26</a>, and into the generative half of the book, where the cross-attention you build here is the mechanism that lets a sentence steer a <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion model</a>. The convolution gave you the first decade of deep vision; attention is writing the second.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Vaswani, A. et al. "Attention Is All You Need." NeurIPS (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></div>
+<div class="bib-annotation">The transformer paper. It introduced scaled dot-product attention, multi-head attention, and the encoder-decoder block of Section 22.1. Written for language, but the block it defines is the engine inside every architecture in this chapter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Dosovitskiy, A. et al. "An Image Is Worth 16x16 Words: Transformers for Image Recognition at Scale." ICLR (2021). <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">arXiv:2010.11929</a></div>
+<div class="bib-annotation">The Vision Transformer (ViT) of Section 22.2. Splits an image into 16x16 patches, embeds each as a token, and feeds a near-standard transformer encoder. The paper that started this chapter, including the key finding that ViTs need large pretraining data to beat CNNs.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Touvron, H. et al. "Training data-efficient image transformers &amp; distillation through attention." ICML (2021). <a href="https://arxiv.org/abs/2012.12877" target="_blank" rel="noopener">arXiv:2012.12877</a></div>
+<div class="bib-annotation">DeiT of Section 22.3. Strong augmentation plus a distillation token learning from a CNN teacher let a ViT reach competitive ImageNet accuracy with no external data, on a single 8-GPU node, in a few days.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, Z. et al. "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows." ICCV (2021). <a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener">arXiv:2103.14030</a></div>
+<div class="bib-annotation">Swin of Section 22.4. Window-local attention with shifts between layers gives a multi-scale feature pyramid at linear cost in image size, making transformers practical backbones for detection and segmentation.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, W. et al. "Pyramid Vision Transformer: A Versatile Backbone for Dense Prediction without Convolutions." ICCV (2021). <a href="https://arxiv.org/abs/2102.12122" target="_blank" rel="noopener">arXiv:2102.12122</a></div>
+<div class="bib-annotation">PVT of Section 22.4. An early pyramid transformer that shrinks the token sequence stage by stage and uses spatial-reduction attention, an alternative route to the multi-scale features that dense prediction needs.</div>
+</div>
+
+<h3>Recent Research (2022-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, Z. et al. "A ConvNet for the 2020s." CVPR (2022). <a href="https://arxiv.org/abs/2201.03545" target="_blank" rel="noopener">arXiv:2201.03545</a></div>
+<div class="bib-annotation">ConvNeXt, the counterargument of Section 22.5. By porting transformer-era design and training choices back into a pure CNN, it matches Swin, showing much of the ViT advantage was recipe rather than attention.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Dehghani, M. et al. "Scaling Vision Transformers to 22 Billion Parameters." ICML (2023). <a href="https://arxiv.org/abs/2302.05442" target="_blank" rel="noopener">arXiv:2302.05442</a></div>
+<div class="bib-annotation">ViT-22B, the scale end of Section 22.5. Demonstrates that the transformer's clean scaling story carries into the tens of billions of parameters, the regime where attention's lack of inductive bias becomes an asset rather than a liability.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Oquab, M. et al. "DINOv2: Learning Robust Visual Features without Supervision." TMLR (2024). <a href="https://arxiv.org/abs/2304.07193" target="_blank" rel="noopener">arXiv:2304.07193</a></div>
+<div class="bib-annotation">A frontier ViT backbone trained self-supervised, previewing <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. Its features transfer to detection, segmentation, and depth without fine-tuning, the modern payoff of the patch-and-attend representation.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Darcet, T. et al. "Vision Transformers Need Registers." ICLR (2024). <a href="https://arxiv.org/abs/2309.16588" target="_blank" rel="noopener">arXiv:2309.16588</a></div>
+<div class="bib-annotation">A 2024 fix discussed in Section 22.5: adding a few extra learnable "register" tokens removes high-norm artifact tokens in ViT attention maps, cleaning up the features and the interpretability of where the model looks.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Wightman, R. <code>timm</code> (PyTorch Image Models). <a href="https://github.com/huggingface/pytorch-image-models" target="_blank" rel="noopener">github.com/huggingface/pytorch-image-models</a></div>
+<div class="bib-annotation">The reference implementation source for ViT, DeiT, Swin, and dozens of hybrids, with pretrained weights and the exact training recipes of Sections 22.3 and 22.4. The library shortcut behind most of this chapter's code.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hugging Face Transformers, Vision models. <a href="https://huggingface.co/docs/transformers/index" target="_blank" rel="noopener">huggingface.co/docs/transformers</a></div>
+<div class="bib-annotation">High-level <code>AutoModel</code> and <code>AutoImageProcessor</code> APIs that load ViT, DeiT, and Swin with their preprocessing in a few lines, used in the library shortcuts of Sections 22.2 and 22.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch <code>nn.MultiheadAttention</code> and <code>torch.nn.functional.scaled_dot_product_attention</code>. <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">pytorch.org/docs</a></div>
+<div class="bib-annotation">The built-in, fused (FlashAttention-backed) attention primitive that replaces the from-scratch attention of Section 22.1 with a single, memory-efficient call in production code.</div>
+</div>
+
+<h3>Tutorials &amp; Explainers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Phil Wang (lucidrains). <code>vit-pytorch</code>. <a href="https://github.com/lucidrains/vit-pytorch" target="_blank" rel="noopener">github.com/lucidrains/vit-pytorch</a></div>
+<div class="bib-annotation">A clean, heavily-starred from-scratch implementation of ViT and many variants, the ideal companion for reading the Section 22.2 architecture line by line.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Amirhossein Kazemnejad. "The Annotated ViT" and Jay Alammar, "The Illustrated Transformer." <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">jalammar.github.io/illustrated-transformer</a></div>
+<div class="bib-annotation">The most accessible visual walkthrough of attention, query-key-value, and multi-head mechanics that Section 22.1 formalizes. Read it alongside the math for intuition.</div>
+</div>
+
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Sun, C. et al. "Revisiting Unreasonable Effectiveness of Data in Deep Learning Era (JFT-300M)." ICCV (2017). <a href="https://arxiv.org/abs/1707.02968" target="_blank" rel="noopener">arXiv:1707.02968</a></div>
+<div class="bib-annotation">The 300-million-image internal dataset that the original ViT pretrained on, the concrete reason for the data-hunger of Section 22.3 and the scale crossover of Section 22.5.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Deng, J. et al. "ImageNet: A Large-Scale Hierarchical Image Database." CVPR (2009). <a href="https://www.image-net.org/" target="_blank" rel="noopener">image-net.org</a></div>
+<div class="bib-annotation">The 1.28-million-image benchmark on which DeiT (Section 22.3) proved data-efficient training, and the common yardstick for every CNN-versus-ViT comparison in Section 22.5.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-21-training-recipes/index.html">&#8592; Chapter 21: Training Recipes</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-22.1.html">Section 22.1: Attention &amp; the Transformer Block, Vision Edition &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

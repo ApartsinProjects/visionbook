@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.5: Hierarchical VAEs: From Ladder Networks to NVAE. Stacking latents into a deep hierarchy so one model captures global layout and fine texture together: the ladder-network bidirectional inference path, the depth-stabilizing residual cells and spectral regularization of NVAE and very deep VAEs, and how hierarchical VAEs reached image quality competitive with GANs and diffusion." name="description"/>
+<title>Section 31.5: Hierarchical VAEs: From Ladder Networks to NVAE | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders</a></div>
+<h1>Hierarchical VAEs: From Ladder Networks to NVAE</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"One latent tried to remember the whole portrait at once: the pose, the freckles, the glint in the eye. It got the gist and smudged the rest. So we hired a committee, one for the silhouette, one for the cheeks, one for the eyelashes, and finally the face came back."</p>
+<cite>A Hierarchy of Latents That Learned to Delegate</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A single latent layer must encode global layout and fine texture in the same vector, and that overload is the main reason vanilla VAE samples look blurry; hierarchical VAEs split the code into a stack of latents at different scales, so coarse structure and fine detail each get their own home.</strong> The architecture mirrors an idea you already know: the image pyramids of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> and the feature hierarchies of <a href="../../part-3-deep-learning-for-vision/module-20-cnn-architectures/index.html">Chapter 20</a>, now applied to latent variables. Making a deep stack of latents actually trainable took two key ingredients. The ladder VAE introduced a bidirectional inference path that couples a bottom-up encoder pass with a top-down generative pass, so the upper latents receive a useful learning signal. NVAE and the very deep VAEs added the depth-stabilizing engineering, residual latent cells, careful normalization, and spectral regularization, that let the stack grow to dozens of layers without diverging. The payoff is image quality that, for the first time, made VAEs competitive with GANs and diffusion.</p>
+</div>
+
+<p>
+In <a href="section-31.3.html">Section 31.3</a> and <a href="section-31.4.html">Section 31.4</a> the latent was a single flat vector. That design has a structural limit: every aspect of an image, from "this is a face seen in three-quarter view" down to "this eyelash curls slightly," must be packed into one code and decoded in one shot. Maximum likelihood with a Gaussian decoder then averages over the fine details it cannot pin down, which is why VAE faces come out soft. A hierarchy fixes this by giving the model multiple latent layers, top latents for global decisions and bottom latents for local detail, with each conditioned on the ones above. This section builds that idea up from the flat VAE.
+</p>
+
+<h2>1. Why One Latent Layer Is Not Enough <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Consider what a single 20-dimensional code must do for a face image. It has to specify pose, identity, lighting, expression, hairstyle, and every fine texture, all in twenty numbers, and the decoder must expand all of that simultaneously. There are two failures here. First, capacity: twenty numbers cannot carry both the global plan and the local detail, so detail is sacrificed. Second, structure: the model has no way to express that "given the pose and identity (global), the eyelashes (local) follow," a conditional structure that real images obviously have. A hierarchy of latents $z_1, z_2, \ldots, z_L$ addresses both. The generative model factorizes top-down,
+</p>
+
+<div class="math-block">
+$$p_\theta(x, z_1, \ldots, z_L) = p(z_L)\,\prod_{l=1}^{L-1} p_\theta(z_l \mid z_{l+1})\;\, p_\theta(x \mid z_1)$$
+</div>
+
+<p>
+so the topmost latent $z_L$ is drawn from the prior and decides global structure, each lower latent is drawn conditioned on the one above and refines the picture, and the decoder finally renders the image from the bottom latent. Coarse-to-fine generation falls out naturally: the top of the stack lays out the silhouette, the bottom fills in texture, exactly the multi-resolution decomposition of a <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Laplacian pyramid</a> but with learned, stochastic levels.
+</p>
+
+<h2>2. The Ladder VAE and Bidirectional Inference <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Training a deep latent stack runs into a hard problem on the inference side. A naive encoder that simply mirrors the generative model bottom-up tends to leave the upper latents undertrained: the gradient signal reaching $z_L$ is weak, and those latents collapse toward the prior (the posterior collapse of <a href="section-31.4.html">Section 31.4</a>, now striking the top of the hierarchy first). The <strong>ladder VAE</strong> solves this with a bidirectional inference path. A bottom-up deterministic pass extracts features at every level; then a top-down stochastic pass computes each latent's posterior by <em>combining</em> the bottom-up features with the top-down generative prediction from the layer above. In effect the encoder and the generative model share their top-down pathway, so the posterior at each level is a precision-weighted merge of "what the data says" (bottom-up) and "what the layers above expect" (top-down). This coupling is what gives the upper latents a strong, well-conditioned signal and keeps them alive. Figure 31.5.1 contrasts the flat VAE with the ladder's two coupled passes.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: flat VAE with a single latent. Right: ladder VAE with bottom-up and top-down passes coupling three latents">
+<style>
+.ll{font:11px sans-serif;fill:#1a1a1a;}
+.ls{font:9px sans-serif;fill:#555;}
+.lt{font:11px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.lbox{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.3;}
+.llat{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.lup{stroke:#2f9e5c;stroke-width:1.5;marker-end:url(#luh);fill:none;}
+.ldown{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#ldh);fill:none;}
+</style>
+<defs>
+<marker id="luh" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+<marker id="ldh" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker>
+</defs>
+<text class="lt" x="120" y="30" text-anchor="middle">flat VAE</text>
+<rect class="lbox" x="90" y="250" width="60" height="34"/><text class="ll" x="120" y="272" text-anchor="middle">x</text>
+<rect class="llat" x="90" y="60" width="60" height="34"/><text class="ll" x="120" y="82" text-anchor="middle">z</text>
+<line class="lup" x1="120" y1="248" x2="120" y2="98"/>
+<line class="ldown" x1="135" y1="96" x2="135" y2="246"/>
+<text class="ls" x="120" y="160" text-anchor="middle">one code carries</text>
+<text class="ls" x="120" y="174" text-anchor="middle">everything</text>
+<text class="lt" x="470" y="30" text-anchor="middle">ladder VAE (3 levels)</text>
+<rect class="lbox" x="440" y="250" width="60" height="34"/><text class="ll" x="470" y="272" text-anchor="middle">x</text>
+<rect class="llat" x="440" y="190" width="60" height="30"/><text class="ll" x="470" y="210" text-anchor="middle">z&#8321; fine</text>
+<rect class="llat" x="440" y="125" width="60" height="30"/><text class="ll" x="470" y="145" text-anchor="middle">z&#8322; mid</text>
+<rect class="llat" x="440" y="60" width="60" height="30"/><text class="ll" x="470" y="80" text-anchor="middle">z&#8323; global</text>
+<line class="lup" x1="455" y1="248" x2="455" y2="222"/>
+<line class="lup" x1="455" y1="188" x2="455" y2="157"/>
+<line class="lup" x1="455" y1="123" x2="455" y2="92"/>
+<line class="ldown" x1="485" y1="90" x2="485" y2="123"/>
+<line class="ldown" x1="485" y1="155" x2="485" y2="188"/>
+<line class="ldown" x1="485" y1="220" x2="485" y2="248"/>
+<text class="ls" x="540" y="100" text-anchor="middle" fill="#2f9e5c">green:</text>
+<text class="ls" x="540" y="114" text-anchor="middle" fill="#2f9e5c">bottom-up</text>
+<text class="ls" x="610" y="100" text-anchor="middle" fill="#8e44ad">purple:</text>
+<text class="ls" x="610" y="114" text-anchor="middle" fill="#8e44ad">top-down</text>
+<text class="ls" x="575" y="200" text-anchor="middle">each posterior merges</text>
+<text class="ls" x="575" y="214" text-anchor="middle">both passes</text>
+</svg>
+<figcaption><strong>Figure 31.5.1:</strong> Flat versus ladder VAE. Left: a flat VAE has one latent that must encode every scale. Right: the ladder VAE stacks latents from fine ($z_1$) to global ($z_3$). A bottom-up pass (green) extracts data features; a top-down pass (purple) carries the generative prediction; the posterior at each level merges the two, which keeps the upper latents informative and prevents them from collapsing to the prior.</figcaption>
+</figure>
+
+<p>
+The next block sketches one level of a hierarchical VAE, showing how the top-down prior for a level and the bottom-up data features are combined to form that level's posterior. The full model stacks these cells; the snippet isolates the coupling that defines the ladder.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class LadderLevel(nn.Module):
+    """One level: combine top-down prior with bottom-up evidence."""
+    def __init__(self, dim):
+        super().__init__()
+        self.prior = nn.Linear(dim, 2 * dim)     # p(z_l | z_{l+1}): mu, logvar
+        self.merge = nn.Linear(2 * dim, 2 * dim)  # combine with bottom-up features
+
+    def forward(self, top_down, bottom_up):
+        p_mu, p_logvar = self.prior(top_down).chunk(2, dim=-1)      # from above
+        q_params = self.merge(torch.cat([top_down, bottom_up], -1))
+        q_mu, q_logvar = q_params.chunk(2, dim=-1)                  # posterior
+        std = torch.exp(0.5 * q_logvar)
+        z = q_mu + std * torch.randn_like(std)    # reparameterized sample
+        # KL between this level's posterior q and its conditional prior p:
+        kl = 0.5 * (p_logvar - q_logvar + (q_logvar.exp() + (q_mu - p_mu) ** 2)
+                    / p_logvar.exp() - 1).sum(-1)
+        return z, kl
+# Stacking L of these, with bottom-up features feeding each level, is the
+# hierarchical VAE. The per-level KL is to the CONDITIONAL prior p(z_l|z_{l+1}),
+# not to N(0, I), which is the key difference from the flat VAE.</code></pre>
+<div class="code-caption">One level of a ladder VAE. The level's prior comes top-down from the layer above; its posterior merges that prior with bottom-up data features, and the KL is taken against the conditional prior rather than a fixed standard normal. Stacking these cells builds the full hierarchy.</div>
+
+<h2>3. NVAE and the Engineering of Depth <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The ladder fixed the inference structure, but pushing the stack to the dozens of latent groups needed for high-resolution images exposed raw optimization instability: the KL terms across many levels are hard to balance, activations explode or vanish, and the model diverges. NVAE (2020) is the recipe that tamed this, and it is worth knowing the ingredients because the same problems recur in any very deep generative model. Its latent cells are <strong>residual</strong>, built from depthwise-separable convolutions and squeeze-and-excitation blocks (the efficiency primitives of <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a>), so signal flows cleanly through depth as in a ResNet. It uses careful normalization and a <strong>spectral regularization</strong> that bounds the Lipschitz constant of each layer, which keeps the KL terms smooth and prevents the sharp instabilities that otherwise kill deep VAEs. A residual parameterization of the posterior expresses each level's distribution as a small offset from its prior, which both stabilizes the KL and counters collapse. The companion "Very Deep VAE" work (2021) made a complementary point: a clean hierarchical VAE made deep <em>enough</em> outperforms the autoregressive PixelCNN-class models on likelihood, showing that depth in the latent stack, not architectural exotica, was the missing ingredient.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Hierarchy Is What Made VAEs Sharp</div>
+<p>For years the consensus was that VAEs are inherently blurry and GANs are the only way to get crisp samples. Hierarchical VAEs falsified that. NVAE and Very Deep VAE produced samples competitive with the GANs of their day, and they did so while keeping everything the VAE is prized for: a stable likelihood-based objective, an inference network, no adversarial training, and no mode collapse. The lesson is that the blur was never fundamental to the variational approach; it was the symptom of asking one flat latent to do a multi-scale job. Give the model a latent per scale and a way to train the stack, and the sharpness returns. This insight carries directly into diffusion, which is itself a deep hierarchy of denoising steps, and into the multi-level VQ codebooks of <a href="section-31.6.html">Section 31.6</a>.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Why One Latent Should Not Try to Do Six Jobs</div>
+<p>Asking a single twenty-dimensional code to remember the pose, the identity, the lighting, the hairstyle, and every individual eyelash is like asking one frantic person to be the architect, the bricklayer, and the interior decorator on the same afternoon. The roof gets built, but the curtains come out blurry. A hierarchical VAE does the sensible managerial thing and hires a small department: a top latent that decides the floor plan, middle latents that frame the rooms, and bottom latents that fuss over the trim. The blur that everyone once blamed on the VAE's character turned out to be a staffing problem all along.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Reach for a Reference Implementation</div>
+<p>A correct hierarchical VAE is genuinely hard to implement: the bidirectional inference path, per-level KL balancing, spectral normalization, and the residual cells each have subtle failure modes, and a from-scratch attempt easily runs to hundreds of lines that train unstably. Do not start from a blank file. NVIDIA's official NVAE repository and the community Very Deep VAE implementations provide tested architectures, the exact normalization and regularization settings, and training configs for standard datasets, turning a multi-week reimplementation into a configure-and-run job. The single-level cell above exists to teach the coupling; for real high-resolution work, clone the reference, read its level-construction and KL-balancing code against this section, and adapt it. The library handles the depth-stability engineering that is the entire difficulty.</p>
+</div>
+
+<h2>4. Where Hierarchical VAEs Sit Now <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Hierarchical VAEs occupy an important conceptual position even though pure diffusion now leads on raw image fidelity. Their deep top-down generative path, coarse latents conditioning fine ones, is structurally the same coarse-to-fine refinement that diffusion performs over time steps, and several works draw the equivalence explicitly: a diffusion model can be read as a particular very deep hierarchical VAE whose latents are the noisy intermediates and whose per-step decoders share weights. Understanding the hierarchical VAE therefore demystifies a large part of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> in advance. In practice, the hierarchy idea persists in the multi-resolution latent designs used inside modern image and video autoencoders, and the depth-stabilization tricks NVAE introduced reappear wherever a generative stack must be trained deep. The next block shows how to read off the coarse-to-fine behavior by sampling the top latents and resampling the bottom ones.
+</p>
+
+<pre><code class="language-python">import torch
+
+# Demonstrate coarse-to-fine control in a trained hierarchical VAE.
+model.eval()
+with torch.no_grad():
+    z_top = torch.randn(1, top_dim)            # fix the GLOBAL latent
+    variations = []
+    for _ in range(8):
+        # Resample only the lower (fine-detail) latents, keep z_top fixed.
+        img = model.generate(z_top=z_top, resample_lower=True)
+        variations.append(img)
+    # The 8 images share global structure (same pose/identity, set by z_top)
+    # but differ in fine texture (set by the resampled lower latents).
+    # This is the hierarchy made visible: each scale is a separate control.</code></pre>
+<div class="code-caption">Reading the hierarchy. Fixing the top latent and resampling only the lower ones produces images that agree on global structure but vary in fine detail, the direct visual confirmation that the stack has separated scales, with the top latent owning layout and the bottom latents owning texture.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Hierarchical Latents Inside Video and 3D Autoencoders</div>
+<p>The hierarchical-VAE idea is alive in 2024 to 2026 wherever the data is too big for a flat latent. Modern video generators compress with spatiotemporal autoencoders that use multi-scale latents to separate slow global motion from fast local texture, the temporal analog of NVAE's spatial hierarchy, and 3D generation pipelines apply the same multi-resolution latent structure to voxel and triplane representations. The clean equivalence between a very deep hierarchical VAE and a diffusion model, sharpened in several 2021 to 2023 papers, also continues to guide the design of efficient few-step samplers, since a shallower but better-conditioned hierarchy can replace many diffusion steps. The depth-stable cell design and spectral regularization of NVAE remain part of the standard toolkit for training any deep generative stack. Hierarchy, first introduced here to fix VAE blur, became a general principle for scaling generative models, and you will see it again as the multi-scale latents of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> and the video models of <a href="../module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Two-Scale Latent for Medical Image Synthesis</div>
+<p><strong>Who:</strong> a research group generating synthetic retinal scans to augment a small labeled dataset for a diabetic-retinopathy classifier, 2024. <strong>Situation:</strong> a flat VAE produced retinas with believable overall vasculature but smudged the fine microaneurysms that are the actual diagnostic signal. <strong>Problem:</strong> the synthetic images were useless for training a detector of the very features they blurred away. <strong>Decision:</strong> they switched to a two-level hierarchical VAE, letting the top latent capture global vessel layout and the bottom latent capture fine lesions, and verified with a clinician that the bottom-level samples preserved microaneurysm appearance. <strong>Result:</strong> the synthetic scans retained diagnostically relevant fine detail, and adding them to training improved the downstream classifier on rare-lesion cases. <strong>Lesson:</strong> when the signal you care about lives at a different scale than the bulk of the image's energy, a flat latent will average it away; a hierarchy that gives that scale its own latent is the principled fix, and it matters most exactly when fine detail is the point.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.5.1: Why the Top Latents Collapse First <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In a deep hierarchical VAE trained with a naive bottom-up encoder, the topmost latents are the ones most prone to collapsing toward the prior. Explain in three or four sentences why the top of the stack is the most vulnerable, in terms of how far the gradient signal must travel and how much the powerful lower layers can reconstruct on their own. Then explain how the ladder VAE's top-down pass changes this, referring to the precision-weighted merge of subsection 2.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.5.2: A Two-Level VAE <span class="exercise-type coding">Coding</span></div>
+<p>Build a two-level hierarchical VAE for MNIST using the <code>LadderLevel</code> cell of subsection 2: a bottom-up convolutional encoder producing features at two resolutions, two latent levels, and a top-down generative path. Train it, then reproduce the coarse-to-fine demonstration of subsection 4: fix the top latent and resample the bottom latent several times, and display the results. Confirm that the images share global digit identity while varying in stroke detail, and compare the sample sharpness to a flat VAE with the same total latent dimension trained for the same time.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.5.3: Diffusion as a Deep Hierarchical VAE <span class="exercise-type analysis">Analysis</span></div>
+<p>The text claims a diffusion model can be read as a very deep hierarchical VAE. Write a one-page analysis making the correspondence precise: identify what plays the role of each latent $z_l$, what the per-level conditional prior $p(z_l \mid z_{l+1})$ corresponds to, why the per-step decoders share weights, and what the ELBO of the hierarchical VAE becomes in this view. Then state one concrete consequence of the equivalence for sampling efficiency, connecting it to the few-step-sampler discussion you will meet in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-31.4.html">&#8592; Section 31.4: Disentanglement, beta-VAE &amp; Posterior Collapse</a>
+<a href="index.html">Chapter 31</a>
+<a class="next" href="section-31.6.html">Section 31.6: Discrete Latents: VQ-VAE &amp; Learned Codebooks &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

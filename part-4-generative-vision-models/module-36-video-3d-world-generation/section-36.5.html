@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.5: World Models: Latent Dynamics, RSSM &amp; Learning in Imagination. The recurrent state-space model that separates deterministic and stochastic latent state, the Dreamer recipe, and training a policy inside the model's own dream." name="description"/>
+<title>Section 36.5: World Models: Latent Dynamics, RSSM &amp; Learning in Imagination | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>World Models: Latent Dynamics, RSSM &amp; Learning in Imagination</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I do not need to crash a thousand real cars to learn to drive. I crash a thousand imaginary ones, in a dream I built from watching, and wake up cautious."</p>
+<cite>An Agent That Learned to Plan Inside Its Own Head</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A world model is a learned simulator: it compresses observations into a latent state and learns a transition function that predicts the next latent state from the current one and an action, so an agent can train by rolling out imagined futures instead of acting in the costly real world.</strong> The recurrent state-space model (RSSM) is the canonical recipe, splitting the latent into a deterministic memory and a stochastic part so it can model both predictable structure and genuine uncertainty. This section builds the RSSM and shows how Dreamer trains a policy entirely inside it.</p>
+</div>
+
+<p>
+Every generative model so far in this chapter produced <em>observations</em>: frames, objects, scenes. A world model produces <em>dynamics</em>. It is the point where generative vision meets decision-making, and it closes an arc that began far back in the book. <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> introduced state estimation with the Kalman filter: a hidden state, a motion model that predicts how it evolves, and observations that correct it. A world model is that idea made fully learned and deeply nonlinear, with a VAE-style encoder (<a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>) for the observation model and a neural network for the transition. The cross-reference map names this exactly: motion models and Kalman state estimation, deepened through video understanding and VAE latents, transformed here into learned latent dynamics.
+</p>
+
+<h2>1. Why Imagine? The Sample-Efficiency Argument <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Reinforcement learning that acts directly in an environment is sample-hungry: a robot or game agent may need millions of real interactions to learn a good policy, and real interactions are slow, expensive, or dangerous. The world-model proposal, articulated in Ha and Schmidhuber's "World Models" (2018), is to learn a model of the environment from logged experience, then train the policy by simulating, or <em>imagining</em>, rollouts inside that model. Imagined steps are cheap (a forward pass, no physics engine, no real robot), so the policy can practice billions of times in its own dream and only occasionally touch reality to refine the model.
+</p>
+
+<p>
+This is the central payoff and it is dramatic: world-model agents such as DreamerV3 (Hafner et al., 2023) reach strong performance with one to two orders of magnitude fewer real environment steps than model-free baselines, and a single configuration masters domains from Atari to continuous control to Minecraft. The price is that the dream must be good enough; a policy that learns to exploit a flaw in the model (driving through an imaginary wall the model failed to render) fails in reality. The quality of the world model is the ceiling on the policy, which is why evaluation (<a href="section-36.8.html">Section 36.8</a>) is so central.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+An agent that learns inside its own dream has exactly the problem of a student who only studies the answer key: if the key has a typo, the student confidently learns the typo. A Dreamer agent that discovers it can phase through a wall the model forgot to render will become a world-class wall-phaser, and then drive straight into a real wall on day one. The polite name for this is "model exploitation"; the honest name is "the dream lied and the agent believed it."
+</p>
+</div>
+
+<h2>2. The RSSM: Deterministic Memory Meets Stochastic State <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The technical heart is the <strong>Recurrent State-Space Model</strong>. The latent state at time $t$ is split into two parts: a deterministic recurrent state $h_t$ (a GRU's hidden state, carrying reliable memory of the past) and a stochastic state $z_t$ (a sampled latent capturing the irreducible uncertainty of what comes next). This split is the RSSM's signature insight. A purely deterministic model cannot represent genuine randomness (a die roll, an opponent's choice); a purely stochastic model struggles to carry long-range memory. Splitting them gets both.
+</p>
+
+<p>
+The model has four learned components. The <strong>recurrent model</strong> updates the deterministic state, $h_t = f(h_{t-1}, z_{t-1}, a_{t-1})$, folding in the previous action $a_{t-1}$. The <strong>representation model</strong> (the encoder, used during training) infers the stochastic state from the current observation, $z_t \sim q(z_t \mid h_t, x_t)$. The <strong>transition (prior) model</strong> predicts the stochastic state from memory alone, $\hat{z}_t \sim p(z_t \mid h_t)$, with no access to the observation, this is the predictor used to imagine. Decoder, reward, and continuation heads read out pixels, reward, and episode-end from the full state $(h_t, z_t)$. Training maximizes a variational lower bound (the ELBO you met in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>), reconstructing observations and rewards while a KL term pulls the observation-informed posterior $q$ toward the observation-free prior $p$, so the prior alone can carry the dream forward.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The recurrent state-space model unrolled over two timesteps: a deterministic recurrent state h flows left to right through a GRU taking the previous stochastic state and action; at each step a stochastic state z is drawn from a posterior using the observation during training or from a prior using only h during imagination; the full state h and z decodes to a predicted observation and reward">
+  <g font-family="sans-serif" font-size="12.5">
+    <!-- timestep t -->
+    <text x="200" y="28" text-anchor="middle" font-weight="bold" fill="#5a626c">timestep t</text>
+    <rect x="150" y="45" width="90" height="40" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5" rx="5"/>
+    <text x="195" y="70" text-anchor="middle" font-weight="bold" fill="#1b4f72">h_t (GRU)</text>
+    <text x="195" y="100" text-anchor="middle" font-size="10" fill="#1b4f72">deterministic memory</text>
+    <rect x="150" y="140" width="90" height="40" fill="#e8daef" stroke="#7d3c98" stroke-width="1.5" rx="5"/>
+    <text x="195" y="165" text-anchor="middle" font-weight="bold" fill="#512e5f">z_t</text>
+    <text x="195" y="200" text-anchor="middle" font-size="10" fill="#512e5f">stochastic state</text>
+    <line x1="195" y1="85" x2="195" y2="140" stroke="#7d3c98" stroke-width="1.3" marker-end="url(#ah2)"/>
+    <text x="255" y="118" text-anchor="middle" font-size="9.5" fill="#512e5f">prior p(z|h)</text>
+    <text x="255" y="132" text-anchor="middle" font-size="9.5" fill="#512e5f">or post q(z|h,x)</text>
+    <rect x="150" y="230" width="90" height="36" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5" rx="5"/>
+    <text x="195" y="253" text-anchor="middle" font-size="11" fill="#145a32">decode x_t, r_t</text>
+    <line x1="195" y1="180" x2="195" y2="230" stroke="#1e8449" stroke-width="1.3" marker-end="url(#ah3)"/>
+    <!-- transition to t+1 -->
+    <line x1="240" y1="65" x2="430" y2="65" stroke="#2980b9" stroke-width="1.8" marker-end="url(#ah1)"/>
+    <text x="335" y="55" text-anchor="middle" font-size="10.5" fill="#1b4f72">h_{t+1}=f(h_t, z_t, a_t)</text>
+    <line x1="240" y1="160" x2="320" y2="100" stroke="#7d3c98" stroke-width="1.2" stroke-dasharray="3,3"/>
+    <rect x="300" y="95" width="60" height="26" fill="#fcf3cf" stroke="#b7950b" stroke-width="1.3" rx="4"/>
+    <text x="330" y="113" text-anchor="middle" font-size="10.5" fill="#7d6608">action a_t</text>
+    <line x1="360" y1="108" x2="430" y2="80" stroke="#b7950b" stroke-width="1.2" stroke-dasharray="3,3"/>
+    <!-- timestep t+1 -->
+    <text x="540" y="28" text-anchor="middle" font-weight="bold" fill="#5a626c">timestep t+1</text>
+    <rect x="490" y="45" width="90" height="40" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5" rx="5"/>
+    <text x="535" y="70" text-anchor="middle" font-weight="bold" fill="#1b4f72">h_{t+1}</text>
+    <rect x="490" y="140" width="90" height="40" fill="#e8daef" stroke="#7d3c98" stroke-width="1.5" rx="5"/>
+    <text x="535" y="165" text-anchor="middle" font-weight="bold" fill="#512e5f">z_{t+1}</text>
+    <line x1="535" y1="85" x2="535" y2="140" stroke="#7d3c98" stroke-width="1.3" marker-end="url(#ah2)"/>
+    <rect x="490" y="230" width="90" height="36" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5" rx="5"/>
+    <text x="535" y="253" text-anchor="middle" font-size="11" fill="#145a32">decode x, r</text>
+    <line x1="535" y1="180" x2="535" y2="230" stroke="#1e8449" stroke-width="1.3" marker-end="url(#ah3)"/>
+    <text x="710" y="150" text-anchor="middle" font-size="11" fill="#5a626c">imagination: use the</text>
+    <text x="710" y="167" text-anchor="middle" font-size="11" fill="#5a626c">prior p(z|h), no observation,</text>
+    <text x="710" y="184" text-anchor="middle" font-size="11" fill="#5a626c">to roll the dream forward</text>
+  </g>
+  <defs>
+    <marker id="ah1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2980b9"/></marker>
+    <marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#7d3c98"/></marker>
+    <marker id="ah3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1e8449"/></marker>
+  </defs>
+</svg>
+<figcaption><strong>Figure 36.5.1</strong>: The RSSM unrolled over two timesteps. The deterministic recurrent state $h$ (blue) flows forward through a GRU that ingests the previous stochastic state and action; the stochastic state $z$ (purple) is drawn from the observation-informed posterior during training and from the observation-free prior during imagination; the full state decodes to a predicted observation and reward (green). The prior path is what lets the model dream forward without seeing the world.</figcaption>
+</figure>
+
+<p>
+Figure 36.5.1 unrolls the RSSM and highlights the one path that makes imagination possible: the prior $p(z_t \mid h_t)$, which predicts the next stochastic state from memory alone. During training the posterior $q$ (which peeks at the observation) drives reconstruction; during imagination only the prior runs, so the model generates futures without any real input. The code below implements one RSSM transition step.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class RSSMCell(nn.Module):
+    """One step of a Recurrent State-Space Model: deterministic GRU memory plus
+    a stochastic latent drawn from a prior (imagination) or posterior (training)."""
+    def __init__(self, stoch=32, deter=256, action_dim=6, obs_feat=1024, hidden=256):
+        super().__init__()
+        self.gru = nn.GRUCell(stoch + action_dim, deter)
+        self.prior_net = nn.Sequential(nn.Linear(deter, hidden), nn.SiLU(),
+                                       nn.Linear(hidden, 2 * stoch))   # mean, logstd
+        self.post_net = nn.Sequential(nn.Linear(deter + obs_feat, hidden), nn.SiLU(),
+                                      nn.Linear(hidden, 2 * stoch))
+        self.stoch = stoch
+
+    def _sample(self, params):
+        mean, logstd = params.chunk(2, dim=-1)
+        std = torch.exp(logstd.clamp(-5, 2))
+        eps = torch.randn_like(std)
+        return mean + std * eps, mean, std        # reparameterized sample
+
+    def forward(self, prev_stoch, prev_action, prev_deter, obs_feat=None):
+        x = torch.cat([prev_stoch, prev_action], dim=-1)
+        deter = self.gru(x, prev_deter)            # advance deterministic memory
+        prior = self.prior_net(deter)              # predict next state from memory alone
+        if obs_feat is None:                       # IMAGINATION: dream forward
+            stoch, mean, std = self._sample(prior)
+            return stoch, deter, (mean, std), None
+        post = self.post_net(torch.cat([deter, obs_feat], dim=-1))  # use observation
+        stoch, _, _ = self._sample(post)           # TRAINING: posterior sample
+        return stoch, deter, prior, post           # KL(post || prior) trains the dream
+
+cell = RSSMCell()
+z, h = torch.zeros(4, 32), torch.zeros(4, 256)
+a = torch.zeros(4, 6)
+z, h, prior, post = cell(z, a, h, obs_feat=torch.randn(4, 1024))
+print(z.shape, h.shape)   # torch.Size([4, 32]) torch.Size([4, 256])</code></pre>
+<div class="code-caption">One RSSM transition step. The GRU advances deterministic memory; a prior network predicts the next stochastic state from memory alone (used to imagine), while a posterior network uses the observation (used in training). The KL between posterior and prior is the loss term that teaches the prior to dream accurately.</div>
+
+<h2>3. Learning in Imagination: The Dreamer Loop <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+With a trained RSSM, the Dreamer recipe (Hafner et al., 2020) learns behavior without touching the environment. Starting from latent states encoded from real replayed experience, it rolls the RSSM forward using only the prior and the current policy's actions, generating an imagined trajectory of latent states, predicted rewards, and continuation flags. An <strong>actor-critic</strong> is then trained on this imagined trajectory: the critic learns to predict the long-horizon value of latent states, and the actor (policy) is updated to maximize that value. Because the entire rollout is differentiable, gradients of value can flow back through the imagined dynamics into the policy, an analytic policy gradient that model-free methods cannot get.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Three Loops of a World-Model Agent</div>
+<p>
+A Dreamer-style agent runs three nested loops, and keeping them straight demystifies the whole system. The <strong>environment loop</strong> (slow, expensive) acts in reality with the current policy and stores experience in a replay buffer. The <strong>model loop</strong> (offline) trains the RSSM on replayed sequences to reconstruct observations and rewards and to make the prior match the posterior. The <strong>imagination loop</strong> (fast, billions of steps) rolls the RSSM forward from replayed states and trains the actor-critic purely on dreamed trajectories. Real data trains the model; the model trains the policy; the policy gathers more real data. Sample efficiency comes entirely from the fact that the inner imagination loop never touches the environment.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: DreamerV3 Out of the Box</div>
+<p>
+A full RSSM, the actor-critic, the replay buffer, and the imagination loop are roughly a thousand lines of careful code with many stabilizing tricks (symlog rewards, free-bits KL, percentile return normalization). The official DreamerV3 implementation runs an agent on a new environment from one command:
+</p>
+<pre><code class="language-python"># Train DreamerV3 on a Gym environment with the reference implementation.
+# pip install dreamerv3 ; then:
+import dreamerv3
+from dreamerv3 import embodied
+config = embodied.Config(dreamerv3.configs["defaults"])
+config = config.update({"task": "gym_CartPole-v1", "run.steps": 5e4})
+dreamerv3.run(config)   # builds RSSM, actor-critic, replay, imagination loop</code></pre>
+<div class="code-caption">Running DreamerV3 on a Gym environment from one config: the from-scratch RSSM cell above is one of its dozens of components, all wired and stabilized.</div>
+<p>
+This replaces the entire from-scratch system, the RSSM cell above is just one of its dozens of components, with a single configured run, and it carries the years of stabilization tricks that make a fixed hyperparameter set work across very different domains. Reach for it whenever you want results rather than understanding.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Warehouse Robot That Trained in a Dream</div>
+<p>
+A logistics company wanted a mobile robot to learn to navigate a cluttered, frequently rearranged warehouse aisle. Training a model-free policy on the real robot was a non-starter: each real episode took minutes, collisions damaged stock, and the layout changed weekly so a fixed simulator was useless. The team logged a few thousand teleoperated and random episodes, trained an RSSM world model on the camera and odometry streams, then trained the navigation policy entirely in imagination, billions of dreamed steps overnight on a single GPU. The robot touched the real floor only to gather more data when the dream's predictions diverged from reality (high reconstruction error flagged unfamiliar situations). Within two weeks of mostly-imagined training it navigated reliably, and re-adapting to a new layout took a day of fresh logging rather than a fresh from-scratch training run. The lesson: <em>when real interaction is the bottleneck, the world model moves the expensive learning into a cheap dream, and the only real cost becomes keeping the dream honest where it matters.</em>
+</p>
+</div>
+
+<h2>4. The Limits and the Road Ahead <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The RSSM-Dreamer recipe is elegant and sample-efficient but has clear boundaries. Its latent is small and its decoder modest, so it excels on games and control tasks with structured dynamics but does not, by itself, generate the rich, photorealistic, long-horizon video that <a href="section-36.1.html">Sections 36.1</a> and <a href="section-36.2.html">36.2</a> produce. The next two sections take the two roads out of this limitation. <a href="section-36.6.html">Section 36.6</a> scales the world model up to pixel-space generative simulators (GAIA-1, playable game engines) that fuse the video-generation machinery with action conditioning, trading the RSSM's compact latent for the raw generative power of large video models. <a href="section-36.7.html">Section 36.7</a> goes the opposite way: it argues that the pixel decoder is wasteful and that prediction should happen purely in representation space, the JEPA philosophy. Both descend from the same insight you just built: a latent state plus a learned transition is a model of the world.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scaling Latent World Models (2024-2026)</div>
+<p>
+DreamerV3 (2023) showed one configuration mastering 150-plus tasks, settling the question of whether latent world models generalize. The 2024 to 2025 frontier scales the idea: <strong>TD-MPC2</strong> couples learned latent dynamics with planning (model-predictive control in latent space) and scales to a single agent across many embodiments; <strong>transformer-based world models</strong> (IRIS, the tokenized-world-model line, and Diamond, which uses a diffusion decoder inside the world model in 2024) replace the GRU and the small decoder with sequence transformers and diffusion heads, sharply raising visual fidelity and bringing the RSSM lineage into contact with the video-diffusion lineage. The two families of this chapter, compact latent world models and large generative video simulators, are actively merging, and the open question is whether the right architecture is a small predictive latent (Section 36.7) or a large generative one (Section 36.6). That question is the subject of the rest of the chapter.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> The RSSM splits its latent into a deterministic state $h$ and a stochastic state $z$. Give a concrete environment in which a purely deterministic latent would fail, and one in which a purely stochastic latent would fail, and explain how the split resolves both. Relate $h$ and the transition function to the Kalman filter's state and motion model from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</p>
+<p><span class="exercise-type">Coding.</span> Using the <code>RSSMCell</code>, write an imagination rollout: from a zero initial state, repeatedly call the cell with <code>obs_feat=None</code> and a fixed action, collecting the deterministic states over 20 steps. Plot the norm of $h_t$ over time for a randomly initialized (untrained) cell, and explain why the trajectory is meaningless until the prior and GRU are trained. Then describe what the KL(posterior, prior) loss would change about this rollout once training converges.</p>
+<p><span class="exercise-type">Analysis.</span> A model-free agent needs 10 million real environment steps; each real step costs one second of robot time. A Dreamer agent needs 1 million real steps plus 1 billion imagined steps; each imagined step costs one millisecond of GPU time. Compute the wall-clock for each and identify the dominant cost in the Dreamer case. Then argue the failure mode: what happens to the policy if the world model is systematically wrong about one rare but high-stakes transition (an obstacle the decoder never learned to render)?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.4.html">&#8592; Section 36.4: Generative Neural Rendering</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.6.html">Section 36.6: Generative World Simulators &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

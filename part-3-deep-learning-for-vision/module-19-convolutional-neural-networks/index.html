@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 19: Convolutional Neural Networks. The hand-designed convolution of Chapter 3 made learnable: weight sharing, locality, the inductive bias that fits images, pooling, batch normalization, a CIFAR-10 network from scratch, and visualizing what CNNs learn." name="description"/>
+<title>Chapter 19: Convolutional Neural Networks | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Convolutional Neural Networks</a></div>
+<h1>Chapter 19: Convolutional Neural Networks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me I had too many parameters. So I started sharing. Now the same nine weights work the whole image, and I have never been more confident about a cat in the top-left corner."</p>
+<cite>A Newly Efficient Convolutional Layer</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This chapter takes the convolution you built by hand in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> and lets gradient descent choose the weights.</strong> The machinery is unchanged: a small grid of numbers slides across the image and computes a weighted sum at each stop. What changes is that the numbers are no longer designed; they are learned. That single shift, plus two structural priors named locality and weight sharing, turns the humble filter into the dominant architecture for images for a decade, and explains why a network with a few million weights can outperform one with a few billion. Everything else in this chapter, pooling, batch normalization, feature hierarchies, exists to make that learnable convolution train well and see far.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+In <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a> you built fully connected networks and trained them with backpropagation and PyTorch. Those networks treat an image as a flat vector of pixels, which throws away the one fact every photograph obeys: nearby pixels are related, and a pattern that appears in one corner can appear in any other. A fully connected layer on a modest $224 \times 224$ color image needs over 150 million weights just to reach a 1000-unit hidden layer, and it must relearn the concept of an edge separately for every location. This is the problem convolutional neural networks solve, and they solve it not by adding capacity but by removing it intelligently.
+</p>
+<p>
+Section 19.1 makes the argument from first principles. It shows that a convolutional layer is exactly a fully connected layer with two constraints bolted on: each output looks only at a local patch (locality), and the same weights are reused at every position (weight sharing). These constraints are an <em>inductive bias</em>, a built-in assumption about what images are like, and because the assumption is true, the constrained network generalizes from far less data. Section 19.2 turns the idea into the real layer practitioners use, with multiple input and output channels, stride, padding, and dilation, and shows the exact tensor shapes that PyTorch's <code>Conv2d</code> expects. Section 19.3 introduces pooling and the concept of the receptive field, the window of input pixels that influences a given activation, and explains how stacking layers grows that window into a feature hierarchy that climbs from edges to textures to object parts.
+</p>
+<p>
+Section 19.4 confronts the practical reason early deep CNNs were hard to train: as signals propagate through many layers, their statistics drift, and learning stalls. Batch normalization and its relatives (layer, group, and instance normalization) fix this by re-centering and re-scaling activations, and they remain in nearly every architecture you will meet in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. Section 19.5 is the payoff: a complete convolutional network trained end to end on CIFAR-10, with the full PyTorch training loop, data loading, augmentation, and evaluation, reaching competitive accuracy in minutes on a single GPU. Section 19.6 closes the loop on understanding. It opens the trained network and shows what it learned, visualizing first-layer filters that rediscover the Sobel and Gabor kernels of Part I, feature maps that light up on textures, and saliency and Grad-CAM maps that reveal which pixels drove a decision.
+</p>
+<p>
+A word on why this chapter is load-bearing. The convolution is the book's signature recurring character. You met it as a designed filter in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>; here it becomes learnable, and in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> the same operation, stacked into a U-Net, will turn noise into photographs. The vocabulary set here, channels, stride, receptive field, normalization, feature map, is the vocabulary of every architecture diagram in the rest of the book. Read this chapter where the kernels are still small enough to inspect by eye, because by <a href="../module-22-vision-transformers/index.html">Chapter 22</a> they will be replaced, and you will want to know exactly what they were doing.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a>, which introduces tensors, automatic differentiation, the training loop, and the optimizers this chapter uses without re-deriving them. The conceptual heart of the chapter rests on <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a>, where convolution, correlation, kernels, and border handling were built from scratch; this chapter assumes you can read a $3 \times 3$ kernel and predict roughly what it does. The first-layer filter visualizations in Section 19.6 connect directly to the Sobel and Gabor filters of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> and the gradient operators of <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>. Basic linear algebra (dot products, matrix shapes) and comfort with NumPy arrays from <a href="../../part-1-image-processing/module-00-python-imaging-stack/index.html">Chapter 0</a> are assumed throughout.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">19.1</span>
+<a href="section-19.1.html"><span class="section-title">Why Convolution? Locality, Weight Sharing &amp; Inductive Bias</span></a>
+<span class="section-desc">A convolutional layer derived as a constrained fully connected layer: local connectivity and weight sharing as priors, the parameter-count argument, and equivariance to translation.</span>
+</li>
+<li>
+<span class="section-num">19.2</span>
+<a href="section-19.2.html"><span class="section-title">Convolution Layers: Channels, Stride, Padding &amp; Dilation</span></a>
+<span class="section-desc">The real layer: multi-channel filters, the output-size formula, stride for downsampling, padding to control shape, dilation for cheap receptive-field growth, and the exact PyTorch tensor shapes.</span>
+</li>
+<li>
+<span class="section-num">19.3</span>
+<a href="section-19.3.html"><span class="section-title">Pooling, Receptive Fields &amp; Feature Hierarchies</span></a>
+<span class="section-desc">Max and average pooling, the receptive-field calculation, why deep stacks see globally, and how the edges-to-parts-to-objects hierarchy emerges from repeated convolution and downsampling.</span>
+</li>
+<li>
+<span class="section-num">19.4</span>
+<a href="section-19.4.html"><span class="section-title">Batch Normalization &amp; Friends</span></a>
+<span class="section-desc">Internal covariate shift and the smoother loss landscape, the batch-norm forward and backward pass, train-versus-eval behavior, and when to reach for layer, group, or instance normalization instead.</span>
+</li>
+<li>
+<span class="section-num">19.5</span>
+<a href="section-19.5.html"><span class="section-title">A CNN from Scratch: CIFAR-10 End to End</span></a>
+<span class="section-desc">A complete network and training loop: data loading and augmentation, the conv-BN-ReLU-pool block, optimizer and schedule, overfitting diagnostics, and reaching competitive accuracy on a single GPU.</span>
+</li>
+<li>
+<span class="section-num">19.6</span>
+<a href="section-19.6.html"><span class="section-title">Visualizing What CNNs Learn</span></a>
+<span class="section-desc">Opening the trained network: first-layer filters that rediscover edge and Gabor kernels, feature-map activations, maximally activating patches, saliency maps, and Grad-CAM class evidence.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+This chapter gives you the layer and the network; the next gives you the great designs built from them. In <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures: From LeNet to ConvNeXt</a>, the conv-BN-ReLU block you assembled here becomes a building unit in the architectures that defined the field: LeNet's first demonstration, AlexNet's 2012 breakthrough, VGG's uniform depth, the residual connection of ResNet that finally made hundred-layer networks trainable, the efficiency of MobileNet and EfficientNet, and ConvNeXt's modern answer to the vision transformer. You will see how each design trades off accuracy, parameters, and compute, and why the residual connection and batch normalization you learned here turn out to be the two ideas that made all the depth possible.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">LeCun, Y. et al. "Gradient-Based Learning Applied to Document Recognition." Proceedings of the IEEE (1998). <a href="http://yann.lecun.com/exdb/publis/pdf/lecun-98.pdf" target="_blank" rel="noopener">lecun.com/exdb/publis</a></div>
+<div class="bib-annotation">The LeNet-5 paper that introduced the modern convolutional network: convolution, subsampling (pooling), and a learnable feature hierarchy trained by backpropagation. Every section of this chapter descends from it.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Krizhevsky, A., Sutskever, I., and Hinton, G. "ImageNet Classification with Deep Convolutional Neural Networks." NeurIPS (2012). <a href="https://papers.nips.cc/paper/4824-imagenet-classification-with-deep-convolutional-neural-networks" target="_blank" rel="noopener">papers.nips.cc</a></div>
+<div class="bib-annotation">AlexNet: the network whose 2012 ImageNet win launched the deep-learning era of computer vision. Popularized ReLU, dropout, and GPU training, all built on the convolutional layer of Section 19.2.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ioffe, S. and Szegedy, C. "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift." ICML (2015). <a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">arXiv:1502.03167</a></div>
+<div class="bib-annotation">The batch-normalization paper of Section 19.4. The "internal covariate shift" explanation has been challenged, but the technique it introduced remains in nearly every CNN you will train.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zeiler, M. and Fergus, R. "Visualizing and Understanding Convolutional Networks." ECCV (2014). <a href="https://arxiv.org/abs/1311.2901" target="_blank" rel="noopener">arXiv:1311.2901</a></div>
+<div class="bib-annotation">The deconvolution-based feature visualizations behind Section 19.6, showing the edges-to-parts-to-objects hierarchy directly and explaining why opening a trained CNN is worth the effort.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Luo, W. et al. "Understanding the Effective Receptive Field in Deep Convolutional Neural Networks." NeurIPS (2016). <a href="https://arxiv.org/abs/1701.04128" target="_blank" rel="noopener">arXiv:1701.04128</a></div>
+<div class="bib-annotation">Shows that the theoretical receptive field of Section 19.3 overstates the truth: influence falls off like a Gaussian, so the effective receptive field is much smaller than the nominal one. Essential reading after computing receptive fields by hand.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Selvaraju, R. et al. "Grad-CAM: Visual Explanations from Deep Networks via Gradient-Based Localization." ICCV (2017). <a href="https://arxiv.org/abs/1610.02391" target="_blank" rel="noopener">arXiv:1610.02391</a></div>
+<div class="bib-annotation">The class-discriminative localization method used in Section 19.6 to show which pixels drove a prediction. Works on any CNN without retraining and is a standard debugging tool in production.</div>
+</div>
+
+<h3>Recent Research (2022-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, Z. et al. "A ConvNet for the 2020s." CVPR (2022). <a href="https://arxiv.org/abs/2201.03545" target="_blank" rel="noopener">arXiv:2201.03545</a></div>
+<div class="bib-annotation">ConvNeXt: a modernized pure-convolutional network that matches vision transformers by importing their training recipe and macro design, while keeping the learnable convolution at its core. The bridge from this chapter to Chapter 20.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ding, X. et al. "Scaling Up Your Kernels to 31x31: Revisiting Large Kernel Design in CNNs." CVPR (2022). <a href="https://arxiv.org/abs/2203.06717" target="_blank" rel="noopener">arXiv:2203.06717</a></div>
+<div class="bib-annotation">RepLKNet shows that very large depthwise kernels enlarge the effective receptive field directly, an alternative to the deep-stack route of Section 19.3 for capturing long-range context.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Brock, A. et al. "High-Performance Large-Scale Image Recognition Without Normalization." ICML (2021). <a href="https://arxiv.org/abs/2102.06171" target="_blank" rel="noopener">arXiv:2102.06171</a></div>
+<div class="bib-annotation">NFNets: removing batch normalization (Section 19.4) entirely using adaptive gradient clipping and careful initialization, reaching state-of-the-art accuracy. The strongest evidence that normalization is a means, not an end.</div>
+</div>
+
+<h3>Books &amp; Courses</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Prince, S. J. D. <em>Understanding Deep Learning</em> (2023). <a href="https://udlbook.github.io/udlbook/" target="_blank" rel="noopener">udlbook.github.io</a></div>
+<div class="bib-annotation">Free, exceptionally clear treatment of convolutional networks, receptive fields, and normalization, with figures that complement this chapter. The convolution chapter is a recommended parallel read.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, A. et al. <em>Dive into Deep Learning</em> (2023). <a href="https://d2l.ai/" target="_blank" rel="noopener">d2l.ai</a></div>
+<div class="bib-annotation">Interactive textbook with runnable PyTorch code for every CNN concept in this chapter, including a from-scratch convolution and a batch-norm implementation matching Sections 19.2 and 19.4.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch. <code>torch.nn.Conv2d</code> and <code>torch.nn.BatchNorm2d</code> documentation. <a href="https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html" target="_blank" rel="noopener">pytorch.org/docs</a></div>
+<div class="bib-annotation">The reference for the exact arguments, tensor shapes, and default behaviors of the layers used throughout this chapter, including padding modes, groups, and the running-statistics machinery of batch norm.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">torchvision. Datasets, transforms, and models reference. <a href="https://pytorch.org/vision/stable/index.html" target="_blank" rel="noopener">pytorch.org/vision</a></div>
+<div class="bib-annotation">Provides the CIFAR-10 dataset loader, augmentation transforms, and pretrained backbones used in Sections 19.5 and 19.6.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Gildenblat, J. et al. <code>pytorch-grad-cam</code> library. <a href="https://github.com/jacobgil/pytorch-grad-cam" target="_blank" rel="noopener">github.com/jacobgil/pytorch-grad-cam</a></div>
+<div class="bib-annotation">A maintained implementation of Grad-CAM and a dozen related class-activation methods used in Section 19.6, with a few-line API that replaces the from-scratch hook code.</div>
+</div>
+
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Krizhevsky, A. "Learning Multiple Layers of Features from Tiny Images" (CIFAR-10/100 technical report, 2009). <a href="https://www.cs.toronto.edu/~kriz/cifar.html" target="_blank" rel="noopener">cs.toronto.edu/~kriz/cifar</a></div>
+<div class="bib-annotation">The CIFAR-10 dataset trained in Section 19.5: 60,000 32x32 color images in 10 classes, the standard small-scale benchmark for prototyping convolutional architectures.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-18-neural-networks-pytorch/index.html">&#8592; Chapter 18: Neural Networks &amp; PyTorch for Vision</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-19.1.html">Section 19.1: Why Convolution? &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

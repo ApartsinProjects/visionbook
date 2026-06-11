@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.4: CLIP: Language as Supervision. Training an image encoder and a text encoder so an image and its caption meet in one embedding space, the symmetric contrastive objective, zero-shot classification via prompts, the SigLIP refinement, and why web-scale text beats curated labels." name="description"/>
+<title>Section 25.4: CLIP: Language as Supervision | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models</a></div>
+<h1>CLIP: Language as Supervision</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They never told me the names of things. They just showed me four hundred million photos and the captions people had already typed underneath them. By the time they were done, I could recognize a thing I had never been trained on, simply by reading its description. Turns out the internet is one enormous, badly punctuated labeled dataset."</p>
+<cite>A CLIP Encoder Fluent in Pictures and Words</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>CLIP trains an image encoder and a text encoder jointly so that an image and the caption that describes it land at the same point in a shared embedding space. Because captions are free on the web, this turns the entire internet into supervision, and because the space is shared with language, the model can recognize a category it was never explicitly trained on simply by comparing the image to a text description of that category.</strong> That is zero-shot classification, and it is the capability that reorganized computer vision around foundation models. The objective is the same softmax-over-similarities contrastive loss from <a href="section-25.2.html">Section 25.2</a>, now applied symmetrically across the two modalities. This section builds it, shows how a prompt becomes a classifier, and explains why noisy web text beat clean human labels.</p>
+</div>
+
+<p>
+Every method so far in this chapter learned from pixels alone. CLIP (Radford et al., 2021) brings in the one signal the internet produces at planetary scale for free: the text humans write alongside images. We will see how an image and its caption are encoded into a common space, write the symmetric contrastive loss that aligns them, build a zero-shot classifier out of nothing but text prompts, and understand why four hundred million noisy web pairs produced more robust features than a million clean ImageNet labels. This is the section where the learned descriptor of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> finally becomes a universal one, comparable not just to other images but to words, and it is the exact component that will let a text prompt drive an image generator in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>.
+</p>
+
+<h2>1. Two Encoders, One Embedding Space <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+CLIP has two networks. An <strong>image encoder</strong> (a ViT from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, or a ResNet from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>) maps an image to a vector. A <strong>text encoder</strong> (a transformer) maps a caption to a vector of the same dimension. Both are followed by a linear projection into a shared $d$-dimensional space, and both outputs are L2-normalized so they lie on the unit hypersphere, where the dot product is the cosine similarity. The training data is a batch of $N$ image-caption pairs. The goal: each image should be closest to its own caption and far from the other $N - 1$ captions, and symmetrically each caption should be closest to its own image. Figure 25.4.1 shows the contrastive matrix this sets up.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CLIP: a batch of images and captions encoded into a shared space form an N by N similarity matrix; the diagonal pairs are positives, off-diagonal are negatives">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10px sans-serif;fill:#555;}
+.pimg{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.ptxt{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.4;}
+.pcell{fill:#f7f7f7;stroke:#ccc;stroke-width:1;}
+.pdiag{fill:#fde8c8;stroke:#d6802b;stroke-width:1.5;}
+.par{stroke:#777;stroke-width:1.3;marker-end:url(#pah);fill:none;}
+</style>
+<defs><marker id="pah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="pimg" x="20" y="60" width="40" height="26"/><text class="ps" x="40" y="78" text-anchor="middle">img 1</text>
+<rect class="pimg" x="20" y="92" width="40" height="26"/><text class="ps" x="40" y="110" text-anchor="middle">img 2</text>
+<rect class="pimg" x="20" y="124" width="40" height="26"/><text class="ps" x="40" y="142" text-anchor="middle">img 3</text>
+<rect class="pimg" x="20" y="156" width="40" height="26"/><text class="ps" x="40" y="174" text-anchor="middle">img 4</text>
+<text class="ps" x="40" y="50" text-anchor="middle">image encoder</text>
+<rect class="ptxt" x="120" y="20" width="44" height="24"/><text class="ps" x="142" y="36" text-anchor="middle">cap 1</text>
+<rect class="ptxt" x="172" y="20" width="44" height="24"/><text class="ps" x="194" y="36" text-anchor="middle">cap 2</text>
+<rect class="ptxt" x="224" y="20" width="44" height="24"/><text class="ps" x="246" y="36" text-anchor="middle">cap 3</text>
+<rect class="ptxt" x="276" y="20" width="44" height="24"/><text class="ps" x="298" y="36" text-anchor="middle">cap 4</text>
+<g>
+<rect class="pdiag" x="120" y="60" width="44" height="26"/><rect class="pcell" x="172" y="60" width="44" height="26"/><rect class="pcell" x="224" y="60" width="44" height="26"/><rect class="pcell" x="276" y="60" width="44" height="26"/>
+<rect class="pcell" x="120" y="92" width="44" height="26"/><rect class="pdiag" x="172" y="92" width="44" height="26"/><rect class="pcell" x="224" y="92" width="44" height="26"/><rect class="pcell" x="276" y="92" width="44" height="26"/>
+<rect class="pcell" x="120" y="124" width="44" height="26"/><rect class="pcell" x="172" y="124" width="44" height="26"/><rect class="pdiag" x="224" y="124" width="44" height="26"/><rect class="pcell" x="276" y="124" width="44" height="26"/>
+<rect class="pcell" x="120" y="156" width="44" height="26"/><rect class="pcell" x="172" y="156" width="44" height="26"/><rect class="pcell" x="224" y="156" width="44" height="26"/><rect class="pdiag" x="276" y="156" width="44" height="26"/>
+</g>
+<text class="ps" x="220" y="205" text-anchor="middle">N x N similarity matrix</text>
+<line class="par" x1="340" y1="120" x2="400" y2="120"/>
+<rect class="pdiag" x="410" y="80" width="170" height="30"/>
+<text class="pl" x="495" y="100" text-anchor="middle">maximize the diagonal</text>
+<rect class="pcell" x="410" y="130" width="170" height="30"/>
+<text class="pl" x="495" y="150" text-anchor="middle">minimize off-diagonal</text>
+<text class="ps" x="495" y="190" text-anchor="middle">positives = matching pairs</text>
+<text class="ps" x="495" y="206" text-anchor="middle">negatives = all mismatches</text>
+</svg>
+<figcaption><strong>Figure 25.4.1:</strong> The CLIP contrastive objective. A batch of $N$ images and $N$ captions is encoded into a shared space, and every image-caption pair gets a similarity score, forming an $N \times N$ matrix. The $N$ diagonal entries are the true (matching) pairs and should be high; the $N^2 - N$ off-diagonal entries are mismatches and should be low. The loss is symmetric cross-entropy along rows and columns.</figcaption>
+</figure>
+
+<p>
+The loss is the InfoNCE of <a href="section-25.2.html">Section 25.2</a> applied in both directions. Let $I_i$ be the normalized embedding of image $i$, $T_j$ the embedding of caption $j$, and $\tau$ a learned temperature. The image-to-text loss treats each image's matching caption as the correct class among all $N$ captions; the text-to-image loss does the reverse. The total is their average,
+</p>
+
+<div class="math-block">
+$$\mathcal{L} = \tfrac{1}{2}\!\left[ -\frac{1}{N}\sum_{i} \log \frac{\exp(I_i^\top T_i / \tau)}{\sum_j \exp(I_i^\top T_j / \tau)} \;-\; \frac{1}{N}\sum_{j} \log \frac{\exp(I_j^\top T_j / \tau)}{\sum_i \exp(I_i^\top T_j / \tau)} \right]$$
+</div>
+
+<p>
+Both terms are just cross-entropy over the rows and columns of the similarity matrix, with the correct class on the diagonal. The implementation is strikingly short for what it produces.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def clip_loss(image_emb, text_emb, logit_scale):
+    """image_emb, text_emb: (N, d). logit_scale = exp(learned temperature). Symmetric."""
+    image_emb = F.normalize(image_emb, dim=1)        # onto the unit hypersphere
+    text_emb = F.normalize(text_emb, dim=1)
+    logits = logit_scale * image_emb @ text_emb.t()  # (N, N) similarity matrix
+    targets = torch.arange(image_emb.size(0), device=image_emb.device)  # diagonal = matches
+    loss_i = F.cross_entropy(logits, targets)        # each image picks its caption (rows)
+    loss_t = F.cross_entropy(logits.t(), targets)    # each caption picks its image (cols)
+    return (loss_i + loss_t) / 2
+
+torch.manual_seed(0)
+img = torch.randn(6, 512); txt = torch.randn(6, 512)
+scale = torch.tensor(100.0)                          # exp of the learned temperature
+print("CLIP loss:", round(clip_loss(img, txt, scale).item(), 4))
+# CLIP loss: ~ high for random embeddings; drops toward 0 as the diagonal dominates</code></pre>
+<div class="code-caption">The complete CLIP training loss. The matrix <code>image_emb @ text_emb.t()</code> holds every image-caption similarity; cross-entropy on its rows aligns images to captions, on its columns aligns captions to images, and the diagonal target index is what makes matching pairs the positives.</div>
+
+<p>
+That is the entire training objective. There is no classification head, no fixed label set, no taxonomy. The supervision is purely "this caption goes with this image and not the others", repeated over four hundred million pairs. The temperature is learned (parameterized as $\exp$ of a free scalar so it stays positive) and clamped to avoid runaway scaling. Everything CLIP can do downstream emerges from this single alignment.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Shared Space Makes Words and Images Comparable</div>
+<p>The defining property of CLIP is that an image embedding and a text embedding live in the <em>same</em> space, so you can take the dot product of a photo and a sentence and get a meaningful similarity. Every CLIP capability follows from this one fact. Zero-shot classification compares an image to text descriptions of classes. Image retrieval by text compares a query sentence to a database of image embeddings. And, most consequentially for the rest of the book, a diffusion model can be steered by a text prompt because the prompt's CLIP embedding is a vector the image generator understands, the mechanism behind <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">text-to-image generation</a>.</p>
+</div>
+
+<h2>2. Zero-Shot Classification: A Prompt Becomes a Classifier <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the payoff that startled the field. CLIP was never trained to classify ImageNet, yet it classifies ImageNet competitively without seeing a single labeled ImageNet example. The trick: turn each class name into a sentence, embed all the sentences with the text encoder, embed the image with the image encoder, and pick the class whose sentence embedding is most similar to the image. The class names are the only thing you supply; no training, no labeled examples, no fine-tuning. A new set of classes is a new set of sentences, computed in seconds. This is what zero-shot means: the model generalizes to categories specified only at inference time.
+</p>
+
+<p>
+The sentence template matters more than it should, an effect called <strong>prompt engineering</strong>. The bare class name "cat" embeds less usefully than "a photo of a cat", because the training captions were natural sentences, so a sentence-shaped prompt sits closer to the image distribution the text encoder learned. Averaging the embeddings of several templates ("a photo of a {}", "a blurry photo of a {}", "a {} in the wild") gives a more robust class vector still. The code below builds a zero-shot classifier from class names alone.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def zero_shot_classifier(class_names, text_encoder, tokenizer, templates):
+    """Build a (num_classes, d) weight matrix from text prompts, no training at all."""
+    weights = []
+    for name in class_names:
+        prompts = [t.format(name) for t in templates]          # "a photo of a cat", ...
+        tokens = tokenizer(prompts)
+        embs = F.normalize(text_encoder(tokens), dim=1)        # (num_templates, d)
+        weights.append(F.normalize(embs.mean(0), dim=0))       # average then renormalize
+    return torch.stack(weights)                                # (num_classes, d)
+
+def classify(image_emb, class_weights):
+    """Pick the class whose text embedding is most similar to the image embedding."""
+    image_emb = F.normalize(image_emb, dim=1)
+    logits = image_emb @ class_weights.t()                     # (batch, num_classes)
+    return logits.argmax(dim=1)
+
+# Usage sketch (encoders from a pretrained CLIP):
+templates = ["a photo of a {}.", "a blurry photo of a {}.", "a {} in nature."]
+# W = zero_shot_classifier(["cat", "dog", "car"], text_encoder, tokenizer, templates)
+# preds = classify(image_features, W)
+print("a zero-shot classifier is just a stack of text embeddings; classes set at inference")</code></pre>
+<div class="code-caption">Zero-shot classification with CLIP. The classifier "weights" are nothing but the averaged text embeddings of prompts built from the class names, so swapping in a new label set requires no retraining, only new sentences. This is the from-scratch view of CLIP's headline capability.</div>
+
+<p>
+Because the classifier is just text, CLIP can recognize categories that no labeled dataset ever covered: a specific dog breed, a brand of car, an abstract attribute like "a person smiling". This open vocabulary is what carries forward into the open-vocabulary detection and segmentation of <a href="section-25.5.html">Section 25.5</a>. The same property also makes CLIP a measurement tool: the similarity between a generated image and a text prompt, called CLIPScore, is a standard way to <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">evaluate text-to-image models</a> in Chapter 37.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>CLIP can be fooled by a sticky note. In a 2021 demonstration, OpenAI showed that taping a piece of paper reading "iPod" onto an apple made CLIP confidently classify the apple as an iPod. The model had learned to read text in images so well that written words could override visual content, a phenomenon the authors named a typographic attack. It is a vivid reminder that learning from captioned web images teaches a model to associate pictures of words with their meanings, sometimes too literally.</p>
+</div>
+
+<h2>3. Why Web Text Beat Clean Labels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+CLIP's web captions are noisy: misspelled, irrelevant, sometimes wrong. A clean dataset like ImageNet has a million carefully verified labels. Intuition says clean labels should win, yet CLIP's features transferred better and, crucially, were far more <strong>robust</strong> to distribution shift, holding accuracy on stylized, sketched, and adversarially-collected versions of ImageNet where supervised models collapsed. Two reasons explain the surprise. First, scale: four hundred million pairs is four hundred times ImageNet, and the diversity of web images covers far more of the visual world than any curated set. Second, the supervision is richer per example: a free-form caption ("a brown dog catching a frisbee on a beach at sunset") carries far more information than a single class index, describing objects, attributes, relations, and context all at once. The model that must match that sentence learns a more compositional representation than the model that must emit one of a thousand integers.
+</p>
+
+<p>
+This reframed a belief that had held since the start of deep learning. The bottleneck was never the absence of clean labels; it was the absence of <em>scale</em>, and the web provides scale in the form of weak, free, abundant language supervision. The transfer-learning lesson of <a href="../module-21-training-recipes/index.html">Chapter 21</a> reaches its largest form here: pretrain on everything, then specialize cheaply. The practical example shows a team acting on exactly this.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Shipping a Visual Search Feature in Two Weeks</div>
+<p><strong>Who:</strong> a four-person team at a home-decor marketplace, 2022, asked to add a "search by text" feature so shoppers could type "mid-century walnut sideboard" and see matching products. <strong>Situation:</strong> their catalog had roughly two million product photos but inconsistent, sparse text tags, and they had no budget to label a taxonomy. <strong>Problem:</strong> a conventional approach would require defining hundreds of categories and training a classifier per attribute, weeks of labeling they did not have. <strong>Decision:</strong> they embedded every product photo once with a pretrained CLIP image encoder and stored the vectors, then at query time embedded the shopper's text with the CLIP text encoder and returned the nearest product vectors by cosine similarity, exactly the shared-space comparison of subsection 1. No training, no taxonomy, no labels. <strong>Result:</strong> the feature shipped in under two weeks; free-text queries that no fixed taxonomy would have anticipated ("cozy reading nook chair") returned sensible results because CLIP understood the descriptions compositionally. They later fine-tuned the image encoder on their own catalog to sharpen domain-specific terms, but the zero-shot version was already good enough to launch. <strong>Lesson:</strong> a CLIP embedding is a universal descriptor you can compute once and reuse across search, recommendation, and deduplication. When the task is "match images to language", a pretrained CLIP often removes the entire labeling project.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Zero-Shot Classification in Five Lines</div>
+<p>The two encoders, the tokenizer, the projection heads, and the prompt machinery are all packaged. With OpenCLIP, a full zero-shot pipeline is a handful of lines:</p>
+<pre><code class="language-python">import open_clip, torch
+model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+image = preprocess(some_pil_image).unsqueeze(0)
+text = tokenizer(["a photo of a cat", "a photo of a dog"])
+with torch.no_grad():
+    img_f = model.encode_image(image); txt_f = model.encode_text(text)
+    probs = (img_f @ txt_f.T).softmax(dim=-1)        # zero-shot class probabilities</code></pre>
+<p>This replaces the two encoders, the contrastive training, the four-hundred-million-pair dataset, and the prompt-averaging code with one model download. The library handles preprocessing, tokenization, the normalization, and the learned temperature, and exposes both CLIP and the SigLIP variants below through the same interface. The from-scratch loss and classifier above exist so you know what <code>encode_image</code> and that final softmax are doing.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: SigLIP and the Sigmoid Objective</div>
+<p>CLIP's softmax loss normalizes over the whole batch, which couples every pair to every other and rewards very large batches, the same hardware pressure that shaped <a href="section-25.2.html">Section 25.2</a>. SigLIP (Zhai et al., 2023) replaces the softmax with a pairwise <em>sigmoid</em> loss: each image-text pair is independently judged match or non-match, removing the all-pairs normalization. This trains well at far smaller batch sizes and now anchors many 2024 to 2026 systems, including the open-vocabulary detectors of <a href="section-25.5.html">Section 25.5</a> and the vision encoders inside multimodal language models. Parallel directions include EVA-CLIP and DFN, which improve CLIP through better data filtering rather than a new loss, echoing the data-curation lesson of DINOv2. The open question for the next few years is how much further language supervision scales, and whether the next jump comes from a better objective, better data, or fusing CLIP-style alignment with the self-distillation and masked modeling of <a href="section-25.3.html">Section 25.3</a>, the convergence we map in <a href="section-25.6.html">Section 25.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.1: Why Symmetric Loss <span class="exercise-type conceptual">Conceptual</span></div>
+<p>CLIP averages an image-to-text loss and a text-to-image loss. Explain what each term enforces on its own, and construct a degenerate failure that could occur if you optimized only the image-to-text direction (each image finds its caption, but captions are free to collide). Then argue why the symmetric average prevents this, and relate the structure to the row-versus-column cross-entropy in the code of subsection 1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.2: Prompt Engineering Matters <span class="exercise-type coding">Coding</span></div>
+<p>Using the OpenCLIP library shortcut, build three zero-shot classifiers for a 10-class subset of your choice: one using the bare class name, one using "a photo of a {}.", and one averaging five diverse templates. Evaluate all three on a labeled test set and report accuracy for each. You should see the sentence template beat the bare name and the averaged templates beat the single template. Write one paragraph explaining why, in terms of the distribution of text the encoder was trained on.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.4.3: Noisy Scale Versus Clean Labels <span class="exercise-type analysis">Analysis</span></div>
+<p>The section argues that 400 million noisy web pairs beat 1 million clean ImageNet labels for transfer and robustness, citing two reasons: scale and richer per-example supervision. Design a thought experiment (or a small real one if you have the data) that would let you separate these two factors: how could you hold the supervision type fixed and vary only scale, and hold scale fixed and vary only supervision richness (caption versus class index)? Predict the outcome of each arm and explain which factor you expect to dominate for robustness to distribution shift specifically.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.3.html">&#8592; Section 25.3: Self-Distillation &amp; Masked Image Modeling</a>
+<a href="index.html">Chapter 25</a>
+<a class="next" href="section-25.5.html">Section 25.5: Open-Vocabulary Detection &amp; Segmentation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

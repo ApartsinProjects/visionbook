@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.4: Energy-Based Models, Score Matching and Langevin Dynamics. Modeling an unnormalized energy E(x), the intractable partition function, learning the score (gradient of log-density) by score matching, and sampling with Langevin dynamics, the ancestor of diffusion." name="description"/>
+<title>Section 30.4: Energy-Based Models &amp; Score Matching | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Foundations of Generative Modeling</a></div>
+<h1>Energy-Based Models, Score Matching &amp; Langevin Dynamics</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Nobody could tell me how much probability there was in total, so I gave up trying to count it. I only learned which way was uphill. Turns out that if you always know which way the data lies, and take small steps with a little luck mixed in, you arrive anyway. The grand total never mattered."</p>
+<cite>An Energy Function With a Missing Normalizer</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You can model a distribution without ever normalizing it. Assign every image an energy $E(\mathbf{x})$, declare that probability falls off exponentially with energy, learn the gradient of log-probability (the score) instead of the probability itself, and sample by walking uphill in probability with noise injected. That gradient field, the score, and that sampling walk, Langevin dynamics, are the direct mathematical ancestors of diffusion models.</strong> The reason this matters is that the obvious approach, write a normalized density and maximize its likelihood, hits a wall: the normalizing constant (the partition function) is an integral over all images that nobody can compute. This section shows the wall, then shows three ways around it that together make up the score-based view of generative modeling. By the end you will see why <a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s diffusion models are not a new idea but the maturation of the one built here.</p>
+</div>
+
+<p>
+The previous two sections took the latent route to $p(\mathbf{x})$: introduce a hidden code and decode it. This section takes a different route that uses no latent at all. We model the data distribution's shape directly through an energy, confront the partition-function problem that makes direct likelihood training impossible, and then sidestep it by learning the score and sampling with Langevin dynamics. This is the most mathematical section of the chapter, and it is deliberately so: the machinery here is the spine of modern diffusion, flagged in the cross-reference map as the arc that runs from energies and scores here, through the score SDEs of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, to flow matching. We build it carefully so that arc feels like one continuous idea.
+</p>
+
+<h2>1. Energy-Based Models and the Partition Function <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+An <strong>energy-based model (EBM)</strong> defines a probability density through a scalar energy function $E_\theta(\mathbf{x})$, a neural network that outputs one number per image. Low energy means high probability:
+</p>
+
+<div class="math-block">
+$$p_\theta(\mathbf{x}) = \frac{e^{-E_\theta(\mathbf{x})}}{Z_\theta}, \qquad Z_\theta = \int e^{-E_\theta(\mathbf{x})} \, d\mathbf{x}.$$
+</div>
+
+<p>
+This is wonderfully flexible: any function $E_\theta$ at all defines a valid density, so the network has no architectural constraint (unlike the invertibility a flow demands). The catch is $Z_\theta$, the <strong>partition function</strong>, the normalizing constant that makes the density integrate to one. It is an integral over the entire $150{,}528$-dimensional image space, and it is hopeless to compute. Worse, it depends on $\theta$, so it changes every time we update the network. Maximum-likelihood training needs $\log p_\theta(\mathbf{x}) = -E_\theta(\mathbf{x}) - \log Z_\theta$, and the $\log Z_\theta$ term, with its intractable gradient, blocks the path. The energy view is the bottom of the cross-reference arc "scores and energies"; everything in this section is about getting useful behavior out of $E_\theta$ without ever touching $Z_\theta$.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Gradient of Log-Probability Forgets the Normalizer</div>
+<p>Here is the trick that unlocks everything. Take the gradient of the log-density with respect to $\mathbf{x}$ (not with respect to $\theta$):</p>
+<div class="math-block">
+$$\nabla_{\mathbf{x}} \log p_\theta(\mathbf{x}) = \nabla_{\mathbf{x}} \big(-E_\theta(\mathbf{x}) - \log Z_\theta\big) = -\nabla_{\mathbf{x}} E_\theta(\mathbf{x}).$$
+</div>
+<p>The $\log Z_\theta$ term is a constant in $\mathbf{x}$, so its gradient is zero and it vanishes. The gradient of log-probability with respect to the image, called the <strong>score</strong> and written $\mathbf{s}_\theta(\mathbf{x}) = \nabla_{\mathbf{x}} \log p_\theta(\mathbf{x})$, depends only on the energy's gradient and is completely free of the intractable partition function. If we learn the score directly, we never need $Z_\theta$ at all. This single observation is the seed of score-based generative modeling.</p>
+</div>
+
+<h2>2. The Score Is a Vector Field Pointing Toward Data <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+What is the score, geometrically? At every point $\mathbf{x}$ in image space, the score $\mathbf{s}(\mathbf{x}) = \nabla_{\mathbf{x}} \log p(\mathbf{x})$ is a vector pointing in the direction of steepest increase of log-probability, the direction that most quickly moves you toward more-probable images. Recall the manifold picture of <a href="section-30.1.html">Section 30.1</a>: real images sit on a thin sheet, and almost everywhere else is low-probability noise. The score field is the set of arrows pointing back toward that sheet from wherever you are. Stand on a noise point and the score points toward the manifold; stand on the manifold and the score points along the directions of higher density. Figure 30.4.1 draws this field for a simple two-mode distribution.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 2D plane with two density blobs and a field of arrows pointing toward the high-density centers, with one sample trajectory walking uphill toward a mode">
+<style>
+.st{font:13px sans-serif;fill:#1a1a1a;}
+.ss{font:11px sans-serif;fill:#555;}
+.sblob{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.3;opacity:0.7;}
+.sarr{stroke:#2c6fb5;stroke-width:1.3;fill:none;marker-end:url(#sah);}
+.straj{stroke:#c0392b;stroke-width:2.2;fill:none;marker-end:url(#sath);}
+.spt{fill:#c0392b;}
+</style>
+<defs>
+<marker id="sah" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L5,3 L0,6 Z" fill="#2c6fb5"/></marker>
+<marker id="sath" markerWidth="8" markerHeight="8" refX="6" refY="3.5" orient="auto"><path d="M0,0 L6,3.5 L0,7 Z" fill="#c0392b"/></marker>
+</defs>
+<text class="st" x="350" y="24" text-anchor="middle">The score field of a two-mode density (arrows = gradient of log p)</text>
+<ellipse class="sblob" cx="210" cy="160" rx="55" ry="55"/>
+<ellipse class="sblob" cx="490" cy="160" rx="55" ry="55"/>
+<text class="ss" x="210" y="164" text-anchor="middle">mode A</text>
+<text class="ss" x="490" y="164" text-anchor="middle">mode B</text>
+<!-- arrows pointing inward toward modes -->
+<line class="sarr" x1="120" y1="90" x2="165" y2="125"/>
+<line class="sarr" x1="120" y1="230" x2="165" y2="195"/>
+<line class="sarr" x1="300" y1="90" x2="255" y2="125"/>
+<line class="sarr" x1="300" y1="230" x2="255" y2="195"/>
+<line class="sarr" x1="400" y1="90" x2="445" y2="125"/>
+<line class="sarr" x1="400" y1="230" x2="445" y2="195"/>
+<line class="sarr" x1="580" y1="90" x2="535" y2="125"/>
+<line class="sarr" x1="580" y1="230" x2="535" y2="195"/>
+<line class="sarr" x1="350" y1="120" x2="350" y2="120"/>
+<!-- a Langevin trajectory from a noise start to mode B -->
+<circle class="spt" cx="630" cy="60" r="4"/>
+<text class="ss" x="640" y="56" >start (noise)</text>
+<path class="straj" d="M 630 60 Q 580 100 560 120 Q 520 145 500 158"/>
+<text class="ss" x="350" y="285" text-anchor="middle">Langevin sampling (red): follow the score uphill, add noise, repeat, until you land in a mode</text>
+</svg>
+<figcaption><strong>Figure 30.4.1:</strong> The score field of a two-mode distribution. Blue arrows are the score $\nabla_{\mathbf{x}} \log p(\mathbf{x})$, pointing from every location toward the nearest high-density region. The red trajectory is one Langevin sampling run: it starts at a random noise point, repeatedly steps in the score direction with a little noise added, and is carried into one of the modes. Sampling becomes a guided walk uphill in probability, no normalizer required.</figcaption>
+</figure>
+
+<h2>3. Score Matching: Learning the Field Without the Density <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+We want to train a network $\mathbf{s}_\theta(\mathbf{x})$ to match the true score $\nabla_{\mathbf{x}} \log p_{\text{data}}(\mathbf{x})$. The obvious objective, the expected squared difference between them, is unusable because we do not know the true score (it depends on the data density we are trying to learn). Hyvarinen's <strong>score matching</strong> result (2005) is a remarkable identity: that intractable objective equals, up to a constant, a tractable one that involves only the model's score and its derivative,
+</p>
+
+<div class="math-block">
+$$J(\theta) = \mathbb{E}_{p_{\text{data}}(\mathbf{x})}\left[\tfrac{1}{2}\big\|\mathbf{s}_\theta(\mathbf{x})\big\|^2 + \operatorname{tr}\big(\nabla_{\mathbf{x}} \mathbf{s}_\theta(\mathbf{x})\big)\right] + \text{const}.$$
+</div>
+
+<p>
+The true density never appears; only expectations over the data (which we approximate with samples) and the model's own score and Jacobian trace remain. The trace term is expensive in high dimensions, which led to two practical variants: <strong>sliced score matching</strong> (project the Jacobian onto random directions) and, far more important for vision, <strong>denoising score matching</strong>. The denoising variant adds Gaussian noise of scale $\sigma$ to the data and trains the network to predict the score of the noised distribution, which has a beautifully simple closed form: the score of a Gaussian-noised point is proportional to the noise that was added. That equivalence, learning the score equals learning to denoise, is the exact bridge to diffusion, and it is worth stating in code.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+# Denoising score matching: add noise of scale sigma, predict the score.
+# Key fact: for x_noisy = x + sigma * eps with eps ~ N(0, I),
+#   the score of the noised density is  -(x_noisy - x) / sigma^2 = -eps / sigma.
+# So a network that predicts the score is, up to scale, predicting the noise eps.
+
+def denoising_score_matching_loss(score_net, x, sigma):
+    eps = torch.randn_like(x)                       # the noise we add
+    x_noisy = x + sigma * eps                       # corrupt the clean data
+    target_score = -eps / sigma                     # closed-form score of the noised point
+    pred_score = score_net(x_noisy, sigma)          # network's estimate of the score
+    return ((pred_score - target_score) ** 2).mean()
+
+# A tiny score network for a 2-D toy (in practice a U-Net over images).
+score_net = nn.Sequential(nn.Linear(3, 64), nn.SiLU(),
+                          nn.Linear(64, 64), nn.SiLU(),
+                          nn.Linear(64, 2))
+def net(x, sigma):                                  # concat sigma as a feature
+    s = torch.full((x.size(0), 1), float(sigma))
+    return score_net(torch.cat([x, s], dim=1))
+
+x = torch.randn(256, 2)                             # toy "data" batch
+loss = denoising_score_matching_loss(net, x, sigma=0.5)
+print("DSM loss:", round(loss.item(), 4))           # DSM loss: a positive scalar to minimize</code></pre>
+<div class="code-caption">Denoising score matching in code. Adding Gaussian noise of scale $\sigma$ gives the noised distribution a closed-form score, $-\boldsymbol{\epsilon}/\sigma$, so the training target is simply (a scaling of) the noise that was added. A network minimizing this loss learns the score, and predicting the score is the same task as predicting the noise. This is precisely the objective <a href="../module-33-diffusion-models/index.html">Chapter 33</a> trains a U-Net on, across many noise levels at once.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Learning to Denoise Is Learning the Score</div>
+<p>The single most important takeaway of this section is the equivalence in the code above. Training a network to remove Gaussian noise from a corrupted image is mathematically the same as training it to estimate the score of the noised data distribution. This is why the denoising thread that runs through the whole book, from the Gaussian and non-local-means filters of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>, through denoising autoencoders, lands exactly on diffusion. A diffusion model is a denoiser trained at many noise levels, and because denoising is score estimation, a diffusion model is a score estimator. The arrow field of Figure 30.4.1 and the denoiser of Chapter 7 are the same object seen from two sides.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The partition function $Z_\theta$ is the integral nobody can compute, lurking in every energy-based model like an unpaid invoice. Score matching's entire trick is to differentiate with respect to $\mathbf{x}$ so that $Z_\theta$, being constant in $\mathbf{x}$, politely shows itself out. We did not solve the hardest integral in the room. We just asked it a question it could not answer and watched it leave.</p>
+</div>
+
+<h2>4. Langevin Dynamics: Sampling by Following the Score <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A learned score field is a set of arrows; <strong>Langevin dynamics</strong> is how you turn arrows into samples. Starting from a random point, repeatedly take a small step in the score direction (uphill in probability) and add a calibrated dose of Gaussian noise:
+</p>
+
+<div class="math-block">
+$$\mathbf{x}_{t+1} = \mathbf{x}_t + \tfrac{\eta}{2}\,\mathbf{s}_\theta(\mathbf{x}_t) + \sqrt{\eta}\,\boldsymbol{\epsilon}_t, \qquad \boldsymbol{\epsilon}_t \sim \mathcal{N}(\mathbf{0}, \mathbf{I}).$$
+</div>
+
+<p>
+The score term drags the sample toward high-density regions; the noise term keeps it from collapsing onto a single point and lets it explore. As the step size $\eta$ shrinks and the number of steps grows, the distribution of $\mathbf{x}_t$ provably converges to the true $p(\mathbf{x})$. Without the noise term this would be plain gradient ascent that piles every sample onto the nearest mode (no diversity); the noise is what makes it sample rather than optimize. The toy implementation below follows the score of a known two-mode density and shows the walk converging into the modes, exactly the red trajectory of Figure 30.4.1.
+</p>
+
+<pre><code class="language-python">import torch
+
+# Known toy density: mixture of two Gaussians in 1-D, so we can write the true score.
+def true_score(x):
+    # p(x) = 0.5 N(-2, 0.5^2) + 0.5 N(+2, 0.5^2); score = d/dx log p(x).
+    import math
+    def comp(mu): return torch.exp(-0.5 * ((x - mu) / 0.5) ** 2)
+    pa, pb = comp(-2.0), comp(2.0)
+    p = pa + pb                                       # unnormalized density (Z cancels in the score)
+    grad = pa * (-(x + 2) / 0.25) + pb * (-(x - 2) / 0.25)
+    return grad / p                                   # = d/dx log p(x)
+
+def langevin(score_fn, n=2000, steps=500, eta=0.02):
+    x = torch.randn(n, 1) * 3                          # start from broad noise
+    for _ in range(steps):
+        noise = torch.randn_like(x)
+        x = x + 0.5 * eta * score_fn(x) + (eta ** 0.5) * noise   # the update above
+    return x
+
+samples = langevin(true_score)
+# Most samples should land near -2 or +2, recovering the two modes.
+near_a = ((samples + 2).abs() < 0.6).float().mean()
+near_b = ((samples - 2).abs() < 0.6).float().mean()
+print(f"fraction near mode -2: {near_a:.2f}, near +2: {near_b:.2f}")
+# fraction near mode -2: ~0.49, near +2: ~0.49</code></pre>
+<div class="code-caption">Langevin sampling from a known two-mode density. Starting from broad noise, each step nudges samples uphill along the score and injects Gaussian noise; after a few hundred steps the samples have settled into the two modes in roughly equal proportion. The noise term is essential: remove it and every sample collapses onto whichever mode it started nearest, destroying diversity.</div>
+
+<p>
+One practical wrinkle drove the field forward. In high dimensions the score is poorly estimated far from the data (there is almost no training data out in the empty regions of pixel space), so naive Langevin sampling mixes badly. The fix, introduced by Song and Ermon in the Noise Conditional Score Network (2019), is to estimate the score at <em>many</em> noise levels and sample by <strong>annealed Langevin dynamics</strong>: start at a high noise level where the score is easy to estimate everywhere, then gradually anneal to low noise. That annealing across noise levels is, almost exactly, the reverse process of a diffusion model, which is why this section is the direct precursor to <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Why a Research Team Bet on Scores</div>
+<p><strong>Who:</strong> a generative-modeling research group around 2019, weighing where to invest. <strong>Situation:</strong> GANs produced the sharpest images but were notoriously unstable to train and prone to mode collapse; the team had burned months babysitting adversarial training runs that diverged for no clear reason. <strong>Problem:</strong> they wanted GAN-level sample quality with a stable, well-understood training objective and full coverage of the data distribution. <strong>Decision:</strong> they pursued the score-matching route precisely because its training objective is a plain regression loss (predict the noise), with no adversary, no minimax game, and no partition function. The bet was that a stable objective plus annealed Langevin sampling could eventually match GAN quality. <strong>Result:</strong> within two years the score and diffusion line (NCSN, then DDPM in 2020) had matched and then surpassed GANs on image quality, with markedly more stable training, and by 2022 it underpinned the text-to-image systems that reached the public. <strong>Lesson:</strong> the choice of <em>objective</em> can matter more than the choice of architecture. Trading the adversarial game for a denoising regression, an idea that lives entirely in this section, is what made large-scale image generation stable enough to industrialize. The energy and score view was not a curiosity; it was the foundation the field actually built on.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Annealed Score Sampling as a Scheduler</div>
+<p>You will almost never hand-code annealed Langevin sampling in production. In <code>diffusers</code> the entire noise-level schedule and the score-following update are packaged as a scheduler object, and sampling is a short loop over timesteps:</p>
+<pre><code class="language-python">import torch
+from diffusers import UNet2DModel, DDPMScheduler
+
+model = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to("cuda")   # a trained score/noise net
+scheduler = DDPMScheduler.from_pretrained("google/ddpm-cifar10-32")        # the annealing schedule
+scheduler.set_timesteps(1000)
+
+x = torch.randn(4, 3, 32, 32, device="cuda")                               # start from pure noise
+for t in scheduler.timesteps:                                              # high noise -> low noise
+    noise_pred = model(x, t).sample                                        # the learned score/noise
+    x = scheduler.step(noise_pred, t, x).prev_sample                       # one annealed update</code></pre>
+<div class="code-caption">Annealed score sampling packaged as a <code>diffusers</code> scheduler. The loop over <code>scheduler.timesteps</code> walks from high noise to low noise; each <code>step</code> call performs one annealed-Langevin update, bundling the noise-level schedule, step size, and noise injection that the from-scratch <code>langevin</code> function spelled out by hand.</div>
+<p>The scheduler handles the noise-level schedule, the step sizes, and the noise injection, the entire annealed-Langevin machinery of this section, in one <code>step</code> call. Hand-rolling it correctly across a thousand levels is the multi-hundred-line task that <a href="../module-33-diffusion-models/index.html">Chapter 33</a> walks through; the from-scratch toy above exists so the <code>step</code> call is not a black box.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Discrete Steps to Continuous Flows</div>
+<p>The arc that begins in this section is still advancing in 2024 to 2026. Song et al. (2021) unified score matching and diffusion under a single stochastic differential equation, the score-SDE view, showing the discrete Langevin steps here as a discretization of a continuous-time process, and you will meet that view directly in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. Flow matching (Lipman et al., 2023) and rectified flow (Liu et al., 2023) push further, replacing the noisy stochastic walk with a learned deterministic velocity field that transports noise to data along straight-ish paths, the basis of Stable Diffusion 3 and several 2024 to 2025 systems. The through-line of the cross-reference map, "scores and energies introduced here, deepened into score SDEs, transformed into flow matching", is one of the cleanest in the book: nearly every state-of-the-art image generator today is, under the hood, estimating the score field this section defines and integrating along it. What changes year to year is the integrator and the schedule, not the core idea.</p>
+</div>
+
+<h2>5. What You Carry Into the Diffusion Chapter <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+This section built the engine room of modern generation without ever naming diffusion as such. You learned that an energy defines a density up to an intractable constant; that the score, the gradient of log-probability, sidesteps that constant entirely; that the score can be learned by denoising; and that Langevin dynamics turns a learned score into samples, made robust by annealing across noise levels. When <a href="../module-33-diffusion-models/index.html">Chapter 33</a> introduces the forward noising process and the learned reverse process, you will recognize the reverse process as exactly the annealed score walk built here. The remaining foundational question is what we are actually trading when we choose one sampler or one family over another, the quality, diversity, and speed of the result, which is the subject of the next section.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.4.1: Where Did the Normalizer Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Write out $\log p_\theta(\mathbf{x}) = -E_\theta(\mathbf{x}) - \log Z_\theta$ and take its gradient with respect to $\mathbf{x}$, showing each step, to confirm that the score equals $-\nabla_{\mathbf{x}} E_\theta(\mathbf{x})$ and the partition function drops out. Then explain in one or two sentences why the gradient with respect to the <em>parameters</em> $\theta$ does <em>not</em> let $Z_\theta$ drop out, which is exactly why direct maximum-likelihood training of an EBM is hard while score matching is not.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.4.2: Langevin With and Without Noise <span class="exercise-type coding">Coding</span></div>
+<p>Take the <code>langevin</code> function from Section 4 and make a copy that drops the noise term (keep only the score step). Run both on the two-mode density, starting all samples from the same broad-noise initialization, and report the fraction of samples landing near each mode for each version. You should find the noiseless version collapses samples onto whichever mode they started nearest, while the noisy version recovers both modes in roughly equal proportion. Write two sentences explaining why the noise term is what turns optimization into sampling.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.4.3: Why Anneal the Noise Level? <span class="exercise-type analysis">Analysis</span></div>
+<p>The text claims that in high dimensions the score is poorly estimated far from the data, motivating annealed Langevin. Construct the argument carefully: explain why training data is essentially absent from the empty regions of a high-dimensional space (recall the curse of dimensionality from <a href="section-30.1.html">Section 30.1</a>), why a score network therefore cannot learn reliable arrows there, and how starting at a high noise level (which spreads the data out to fill more of the space) repairs this. Conclude by stating in one sentence the relationship between the annealing schedule here and the reverse process of a diffusion model.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-30.3.html">&#8592; Section 30.3: Latent Variables &amp; Latent Space</a>
+<a href="index.html">Chapter 30</a>
+<a class="next" href="section-30.5.html">Section 30.5: Sampling, Likelihood &amp; the Trilemma &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.4: NeRF: Neural Radiance Fields. Representing a scene as a small network mapping position and direction to color and density, the volume rendering equation, positional encoding, the training loop, and why camera poses are the prerequisite." name="description"/>
+<title>Section 27.4: NeRF: Neural Radiance Fields | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>NeRF: Neural Radiance Fields</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked where the 3D model was stored. I pointed at a five-megabyte network and said, the scene is in here, but only as a promise: ask me about any point in space and which way you are looking, and I will tell you its color. The geometry exists only when you query it."</p>
+<cite>A Radiance Field That Keeps the Whole Room in Its Head</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A neural radiance field stores an entire scene as a small network that maps a 3D location and a viewing direction to a color and a density, and renders new views by marching rays through that field and integrating the colors weighted by how much each point blocks the light.</strong> NeRF is the place where the volume rendering of computer graphics meets the gradient descent of deep learning. There is no mesh, no point cloud, no voxel grid; the geometry lives implicitly in the weights, and a photorealistic image of a never-before-seen viewpoint emerges from querying the network along millions of rays. This section derives the volume rendering equation, explains the positional encoding that lets a small MLP represent sharp detail, walks through the training loop that fits the field to a set of posed photographs, and is honest about the prerequisite no demo mentions: you must already know the camera poses, which come from the structure from motion of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+</div>
+
+<p>
+Everything in <a href="section-27.2.html">Section 27.2</a> and <a href="section-27.3.html">Section 27.3</a> stored geometry as explicit numbers. NeRF, introduced by Mildenhall and colleagues in 2020, made a different bet that reshaped the field: represent the scene as a continuous function, and learn that function with a neural network. The payoff is novel-view synthesis of startling realism, including view-dependent effects like specular highlights that an explicit mesh struggles with. The price is a representation you cannot directly inspect and, in the original form, hours of training and seconds per frame. We build the idea from its two halves: the rendering model (pure graphics, no learning) and the field (the network that the rendering trains).
+</p>
+
+<h2>1. The Scene as a Function <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A neural radiance field is a function
+</p>
+
+<div class="math-block">
+$$F_\Theta : (x, y, z, \theta, \phi) \;\longmapsto\; (r, g, b, \sigma)$$
+</div>
+
+<p>
+that takes a 3D position $(x, y, z)$ and a viewing direction $(\theta, \phi)$ and returns an emitted color $(r, g, b)$ and a volume density $\sigma$. The density says how much the point blocks light (opaque surfaces have high density, empty air has zero), and it depends only on position, not direction, because where matter is does not change with how you look at it. The color, by contrast, depends on direction too, which is exactly what lets NeRF render a glossy surface that looks different from different angles. $F_\Theta$ is implemented as a multilayer perceptron of a few hundred thousand to a few million weights, the entire "model" of the scene.
+</p>
+
+<p>
+The key conceptual shift is that the scene is not stored anywhere as geometry; it is stored as the <em>ability to answer queries</em> about any point. To make a picture, you ask the network about many points along many rays and combine the answers. That combination is the volume rendering equation.
+</p>
+
+<h2>2. Volume Rendering: Turning a Field Into a Pixel <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To find the color of one pixel, shoot a ray from the camera center through that pixel into the scene, exactly the ray of the pinhole camera from <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. Sample many points along the ray, query the field at each for its color $c_i$ and density $\sigma_i$, and accumulate them front to back. A point contributes its color in proportion to two things: how dense it is (how much light it emits or reflects) and how much of the light has <em>not already been blocked</em> by points in front of it. That second factor is the transmittance. Figure 27.4.1 shows the ray marching, and the discrete rendering equation is
+</p>
+
+<div class="math-block">
+$$C(\mathbf{r}) = \sum_{i=1}^{N} T_i\,\big(1 - e^{-\sigma_i \delta_i}\big)\, c_i, \qquad T_i = \exp\!\Big(-\sum_{j<i} \sigma_j \delta_j\Big)$$
+</div>
+
+<p>
+Here $\delta_i$ is the distance between adjacent samples, $1 - e^{-\sigma_i \delta_i}$ is the opacity (alpha) contributed by sample $i$, and $T_i$ is the accumulated transmittance, the fraction of light that survived from the camera to sample $i$. This is precisely the alpha compositing you would use to layer translucent images, applied along a ray. Critically, every operation here is differentiable, so the rendered pixel color $C(\mathbf{r})$ can be compared to the true pixel and the error backpropagated all the way into the network weights $\Theta$.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A camera ray marched through a scene, sampling points queried by the NeRF MLP for color and density, then integrated into one pixel color">
+<style>
+.nl{font:12px sans-serif;fill:#1a1a1a;}
+.ns{font:10px sans-serif;fill:#555;}
+.nray{stroke:#777;stroke-width:1.5;}
+.ncam{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.nsamp{fill:#fff;stroke:#2f9e5c;stroke-width:1.5;}
+.nsurf{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.nmlp{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.nar{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#nah);fill:none;}
+</style>
+<defs><marker id="nah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker></defs>
+<polygon class="ncam" points="20,110 20,160 55,135"/>
+<text class="nl" x="30" y="100" text-anchor="middle">camera</text>
+<line class="nray" x1="55" y1="135" x2="470" y2="135"/>
+<circle class="nsamp" cx="110" cy="135" r="6"/>
+<circle class="nsamp" cx="160" cy="135" r="6"/>
+<circle class="nsamp" cx="210" cy="135" r="6"/>
+<circle class="nsurf" cx="270" cy="135" r="8"/>
+<circle class="nsurf" cx="300" cy="135" r="8"/>
+<circle class="nsamp" cx="360" cy="135" r="6"/>
+<circle class="nsamp" cx="420" cy="135" r="6"/>
+<text class="ns" x="180" y="170" text-anchor="middle">empty (low density)</text>
+<text class="ns" x="285" y="115" text-anchor="middle">surface (high density)</text>
+<line class="nar" x1="285" y1="125" x2="540" y2="70"/>
+<rect class="nmlp" x="542" y="48" width="120" height="48"/>
+<text class="nl" x="602" y="68" text-anchor="middle">MLP F(x,d)</text>
+<text class="ns" x="602" y="86" text-anchor="middle">→ color, density</text>
+<rect class="nmlp" x="542" y="160" width="120" height="56" fill="#efe0fa"/>
+<text class="nl" x="602" y="184" text-anchor="middle">volume</text>
+<text class="nl" x="602" y="200" text-anchor="middle">integrate</text>
+<text class="ns" x="602" y="212" text-anchor="middle">→ pixel color</text>
+<line class="nar" x1="602" y1="96" x2="602" y2="158"/>
+</svg>
+<figcaption><strong>Figure 27.4.1:</strong> Volume rendering a single pixel. A ray is cast from the camera through the pixel; points are sampled along it and each is queried by the MLP for color and density. Samples in empty space have near-zero density and contribute nothing; samples at the surface have high density and dominate the accumulated color. Integrating the samples front-to-back with the transmittance weighting yields the pixel.</figcaption>
+</figure>
+
+<h2>3. Positional Encoding: Why a Raw Coordinate Is Not Enough <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+There is one subtlety without which NeRF produces only blurry blobs. An MLP fed raw 3D coordinates has a strong <em>spectral bias</em>: it learns low-frequency functions easily and high-frequency detail (sharp edges, fine texture) only with great difficulty. The fix is to lift each coordinate into a high-dimensional space of sinusoids of increasing frequency before feeding the network:
+</p>
+
+<div class="math-block">
+$$\gamma(p) = \big(\sin(2^0 \pi p), \cos(2^0 \pi p), \ldots, \sin(2^{L-1}\pi p), \cos(2^{L-1}\pi p)\big)$$
+</div>
+
+<p>
+applied to each coordinate. This <strong>positional encoding</strong> (the same Fourier-feature idea, and the same name, as the transformer positional encoding of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, here serving a geometric rather than a sequence-ordering role) gives the MLP direct access to high-frequency basis functions, so it can represent crisp detail. With $L = 10$ for position the coordinate expands from 3 numbers to 63, and the difference between encoded and raw input is the difference between a photorealistic NeRF and a smudge. This is also the exact bottleneck that Instant-NGP later attacked by replacing the fixed sinusoids with a learned multi-resolution hash grid, cutting training from hours to seconds.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: NeRF Is Graphics Made Differentiable</div>
+<p>The volume rendering equation of subsection 2 is not new; it is decades-old computer graphics, the same compositing used to render clouds and smoke. NeRF's contribution is to make every step differentiable and to put a learnable network where the scene data used to be, so that gradient descent on a photometric loss <em>discovers</em> the scene from photographs. This pattern, take a classical, non-learned forward model (here, volume rendering), make it differentiable, and optimize its inputs, is one of the most productive recipes in modern vision, and it returns in <a href="section-27.5.html">Section 27.5</a> with rasterization and in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> when a 2D generative prior sculpts a 3D field.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Schrodinger's Living Room</div>
+<p>A NeRF is the most non-committal way to store a scene ever invented. Ask where the sofa is and it answers, in effect, "I will tell you the moment you point a ray at it, and not one nanosecond sooner." The geometry has no fixed location, no mesh, no coordinates you can read off; it exists only as a standing willingness to answer questions. It is a five-megabyte promise that the room will look correct from wherever you happen to stand, which is either profound or deeply unhelpful depending on whether you wanted to edit it.</p>
+</div>
+
+<h2>4. The Training Loop and the Pose Prerequisite <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Training a NeRF is conceptually simple given the differentiable renderer. You have a set of photographs, each with a known camera pose. Repeatedly: pick a random batch of pixels across the images, cast their rays, sample points, query the network, volume-render the predicted colors, compare to the true pixel colors with a mean-squared loss, and step the optimizer. After enough iterations the network's density concentrates on the true surfaces and its colors match the photographs, at which point you can render any new viewpoint. The skeletal training step below shows the structure; the per-ray rendering is the equation of subsection 2.
+</p>
+
+<pre><code class="language-python">import torch
+
+def render_rays(mlp, rays_o, rays_d, near, far, n_samples=64):
+    """March rays through the field and volume-render. Returns (R,3) pixel colors."""
+    t = torch.linspace(near, far, n_samples, device=rays_o.device)        # sample depths
+    pts = rays_o[:, None, :] + rays_d[:, None, :] * t[None, :, None]      # (R, S, 3) points
+    rgb, sigma = mlp(pts, rays_d)                  # query field: color (R,S,3), density (R,S)
+    delta = t[1:] - t[:-1]                         # gaps between samples
+    delta = torch.cat([delta, torch.full_like(delta[:1], 1e9)])
+    alpha = 1.0 - torch.exp(-sigma * delta)        # opacity per sample (eq. of subsec 2)
+    T = torch.cumprod(1.0 - alpha + 1e-10, dim=1)  # accumulated transmittance
+    T = torch.roll(T, 1, dims=1); T[:, 0] = 1.0
+    weights = T * alpha                            # contribution of each sample
+    return (weights[..., None] * rgb).sum(dim=1)   # integrate to pixel color
+
+def train_step(mlp, optim, rays_o, rays_d, target_rgb, near, far):
+    pred = render_rays(mlp, rays_o, rays_d, near, far)
+    loss = ((pred - target_rgb) ** 2).mean()       # photometric loss, the only supervision
+    optim.zero_grad(); loss.backward(); optim.step()
+    return loss.item()</code></pre>
+<div class="code-caption">The core NeRF training step. <code>render_rays</code> implements the volume integral of subsection 2: sample along each ray, query the field, convert density to opacity and transmittance, and sum. The loss is simply the squared difference between rendered and true pixels; nothing supervises geometry directly.</div>
+
+<p>
+The line every introduction glosses over is <code>rays_o, rays_d</code>: the ray origins and directions, which require knowing the exact camera pose (position and orientation) of every photograph. NeRF does not estimate these. You must supply them, and in practice they come from running <strong>structure from motion</strong> (COLMAP) over the input images, the exact pipeline of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>: detect and match features, estimate relative poses, and bundle-adjust. If those poses are wrong, the NeRF is wrong, no matter how good the network. This dependency is why <a href="section-27.6.html">Section 27.6</a> treats the whole capture-to-render pipeline as one workflow rather than treating NeRF as a standalone model.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Museum Digitization Project Learns That Poses Come First</div>
+<p><strong>Who:</strong> a small heritage-tech studio digitizing museum artifacts into interactive web exhibits, 2022. <strong>Situation:</strong> they captured 150 photos of a carved relief and trained a NeRF, expecting a crisp 3D rendering. <strong>Problem:</strong> the result was a ghostly double image with floating clouds of color (NeRF "floaters"), and they assumed the network was undertrained. After days of tuning the MLP, nothing improved. <strong>Decision:</strong> they finally inspected the COLMAP output and found that the reflective glass case had produced mismatched features, so a third of the recovered camera poses were badly wrong; the photometric loss was being fed contradictory geometry. They re-shot without the case, verified the sparse reconstruction looked clean, and retrained. <strong>Result:</strong> a sharp, view-consistent NeRF on the first attempt, with no change to the network at all. <strong>Lesson:</strong> a NeRF can only be as good as its poses; when a radiance field looks broken, suspect the structure-from-motion stage of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a> before you touch the network.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Nerfstudio Trains a NeRF From a Folder of Images</div>
+<p>The hundreds of lines of ray generation, hierarchical sampling, and pose bookkeeping are wrapped end-to-end by Nerfstudio, which also runs COLMAP for you. A full capture-to-NeRF on your own photos is two commands:</p>
+<pre><code class="language-python"># Shell commands (run in a terminal), not Python:
+# 1. Recover camera poses from a folder of images via COLMAP, then package them.
+#    ns-process-data images --data ./my_photos --output-dir ./my_capture
+# 2. Train a fast NeRF (Instant-NGP-style) and launch the live web viewer.
+#    ns-train nerfacto --data ./my_capture</code></pre>
+<p>Nerfstudio's <code>nerfacto</code> bundles the hash-grid encoding, proposal sampling, and pose refinement that took the field years to develop, and gives a real-time browser viewer. It replaces the from-scratch loop above (and the manual COLMAP wrangling) with two commands, and it is the same tool the capture pipeline of <a href="section-27.6.html">Section 27.6</a> is built around.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Faster, Generalizable, and Pose-Free Radiance Fields (2024-2026)</div>
+<p>Three frontiers extend NeRF. <strong>Speed</strong>: Instant-NGP (2022) and its descendants brought training to seconds; the 3D Gaussian splatting of <a href="section-27.5.html">Section 27.5</a> pushed rendering to real time. <strong>Generalization</strong>: rather than fitting one network per scene, feed-forward models such as <strong>pixelNeRF</strong>, <strong>MVSNeRF</strong>, and the 2024-2025 large reconstruction models (LRM) predict a radiance field from a few images (or even one) in a single forward pass, learning a prior over scenes instead of optimizing each from scratch. <strong>Pose-free</strong>: methods like <strong>BARF</strong> and <strong>Nope-NeRF</strong>, and the 2025 <strong>VGGT</strong> and <strong>DUSt3R</strong> family, jointly recover poses and geometry, attacking the very COLMAP dependency that broke the museum project above, in some cases removing structure-from-motion entirely. The trajectory points toward feed-forward, pose-free 3D reconstruction that runs in seconds, which is also the engine behind the 3D generation of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
+</div>
+
+<p>
+NeRF is photorealistic and conceptually elegant, but the per-ray network query makes the original slow: every pixel of every frame costs dozens of forward passes. The representation that kept the quality while rendering in real time abandons the network-per-point idea entirely and returns to an explicit, but differentiable, point-based scene. That is 3D Gaussian splatting, the subject of <a href="section-27.5.html">Section 27.5</a>.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.1: Density, Opacity, and Transmittance <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a single ray with five evenly spaced samples ($\delta_i = 1$) whose densities are $\sigma = [0, 0, 5, 0, 0]$ (a thin opaque surface at the third sample in otherwise empty space). Compute the opacity $1 - e^{-\sigma_i \delta_i}$ and the transmittance $T_i$ at each sample, then the rendering weight $T_i(1 - e^{-\sigma_i \delta_i})$. Verify that almost all the weight falls on the third sample and explain in two sentences why this means the surface color dominates the pixel and why samples behind the surface contribute nothing.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.2: The Positional Encoding Ablation <span class="exercise-type coding">Coding</span></div>
+<p>Implement the positional encoding $\gamma(p)$ of subsection 3 as a function that maps a coordinate to a vector of $2L$ sinusoids. Fit a tiny MLP to reproduce a 1D high-frequency target signal (for example $f(x) = \sin(20x) + \tfrac{1}{2}\sin(50x)$ on $[0,1]$) twice: once with raw $x$ as input and once with $\gamma(x)$ at $L=10$. Plot both fits against the target and report the final loss of each. Explain how the result demonstrates the spectral-bias problem and why NeRF needs the encoding to render sharp detail.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.4.3: Why View-Dependent Color <span class="exercise-type analysis">Analysis</span></div>
+<p>NeRF makes density depend only on position but color depend on both position and view direction. Explain in a paragraph what real-world optical phenomenon this design choice is meant to capture, and what would go wrong if color were also position-only (consider a shiny metal sphere photographed from several angles). Then argue why making density depend on direction would be physically incorrect and could let the network "cheat" by hiding geometry that only appears from certain views, harming novel-view synthesis.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.3.html">&#8592; Section 27.3: Learning on Point Clouds: PointNet &amp; Successors</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="section-27.5.html">Section 27.5: 3D Gaussian Splatting &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

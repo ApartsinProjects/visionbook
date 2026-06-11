@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.6: Fine-tuning text-to-image models. Full fine-tuning and its cost, textual inversion that learns a new word, DreamBooth that binds a subject with a prior-preservation loss, and LoRA's low-rank adapters that make subject and style customization a single-GPU afternoon." name="description"/>
+<title>Section 34.6: Fine-Tuning Text-to-Image Models | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Text-to-Image Systems</a></div>
+<h1>Fine-Tuning Text-to-Image Models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I already know ten million faces. You want me to learn an eleventh, your dog, from five photos, without forgetting the other ten million. People call this 'fine-tuning'. I call it learning a single new word and promising not to bulldoze the dictionary."</p>
+<cite>A Pretrained Generator Negotiating Its Next Lesson</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fine-tuning teaches a pretrained generator a new concept (a face, a product, a style) without retraining it from scratch, and the methods form a ladder from heaviest to lightest: full fine-tuning, then DreamBooth, then LoRA, then textual inversion, trading capacity for cost and forgetting risk.</strong> The central challenge is teaching the new thing without bulldozing everything the model already knows, and the methods differ mainly in how they protect the existing knowledge. This section walks the ladder, builds a LoRA fine-tune that runs on a single consumer GPU, and explains which method fits which job. It is the transfer-learning thread of <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a> reaching its generative conclusion.</p>
+</div>
+
+<p>
+Prompting (<a href="section-34.5.html">Section 34.5</a>) steers a model toward concepts it already knows. Fine-tuning teaches it concepts it does not. When you need <em>your</em> dog, <em>this</em> product, or a consistent character across a children's book (the studio from <a href="section-34.3.html">Section 34.3</a>), no prompt suffices, because the concept is not in the training distribution. This section covers how to inject it. The transfer-learning principle is the one from <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>: start from strong pretrained weights and adapt minimally, because adapting too much destroys the general capability you started from.
+</p>
+
+<h2>1. The Forgetting Problem and the Method Ladder <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Naive fine-tuning has a signature failure: <strong>catastrophic forgetting</strong>. Train a billion-parameter generator on five photos of your dog and it will learn your dog and forget how to draw anything else, because the gradient from five images, applied to all parameters, overwrites the broad knowledge with the narrow. Every method on the ladder is a different answer to "how do I add the new concept without overwriting the old?" Table 34.6.1 lays out the ladder; the rest of the section explains each rung.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 34.6.1:</strong> <em>The fine-tuning ladder, heaviest to lightest.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">What changes</th><th scope="col">Storage</th><th scope="col">Forgetting risk</th><th scope="col">Best for</th></tr>
+</thead>
+<tbody>
+<tr><td>Full fine-tune</td><td>All weights</td><td>Full model (GBs)</td><td>High</td><td>A whole new domain, large data</td></tr>
+<tr><td>DreamBooth</td><td>All weights + prior-preservation loss</td><td>Full model (GBs)</td><td>Medium (guarded)</td><td>A specific subject, high fidelity</td></tr>
+<tr><td>LoRA</td><td>Small low-rank adapters</td><td>A few MB</td><td>Low</td><td>Subjects and styles, shareable</td></tr>
+<tr><td>Textual inversion</td><td>One new embedding vector</td><td>A few KB</td><td>None (model frozen)</td><td>A concept describable as a "word"</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>2. Textual Inversion: Learn One New Word <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The lightest method changes nothing in the model. Textual inversion freezes the entire generator and learns a single new embedding vector, a new "word" in the text encoder's vocabulary, that, when placed in a prompt, evokes the target concept. You introduce a pseudo-token like <code>&lt;my-dog&gt;</code>, initialize its embedding, and optimize <em>only</em> that vector so that "a photo of <code>&lt;my-dog&gt;</code>" reconstructs your training images under the frozen diffusion objective. Because the model is untouched, there is zero forgetting and the artifact is a few-kilobyte vector you can email. The cost is capacity: a single vector cannot capture fine appearance detail, so textual inversion is best for concepts that genuinely behave like a word (a recognizable style, a simple object) rather than a specific complex subject.
+</p>
+
+<p>
+Mechanically it is the cleanest illustration of the whole chapter: it manipulates exactly the conditioning sequence of <a href="section-34.1.html">Section 34.1</a> and nothing else. The new word slots into the per-token embeddings, cross-attention (<a href="section-34.2.html">Section 34.2</a>) routes it to the right spatial regions, and the frozen denoiser does the rest.
+</p>
+
+<h2>3. DreamBooth: Bind a Subject to a Rare Token <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+DreamBooth aims higher: faithful reproduction of a specific subject. It fine-tunes the whole model (or, in practice, combines with LoRA) to bind the subject to a rare token, "a photo of sks dog", where <code>sks</code> is chosen to have little prior meaning. The key idea that prevents forgetting is the <strong>prior-preservation loss</strong>. Alongside the few subject images, DreamBooth generates a batch of generic images from the model itself ("a photo of a dog") and includes them in training with their original captions. The model is thus simultaneously taught the new subject and reminded of the broad class, so it learns "sks dog is this particular dog" without collapsing the entire concept of "dog" onto your pet. The training objective is the standard diffusion loss plus the prior-preservation term:
+</p>
+
+<p>
+$$ \mathcal{L} = \mathbb{E}\big[\|\epsilon - \epsilon_\theta(z_t, t, c_{\text{sks}})\|^2\big] + \lambda\,\mathbb{E}\big[\|\epsilon' - \epsilon_\theta(z'_{t'}, t', c_{\text{class}})\|^2\big], $$
+</p>
+
+<p>
+where the first term learns the subject from your photos and the second, weighted by $\lambda$, preserves the class prior using the model's own generated class images. The prior-preservation term is the regularizer that guards the dictionary the epigraph worries about.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The famous <code>sks</code> token was supposed to be a meaningless string the model had no prior for, so that DreamBooth could fill it with your subject cleanly. There is a wrinkle: <code>sks</code> is also the name of a Soviet semi-automatic rifle, so it was never as empty as intended, and careful practitioners now pick genuinely rare tokens instead. The deeper point is the one that makes the whole method work: you are teaching the model a brand-new word, and the best new word is one the model has the fewest existing opinions about. The mnemonic for the ladder: <em>freeze more, forget less.</em></p>
+</div>
+
+<h2>4. LoRA: The Practical Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+LoRA (Low-Rank Adaptation) is where most practitioners live, because it is cheap, shareable, and resistant to forgetting. The insight, borrowed from language models, is that the weight <em>update</em> needed to adapt a model to a new concept is low-rank: instead of learning a full update $\Delta W$ to a weight matrix $W \in \mathbb{R}^{d \times k}$, learn two small matrices $A \in \mathbb{R}^{d \times r}$ and $B \in \mathbb{R}^{r \times k}$ with rank $r \ll \min(d, k)$, and use $W + BA$ at inference. For a $1024 \times 1024$ matrix with $r = 8$, that is 16384 trainable parameters instead of a million, a 64-fold reduction. The base weights are frozen, so forgetting is minimal, and the adapter is a few megabytes you can publish and combine. LoRA is applied specifically to the cross-attention layers of <a href="section-34.2.html">Section 34.2</a>, since that is where the text-to-image binding lives.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="LoRA: a frozen weight matrix W is augmented by a low-rank product B times A; only A and B are trained">
+<style>
+.fz{fill:#e8eaee;stroke:#5a626c;stroke-width:1.5;}
+.tr{fill:#dce6f0;stroke:#14385c;stroke-width:1.8;}
+.t{font-family:Georgia,serif;font-size:12px;fill:#111418;}
+.s{font-family:Georgia,serif;font-size:10.5px;fill:#5a626c;}
+.op{font-family:Georgia,serif;font-size:20px;fill:#111418;}
+.ar{stroke:#14385c;stroke-width:1.5;fill:none;marker-end:url(#m6);}
+</style>
+<defs><marker id="m6" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#14385c"/></marker></defs>
+<text class="s" x="60" y="40">input x</text>
+<rect class="fz" x="60" y="60" width="120" height="120"/>
+<text class="t" x="95" y="115">W (frozen)</text>
+<text class="s" x="92" y="135">d &#215; k, large</text>
+<text class="op" x="205" y="128">+</text>
+<rect class="tr" x="250" y="60" width="40" height="120"/>
+<text class="t" x="262" y="125">A</text>
+<text class="s" x="248" y="200">d &#215; r</text>
+<rect class="tr" x="320" y="95" width="120" height="40"/>
+<text class="t" x="372" y="120">B</text>
+<text class="s" x="350" y="155">r &#215; k</text>
+<text class="op" x="460" y="128">=</text>
+<rect class="tr" x="500" y="60" width="120" height="120"/>
+<text class="t" x="520" y="115">W + BA</text>
+<text class="s" x="515" y="135">effective weight</text>
+<path class="ar" d="M180,120 L203,120"/>
+<path class="ar" d="M290,120 L318,120"/>
+<path class="ar" d="M445,120 L498,120"/>
+<text class="s" x="250" y="50">trainable (tiny)</text>
+</svg>
+<figcaption><strong>Figure 34.6.1:</strong> LoRA. The large pretrained weight $W$ stays frozen; only the two small matrices $A$ and $B$ (rank $r$) are trained, and the effective weight is $W + BA$. The trainable parameter count drops by orders of magnitude, the adapter is a few megabytes, and the frozen base preserves general capability.</figcaption>
+</figure>
+
+<p>
+Figure 34.6.1 shows why LoRA is forgiving: the bulk of the model is frozen by construction, so the worst a bad LoRA can do is be ignored. The following script trains a LoRA on the cross-attention projections of an SD model, runnable on an 8 GB GPU.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+from peft import LoraConfig, get_peft_model
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+unet = pipe.unet
+
+# Inject rank-8 LoRA adapters into the cross-attention projection matrices only.
+lora = LoraConfig(r=8, lora_alpha=16,
+                  target_modules=["to_q", "to_k", "to_v", "to_out.0"])
+unet = get_peft_model(unet, lora)
+unet.print_trainable_parameters()
+# e.g. trainable params: 797,184 || all params: 860,318,148 || trainable%: 0.09
+
+opt = torch.optim.AdamW(
+    [p for p in unet.parameters() if p.requires_grad], lr=1e-4)
+
+for step, (latents, text_embeds) in enumerate(my_dataloader):  # your subject images
+    noise = torch.randn_like(latents)
+    t = torch.randint(0, 1000, (latents.size(0),), device="cuda")
+    noisy = pipe.scheduler.add_noise(latents, noise, t)         # forward process
+    pred = unet(noisy, t, encoder_hidden_states=text_embeds).sample
+    loss = torch.nn.functional.mse_loss(pred, noise)            # noise-prediction loss
+    loss.backward(); opt.step(); opt.zero_grad()
+
+unet.save_pretrained("my-subject-lora")   # a few MB, not the whole model</code></pre>
+<div class="code-caption">Training a LoRA adapter on SD 1.5. Only 0.09 percent of the parameters are trainable (the rank-8 adapters on the cross-attention projections); the base U-Net is frozen. The loss is the same noise-prediction objective from <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. The saved adapter is megabytes, not the gigabytes a full fine-tune would produce.</div>
+
+<p>
+The <code>print_trainable_parameters</code> line is the whole pitch: under one percent of the model trains, which is why this fits on a consumer GPU in an afternoon and why the result is a shareable file rather than a model fork. Loading it back is one call, and adapters compose: a subject LoRA and a style LoRA can be applied together.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Freezing Is the Anti-Forgetting Trick</div>
+<p>
+Every method that resists catastrophic forgetting does so by freezing the bulk of the model and confining the change to a small, isolated set of parameters: a single embedding (textual inversion), low-rank adapters (LoRA), or a regularized full update (DreamBooth's prior-preservation loss). The general capability lives in the frozen weights and cannot be overwritten by a few training images. This is the same principle as freezing a pretrained backbone in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>; generative fine-tuning simply makes the cost of forgetting more visible, because a forgotten generator produces visibly broken images.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Train and Load With One Script</div>
+<p>
+You do not write the training loop above by hand for standard cases. The <code>diffusers</code> repository ships maintained training scripts for DreamBooth, textual inversion, and LoRA, and loading a trained LoRA into any pipeline is one call.
+</p>
+<pre><code class="language-python"># Train via the official script (one shell command, abbreviated):
+# accelerate launch train_dreambooth_lora.py \
+#   --pretrained_model_name_or_path=stable-diffusion-v1-5/stable-diffusion-v1-5 \
+#   --instance_data_dir=./my_dog --instance_prompt="a photo of sks dog" \
+#   --rank=8 --output_dir=./my-dog-lora
+
+from diffusers import StableDiffusionPipeline
+import torch
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+pipe.load_lora_weights("./my-dog-lora")            # one line to attach the adapter
+image = pipe("a photo of sks dog wearing sunglasses on the beach").images[0]</code></pre>
+<div class="code-caption">The maintained training script replaces the hand-written loop, and <code>load_lora_weights</code> attaches a trained adapter to any compatible pipeline in one line. Multiple adapters can be loaded and weighted together, which is how community subject and style LoRAs are combined.</div>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Brand Mascot That Had to Stay On-Model</div>
+<p><strong>Who:</strong> A consumer brand that needed hundreds of marketing images of its cartoon mascot in new scenes, all perfectly on-model (same proportions, colors, and face).</p>
+<p><strong>Situation:</strong> Prompting alone (<a href="section-34.5.html">Section 34.5</a>) produced cousins of the mascot, never the mascot itself, because the exact character was not in the training distribution. They had about 40 clean reference images.</p>
+<p><strong>Problem:</strong> They first tried a full fine-tune, which nailed the mascot but forgot how to render the varied backgrounds and props the campaign needed: catastrophic forgetting from subsection 1, the whole-model update overwriting general scene knowledge with 40 mascot images.</p>
+<p><strong>Decision:</strong> They switched to a DreamBooth-plus-LoRA recipe: bind the mascot to a rare token with the prior-preservation loss of subsection 3 to keep "cartoon character" intact, and confine the update to rank-16 LoRA adapters (subsection 4) so the base model's scene knowledge stayed frozen. They captioned the 40 references descriptively, applying the DALL-E 3 caption lesson from <a href="section-34.3.html">Section 34.3</a>.</p>
+<p><strong>Result:</strong> The mascot stayed on-model across hundreds of novel scenes, the model still rendered diverse backgrounds, and the deliverable was a 12 MB adapter the design team loaded into the stock pipeline. The full fine-tune's forgetting was solved by freezing plus prior preservation, not by more data.</p>
+<p><strong>Lesson:</strong> Match the rung to the job. A specific subject that must coexist with general capability calls for DreamBooth-plus-LoRA, not a full fine-tune; the freezing is what preserves the breadth, and descriptive captions on the references do as much work as the training algorithm.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Faster, Tuning-Free Personalization</div>
+<p>
+The frontier in 2024 to 2026 is removing the per-subject training loop entirely. Encoder-based personalization methods (IP-Adapter, InstantID, PhotoMaker) take a reference image at inference time and inject its identity through a learned image encoder and extra cross-attention, with no fine-tuning per subject, the zero-shot end of the personalization ladder. DoRA (weight-decomposed LoRA, 2024) improves LoRA's capacity by separating magnitude and direction updates, narrowing the gap to full fine-tuning. On the controllability side, these adapters increasingly compose with the spatial-control methods of <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>, so a single pipeline can fix identity, pose, and style at once. The arc is clear: from full fine-tuning (hours, gigabytes) to LoRA (minutes, megabytes) to tuning-free adapters (seconds, one reference image), the same efficiency descent that <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> traced for inference, now applied to customization.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.1: Choosing a Rung <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, name the method on the ladder you would use and justify it from the forgetting-versus-capacity tradeoff of Table 34.6.1: (a) reproduce a specific person's face with high fidelity from 20 photos; (b) apply a consistent watercolor style to any prompt; (c) capture a simple recurring logo shape; (d) adapt a model to an entirely new domain (medical X-rays) with 50000 images. Then explain why DreamBooth needs a prior-preservation loss but textual inversion does not.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.2: Train and Compose Two LoRAs <span class="exercise-type coding">Coding</span></div>
+<p>Using the official LoRA training script, train one LoRA on a subject (10 to 20 images of an object) and a second LoRA on a style (images sharing a consistent aesthetic). (a) Generate the subject in the style by loading both adapters into one pipeline and weighting them, and report how the result changes as you vary the two adapter weights. (b) Train the subject LoRA again at rank 4 and rank 32 and compare fidelity and overfitting (does rank 32 start memorizing backgrounds from the training images?). (c) Measure each adapter's file size and confirm it matches the parameter count from the rank.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.6.3: Diagnosing Forgetting <span class="exercise-type analysis">Analysis</span></div>
+<p>Deliberately induce catastrophic forgetting: full-fine-tune a small SD model on 5 images of one subject with no prior-preservation loss and a high learning rate for many steps. (a) Track, every N steps, both the subject fidelity (does it look like the target?) and a "general capability" probe (generate "a red bus", "a mountain lake", "a bowl of soup") and describe how the general outputs degrade. (b) Re-run with the prior-preservation loss and with LoRA, and plot the forgetting curve for all three. (c) Relate the result to the freezing principle of the key-insight callout and to backbone freezing in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.5.html">&#8592; Section 34.5: Prompt Engineering</a>
+<a href="index.html">Chapter 34</a>
+<a class="next" href="../module-35-controllable-generation-editing/index.html">Chapter 35: Controllable Generation &amp; Image Editing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

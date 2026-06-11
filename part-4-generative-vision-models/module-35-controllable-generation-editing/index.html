@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 35: Controllable Generation and Image Editing. Moving from prompt roulette to precise control: ControlNet and conditioning adapters that pin layout to edges, depth and pose; personalization with LoRA, DreamBooth and textual inversion; inpainting, outpainting and object replacement; instruction-based editing; real-image inversion for faithful edits; and composing multi-step editing workflows." name="description"/>
+<title>Chapter 35: Controllable Generation &amp; Image Editing | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Chapter 35: Controllable Generation &amp; Image Editing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A prompt is a wish. A control map is a contract. I will still surprise you, but only inside the lines you drew."</p>
+<cite>A Diffusion Model That Finally Reads the Brief</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The text-to-image system of <a href="../module-34-text-to-image/index.html">Chapter 34</a> gives you a slot machine: type a sentence, pull the lever, and accept whatever comes out. This chapter replaces the lever with a steering wheel.</strong> Control comes in three flavors that this chapter treats in turn: spatial control fixes <em>where</em> things go (ControlNet on an edge map, a depth map, a pose skeleton); identity control fixes <em>what</em> a subject or style is (LoRA, DreamBooth, textual inversion teaching the model a specific face or look); and editing control changes part of an image while preserving everything else (inpainting, instruction-based editing, and the inversion machinery that lets you edit a real photograph rather than a generated one). The unifying theme is preservation: a good edit changes exactly what you asked for and nothing more, and most of the engineering in this chapter is about defending the parts of the image you did not mention.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+The last chapter ended with prompting and parameter-efficient fine-tuning, the two levers a practitioner reaches for first. Both are blunt. A prompt describes the image you want in words, but words cannot say "put the horizon exactly here" or "match this person's face" or "change only the jacket." Fine-tuning teaches the model a new concept, but a single LoRA still generates from scratch every time and cannot touch a photo that already exists. This chapter is the toolkit for everything words and weights leave on the table: pixel-accurate layout, subject and style identity, and surgical edits to images the model has never seen.
+</p>
+<p>
+We open with spatial control. <a href="section-35.1.html">Section 35.1</a> introduces ControlNet and the family of conditioning adapters that take a structural map (a Canny edge image, a depth map, an OpenPose skeleton) and force the diffusion model to honor that geometry while still inventing texture, color, and content from the prompt. This is the chapter's first concrete payoff on the book's longest narrative thread: the edge maps you computed with Sobel and Canny in <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a> and the depth maps from <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> now become control signals for a generator.
+</p>
+<p>
+The middle of the chapter handles identity and region. <a href="section-35.2.html">Section 35.2</a> deepens the personalization methods of <a href="../module-34-text-to-image/index.html">Chapter 34</a> into a working comparison of LoRA, DreamBooth, and textual inversion, with the practical question of which to reach for when. <a href="section-35.3.html">Section 35.3</a> covers inpainting, outpainting, and object replacement: how a mask tells the model where it may paint, and the seam and context problems that separate a believable edit from an obvious one, the generative descendant of the classical inpainting you met in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>. <a href="section-35.4.html">Section 35.4</a> turns to instruction-based editing, the InstructPix2Pix line, where the edit is specified as a natural-language command applied to an existing image.
+</p>
+<p>
+The chapter closes on the hardest and most important problem in practical editing. <a href="section-35.5.html">Section 35.5</a> tackles real-image inversion: to edit a real photograph with a diffusion model, you must first recover the noise and conditioning that would have produced it, and naive inversion is lossy and unfaithful. We work through DDIM inversion, null-text optimization, and the prompt-to-prompt and attention-control methods that make edits both faithful to the original and responsive to the new prompt. Finally, <a href="section-35.6.html">Section 35.6</a> steps up a level to composition: real production work chains these tools (segment, then inpaint, then upscale, then color-match) into multi-step workflows, and this section teaches the discipline of building and debugging such pipelines.
+</p>
+<p>
+The recurring lesson is that control is not one mechanism but a layered stack: spatial conditioning, identity adapters, masked regions, instruction parsing, and inversion all compose. The practitioner who understands the seams can combine them, predict where a workflow will break, and fix an edit that bleeds outside its mask, the same modular reasoning that <a href="../module-34-text-to-image/index.html">Chapter 34</a> applied to the generation stack now applied to the control stack.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter assumes the text-to-image stack of <a href="../module-34-text-to-image/index.html">Chapter 34</a> in full: the VAE, the conditioned U-Net or DiT, cross-attention conditioning, classifier-free guidance, and the LoRA/DreamBooth/textual-inversion methods introduced there. It builds directly on the latent diffusion machinery of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, especially the forward and reverse processes and the DDIM sampler, which the inversion of <a href="section-35.5.html">Section 35.5</a> runs in reverse. You will reuse the <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">edge detectors of Chapter 9</a>, the <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">segmentation masks of Chapter 24</a> (SAM in particular), and the <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">monocular depth of Chapter 27</a> as control signals. Comfortable PyTorch and a working <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noopener">diffusers</a> install are assumed; a GPU with 8 GB or more makes the code runnable.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">35.1</span>
+<a href="section-35.1.html"><span class="section-title">Spatial Control: ControlNet &amp; Conditioning Adapters</span></a>
+<span class="section-desc">How a structural map pins down layout: the ControlNet trainable copy with zero-convolution injection, the adapter family (T2I-Adapter, IP-Adapter), conditioning on edges, depth, and pose, and the conditioning-scale dial that trades obedience against creativity.</span>
+</li>
+<li>
+<span class="section-num">35.2</span>
+<a href="section-35.2.html"><span class="section-title">Personalization: LoRA, DreamBooth &amp; Textual Inversion</span></a>
+<span class="section-desc">Teaching a generator a specific subject or style: textual inversion's single learned word, DreamBooth's prior-preserving subject binding, LoRA's low-rank adapters, how the three compare on data, compute, and fidelity, and how to combine and weight multiple LoRAs at inference.</span>
+</li>
+<li>
+<span class="section-num">35.3</span>
+<a href="section-35.3.html"><span class="section-title">Inpainting, Outpainting &amp; Object Replacement</span></a>
+<span class="section-desc">Editing a region while preserving the rest: the inpainting U-Net's mask channels, masked-latent blending, the seam and context problems, extending a canvas with outpainting, and replacing an object by combining a segmentation mask with a new prompt.</span>
+</li>
+<li>
+<span class="section-num">35.4</span>
+<a href="section-35.4.html"><span class="section-title">Instruction-Based Editing</span></a>
+<span class="section-desc">Editing by natural-language command: how InstructPix2Pix builds a synthetic instruction dataset and conditions on both an instruction and an input image, the dual guidance scales that balance instruction-following against image preservation, and the modern editing-model landscape.</span>
+</li>
+<li>
+<span class="section-num">35.5</span>
+<a href="section-35.5.html"><span class="section-title">Real-Image Inversion &amp; Faithful Editing</span></a>
+<span class="section-desc">Editing real photographs: why naive encoding is not enough, DDIM inversion to recover the latent trajectory, null-text optimization to fix the guidance gap, and prompt-to-prompt attention control that edits content while preserving structure.</span>
+</li>
+<li>
+<span class="section-num">35.6</span>
+<a href="section-35.6.html"><span class="section-title">Composing Multi-Step Editing Workflows</span></a>
+<span class="section-desc">Building production pipelines: chaining segmentation, control, inpainting, and upscaling into a directed graph, managing latents and color consistency across stages, debugging where a workflow degrades, and the node-graph tools (ComfyUI) that practitioners use to author them.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+This chapter controls a single still image in space, identity, and content. The next dimension is time and three-dimensional structure. <a href="../module-36-video-3d-world-generation/index.html">Chapter 36: Video, 3D Generation &amp; World Models</a> extends the conditioned, controllable diffusion model into video, where temporal consistency becomes the new preservation problem, and into 3D generation and world models, where the control signals are camera poses and actions rather than edge maps. The ControlNet idea reappears as motion and camera conditioning, the inversion problem reappears as editing a real video, and the multi-step workflow discipline of <a href="section-35.6.html">Section 35.6</a> becomes essential when each stage is a heavy model. After that, <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> asks how we measure whether any of this control actually worked, and how we keep powerful editing tools safe.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, L., Rao, A., Agrawala, M. "Adding Conditional Control to Text-to-Image Diffusion Models (ControlNet)." ICCV (2023). <a href="https://arxiv.org/abs/2302.05543" target="_blank" rel="noopener">arXiv:2302.05543</a></div>
+<div class="bib-annotation">ControlNet, the central method of Section 35.1. It clones the U-Net encoder into a trainable branch connected by zero convolutions, letting a structural map control layout without destroying the base model.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ruiz, N. et al. "DreamBooth: Fine Tuning Text-to-Image Diffusion Models for Subject-Driven Generation." CVPR (2023). <a href="https://arxiv.org/abs/2208.12242" target="_blank" rel="noopener">arXiv:2208.12242</a></div>
+<div class="bib-annotation">DreamBooth, the subject-binding method of Section 35.2, which ties a subject to a rare token with a prior-preservation loss that prevents the model from forgetting the wider class.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Gal, R. et al. "An Image is Worth One Word: Personalizing Text-to-Image Generation using Textual Inversion." ICLR (2023). <a href="https://arxiv.org/abs/2208.01618" target="_blank" rel="noopener">arXiv:2208.01618</a></div>
+<div class="bib-annotation">Textual inversion from Section 35.2: learn one new embedding vector for a concept while freezing the entire model, the lightest personalization method.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hu, E. et al. "LoRA: Low-Rank Adaptation of Large Language Models." ICLR (2022). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">arXiv:2106.09685</a></div>
+<div class="bib-annotation">LoRA, the low-rank adapter of Section 35.2, now the dominant way to fine-tune diffusion models for new styles and subjects on a single GPU and to stack multiple concepts at inference.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Brooks, T., Holynski, A., Efros, A. "InstructPix2Pix: Learning to Follow Image Editing Instructions." CVPR (2023). <a href="https://arxiv.org/abs/2211.09800" target="_blank" rel="noopener">arXiv:2211.09800</a></div>
+<div class="bib-annotation">InstructPix2Pix, the instruction-editing method of Section 35.4. It builds a synthetic (instruction, before, after) dataset with GPT-3 and Prompt-to-Prompt, then trains a model conditioned on both an image and a command.</div>
+</div>
+
+<h3>Inversion &amp; Faithful Editing</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, J., Meng, C., Ermon, S. "Denoising Diffusion Implicit Models (DDIM)." ICLR (2021). <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">arXiv:2010.02502</a></div>
+<div class="bib-annotation">DDIM, whose deterministic sampler is run in reverse in Section 35.5 to invert a real image back to its latent noise, the foundation of faithful real-image editing.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Mokady, R. et al. "Null-text Inversion for Editing Real Images using Guided Diffusion Models." CVPR (2023). <a href="https://arxiv.org/abs/2211.09794" target="_blank" rel="noopener">arXiv:2211.09794</a></div>
+<div class="bib-annotation">Null-text inversion from Section 35.5, which optimizes the unconditional (null) embedding per timestep to close the gap that classifier-free guidance opens in plain DDIM inversion.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hertz, A. et al. "Prompt-to-Prompt Image Editing with Cross Attention Control." ICLR (2023). <a href="https://arxiv.org/abs/2208.01626" target="_blank" rel="noopener">arXiv:2208.01626</a></div>
+<div class="bib-annotation">Prompt-to-Prompt, the attention-injection editing of Section 35.5 that preserves structure by reusing the original cross-attention maps while swapping the words that should change.</div>
+</div>
+
+<h3>Adapters &amp; Recent Methods (2023-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Mou, C. et al. "T2I-Adapter: Learning Adapters to Dig out More Controllable Ability for Text-to-Image Diffusion Models." AAAI (2024). <a href="https://arxiv.org/abs/2302.08453" target="_blank" rel="noopener">arXiv:2302.08453</a></div>
+<div class="bib-annotation">T2I-Adapter, the lightweight alternative to ControlNet in Section 35.1: a small side network that adds control features without cloning the whole encoder.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ye, H. et al. "IP-Adapter: Text Compatible Image Prompt Adapter for Text-to-Image Diffusion Models." (2023). <a href="https://arxiv.org/abs/2308.06721" target="_blank" rel="noopener">arXiv:2308.06721</a></div>
+<div class="bib-annotation">IP-Adapter from Section 35.1, which adds a decoupled cross-attention path so an image can be used as a prompt alongside text, the basis of much identity and style transfer.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kawar, B. et al. "Imagic: Text-Based Real Image Editing with Diffusion Models." CVPR (2023). <a href="https://arxiv.org/abs/2210.09276" target="_blank" rel="noopener">arXiv:2210.09276</a></div>
+<div class="bib-annotation">Imagic, referenced in Section 35.5, which interpolates between an optimized embedding and a target embedding to perform complex single-image edits like changing a pose.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Labs, B. F. et al. "FLUX.1 Kontext: Flow Matching for In-Context Image Generation and Editing." (2025). <a href="https://arxiv.org/abs/2506.15742" target="_blank" rel="noopener">arXiv:2506.15742</a></div>
+<div class="bib-annotation">FLUX.1 Kontext, a 2025 in-context editing model discussed in Section 35.4 that takes a reference image and an instruction and edits in a single flow-matching pass with strong character consistency.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Hugging Face <code>diffusers</code>. <a href="https://huggingface.co/docs/diffusers/index" target="_blank" rel="noopener">huggingface.co/docs/diffusers</a></div>
+<div class="bib-annotation">The reference library for every code example: ControlNet, inpainting, IP-Adapter, instruction-editing, and inversion pipelines, plus the training scripts for DreamBooth and LoRA.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">ComfyUI node-graph interface. <a href="https://github.com/comfyanonymous/ComfyUI" target="_blank" rel="noopener">github.com/comfyanonymous/ComfyUI</a></div>
+<div class="bib-annotation">The node-graph editor of Section 35.6, the standard way practitioners author multi-step control-and-edit workflows as a visual directed graph.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Segment Anything (SAM). Kirillov, A. et al. ICCV (2023). <a href="https://github.com/facebookresearch/segment-anything" target="_blank" rel="noopener">github.com/facebookresearch/segment-anything</a></div>
+<div class="bib-annotation">SAM, the promptable segmenter used in Sections 35.3 and 35.6 to produce the masks that drive object replacement and region editing.</div>
+</div>
+
+<h3>Books &amp; Explainers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Prince, S. J. D. <em>Understanding Deep Learning.</em> MIT Press (2023). <a href="https://udlbook.github.io/udlbook/" target="_blank" rel="noopener">udlbook.github.io/udlbook</a></div>
+<div class="bib-annotation">Its diffusion and conditioning chapters give the cleanest textbook account of the guidance and cross-attention machinery the control methods of this chapter manipulate. Free online.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-34-text-to-image/index.html">&#8592; Chapter 34: Text-to-Image Systems</a>
+<a href="../index.html">Part IV</a>
+<a class="next" href="section-35.1.html">Section 35.1: Spatial Control &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

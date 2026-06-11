@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.6: Training and Deploying a Detector on Custom Data. The end-to-end practitioner workflow: labeling a small dataset, fine-tuning a modern Ultralytics YOLO detector, reading validation mAP honestly, diagnosing common training failures, and exporting to ONNX and TensorRT for deployment." name="description"/>
+<title>Section 23.6: Training &amp; Deploying a Detector on Custom Data | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>Training &amp; Deploying a Detector on Custom Data</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The theory was lovely. Then they handed me four hundred photos of their specific kind of bolt, half of them blurry, and said: by Friday. That is when I learned that detection is ten percent architecture and ninety percent labels, learning rate, and remembering which folder the validation set lives in."</p>
+<cite>A Fine-Tuned Detector With a Deadline</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In practice you almost never design a detector or train one from scratch; you fine-tune a pretrained modern detector on a few hundred to a few thousand of your own labeled images, validate its mAP honestly, and export it to a runtime your deployment target can run.</strong> The four prior sections gave you the conceptual map; this one is the route you actually drive. The workflow is the same regardless of architecture: collect and label data in a standard format, pick a pretrained model sized for your speed budget, fine-tune with sensible augmentation and a transfer-learning schedule, read validation mAP while guarding against the data leaks and easy-set illusions that inflate it, and export to ONNX or TensorRT for the edge. We run it concretely with Ultralytics YOLO, the most common production toolkit, and flag the failure modes that bite real teams.</p>
+</div>
+
+<p>
+Everything from <a href="section-23.1.html">Section 23.1</a> to <a href="section-23.5.html">Section 23.5</a> was about how detectors work. This section is about getting one to work for you. The honest truth of applied detection is that the architecture choice, the subject of four sections, is usually the smallest decision; far more of your time goes to labeling, to the transfer-learning recipe from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, to reading the metrics of <a href="section-23.1.html">Section 23.1</a> without fooling yourself, and to exporting for the hardware of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>. We walk that whole route once, end to end.
+</p>
+
+<h2>1. Collecting and Labeling Data <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A detector learns from images paired with box annotations, so the first task is to produce that pairing for your domain. Two practical rules dominate. First, label what you will deploy on: photograph the objects in the lighting, angles, backgrounds, and resolution your camera will actually see, because a detector trained on clean catalogue photos fails on a noisy warehouse feed. Second, label consistently: agree on exactly how tight a box should be, how to handle occluded or truncated objects, and which borderline cases count, then apply the rules uniformly, since inconsistent labels put a noise floor under your mAP that no architecture can lift.
+</p>
+
+<p>
+Annotation tools (Label Studio, CVAT, Roboflow, and others) export to a handful of standard formats. The two you will meet most are COCO JSON (one file listing all images and annotations, corner-format boxes, used by torchvision and the DETR family) and the YOLO text format (one <code>.txt</code> per image, one line per object: class index and a center-format box normalized to $[0, 1]$, the format and conventions from <a href="section-23.1.html">Section 23.1</a>). Knowing both, and being able to convert between them, saves more debugging hours than any modeling trick. Figure 23.6.1 shows the whole workflow this section follows.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The five-stage custom detector workflow: collect and label, split, fine-tune, validate, export and deploy">
+<style>
+.wl{font:12px sans-serif;fill:#1a1a1a;}
+.ws{font:10px sans-serif;fill:#555;}
+.wbox{stroke-width:1.5;}
+.w1{fill:#eaf2fb;stroke:#2c6fb5;}
+.w2{fill:#e7f5ec;stroke:#2f9e5c;}
+.w3{fill:#fdeee3;stroke:#d6802b;}
+.w4{fill:#f3e8fb;stroke:#8e44ad;}
+.w5{fill:#fff4e6;stroke:#b8860b;}
+.war{stroke:#777;stroke-width:1.5;marker-end:url(#wah);fill:none;}
+</style>
+<defs><marker id="wah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="wbox w1" x="20" y="80" width="110" height="50"/>
+<text class="wl" x="75" y="100" text-anchor="middle">collect +</text>
+<text class="wl" x="75" y="118" text-anchor="middle">label</text>
+<line class="war" x1="132" y1="105" x2="160" y2="105"/>
+<rect class="wbox w2" x="162" y="80" width="100" height="50"/>
+<text class="wl" x="212" y="100" text-anchor="middle">split</text>
+<text class="ws" x="212" y="118" text-anchor="middle">train/val/test</text>
+<line class="war" x1="264" y1="105" x2="292" y2="105"/>
+<rect class="wbox w3" x="294" y="80" width="100" height="50"/>
+<text class="wl" x="344" y="100" text-anchor="middle">fine-tune</text>
+<text class="ws" x="344" y="118" text-anchor="middle">pretrained</text>
+<line class="war" x1="396" y1="105" x2="424" y2="105"/>
+<rect class="wbox w4" x="426" y="80" width="100" height="50"/>
+<text class="wl" x="476" y="100" text-anchor="middle">validate</text>
+<text class="ws" x="476" y="118" text-anchor="middle">read mAP</text>
+<line class="war" x1="528" y1="105" x2="556" y2="105"/>
+<rect class="wbox w5" x="558" y="80" width="120" height="50"/>
+<text class="wl" x="618" y="100" text-anchor="middle">export +</text>
+<text class="wl" x="618" y="118" text-anchor="middle">deploy</text>
+<text class="ws" x="350" y="165" text-anchor="middle">the same five stages regardless of which detector family you chose</text>
+</svg>
+<figcaption><strong>Figure 23.6.1:</strong> The custom-detector workflow. Collect and label data in your deployment conditions, split it without leakage, fine-tune a pretrained model, validate mAP honestly, then export and deploy. The architecture you picked in Sections 23.2 to 23.5 changes only the "fine-tune" box; the rest is identical.</figcaption>
+</figure>
+
+<h2>2. Splitting Data Without Fooling Yourself <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Before training, split your images into training, validation, and test sets. The cardinal rule, the same one from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, is that no information may leak from validation or test into training. In detection this rule has a sharp, easy-to-miss edge: if your images come from video or from burst captures, near-identical consecutive frames must all go to the same split. Put frame 100 in training and frame 101 in validation and your validation mAP will be gloriously high and completely meaningless, because the model has effectively seen the validation images. Split by source clip, by scene, or by capture session, never by random per-frame shuffle, whenever frames are correlated.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A High mAP Is Guilty Until Proven Innocent</div>
+<p>The single most common way a custom-detector project goes wrong is a validation mAP that looks wonderful and collapses in deployment. Three culprits account for nearly all cases: (1) <strong>leakage</strong> from correlated frames split across train and val, as above; (2) <strong>an easy validation set</strong> that does not contain the hard cases (occlusion, small objects, unusual lighting) the deployment will face, so mAP measures the easy slice only; (3) <strong>label noise in validation</strong> that either flatters a model that learned the same mistakes or unfairly penalizes a correct one. Before you trust any mAP, visualize the model's predictions on the validation images by eye, check the size-stratified APs (Section 23.1) so small objects are not hiding a failure, and confirm your split has no correlated-frame leakage. Treat a suspiciously high number as a bug to investigate, not a result to celebrate.</p>
+</div>
+
+<h2>3. Fine-Tuning a Modern Detector <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With clean, split data you fine-tune. We use Ultralytics YOLO because it is the most widely deployed toolkit and reduces the whole training loop to a few lines, but the principles transfer to torchvision and the DETR family. The data is described by a small YAML file naming the train and validation image folders and the class names; the model loads pretrained COCO weights (transfer learning from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, since COCO features are an excellent starting point for almost any natural-image domain); and a single <code>train</code> call runs the schedule with sensible default augmentation. The code below is a complete, runnable fine-tuning script.
+</p>
+
+<pre><code class="language-python">from ultralytics import YOLO
+
+# data.yaml lists: path, train: images/train, val: images/val, names: {0: bolt, 1: nut}
+model = YOLO("yolo11n.pt")          # nano model, COCO-pretrained; start small
+
+results = model.train(
+    data="data.yaml",
+    epochs=100,
+    imgsz=640,                      # train/infer resolution; match your deployment
+    batch=16,
+    lr0=0.01,                       # initial LR; YOLO cosine-decays it automatically
+    patience=20,                    # early-stop if val mAP stalls for 20 epochs
+    augment=True,                   # mosaic, flips, HSV jitter (Chapter 21 policies)
+)
+metrics = model.val()               # evaluates on the val set
+print(metrics.box.map)              # COCO mAP@[0.50:0.95]
+print(metrics.box.map50)            # mAP@0.50
+</code></pre>
+<div class="code-caption">A complete custom fine-tuning run with Ultralytics YOLO. The <code>yolo11n.pt</code> nano model is the right place to start: it trains fast and tells you quickly whether your data and labels are sound before you spend time on a larger model.</div>
+
+<p>
+Two recipe choices matter most. Start with the smallest model (the "n" nano variant) to get a fast signal that your pipeline and labels are correct; only scale up to "s", "m", or larger once you have confirmed the data is sound and you need more accuracy. And match the training image size to your deployment resolution: train at $640$ and deploy at $1280$ and the model sees objects at unfamiliar scales. The augmentation defaults (mosaic, horizontal flip, HSV jitter) implement the policies of <a href="../module-21-training-recipes/index.html">Chapter 21</a> and are usually a good starting point, though mosaic is often disabled for the final few epochs so the model finishes on un-augmented images.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Detector That Learned the Watermark</div>
+<p><strong>Who:</strong> a retail-analytics startup training a detector to find specific product packages on store shelves from phone photos, 2024. <strong>Situation:</strong> their training images came from the brand's marketing team and their validation images from a separate field-collection effort. The first model scored an excellent validation mAP and they prepared to ship. <strong>Problem:</strong> in a pre-launch field test the detector failed badly on ordinary store photos. Investigating, they found the marketing training images all carried a faint corner watermark and a consistent studio background, and the model had partly keyed on those cues; the validation set happened to share the studio look, so validation mAP was inflated. <strong>Decision:</strong> they re-collected training data in real stores, re-split by store location to prevent any single store's shelf from spanning train and val, and added heavy background and color augmentation to break the spurious cues. <strong>Result:</strong> validation mAP dropped to a lower but honest number that matched field performance, and the shipped model worked. <strong>Lesson:</strong> a detector will exploit any shortcut your data offers, including watermarks and backgrounds; an mAP is only as trustworthy as the realism and independence of the set it is measured on, exactly the leakage and easy-set warnings of subsection 2.</p>
+</div>
+
+<h2>4. Diagnosing Training Failures <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+When a custom detector trains poorly, the cause is almost never the architecture and almost always one of a short list of practical faults. Table 23.6.1 is the checklist experienced practitioners run through; the column order roughly matches how often each cause appears. The most common by far is a data or label problem: a class-index off-by-one, boxes in the wrong format (center versus corner, normalized versus pixel, the conversions from <a href="section-23.1.html">Section 23.1</a>), or annotations that are simply inconsistent. The single most useful debugging action is to render a handful of training images with their loaded labels drawn on top, before any training, and confirm the boxes sit on the objects; this five-minute check catches the majority of "the model will not learn" reports.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 23.6.1:</strong> <em>Common custom-detector training failures and their fixes.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Symptom</th>
+<th scope="col">Likely cause</th>
+<th scope="col">Fix</th>
+</tr>
+</thead>
+<tr>
+<td>Loss never drops, mAP near 0</td>
+<td>Wrong box format or class indices</td>
+<td>Render loaded labels on images; verify format and index base</td>
+</tr>
+<tr>
+<td>Train mAP high, val mAP low</td>
+<td>Overfitting or leakage</td>
+<td>More data and augmentation; re-split by source to remove leakage</td>
+</tr>
+<tr>
+<td>Val mAP high, deployment poor</td>
+<td>Easy or non-representative val set</td>
+<td>Re-collect val in deployment conditions; check size-stratified AP</td>
+</tr>
+<tr>
+<td>Small objects missed</td>
+<td>Train resolution too low</td>
+<td>Raise <code>imgsz</code>; use a model with finer pyramid levels</td>
+</tr>
+<tr>
+<td>Loss explodes to NaN</td>
+<td>Learning rate too high</td>
+<td>Lower <code>lr0</code>; confirm warmup is enabled</td>
+</tr>
+</table>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Predict and Export in Two Lines</div>
+<p>Once trained, running inference and exporting to a deployment runtime are each a single call. Ultralytics wraps the entire ONNX and TensorRT export toolchain, which by hand involves tracing the model, pinning opset versions, and wiring the NMS into the graph:</p>
+<pre><code class="language-python">model = YOLO("runs/detect/train/weights/best.pt")
+
+# Inference on new images: returns boxes, classes, scores per image.
+preds = model.predict("new_shelf.jpg", conf=0.4, imgsz=640)
+preds[0].show()                       # draw the boxes
+
+# Export for deployment. One line each:
+model.export(format="onnx")           # portable ONNX graph, runs anywhere
+model.export(format="engine")         # TensorRT engine for NVIDIA edge devices
+</code></pre>
+<p>The ONNX export produces a portable graph that runs under ONNX Runtime on CPU, mobile, or the browser; the TensorRT export produces a hardware-optimized engine for NVIDIA Jetson and server GPUs, often two to five times faster than the PyTorch model. Doing either by hand is a few hundred lines of fragile tracing and post-processing graph surgery; the library does it in one call and bakes the decoding and NMS into the exported graph so the runtime needs no Python. These are the techniques the efficiency chapter, <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>, treats in depth.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Label Less, Detect More</div>
+<p>The expensive, error-prone labeling stage of subsection 1 is the part of this workflow that 2024 to 2026 research is most aggressively automating. <strong>Open-vocabulary detectors</strong> such as Grounding DINO and YOLO-World (Section 23.5) can detect objects from a text prompt with zero domain labels, and teams increasingly use them to <em>auto-label</em> a first pass that human annotators only correct, cutting labeling cost by large factors; the Segment Anything Model of <a href="../module-24-segmentation/index.html">Chapter 24</a> is used the same way for masks. <strong>Self-training and active learning</strong> loops let a partially trained detector propose labels for the unlabeled pool, surfacing only its most uncertain images for human review. And the foundation backbones of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, such as DINOv2, give such strong pretrained features that fine-tuning a detector now needs far fewer labels than the COCO-era recipes assumed. The frontier of applied detection is shifting from "design the model" to "spend your human attention only where the model is genuinely unsure."</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The Ultralytics <code>YOLO("yolo11n.pt")</code> call that fits in one line will, on first run, quietly download the pretrained weights, set up the augmentation pipeline, detect your GPU, pick a batch size, and configure a cosine learning-rate schedule with warmup, all the machinery that a 2016-era detection paper would have devoted half its experimental section to describing. A practitioner today can fine-tune a competitive detector before lunch on hardware that costs less than the GPUs the original papers ran on, which is the quiet, cumulative payoff of the decade of research this chapter traced.</p>
+</div>
+
+<h2>5. The Whole Chapter, in One Pipeline <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Step back and notice how this section reuses everything before it. The boxes and mAP of <a href="section-23.1.html">Section 23.1</a> are the labels you create and the metric you read. The architecture you fine-tune is a member of one of the families from Sections 23.2 to 23.5, chosen by the speed-accuracy trade-off those sections laid out: a YOLO for the edge, a Faster R-CNN for small-object recall, a DINO-DETR for top accuracy. The augmentation and transfer learning come from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, the export targets are the edge devices of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>, and the moment you need pixel-precise outlines instead of boxes you will extend this exact workflow into the segmentation of <a href="../module-24-segmentation/index.html">Chapter 24</a>. Detection is the hub, and you have now driven the full loop from raw images to a deployable model.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.1: Diagnose the Inflated mAP <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague reports a 0.92 validation mAP@0.50 on a custom traffic-sign detector trained from dashcam video, but the model performs poorly on a new drive. List the three most likely causes from subsection 2 and Table 23.6.1, and for each describe the one concrete check or fix you would apply. Which cause is most probable given that the data is dashcam video, and why?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.2: Fine-Tune on a Public Dataset <span class="exercise-type coding">Coding</span></div>
+<p>Download a small public detection dataset (for example a Roboflow Universe dataset or the Oxford-IIIT Pet boxes), write its <code>data.yaml</code>, and fine-tune <code>yolo11n.pt</code> for a modest number of epochs using the script in subsection 3. Report the validation mAP@0.50 and mAP@[0.50:0.95], then render the model's predictions on five validation images and inspect them by eye. Note any class or size for which the model struggles and relate it to the size-stratified AP discussion of <a href="section-23.1.html">Section 23.1</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.6.3: Measure the Export Speedup <span class="exercise-type analysis">Analysis</span></div>
+<p>Take your trained model from Exercise 23.6.2 and benchmark inference latency three ways: the native PyTorch <code>.pt</code> model, the exported ONNX model under ONNX Runtime, and (if you have an NVIDIA GPU) the TensorRT engine. Average over many runs after warmup, and report frames per second for each at your deployment <code>imgsz</code>. Write a short analysis of the speedup each export gives, the accuracy (if any) it costs, and which one you would ship for a CPU-only server versus an NVIDIA Jetson, connecting your reasoning to the deployment considerations of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.5.html">&#8592; Section 23.5: DETR: Detection as Set Prediction</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="../module-24-segmentation/index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.2: DDPM. The denoising diffusion probabilistic model in full: linear and cosine noise schedules, the three equivalent prediction targets (noise, clean image, and velocity), and the variational bound that collapses to the simple noise-prediction loss used everywhere in practice." name="description"/>
+<title>Section 33.2: DDPM | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>DDPM: Noise Schedules, Parameterizations &amp; the Variational View</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I spent a week deriving a variational bound with a dozen KL terms, and at the end it told me to just predict the noise and square the error. I am told this is what physicists call beauty."</p>
+<cite>A Loss Function That Simplified Beyond Recognition</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The denoising diffusion probabilistic model derives a rigorous variational bound on the data log-likelihood, exactly as the VAE did, but that intimidating bound collapses to a simple mean-squared error between true and predicted noise, which is the loss everyone actually trains.</strong> Three design choices turn this principle into a working model: the noise schedule that decides how fast corruption proceeds, the parameterization that decides whether the network predicts the noise, the clean image, or a velocity blend of the two, and the weighting of the loss across timesteps. This section works through all three. The payoff is that you will understand both why the loss is mathematically justified and why, in practice, it is one line of code.</p>
+</div>
+
+<p>
+In <a href="section-33.1.html">Section 33.1</a> you built the forward and reverse processes and trained a denoiser with a noise-prediction loss that we asked you to take on faith. This section pays that debt. We derive where the loss comes from, the variational lower bound that DDPM shares with the <a href="../module-31-autoencoders-vaes/index.html">VAE of Chapter 31</a>, and we show how each term of that bound reduces to a tractable quantity. Then we turn to the engineering knobs that separate a model that trains from one that trains well: the schedule, the parameterization, and the loss weighting. By the end you will be able to read the configuration of any modern diffusion model and know what every field means.
+</p>
+
+<h2>1. The Variational Bound, and How It Collapses <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+We want to maximize the likelihood the model assigns to real data, $\log p_\theta(x_0)$, but the marginal requires integrating over all the latent noisy states $x_1, \dots, x_T$, which is intractable. The same problem appeared with the VAE, and the same tool solves it: the evidence lower bound (ELBO). Treating the entire forward trajectory as the "encoder" and the reverse process as the "decoder," the bound is
+</p>
+
+<div class="math-block">
+$$\log p_\theta(x_0) \ge \mathbb{E}_q\!\left[\log p_\theta(x_0 \mid x_1)\right] - \sum_{t=2}^{T} \mathbb{E}_q\!\left[D_{\mathrm{KL}}\!\big(q(x_{t-1} \mid x_t, x_0)\ \|\ p_\theta(x_{t-1} \mid x_t)\big)\right] - D_{\mathrm{KL}}\!\big(q(x_T \mid x_0)\ \|\ p(x_T)\big).$$
+</div>
+
+<p>
+This looks forbidding, but every piece is benign. The last term compares the fully-corrupted $x_T$ to a standard Gaussian; since the forward process is designed to reach exactly that, the term is essentially zero and has no parameters. The first term is a reconstruction at the final denoising step. The interesting work is in the middle sum: each term compares the model's reverse step $p_\theta(x_{t-1} \mid x_t)$ against the <strong>true posterior</strong> $q(x_{t-1} \mid x_t, x_0)$, which, crucially, is a Gaussian we can write in closed form because we condition on the clean $x_0$. Its mean is
+</p>
+
+<div class="math-block">
+$$\tilde{\mu}_t(x_t, x_0) = \frac{\sqrt{\bar{\alpha}_{t-1}}\,\beta_t}{1 - \bar{\alpha}_t}\, x_0 + \frac{\sqrt{\alpha_t}\,(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t}\, x_t.$$
+</div>
+
+<p>
+A KL divergence between two Gaussians with the same variance reduces to the squared distance between their means. So each middle term becomes $\| \tilde\mu_t - \mu_\theta \|^2$ up to a constant. Substituting the noise-prediction expression for $\mu_\theta$ from <a href="section-33.1.html">Section 33.1</a> and simplifying (the algebra is mechanical but lengthy) turns that mean-distance into a distance between the true noise $\epsilon$ and the predicted noise $\epsilon_\theta$, with a per-timestep weight in front. Ho et al. found that simply <em>dropping</em> that weight, setting it to one for every $t$, trained better and gave the now-canonical loss:
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{simple}} = \mathbb{E}_{t, x_0, \epsilon}\left[\ \big\| \epsilon - \epsilon_\theta\big(\sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon,\ t\big) \big\|^2\ \right].$$
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Bound Justifies the Loss; the Loss Ignores the Bound</div>
+<p>
+The variational derivation tells you the principled objective is a weighted sum of denoising errors. The empirical discovery of DDPM is that the <em>unweighted</em> version, plain mean-squared error on the noise, trains better, because the principled weights overemphasize the tiny-noise steps where the task is trivial. This is a recurring pattern in deep learning: the theory tells you the shape of the objective, and an empirical simplification of it works best. You can train a strong diffusion model knowing only $\mathcal{L}_{\text{simple}}$, but knowing the bound tells you why it is a sound objective and where the freedom to reweight comes from.
+</p>
+</div>
+
+<h2>2. Noise Schedules: Linear vs Cosine <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The schedule $\{\beta_t\}$ decides how quickly the forward process destroys the image, and through $\bar\alpha_t$ it sets the signal-to-noise ratio at every step. The original DDPM used a <strong>linear</strong> schedule, $\beta_t$ rising linearly from $10^{-4}$ to $0.02$. This works but has a flaw at high resolution: it destroys information too quickly near the end, so the last fraction of timesteps carries almost no signal and is wasted. Nichol and Dhariwal proposed a <strong>cosine</strong> schedule that keeps more signal in the middle of the process by defining $\bar\alpha_t$ directly:
+</p>
+
+<div class="math-block">
+$$\bar\alpha_t = \frac{f(t)}{f(0)}, \qquad f(t) = \cos^2\!\left(\frac{t/T + s}{1 + s}\cdot\frac{\pi}{2}\right),$$
+</div>
+
+<p>
+where $s$ is a small offset (about $0.008$) that prevents $\beta_t$ from being too small near $t = 0$. The cosine schedule spends more steps at intermediate noise levels, which is where the model does most of its useful learning, and it noticeably improves sample quality on datasets like ImageNet. Figure 33.2.1 contrasts how $\bar\alpha_t$ decays under the two schedules.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two curves of alpha-bar against timestep: linear drops fast then flattens near zero, cosine decays more gradually keeping signal longer">
+<style>
+.axl{font:12px sans-serif;fill:#1a1a1a;}
+.axs{font:10px sans-serif;fill:#666;}
+.axis{stroke:#888;stroke-width:1.2;}
+.glin{stroke:#d6802b;stroke-width:2.4;fill:none;}
+.gcos{stroke:#2c6fb5;stroke-width:2.4;fill:none;}
+</style>
+<line class="axis" x1="60" y1="250" x2="600" y2="250"/>
+<line class="axis" x1="60" y1="40" x2="60" y2="250"/>
+<text class="axl" x="330" y="285" text-anchor="middle">timestep t (0 to T)</text>
+<text class="axl" x="22" y="150" text-anchor="middle" transform="rotate(-90 22 150)">alpha-bar (signal level)</text>
+<text class="axs" x="55" y="46" text-anchor="end">1.0</text>
+<text class="axs" x="55" y="254" text-anchor="end">0.0</text>
+<path class="glin" d="M60,45 C150,70 220,200 330,238 C430,248 520,250 600,250"/>
+<path class="gcos" d="M60,46 C180,70 300,120 420,200 C490,238 550,248 600,250"/>
+<text class="axl" x="250" y="220" fill="#d6802b">linear</text>
+<text class="axl" x="470" y="155" fill="#2c6fb5">cosine</text>
+</svg>
+<figcaption><strong>Figure 33.2.1:</strong> Signal level $\bar\alpha_t$ versus timestep under the linear (orange) and cosine (blue) schedules. The linear schedule collapses the signal early and flattens near zero for the final third of steps, wasting them; the cosine schedule decays more gradually, keeping useful signal at intermediate steps where the denoiser learns most. The cosine curve is the reason it improves sample quality at high resolution.</figcaption>
+</figure>
+
+<p>
+The two schedules are a few lines apart in code. The function below returns the $\bar\alpha_t$ arrays for both, and you can drop either into the <code>q_sample</code> of <a href="section-33.1.html">Section 33.1</a>.
+</p>
+
+<pre><code class="language-python">import torch
+import math
+
+def linear_alpha_bars(T=1000, b0=1e-4, b1=0.02):
+    betas = torch.linspace(b0, b1, T)
+    return torch.cumprod(1.0 - betas, dim=0)
+
+def cosine_alpha_bars(T=1000, s=0.008):
+    steps = torch.arange(T + 1) / T
+    f = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
+    ab = f / f[0]
+    return ab[1:]                                   # length T, alpha_bar at each step
+
+lin = linear_alpha_bars()
+cos = cosine_alpha_bars()
+print("linear alpha_bar at t=900:", lin[900].item())   # ~0.0001, nearly all noise
+print("cosine alpha_bar at t=900:", cos[900].item())   # larger: signal survives</code></pre>
+<div class="code-caption">Linear and cosine schedules side by side. The print statements show that at $t=900$ the cosine schedule retains far more signal than the linear one, the quantitative version of the gap in Figure 33.2.1.</div>
+
+<h2>3. Three Parameterizations: Noise, Image, and Velocity <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The network has to output <em>something</em> from which the reverse step can be computed, but that something is not unique. Because $x_t$, $x_0$, and $\epsilon$ are linked by the single closed-form equation, predicting any one of them determines the others. There are three standard choices, and each is the right one in a different regime.
+</p>
+
+<ul>
+<li><strong>Noise prediction</strong> ($\epsilon$-prediction): the network outputs the noise $\epsilon_\theta(x_t, t)$. This is the DDPM default and works well across most of the schedule.</li>
+<li><strong>Image prediction</strong> ($x_0$-prediction): the network outputs the clean image directly. This is more stable at very high noise levels, where the noise itself is nearly all the signal and predicting it is uninformative.</li>
+<li><strong>Velocity prediction</strong> ($v$-prediction): the network predicts $v = \sqrt{\bar\alpha_t}\,\epsilon - \sqrt{1-\bar\alpha_t}\,x_0$, a blend that interpolates between the two. It behaves like image prediction at high noise and noise prediction at low noise, giving the best of both, and is the choice used in progressive distillation and many modern systems.</li>
+</ul>
+
+<p>
+The three are exact algebraic re-encodings of each other; given one and the noisy $x_t$, you can recover the others. The reason the choice matters is the implied loss weighting: predicting $\epsilon$, $x_0$, or $v$ puts different emphasis on different noise levels, which changes what the network spends its capacity on. The conversion utilities are short.
+</p>
+
+<pre><code class="language-python">import torch
+
+def to_x0(xt, eps, ab):                              # ab is alpha_bar_t, shape (B,1,1,1)
+    """Recover the clean image from x_t and predicted noise."""
+    return (xt - (1 - ab).sqrt() * eps) / ab.sqrt()
+
+def v_target(x0, eps, ab):
+    """The velocity target used by v-prediction."""
+    return ab.sqrt() * eps - (1 - ab).sqrt() * x0
+
+def eps_from_v(xt, v, ab):
+    """Recover noise from a velocity prediction (for the reverse step)."""
+    return ab.sqrt() * v + (1 - ab).sqrt() * xt
+
+# Sanity check: round-trip consistency on random tensors
+x0 = torch.randn(2, 1, 4, 4); eps = torch.randn_like(x0)
+ab = torch.tensor([0.3, 0.7]).view(-1, 1, 1, 1)
+xt = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+v = v_target(x0, eps, ab)
+assert torch.allclose(eps_from_v(xt, v, ab), eps, atol=1e-5)
+print("parameterizations are mutually consistent")</code></pre>
+<div class="code-caption">Converting between the noise, image, and velocity parameterizations. The assertion confirms they are exact re-encodings: a velocity prediction recovers the same noise the closed form used. Choosing among them is a training-stability decision, not a modeling one.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Velocity prediction got its name and its formula from a 2022 paper on progressive distillation, where the authors needed a target that stayed well-behaved as they repeatedly halved the number of sampling steps. The name evokes physics: $v$ is the instantaneous rate of change along the path from data to noise, and predicting it is like predicting velocity instead of position. Stable Diffusion 2 quietly switched to it, which is why models fine-tuned for one parameterization can misbehave if you load them with a scheduler configured for another.</p>
+</div>
+
+<h2>4. The Network: A Time-Conditioned U-Net <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+For images, the denoiser $\epsilon_\theta$ is almost always a <strong>U-Net</strong>: an encoder that downsamples the image through <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">convolutional</a> blocks, a bottleneck, and a decoder that upsamples back to full resolution, with skip connections joining matching levels. This is the same architecture you met for <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">segmentation in Chapter 24</a>, repurposed: instead of predicting a per-pixel class, it predicts per-pixel noise. Two ingredients make it diffusion-specific. First, the timestep $t$ is embedded (with the sinusoidal encoding of <a href="section-33.1.html">Section 33.1</a>) and injected into every block, usually by adding it to the feature maps, so the same weights behave differently at different noise levels. Second, <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">self-attention</a> layers are inserted at the lower-resolution levels so the network can relate distant regions, which a pure convolution cannot do in one layer. The skip connections matter especially here: they carry the high-frequency detail from the encoder straight to the decoder, exactly the detail that the bottleneck would otherwise lose, and that the denoiser must restore at low noise levels.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: diffusers UNet2DModel</div>
+<p>A correct, attention-augmented, time-conditioned U-Net is several hundred lines of careful PyTorch. The <code>diffusers</code> library gives it to you as a configured class: <code>UNet2DModel(sample_size=64, in_channels=3, out_channels=3, block_out_channels=(128,128,256,256,512,512), down_block_types=(...))</code> builds the full encoder-decoder with residual blocks, the timestep embedding wired into every block, and attention at the resolutions you specify. That is roughly a 300-line reduction over a from-scratch implementation, and the library handles the group-normalization placement, the SiLU activations, and the skip-connection concatenation that are easy to misorder by hand. The forward call <code>unet(noisy_x, timestep).sample</code> returns the predicted noise (or $x_0$ or $v$, per your config) in one line.</p>
+</div>
+
+<h2>5. Putting It Together: The DDPM Training Step <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With the schedule chosen, the parameterization fixed, and the U-Net in hand, the training step is the same three-line idea from <a href="section-33.1.html">Section 33.1</a>, now on real images. The function below is the complete DDPM loss for a batch, and it is what every image-diffusion codebase runs at its core.
+</p>
+
+<pre><code class="language-python">import torch
+
+def ddpm_loss(unet, x0, alpha_bars, T=1000):
+    """One DDPM training step on a batch of images x0 in [-1, 1]."""
+    B = x0.size(0)
+    t = torch.randint(0, T, (B,), device=x0.device)        # random step per image
+    ab = alpha_bars[t].view(B, 1, 1, 1)                     # signal level
+    noise = torch.randn_like(x0)                            # the target
+    xt = ab.sqrt() * x0 + (1 - ab).sqrt() * noise           # closed-form corruption
+    pred = unet(xt, t).sample                               # predicted noise
+    return ((pred - noise) ** 2).mean()                     # L_simple
+
+# Inside a normal training loop:
+# loss = ddpm_loss(unet, batch, alpha_bars)
+# loss.backward(); optimizer.step()</code></pre>
+<div class="code-caption">The full image-diffusion training step, identical in spirit to the 2D toy loop of Section 33.1. The only differences from the toy version are that <code>x0</code> is a batch of images and the denoiser is a U-Net; the diffusion logic, corrupt and predict the noise, is unchanged.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Schedule Swap Rescues a Stalled Training Run</div>
+<p><strong>Who:</strong> a solo researcher fine-tuning a diffusion model on a dataset of 256x256 satellite tiles, 2023. <strong>Situation:</strong> training with the default linear schedule from a tutorial, samples looked muddy and low-contrast even after a week of compute. <strong>Problem:</strong> at 256x256 the linear schedule destroyed the low-frequency structure too early, so the high-noise steps carried no learnable signal and the model never learned the coarse layout that satellite imagery depends on. <strong>Decision:</strong> following the Nichol-Dhariwal finding, she swapped to the cosine schedule (a five-line change to the $\bar\alpha_t$ array) and switched the network from $\epsilon$-prediction to $v$-prediction for stability at the noisy end. <strong>Result:</strong> within two days of further training the samples gained coherent large-scale structure (fields, roads, coastlines) that the linear run never produced, and the FID dropped substantially. <strong>Lesson:</strong> the schedule and parameterization are not incidental defaults; at higher resolution they decide whether the model spends its capacity on signal or on already-destroyed noise. When samples look structurally wrong rather than merely blurry, suspect the schedule before the architecture.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Designing the Schedule and Weighting Properly</div>
+<p>The linear-versus-cosine choice is the tip of a larger design question that the EDM line of work (Karras et al., 2022, arXiv:2206.00364) reframed cleanly: rather than tuning $\beta_t$, parameterize everything in terms of a noise standard deviation $\sigma$ and choose its distribution, the network preconditioning, and the loss weighting to keep the effective target unit-scale at every noise level. EDM's continuous-$\sigma$ formulation and its log-normal sampling of training noise levels became a de facto standard for high-quality models. The 2024 follow-up EDM2 (Karras et al., arXiv:2312.02696) went further, fixing uncontrolled magnitude growth in the network weights and setting the ImageNet generation record at the time. The lesson for a practitioner is that the schedule and loss weighting are first-class hyperparameters; the cosine schedule here is a strong, simple default, but frontier results come from treating the noise-level distribution as something to optimize.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.1: Where Does the KL Go? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The variational bound in subsection 1 has three groups of terms. Explain in a short paragraph why the final term $D_{\mathrm{KL}}(q(x_T \mid x_0) \| p(x_T))$ contributes essentially nothing to the loss and has no learnable parameters, and why the middle KL terms reduce to a squared difference of Gaussian means. Then state, in one sentence, what empirical change DDPM made to the per-timestep weights and why it helped.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.2: Convert Between Parameterizations <span class="exercise-type coding">Coding</span></div>
+<p>Train two copies of the 2D moons denoiser from <a href="section-33.1.html">Section 33.1</a>, one with $\epsilon$-prediction and one with $x_0$-prediction (change the target and adjust the reverse step using the <code>to_x0</code> helper from subsection 3). Sample 512 points from each and overlay them on the true data. Report whether the two produce visibly different sample quality on this easy dataset, and explain why the difference would be larger at high image resolution than on 2D toys.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.2.3: Compare Schedules Quantitatively <span class="exercise-type analysis">Analysis</span></div>
+<p>Using <code>linear_alpha_bars</code> and <code>cosine_alpha_bars</code> from subsection 2, plot the signal-to-noise ratio $\bar\alpha_t / (1 - \bar\alpha_t)$ on a log scale against $t$ for both schedules with $T = 1000$. Identify the timestep range where the two schedules differ most, and write one paragraph arguing, from the curve, why the cosine schedule allocates more "useful" steps. Connect this to the multi-scale coarse-to-fine argument from <a href="section-33.1.html">Section 33.1</a> and to the image-pyramid idea of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.1.html">&#8592; Section 33.1: Destroying &amp; Rebuilding</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.3.html">Section 33.3: The Score-Based View &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

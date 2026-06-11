@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.2: Personalization with LoRA, DreamBooth and Textual Inversion. Teaching a diffusion model a specific subject or style: textual inversion's single learned embedding, DreamBooth's prior-preserving subject binding, LoRA's low-rank adapters, a head-to-head comparison, and how to stack and weight multiple LoRAs at inference." name="description"/>
+<title>Section 35.2: Personalization: LoRA, DreamBooth &amp; Textual Inversion | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Personalization: LoRA, DreamBooth &amp; Textual Inversion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You showed me five photos of your dog and now I cannot stop drawing him. In a spacesuit. On the moon. I regret nothing."</p>
+<cite>A Diffusion Model That Has Bonded With Your Pet</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Personalization teaches a pretrained generator a concept it never saw in training (your face, your product, a particular art style) from a handful of example images, by injecting new knowledge at one of three points in the stack.</strong> Textual inversion adds a new <em>word</em>, a single embedding vector, and changes nothing else. DreamBooth fine-tunes the <em>whole model</em> to bind a subject to a rare token, using a prior-preservation loss so the model does not forget everything else. LoRA inserts small <em>low-rank adapters</em> into the attention layers, the modern default because it is light, composable, and shareable. The three methods sit on a spectrum from "smallest change, least expressive" to "largest change, most expressive," and the practitioner's real skill is choosing the right point on that spectrum for the job.</p>
+</div>
+
+<p>
+<a href="../module-34-text-to-image/index.html">Section 34.6</a> introduced these three methods at the level of "here is what each one does." This section takes them seriously as engineering choices. We work through what each one actually modifies, the loss that keeps DreamBooth from collapsing, the low-rank math that makes LoRA cheap, and a concrete comparison so that when a task lands on your desk you know which to reach for. We close with the production reality that you rarely use one adapter alone: you stack several LoRAs and weight them, which raises its own questions.
+</p>
+
+<h2>1. The Spectrum of Personalization <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Picture the text-to-image stack from <a href="../module-34-text-to-image/index.html">Chapter 34</a> as a line from input to output: text gets embedded, the embeddings condition the U-Net through cross-attention, and the U-Net's weights transform noise into a latent. A new concept can be injected at any of these stages. Inject it at the embedding (add a new word) and you have textual inversion. Inject it into the weights everywhere (fine-tune the U-Net) and you have DreamBooth. Inject it as small additive corrections inside the attention weights and you have LoRA. Figure 35.2.1 places the three on that line.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three personalization methods placed at the embedding, attention-weight, and full-weight stages of the stack">
+<style>
+.s1{font:12px sans-serif;fill:#1a1a1a;}
+.s2{font:10px sans-serif;fill:#555;}
+.stage{fill:#eef0f3;stroke:#8a8f98;stroke-width:1.4;}
+.ti{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.6;}
+.lo{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.6;}
+.db{fill:#fdeee3;stroke:#d6802b;stroke-width:1.6;}
+.fl{stroke:#444;stroke-width:1.6;marker-end:url(#fa);fill:none;}
+</style>
+<defs>
+<marker id="fa" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect class="stage" x="30" y="100" width="110" height="48"/><text class="s2" x="85" y="128" text-anchor="middle">Text embedder</text>
+<rect class="stage" x="300" y="100" width="120" height="48"/><text class="s2" x="360" y="122" text-anchor="middle">U-Net attention</text>
+<text class="s2" x="360" y="138" text-anchor="middle">(cross + self)</text>
+<rect class="stage" x="580" y="100" width="110" height="48"/><text class="s2" x="635" y="128" text-anchor="middle">Latent &#8594; image</text>
+<line class="fl" x1="140" y1="124" x2="298" y2="124"/>
+<line class="fl" x1="420" y1="124" x2="578" y2="124"/>
+<rect class="ti" x="30" y="30" width="110" height="34"/><text class="s2" x="85" y="51" text-anchor="middle">Textual Inversion</text>
+<line class="fl" x1="85" y1="64" x2="85" y2="98"/>
+<text class="s2" x="85" y="190" text-anchor="middle">new word vector</text>
+<rect class="lo" x="305" y="30" width="110" height="34"/><text class="s2" x="360" y="51" text-anchor="middle">LoRA</text>
+<line class="fl" x1="360" y1="64" x2="360" y2="98"/>
+<text class="s2" x="360" y="190" text-anchor="middle">low-rank weight delta</text>
+<rect class="db" x="280" y="200" width="160" height="34"/><text class="s2" x="360" y="221" text-anchor="middle">DreamBooth: all weights</text>
+<line class="fl" x1="200" y1="217" x2="278" y2="217"/>
+<line class="fl" x1="442" y1="217" x2="540" y2="217"/>
+<text class="s2" x="120" y="213" text-anchor="middle" fill="#d6802b">fine-tune</text>
+</svg>
+<figcaption><strong>Figure 35.2.1:</strong> Where each method injects a new concept. Textual inversion (green) adds one vector at the text embedder and freezes everything else. LoRA (blue) adds low-rank deltas inside the attention weights. DreamBooth (orange) fine-tunes the full model. Moving right increases expressive power and the number of trained parameters, but also the risk of overfitting and the storage cost.</figcaption>
+</figure>
+
+<h2>2. Textual Inversion: Learning One Word <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Textual inversion asks the smallest possible question: can a new concept be captured by a single new entry in the embedding table? It freezes the entire model and introduces one new token, written here as <code>&lt;my-cat&gt;</code>, whose embedding vector $v_*$ is the only thing that gets trained. Given a few images of the concept, you run ordinary diffusion training (corrupt the image, predict the noise) on prompts like "a photo of <code>&lt;my-cat&gt;</code>," and backpropagate <em>only into</em> $v_*$. The model's weights never move; you are searching the embedding space for the vector that, when fed through the frozen cross-attention, reconstructs your concept.
+</p>
+
+<div class="math-block">
+$$v_* = \arg\min_{v}\ \mathbb{E}_{x_0,\,\epsilon,\,t}\Big[\big\lVert \epsilon - \epsilon_\theta\big(x_t,\ t,\ c(\text{"a photo of } v\text{"})\big)\big\rVert^2\Big],$$
+</div>
+
+<p>
+where $\theta$ is held fixed and $c(\cdot)$ is the frozen text encoder. The learned artifact is tiny: a single vector of a few thousand floats, often under 10 KB. That is also its limitation. One vector cannot express everything about a complex subject, so textual inversion captures broad style and rough identity well but struggles with fine, exact detail (the precise pattern on a face, the exact logo on a product). It is the method to reach for when you want a shareable, model-agnostic "word" for a look, and the model already knows the rough class your concept belongs to.
+</p>
+
+<h2>3. DreamBooth: Binding a Subject Without Forgetting <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+DreamBooth goes to the other extreme and fine-tunes the whole U-Net so that a rare token (such as <code>sks</code>) becomes a faithful handle on a specific subject. Fine-tuning a giant model on three to five images invites two failures. The first is <strong>overfitting</strong>: the model memorizes the exact training shots and can only reproduce those poses. The second, more insidious, is <strong>language drift</strong> or <strong>catastrophic forgetting</strong>: as the model learns that <code>sks dog</code> means your dog, it starts forgetting what <em>dogs in general</em> look like, and prompts for any dog begin returning your dog.
+</p>
+
+<p>
+DreamBooth's fix is the <strong>prior-preservation loss</strong>. Alongside the few subject images, you generate a few hundred images of the generic class ("a photo of a dog") using the model itself, and train on both sets at once. The subject term teaches the rare token; the class term reminds the model what the broader class looks like, anchoring the prior. The combined objective is
+</p>
+
+<div class="math-block">
+$$\mathcal{L} = \underbrace{\big\lVert \epsilon - \epsilon_\theta(x_t, t, c_{\text{subj}})\big\rVert^2}_{\text{learn the subject}} \;+\; \lambda\,\underbrace{\big\lVert \epsilon' - \epsilon_\theta(x'_{t'}, t', c_{\text{class}})\big\rVert^2}_{\text{preserve the class prior}},$$
+</div>
+
+<p>
+where the second term uses model-generated class images $x'$ with conditioning $c_{\text{class}} = $ "a photo of a dog," and $\lambda$ (often around $1.0$) balances the two. The result is a model that renders your subject in any pose, lighting, and context the prompt asks for, while still being able to draw generic members of the class. The price is size: a full fine-tuned U-Net is gigabytes, and you have one per subject unless you convert it to a LoRA.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Prior Preservation Is Regularization by Self-Generated Data</div>
+<p>
+The class images in DreamBooth are not real; the model generates them from its own prior just before training. This is a clever form of regularization: you are telling the model "whatever you learn about the rare token, do not change your answer to this set of generic prompts you already get right." It is the generative-model version of the rehearsal techniques used against catastrophic forgetting elsewhere in deep learning, and it foreshadows <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>, where models generating their own training data becomes a theme in its own right.
+</p>
+</div>
+
+<h2>4. LoRA: Low-Rank Adapters, the Modern Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+LoRA sits in the productive middle. It comes from the observation, first made for language models in the <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">transfer-learning setting of Chapter 21</a>, that the <em>change</em> a fine-tune makes to a weight matrix is usually low rank: you do not need a full dense update, just a thin one. For a frozen weight matrix $W_0 \in \mathbb{R}^{d \times k}$, LoRA learns a low-rank correction $\Delta W = B A$ where $A \in \mathbb{R}^{r \times k}$ and $B \in \mathbb{R}^{d \times r}$ with rank $r \ll \min(d, k)$, and uses
+</p>
+
+<div class="math-block">
+$$W = W_0 + \frac{\alpha}{r}\,B A.$$
+</div>
+
+<p>
+Only $A$ and $B$ are trained; $W_0$ stays frozen. With $r$ as small as 4 to 16, the adapter has orders of magnitude fewer parameters than the full matrix, so the trained file is a few megabytes rather than gigabytes. $B$ is initialized to zero (the same start-at-identity trick as ControlNet's zero convolutions in <a href="section-35.1.html">Section 35.1</a>), so the model is unchanged at the start of training. The scalar $\alpha / r$ sets the adapter's strength. In diffusion models, LoRA is applied to the attention projection matrices, the same Q, K, V, O matrices you met in the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">attention layers of Chapter 22</a>. The code trains and then loads a LoRA.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+
+# --- Inference: load a trained subject LoRA into a base model. ---
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+
+# A LoRA is a small file of A/B matrices; loading it patches the attention weights.
+pipe.load_lora_weights("my_dog_lora.safetensors", adapter_name="dog")
+pipe.set_adapters(["dog"], adapter_weights=[0.8])   # the alpha/r strength dial
+
+image = pipe(
+    "a photo of sks dog wearing a tiny astronaut helmet on the moon",
+    num_inference_steps=30,
+).images[0]
+image.save("astro_dog.png")</code></pre>
+<div class="code-caption">Loading and weighting a LoRA at inference. The <code>adapter_weights</code> value scales the low-rank correction $\alpha/r \cdot BA$; lowering it toward zero fades the personalization out, raising it past one over-applies the concept. The base model file is untouched on disk.</div>
+
+<p>
+Because a LoRA is just a small additive delta to specific matrices, it has two properties that make it the default. It is <strong>shareable</strong>: a few-megabyte file rather than a multi-gigabyte checkpoint. And it is <strong>composable</strong>: you can load several at once and blend them, which subsection 6 covers. The training script (diffusers ships <code>train_dreambooth_lora.py</code>) combines DreamBooth's prior-preservation idea with LoRA's low-rank parameterization, giving subject fidelity at a fraction of the storage.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The whole reason a LoRA fits in an email attachment is the rank $r$. A full attention matrix update for a 1024-dimensional layer is over a million numbers; a rank-8 LoRA stores two thin matrices, roughly 16,000 numbers, for the same layer. That is why a DreamBooth checkpoint is gigabytes and the equivalent LoRA is megabytes: you are not saving the new model, you are saving the few hundred directions in which it differs from the old one. The "rare token" trick has a similar frugal spirit, the field reached for nonsense strings like <code>sks</code> precisely because the model had almost no prior meaning attached to them, leaving a clean handle to overwrite.</p>
+</div>
+
+<h2>5. Choosing Among the Three <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The three methods are not competitors so much as points on a budget curve. Table 35.2.1 lays out the tradeoffs that decide which to use.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 35.2.1:</strong> <em>Personalization methods compared on what they train, cost, and best use.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Method</th>
+<th scope="col">What it trains</th>
+<th scope="col">Artifact size</th>
+<th scope="col">Images needed</th>
+<th scope="col">Best for</th>
+</tr>
+</thead>
+<tr>
+<td>Textual Inversion</td>
+<td>One embedding vector</td>
+<td>~10 KB</td>
+<td>3 to 5</td>
+<td>Styles, rough identity, shareable "words"</td>
+</tr>
+<tr>
+<td>DreamBooth (full)</td>
+<td>The entire U-Net</td>
+<td>2 to 7 GB</td>
+<td>3 to 5</td>
+<td>Highest subject fidelity, one-off use</td>
+</tr>
+<tr>
+<td>LoRA (DreamBooth-LoRA)</td>
+<td>Low-rank attention deltas</td>
+<td>2 to 200 MB</td>
+<td>5 to 20</td>
+<td>The default: good fidelity, shareable, stackable</td>
+</tr>
+</table>
+</div>
+
+<p>
+The rule of thumb: start with LoRA. It gives most of DreamBooth's fidelity at a thousandth of the storage and composes with other adapters. Reach for full DreamBooth only when you need the absolute best fidelity for one important subject and storage does not matter. Use textual inversion when you want a portable concept word that works across many base models, or when you only need to capture a style rather than an exact subject. All three are referenced in <a href="../module-34-text-to-image/index.html">Chapter 34</a>; the practical difference is almost always storage and composability, which is why the field converged on LoRA.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: peft and the diffusers Training Scripts</div>
+<p>Writing a LoRA layer means subclassing every attention module to add the $BA$ path, hooking the optimizer to train only $A$ and $B$, and serializing just those tensors, perhaps two hundred lines. The Hugging Face <code>peft</code> library does it in one call: <code>get_peft_model(unet, LoraConfig(r=8, target_modules=["to_q","to_k","to_v","to_out.0"]))</code> wraps the attention projections automatically, and <code>save_pretrained</code> writes only the adapter. For the full pipeline, the diffusers <code>train_dreambooth_lora.py</code> script handles prior-preservation image generation, the combined loss, mixed precision, and checkpointing; you supply a folder of images and a config. Implement the low-rank math once for understanding; in practice you run the script.</p>
+</div>
+
+<h2>6. Stacking and Weighting Multiple LoRAs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The composability of LoRA is its quiet superpower and its quiet trap. Because each LoRA is an additive delta to the same matrices, you can load several at once: a subject LoRA for your character, a style LoRA for a watercolor look, and a detail LoRA for sharper textures. diffusers exposes this directly.
+</p>
+
+<pre><code class="language-python">pipe.load_lora_weights("character.safetensors", adapter_name="char")
+pipe.load_lora_weights("watercolor.safetensors", adapter_name="style")
+
+# Blend two adapters with per-adapter weights; they add into the same matrices.
+pipe.set_adapters(["char", "style"], adapter_weights=[0.9, 0.6])
+
+image = pipe("a portrait of sks person, painterly", num_inference_steps=30).images[0]</code></pre>
+<div class="code-caption">Stacking a subject and a style LoRA with independent weights. Because both add deltas to the same attention matrices, their effects superpose, but conflicting concepts can interfere; the weights are the knob you tune to keep one from overwhelming the other.</div>
+
+<p>
+The trap is interference. Two LoRAs that touch the same matrices can fight: a strong style LoRA can wash out a subject's identity, or two subject LoRAs can blend into a chimera. The weights are the first line of defense, but for serious multi-concept work the field has developed merging methods (such as orthogonal or SVD-based merges) that combine adapters with less conflict than naive addition. The practical discipline is to tune one LoRA at a time, then add the next at a low weight and raise it until it just takes effect.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Game Studio Builds a Consistent Character LoRA</div>
+<p><strong>Who:</strong> a four-person concept-art team at an indie game studio, 2024. <strong>Situation:</strong> they needed hundreds of illustrations of the same hero character in different scenes, costumes, and lighting for marketing and in-game art. <strong>Problem:</strong> prompting alone could not hold the character's face and proportions consistent; every image was a slightly different person, and full DreamBooth checkpoints at 4 GB each were unmanageable to version and share across the team. <strong>Decision:</strong> they trained a single DreamBooth-LoRA on twenty clean turnaround renders of the character at rank 16, producing a 40 MB file they checked into their asset repository. They paired it at inference with an existing watercolor style LoRA at weight 0.5. <strong>Result:</strong> a portable, version-controlled character that any team member could load, render in any scene, and restyle by swapping the style LoRA, with the character weight held at 0.9 so identity never drifted. <strong>Lesson:</strong> LoRA's small size and composability turn personalization from a storage problem into an asset-management win; the character became a file you check in, not a model you redeploy.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Personalization Without Training</div>
+<p>The methods above all require a training run, even if a short one. The frontier through 2024 and 2025 is <em>encoder-based</em> or <em>tuning-free</em> personalization: a single forward pass that injects identity from one reference photo with no optimization at all. InstantID (2024, arXiv:2401.07519) and PhotoMaker (CVPR 2024, arXiv:2312.04461) encode a face into conditioning tokens and combine them with an IP-Adapter-style path from <a href="section-35.1.html">Section 35.1</a>, producing identity-consistent images instantly. The same idea generalizes: IP-Adapter-FaceID and the in-context character consistency of FLUX.1 Kontext (2025, arXiv:2506.15742) take a reference image and a prompt and keep the subject without ever updating a weight. The trajectory mirrors the rest of the field: a per-instance optimization gives way to a learned amortized encoder that does the same job in one shot.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.1: Pick the Method <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, choose textual inversion, DreamBooth, or LoRA and justify the choice in one or two sentences using Table 35.2.1: (a) you want to share a "1970s film grain" look that works across SD 1.5, SDXL, and any base model a community member uses; (b) you must reproduce a single celebrity's exact face for one premium ad with no storage constraint; (c) you are building a library of fifty reusable character assets that artists will mix and match. State which property (artifact size, fidelity, composability, model-portability) is decisive in each case.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.2: Train and Strength-Sweep a LoRA <span class="exercise-type coding">Coding</span></div>
+<p>Using diffusers' <code>train_dreambooth_lora.py</code> on 10 to 20 photos of a single object, train a rank-8 LoRA for a rare token. Then, with a fixed prompt and seed, render the object at <code>adapter_weights</code> in $\{0.2, 0.5, 0.8, 1.1, 1.5\}$. Describe the transition from "concept absent" to "concept overcooked" (over-saturated, ignoring the rest of the prompt) and report the weight that best balances fidelity and prompt-following.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.2.3: Why Prior Preservation? <span class="exercise-type analysis">Analysis</span></div>
+<p>Train two DreamBooth models on the same five subject images, one with the prior-preservation term and one without. After each, prompt for a generic member of the class (for example "a photo of a dog" if the subject is a dog) several times. Compare the outputs and explain, in terms of the combined loss in subsection 3, why the model trained without prior preservation begins returning the specific subject for the generic prompt. Connect this to catastrophic forgetting as discussed for transfer learning in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-35.1.html">&#8592; Section 35.1: Spatial Control</a>
+<a href="index.html">Chapter 35</a>
+<a class="next" href="section-35.3.html">Section 35.3: Inpainting &amp; Outpainting &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

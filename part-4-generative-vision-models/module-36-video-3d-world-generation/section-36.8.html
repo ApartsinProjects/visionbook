@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.8: Evaluating World Models: Physical Consistency, Controllability &amp; Coherence. Why FVD and photorealism are not enough: probing physical plausibility, action controllability, long-horizon coherence, and the physics-reasoning benchmarks for generative video." name="description"/>
+<title>Section 36.8: Evaluating World Models | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Evaluating World Models: Physical Consistency, Controllability &amp; Coherence</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me a perfect score on beauty and a passing grade on motion. Then a physicist watched my video, saw a glass of water refill itself, and gave me a zero. We are now arguing about which of them was measuring the right thing."</p>
+<cite>A Video Model Awaiting Its Real Performance Review</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A world model that looks photorealistic can still be physically nonsensical, so evaluating one means measuring properties that appearance metrics like FID and FVD cannot see: does it obey physics, does it respond correctly to actions, and does it stay coherent over long horizons?</strong> This section builds the evaluation triad, physical consistency, controllability, and coherence, that separates a convincing renderer from a genuine simulator, and connects it to the broader generative-evaluation toolkit that <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> formalizes.</p>
+</div>
+
+<p>
+Throughout this chapter the recurring worry has been whether these models have learned the <em>structure</em> of the world or only its <em>surface</em>. <a href="section-36.2.html">Section 36.2</a> noted that text-to-video models fail at counting and conservation; <a href="section-36.6.html">Section 36.6</a> noted that simulators drift and hallucinate; <a href="section-36.7.html">Section 36.7</a> argued the whole pixel objective might be misdirected. All of these are claims about quality that you cannot settle by looking, because the failures hide in dynamics and physics, not in any single frame. Evaluation is therefore not an afterthought here; it is the instrument that decides which models are real progress. And the first thing to establish is why the standard metric is insufficient.
+</p>
+
+<h2>1. Why FID and FVD Are Necessary but Not Sufficient <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The standard generative-video metric is the <strong>Fr&eacute;chet Video Distance</strong> (FVD), the temporal cousin of the Fr&eacute;chet Inception Distance (FID) you will meet in full in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>. FVD embeds real and generated clips with a pretrained video network (an I3D action-recognition model from <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>) and measures the distance between the two distributions of features, modeled as Gaussians:
+</p>
+
+<p>
+$$ \text{FVD} \;=\; \lVert \mu_r - \mu_g \rVert_2^2 \;+\; \operatorname{Tr}\!\left( \Sigma_r + \Sigma_g - 2\,(\Sigma_r \Sigma_g)^{1/2} \right), $$
+</p>
+
+<p>
+where $(\mu_r, \Sigma_r)$ and $(\mu_g, \Sigma_g)$ are the mean and covariance of real and generated feature distributions. This is the same feature-statistics-comparison idea the cross-reference map traces from the humble histograms of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>. FVD is genuinely useful: it captures gross appearance and motion realism and tracks human judgments of overall quality. But it is blind to exactly the failures world models exhibit. A clip where a glass refills itself, an object teleports, or a "turn left" command makes the car go straight can have an excellent FVD, because the feature distribution still looks like real driving video on average. FVD measures distributional realism; it does not measure physical truth, action obedience, or long-range consistency. You must add metrics that probe those directly.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+FVD is the metric equivalent of grading an essay by checking that the right proportion of words are nouns. A video of a glass of water cheerfully refilling itself contains all the textures, lighting, and motion statistics of perfectly normal footage, so FVD nods approvingly while the second law of thermodynamics quietly weeps. The metric is not wrong, it is just answering "does this look like the dataset on average?" when the question you needed was "did the candle get shorter?" Always ask what a single number is actually measuring before you let it run your leaderboard.
+</p>
+</div>
+
+<h2>2. The Evaluation Triad <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Three orthogonal axes, beyond appearance, define a good world model, and each needs its own probe.
+</p>
+
+<p>
+<strong>Physical consistency.</strong> Does the generated world obey physical laws? The cleanest tests are controlled and counterfactual: generate scenarios with known physics (a ball rolling off a table, two objects colliding, a liquid being poured) and check whether the outcome matches the law. Kang et al. (2024), the physical-law study from <a href="section-36.2.html">Section 36.2</a>, do exactly this, varying whether test conditions are in or out of the training distribution to ask whether the model learned the <em>rule</em> or merely interpolated seen motions. Practical proxies include object-permanence checks (track objects through occlusions and verify they reappear correctly), conservation checks (count objects, measure sizes over time), and trajectory-physics checks (fit the generated motion to the expected equation and measure the residual).
+</p>
+
+<p>
+<strong>Controllability.</strong> For an interactive simulator (<a href="section-36.6.html">Section 36.6</a>), does the generated future actually obey the action? This is measured by an <em>action-following</em> score: condition the model on an action, generate, then use a separate perception model (a detector or pose estimator from Parts II and III) to verify the action was carried out. If you command "turn left" and an independent lane-detector confirms the trajectory bent left, the model is controllable; if the video is gorgeous but the car drifts straight, it is not. Controllability is invisible to FVD entirely.
+</p>
+
+<p>
+<strong>Long-horizon coherence.</strong> Does the world stay consistent over time? This targets the drift of <a href="section-36.6.html">Section 36.6</a> and the identity drift of <a href="section-36.1.html">Section 36.1</a>. Probes include re-identification (an object seen early should be recognizable later), loop-closure (turn 360 degrees and the scene should match where you started), and the flow-based warping error of <a href="section-36.1.html">Section 36.1</a> extended over long windows. Coherence degrades gracefully in good models and catastrophically in bad ones, and only a long rollout reveals it.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The world-model evaluation triad: at the base, appearance metrics like FVD measure distributional realism but miss dynamics; above them, three orthogonal axes, physical consistency, controllability, and long-horizon coherence, each with its own probe, are what actually distinguish a simulator from a renderer">
+  <g font-family="sans-serif" font-size="12.5">
+    <rect x="230" y="215" width="360" height="45" fill="#eaecee" stroke="#85929e" stroke-width="1.5" rx="6"/>
+    <text x="410" y="235" text-anchor="middle" font-weight="bold" fill="#566573">Appearance: FID / FVD</text>
+    <text x="410" y="252" text-anchor="middle" font-size="11" fill="#566573">necessary, not sufficient, blind to dynamics</text>
+    <rect x="40" y="70" width="220" height="110" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.6" rx="8"/>
+    <text x="150" y="96" text-anchor="middle" font-weight="bold" fill="#145a32">Physical Consistency</text>
+    <text x="150" y="120" text-anchor="middle" font-size="11" fill="#145a32">objects do not teleport,</text>
+    <text x="150" y="138" text-anchor="middle" font-size="11" fill="#145a32">liquids conserve, gravity holds</text>
+    <text x="150" y="162" text-anchor="middle" font-size="10.5" fill="#145a32">probe: counterfactual physics tests</text>
+    <rect x="300" y="70" width="220" height="110" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.6" rx="8"/>
+    <text x="410" y="96" text-anchor="middle" font-weight="bold" fill="#1a5276">Controllability</text>
+    <text x="410" y="120" text-anchor="middle" font-size="11" fill="#1a5276">the future obeys the action</text>
+    <text x="410" y="138" text-anchor="middle" font-size="11" fill="#1a5276">"turn left" bends left</text>
+    <text x="410" y="162" text-anchor="middle" font-size="10.5" fill="#1a5276">probe: action-following score</text>
+    <rect x="560" y="70" width="220" height="110" fill="#ebdef0" stroke="#7d3c98" stroke-width="1.6" rx="8"/>
+    <text x="670" y="96" text-anchor="middle" font-weight="bold" fill="#512e5f">Long-Horizon Coherence</text>
+    <text x="670" y="120" text-anchor="middle" font-size="11" fill="#512e5f">identity persists, loops close,</text>
+    <text x="670" y="138" text-anchor="middle" font-size="11" fill="#512e5f">no drift over time</text>
+    <text x="670" y="162" text-anchor="middle" font-size="10.5" fill="#512e5f">probe: re-id, warping error</text>
+    <line x1="150" y1="180" x2="320" y2="215" stroke="#85929e" stroke-width="1.2" stroke-dasharray="3,3"/>
+    <line x1="410" y1="180" x2="410" y2="215" stroke="#85929e" stroke-width="1.2" stroke-dasharray="3,3"/>
+    <line x1="670" y1="180" x2="500" y2="215" stroke="#85929e" stroke-width="1.2" stroke-dasharray="3,3"/>
+    <text x="410" y="30" text-anchor="middle" font-weight="bold" fill="#5a626c">What actually separates a simulator from a renderer</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 36.8.1</strong>: The world-model evaluation triad. Appearance metrics (FID, FVD) sit at the base: necessary for ruling out obvious unrealism, but blind to dynamics. The three axes that distinguish a genuine simulator from a beautiful renderer, physical consistency, controllability, and long-horizon coherence, each require a dedicated probe that appearance metrics cannot provide.</figcaption>
+</figure>
+
+<p>
+Figure 36.8.1 organizes the triad over the appearance baseline. The code below implements a concrete controllability probe, the action-following score, which uses an independent perception model exactly as the figure prescribes.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def action_following_score(simulator, perception_model, action_tests):
+    """Controllability: does the generated future obey the commanded action?
+    perception_model independently measures what the generated world actually did."""
+    correct = 0
+    for init_frame, action, expected_effect in action_tests:
+        simulator.reset(init_frame)
+        rollout = [simulator.step(action) for _ in range(16)]   # generate the future
+        # an INDEPENDENT model reads off what actually happened (no peeking at the action)
+        measured = perception_model.measure_effect(rollout)     # e.g. ego-trajectory bend
+        # score 1 if the measured effect matches what the action should have caused
+        correct += int(np.sign(measured) == np.sign(expected_effect)
+                        and abs(measured) > 0.2 * abs(expected_effect))
+    return correct / len(action_tests)
+
+# A model with high FVD but low action-following looks real but ignores control.
+# This single number catches the failure FVD cannot see.
+print(f"action-following: {action_following_score(sim, detector, tests):.2f}")</code></pre>
+<div class="code-caption">A controllability probe: command an action, generate the future, and use an independent perception model to verify the action's effect actually occurred. The score is invisible to FVD and directly measures whether a simulator is steerable rather than merely realistic.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Evaluate the Property, Not the Pixels</div>
+<p>
+The governing principle of world-model evaluation is to measure the property you actually care about with a probe designed for it, rather than hoping a general appearance metric captures it. Physical consistency needs counterfactual physics tests; controllability needs an independent action-following readout; coherence needs long rollouts and re-identification. Each probe borrows a tool from earlier in the book, a detector or tracker from Parts II and III, optical flow from Chapters 15 and 26, used as an objective referee on the generated world. This is also why the predictive models of <a href="section-36.7.html">Section 36.7</a>, which produce no pixels, can still be evaluated: you probe their predicted representations for the same properties, sidestepping appearance entirely. A world model is judged by what it gets right about the world, not by how the world looks.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Leaderboard That Lied</div>
+<p>
+A team building a driving world model tracked FVD as their headline metric and watched it improve steadily across six months of training; the leadership deck showed a confident downward curve and the videos looked stunning. When they finally integrated the model into the planning stack as a scenario generator, the planner trained on its output performed worse on the real closed course than one trained on the old, uglier model. The diagnosis, run too late, was that the new model had optimized appearance realism (driving FVD down) while quietly losing action controllability: commanding a lane change produced beautiful video of a car that subtly did not change lanes, so the planner learned wrong action-outcome associations. The team added the action-following probe and a long-horizon coherence check to their CI dashboard alongside FVD, and the next model that improved on all three transferred correctly. The lesson the tech lead wrote into the team's playbook: <em>FVD is a smoke detector, not a fire inspector; a world model must be measured on physics, control, and coherence, or you will ship a gorgeous model that cannot simulate.</em>
+</p>
+</div>
+
+<h2>3. The Benchmarks and the Open Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A 2024 to 2025 wave of benchmarks operationalizes the triad. VBench and its successors decompose video-generation quality into many interpretable dimensions (subject consistency, motion smoothness, temporal flicker, and increasingly physics and action dimensions) rather than one FVD number. Physics-focused suites (Physion-style intuitive-physics benchmarks adapted to generation, and the controlled physical-law probes of Kang et al., 2024) test prediction of collisions, support, and containment. Action-controllable benchmarks score generated environments on whether the commanded action produced the right effect. The common thread is decomposition: replace a single opaque score with a panel of targeted probes, each measuring one property, so a model cannot hide a dynamics failure behind appearance realism.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: VBench for Decomposed Video Evaluation</div>
+<p>
+Hand-implementing FVD, subject-consistency tracking, motion-smoothness flow analysis, and a dozen other dimensions is a large evaluation codebase. VBench packages the whole decomposed suite:
+</p>
+<pre><code class="language-python"># VBench: a decomposed video-generation benchmark.
+# pip install vbench ; then:
+from vbench import VBench
+bench = VBench(device="cuda", full_info_dir="vbench_info")
+results = bench.evaluate(
+    videos_path="generated_clips/",
+    dimension_list=["subject_consistency", "motion_smoothness",
+                    "temporal_flickering", "dynamic_degree"])
+print(results)   # a per-dimension score panel, not one opaque number</code></pre>
+<div class="code-caption">VBench returns a decomposed per-dimension score panel rather than a single FVD number, so a dynamics failure cannot hide behind appearance realism.</div>
+<p>
+This replaces a sprawling, error-prone evaluation harness, separate implementations of FVD, tracking-based consistency, and flow-based smoothness, with one call that returns a per-dimension panel aligned to human judgments, so you can see <em>which</em> property a model fails rather than only that its single score moved.
+</p>
+</div>
+
+<h2>4. What "Good" Means, and Where the Chapter Lands <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Pulling the chapter together: a world model is good to the extent that it predicts the consequences of being in and acting on a world, measured by physical consistency, controllability, and long-horizon coherence, with appearance realism (FVD) as a necessary floor rather than the goal. This reframing answers the worry that opened the chapter. Video models, 3D generators, and world simulators are all attempts to generate something that must stay consistent with itself, and the evaluation triad is simply the operational definition of that self-consistency along the three axes the chapter added, time, space, and action.
+</p>
+
+<p>
+The arc that ran from a single denoised pixel in <a href="../module-33-diffusion-models/index.html">Chapter 33</a> to a controllable simulator of reality is now complete, and it ends on an evaluation question that is bigger than world models. How do we measure any generative model, manage its risks, and turn it from a curiosity into a trustworthy tool and a data engine? Section 36.8's FVD is one instance of the distribution metrics that <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37: Evaluation, Safety &amp; Generative Data Engines</a> treats in full, and the controllable-simulator capability this chapter celebrated is exactly the capability whose safety and provenance Chapter 37 must confront. The instrument you built here generalizes there.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Toward Physical-Reasoning Evaluation (2024-2026)</div>
+<p>
+World-model evaluation is itself a fast-moving research area. The central 2024 to 2025 result is the controlled physical-law study (Kang et al., 2024) finding that scaling video generation improves in-distribution motion but does not reliably induce out-of-distribution physical laws, sharpening the simulator-versus-renderer debate with real evidence rather than intuition. Alongside it, <strong>decomposed benchmarks</strong> (the VBench line) and <strong>physics-reasoning probes</strong> are maturing into standard tools, and a growing thread uses large multimodal models as automated judges of physical plausibility (asking a vision-language model "is this video physically possible?"), echoing the LLM-as-judge methods that <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> examines critically. The open and consequential question, unresolved as of this writing, is whether passing these evaluations requires architectural commitments (explicit state, the predictive objective of <a href="section-36.7.html">Section 36.7</a>, action conditioning) or simply more scale, the same fork that has run through this entire chapter. How we measure world models will shape which answer the field pursues.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> Construct a generated driving clip that would score an excellent FVD yet be a terrible world model. Identify which of the three triad axes (physical consistency, controllability, coherence) your example violates, and explain precisely why FVD, being a distance between feature distributions, is blind to that violation.</p>
+<p><span class="exercise-type">Coding.</span> Implement a simple physical-consistency probe for a "ball dropped from a height" scenario: generate (or take) a clip, track the ball's vertical position per frame (a detector or color threshold suffices), fit a parabola $y = \tfrac{1}{2} g t^2 + v_0 t + y_0$, and report the fit residual and the implied $g$. Argue how the residual and the recovered $g$ together distinguish a physically faithful model from one that merely produces plausible-looking downward motion.</p>
+<p><span class="exercise-type">Analysis.</span> The chapter presented generative world models (Sections 36.5, 36.6) and predictive ones (Section 36.7). Design an evaluation protocol that can fairly compare a pixel-rendering simulator against a decoder-free JEPA predictor on the same task, given that one produces video and the other produces only embeddings. Which triad axes can be measured for both without rendering, and which require a decoder, and what does that asymmetry imply about how to run a fair benchmark?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.7.html">&#8592; Section 36.7: Predictive World Models: JEPA &amp; Decoder-Free Latents</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37: Evaluation, Safety &amp; Generative Data Engines &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

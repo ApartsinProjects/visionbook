@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.6: Kalman Filters and Multi-Object Data Association. The constant-velocity Kalman filter for tracking, the predict-update cycle, gating, the Hungarian assignment, and the SORT and DeepSORT multi-object tracking pipelines." name="description"/>
+<title>Section 15.6: Kalman Filters &amp; Multi-Object Data Association | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Kalman Filters &amp; Multi-Object Data Association</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me where you think it is, and I will tell you where it actually is, weighted by exactly how much I trust each of you. I am not guessing. I am performing optimal Bayesian inference. Loudly."</p>
+<cite>A Kalman Filter With Justified Confidence</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A tracker that only believes its latest measurement jitters and dies in occlusion; a tracker that maintains a <em>predicted state with uncertainty</em> rides through noise and brief disappearances, and lets you follow many objects at once.</strong> This section adds two ideas that turn the frame-to-frame trackers of <a href="section-15.5.html">Section 15.5</a> into a robust multi-object system. The Kalman filter is the optimal recursive estimator for a linear system under Gaussian noise: it keeps a belief about each object's state (position and velocity), predicts forward by physics, then corrects with each measurement, blending the two by their relative certainties. Data association answers the multi-object question the filter cannot: given this frame's detections and last frame's predicted tracks, which measurement belongs to which object? The Hungarian algorithm solves that assignment optimally, and SORT, the combination of a constant-velocity Kalman filter with Hungarian matching on detection boxes, is the lightweight multi-object tracker that still anchors production pipelines in 2026.</p>
+</div>
+
+<p>
+The appearance trackers of the previous section follow one object by what it looks like, and they have no principled way to handle the moment the object is hidden or to manage several objects at once. This section supplies both missing pieces. First, a motion model that carries a track through gaps by predicting where the object should be, with a calibrated sense of how uncertain that prediction is. Second, an assignment procedure that, every frame, hands each new detection to the right existing track. Together they form the classical backbone of multi-object tracking (MOT), and they connect this chapter directly to the state-estimation thread that the world models of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> later learn rather than hand-specify.
+</p>
+
+<h2>1. State, Prediction, and the Kalman Cycle <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Model a tracked object by a hidden <strong>state vector</strong>. For a point moving in the image plane, a natural choice is position and velocity, $\mathbf{x} = [p_x, p_y, v_x, v_y]^\top$. We never observe the state directly; we observe a noisy <strong>measurement</strong> (a detection's center) $\mathbf{z} = [p_x, p_y]^\top$. The Kalman filter maintains a Gaussian belief over the state, summarized by a mean $\hat{\mathbf{x}}$ and a covariance $P$ (the uncertainty ellipse). Two matrices define the dynamics: the <strong>transition</strong> $F$ advances the state by one time step under constant-velocity physics, and the <strong>measurement</strong> $H$ extracts the observable part (position) from the state.
+</p>
+<p>
+$$ F = \begin{bmatrix} 1 & 0 & \Delta t & 0 \\ 0 & 1 & 0 & \Delta t \\ 0 & 0 & 1 & 0 \\ 0 & 0 & 0 & 1 \end{bmatrix}, \qquad H = \begin{bmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 \end{bmatrix}. $$
+</p>
+<p>
+The filter runs a two-step cycle each frame. The <strong>predict</strong> step pushes the belief forward by the physics and inflates its uncertainty by the process noise $Q$ (how much real motion departs from constant velocity):
+</p>
+<p>
+$$ \hat{\mathbf{x}}^- = F \hat{\mathbf{x}}, \qquad P^- = F P F^\top + Q. $$
+</p>
+<p>
+The <strong>update</strong> step folds in the new measurement $\mathbf{z}$, weighting prediction against measurement by the <strong>Kalman gain</strong> $K$, which is large when the measurement is trusted (small measurement noise $R$) and small when the prediction is trusted:
+</p>
+<p>
+$$ K = P^- H^\top (H P^- H^\top + R)^{-1}, \quad \hat{\mathbf{x}} = \hat{\mathbf{x}}^- + K(\mathbf{z} - H\hat{\mathbf{x}}^-), \quad P = (I - KH)P^-. $$
+</p>
+<p>
+The bracketed term $\mathbf{z} - H\hat{\mathbf{x}}^-$ is the <strong>innovation</strong>, the surprise between what was measured and what was predicted; the gain decides how much of that surprise to believe. Listing 15.6.1 implements the full cycle from scratch on a noisy 2D trajectory so the predict-update mechanics are visible.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+dt = 1.0
+F = np.array([[1, 0, dt, 0],      # constant-velocity transition
+              [0, 1, 0, dt],
+              [0, 0, 1, 0],
+              [0, 0, 0, 1]], float)
+H = np.array([[1, 0, 0, 0],       # we measure position only
+              [0, 1, 0, 0]], float)
+Q = np.eye(4) * 0.01              # process noise: trust the motion model
+R = np.eye(2) * 4.0               # measurement noise: detector jitter (px^2)
+
+x = np.array([0, 0, 1, 0.5], float)   # initial state guess
+P = np.eye(4) * 10.0                   # high initial uncertainty
+
+def predict(x, P):
+    x = F @ x
+    P = F @ P @ F.T + Q
+    return x, P
+
+def update(x, P, z):
+    y = z - H @ x                       # innovation
+    S = H @ P @ H.T + R                 # innovation covariance
+    K = P @ H.T @ np.linalg.inv(S)      # Kalman gain
+    x = x + K @ y
+    P = (np.eye(4) - K @ H) @ P
+    return x, P
+
+# simulate: true point drifts; detector gives noisy positions, with a gap
+for t in range(10):
+    x, P = predict(x, P)
+    if t not in (4, 5):                 # frames 4-5 = occlusion, no detection
+        z = np.array([t * 1.0, t * 0.5]) + np.random.randn(2) * 2
+        x, P = update(x, P, z)
+    print(f"t={t} pos=({x[0]:.2f},{x[1]:.2f}) "
+          f"vel=({x[2]:.2f},{x[3]:.2f}) trace(P)={np.trace(P):.1f}")
+# During the t=4,5 gap the filter coasts on velocity; trace(P) grows
+# (uncertainty rises), then shrinks again once detections resume.</code></pre>
+<div class="code-caption"><strong>Listing 15.6.1:</strong> A constant-velocity Kalman filter from scratch. The predict-only frames (4 and 5) show the filter coasting through an occlusion on its velocity estimate while its uncertainty <code>trace(P)</code> grows, then contracting once measurements resume. This coasting is exactly why a Kalman tracker survives gaps that kill a pure appearance tracker.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Kalman Gain Is an Automatic Trust Dial</div>
+<p>The entire filter reduces to one idea: blend prediction and measurement in proportion to their certainties. When the detector is reliable (small $R$) the gain $K$ is large and the filter follows measurements closely; when the prediction is reliable (small $P^-$, smooth motion) the gain is small and the filter smooths through noise. During occlusion there is no measurement, so the filter runs predict only, coasting on velocity while $P$ grows to advertise its rising doubt. You never hand-tune a smoothing constant; you specify the two noise levels $Q$ and $R$ in physical units, and the optimal blend falls out. For nonlinear dynamics or nonlinear measurements, the Extended and Unscented Kalman filters keep this same predict-update skeleton with a linearization step, which is why this cycle is worth knowing cold.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: A Filter Born on the Way to the Moon</div>
+<p>The predict-update cycle in Listing 15.6.1 is not just textbook decoration; the very same recursion flew on Apollo. The guidance computer ran a Kalman filter to fuse noisy star sightings with inertial measurements, coasting on its state estimate exactly the way our tracker coasts through frames 4 and 5, and NASA engineers reportedly had to talk Kalman's deeply skeptical reviewers into believing it would work. A doorway people-counter and a lunar trajectory run the same four lines of algebra; only the units of $Q$ and $R$ change.</p>
+</div>
+
+<h2>2. The Association Problem and Gating <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+One Kalman filter tracks one object. With many objects and a detector that fires every frame (from <a href="section-15.4.html">Section 15.4</a> blobs or a <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> detector), a new problem appears before any filter can update: <strong>which detection belongs to which track?</strong> This is data association, and it is the hard part of multi-object tracking. The Kalman filter is the enabler here too. Each track predicts where its object should be this frame, with an uncertainty ellipse $S$ (the innovation covariance). A candidate detection's plausibility for that track is its <strong>Mahalanobis distance</strong> from the prediction, which weighs the gap by the prediction's uncertainty:
+</p>
+<p>
+$$ d^2(\text{track } i, \text{detection } j) = (\mathbf{z}_j - H\hat{\mathbf{x}}_i^-)^\top S_i^{-1} (\mathbf{z}_j - H\hat{\mathbf{x}}_i^-). $$
+</p>
+<p>
+<strong>Gating</strong> uses this distance to prune impossible pairings: any detection whose $d^2$ exceeds a chi-squared threshold is too far from the track's prediction to belong to it, and is removed from consideration. Gating shrinks the assignment problem from "every track against every detection" to a sparse set of plausible pairings, and it is what lets the Kalman prediction do most of the associator's work: a track that predicts an object will be in the top-left rarely even considers a detection in the bottom-right.
+</p>
+
+<h2>3. Optimal Assignment: The Hungarian Algorithm <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+After gating, we have a cost matrix: rows are tracks, columns are detections, entries are association costs (Mahalanobis distance, or one minus an intersection-over-union, or an appearance-embedding distance). We want the one-to-one assignment of detections to tracks that minimizes total cost, with each track getting at most one detection and vice versa. Greedily grabbing the cheapest pair, then the next cheapest, is fast but can be badly suboptimal: an early greedy choice can force two later tracks into expensive pairings. The <strong>Hungarian algorithm</strong> (Kuhn, 1955) solves this assignment problem optimally in polynomial time. SciPy exposes it as <code>linear_sum_assignment</code>. Figure 15.6.1 lays out the per-frame multi-object loop that strings prediction, gating, Hungarian assignment, and the Kalman update together.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The multi-object tracking loop: Kalman predict for all tracks, gating against new detections, Hungarian assignment, Kalman update for matched tracks, with two side branches creating new tracks from unmatched detections and deleting tracks that go unmatched too long, then looping to the next frame.">
+  <defs>
+    <marker id="arr156" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+    <marker id="arr156b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b9770e"/>
+    </marker>
+  </defs>
+  <rect x="20" y="40" width="120" height="52" rx="8" fill="#eaf2f8" stroke="#2471a3" stroke-width="1.5"/>
+  <text x="80" y="62" font-family="sans-serif" font-size="12" fill="#1a5276" text-anchor="middle" font-weight="bold">Kalman predict</text>
+  <text x="80" y="78" font-family="sans-serif" font-size="11" fill="#1a5276" text-anchor="middle">all tracks</text>
+  <rect x="175" y="40" width="120" height="52" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="235" y="62" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">gate vs new</text>
+  <text x="235" y="78" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">detections</text>
+  <rect x="330" y="40" width="130" height="52" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="395" y="62" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">Hungarian</text>
+  <text x="395" y="78" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">assignment</text>
+  <rect x="495" y="40" width="130" height="52" rx="8" fill="#e8f8f5" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="560" y="62" font-family="sans-serif" font-size="12" fill="#196f3d" text-anchor="middle" font-weight="bold">Kalman update</text>
+  <text x="560" y="78" font-family="sans-serif" font-size="11" fill="#196f3d" text-anchor="middle">matched tracks</text>
+  <!-- forward arrows -->
+  <line x1="140" y1="66" x2="171" y2="66" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr156)"/>
+  <line x1="295" y1="66" x2="326" y2="66" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr156)"/>
+  <line x1="460" y1="66" x2="491" y2="66" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr156)"/>
+  <!-- birth / death branches -->
+  <rect x="330" y="150" width="150" height="44" rx="8" fill="#fef9e7" stroke="#b9770e" stroke-width="1.5"/>
+  <text x="405" y="170" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">unmatched detection</text>
+  <text x="405" y="186" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">to new track (birth)</text>
+  <rect x="510" y="150" width="150" height="44" rx="8" fill="#fdedec" stroke="#922b21" stroke-width="1.5"/>
+  <text x="585" y="170" font-family="sans-serif" font-size="11.5" fill="#922b21" text-anchor="middle">track unmatched too</text>
+  <text x="585" y="186" font-family="sans-serif" font-size="11.5" fill="#922b21" text-anchor="middle">long, delete (death)</text>
+  <line x1="395" y1="92" x2="405" y2="146" stroke="#b9770e" stroke-width="1.8" marker-end="url(#arr156b)"/>
+  <line x1="560" y1="92" x2="585" y2="146" stroke="#922b21" stroke-width="1.8" marker-end="url(#arr156)"/>
+  <!-- loop back -->
+  <path d="M 560 92 L 560 120 L 80 120 L 80 96" fill="none" stroke="#2c3e50" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr156)"/>
+  <text x="320" y="245" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">repeat every frame; births and deaths manage the changing set of objects</text>
+</svg>
+<figcaption><strong>Figure 15.6.1</strong> The multi-object tracking loop (the SORT recipe). Every frame: Kalman-predict all existing tracks, gate them against the frame's detections, solve the optimal assignment with the Hungarian algorithm, and Kalman-update each matched track. Two side branches manage the changing object set: unmatched detections spawn new tracks (birth), and tracks that go unmatched for too many frames are deleted (death).</figcaption>
+</figure>
+
+<p>
+Listing 15.6.2 builds a minimal SORT-style associator: predict every track's box, score track-detection pairs by intersection-over-union, gate weak pairs, and solve the assignment with the Hungarian algorithm.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+def iou(a, b):
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes (Chapter 23 metric)."""
+    xa, ya = max(a[0], b[0]), max(a[1], b[1])
+    xb, yb = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+def associate(track_boxes, det_boxes, iou_gate=0.3):
+    """Match predicted track boxes to detections; return matched index pairs."""
+    if not track_boxes or not det_boxes:
+        return [], list(range(len(track_boxes))), list(range(len(det_boxes)))
+    # cost = 1 - IoU; Hungarian minimizes total cost = maximizes total overlap
+    cost = np.array([[1 - iou(t, d) for d in det_boxes] for t in track_boxes])
+    rows, cols = linear_sum_assignment(cost)
+
+    matches, un_tracks, un_dets = [], [], []
+    matched_d = set()
+    for r, c in zip(rows, cols):
+        if 1 - cost[r, c] < iou_gate:        # gating: reject weak overlaps
+            un_tracks.append(r)
+        else:
+            matches.append((r, c)); matched_d.add(c)
+    un_tracks += [r for r in range(len(track_boxes)) if r not in rows]
+    un_dets = [c for c in range(len(det_boxes)) if c not in matched_d]
+    return matches, un_tracks, un_dets
+
+# Per frame: matches -> Kalman update; un_dets -> birth new tracks;
+# un_tracks unmatched for > max_age frames -> delete (death).</code></pre>
+<div class="code-caption"><strong>Listing 15.6.2:</strong> The associator at the heart of SORT. The cost matrix is one minus the IoU of each predicted-track box against each detection; <code>linear_sum_assignment</code> finds the globally optimal one-to-one matching; the gate rejects weak overlaps so an unrelated detection never hijacks a track. Matched pairs feed the Kalman update of Listing 15.6.1; unmatched detections and tracks drive births and deaths.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SORT and ByteTrack in a Handful of Lines</div>
+<p>The complete SORT loop (a Kalman filter per track, IoU cost, Hungarian assignment, birth and death management) is a few hundred lines, and the original author's <code>sort.py</code> is famously about 300. You rarely write it: <code>ultralytics</code> ships ByteTrack and BoT-SORT behind <code>model.track(source, tracker="bytetrack.yaml")</code>, attaching a persistent <code>id</code> to every detection box with no association code on your side. Standalone, <code>boxmot</code> packages SORT, DeepSORT, OC-SORT, ByteTrack, and StrongSORT behind one interface. Implement the associator of Listing 15.6.2 once to understand what those <code>id</code> numbers cost; use the library tracker in anything that ships, and connect it to the detectors of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>.</p>
+</div>
+
+<h2>4. From SORT to DeepSORT: Adding Appearance <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+SORT associates purely on geometry: Kalman-predicted position and IoU overlap. It is astonishingly effective for its size, but it has one characteristic failure, the <strong>identity switch</strong>. When two objects cross or one is occluded for several frames, geometry alone cannot tell which track each reappearing detection continues, and the IDs swap. <strong>DeepSORT</strong> (Wojke et al., 2017) fixes this by adding an <em>appearance embedding</em>: a small network produces a feature vector per detection (a learned descriptor, the deep cousin of the hand-crafted descriptors of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>), and the association cost combines the Mahalanobis motion distance with the cosine distance between embeddings. Two crossing pedestrians now keep their identities because their appearances differ even when their predicted positions briefly coincide. ByteTrack (2022) took a different, complementary route: associate high-confidence detections first, then recover low-confidence ones in a second pass, recovering occluded objects without any appearance model at all.
+</p>
+<p>
+This is where the chapter's tracking thread hands off. The motion model is hand-specified here (constant velocity, fixed noise); learned multi-object trackers in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a> replace the hand-crafted embedding and increasingly the association logic itself with end-to-end networks. And the deeper idea, maintaining a belief about a hidden state and updating it as observations arrive, is the seed of the latent-dynamics state estimation that the world models of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> learn from data, where a neural network plays the role that $F$, $Q$, and $R$ play in this section.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Warehouse Forklift Safety Zones</div>
+<p><strong>Who:</strong> A safety-systems integrator installing an overhead-camera system to warn when a pedestrian and a forklift converge in a warehouse aisle.</p>
+<p><strong>Situation:</strong> Ceiling cameras feed a learned detector that emits pedestrian and forklift boxes per frame. The system must hold a stable identity per person and per forklift to estimate each one's velocity and predict whether their paths will intersect within two seconds.</p>
+<p><strong>Problem:</strong> Detection-only operation was useless for the safety logic: detectors flicker (a person is missed for two or three frames behind a rack), and without persistent identities there was no velocity to extrapolate, so the path-prediction warning could not be computed. A pure correlation-filter tracker per object drifted and swapped identities when forklifts passed pedestrians.</p>
+<p><strong>Decision:</strong> A DeepSORT pipeline. A constant-velocity Kalman filter per object supplied the velocity for path prediction and coasted each track through the two-to-three-frame detection dropouts. Hungarian assignment on a combined IoU-plus-appearance cost kept identities stable through the frequent pedestrian-forklift crossings, where the appearance embedding broke the geometric ambiguity that had caused the swaps.</p>
+<p><strong>Result:</strong> Identity switches during crossings dropped by roughly an order of magnitude versus geometry-only SORT, the Kalman velocity gave a clean two-second path-intersection prediction, and the safety alarm's false-positive rate fell to a level the warehouse operators would actually leave switched on.</p>
+<p><strong>Lesson:</strong> The detector finds objects; the Kalman filter gives them velocity and memory through dropouts; data association gives them stable identity. The safety feature was impossible with any one of the three alone, and the appearance term was what made identity survive the crossings that geometry could not resolve.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where MOT Is Heading (2024-2026)</div>
+<p>The SORT family remains the benchmark backbone, but recent work pushes in two directions. End-to-end transformer trackers (MOTR, MeMOTR, and successors) fold detection and association into a single network with track queries that persist across frames, removing the explicit Kalman-plus-Hungarian stage; they trade engineering simplicity for heavy training and compute. In the opposite direction, motion-model refinements keep the classical pipeline competitive at near-zero cost: OC-SORT (CVPR 2023) repairs the Kalman filter's behavior through long occlusions by re-anchoring on the last observation, and 2024 variants tune the noise handling for nonlinear and camera-motion-heavy scenes. Foundation-model tracking is the third front: SAM 2 (<a href="https://arxiv.org/abs/2408.00714" target="_blank" rel="noopener">arXiv:2408.00714</a>) tracks prompted objects with a memory bank and pixel masks, blurring the line between segmentation and MOT. The standing 2026 advice mirrors the rest of this chapter: SORT or ByteTrack plus a good detector is the high-throughput default; reach for appearance (DeepSORT, StrongSORT) when crossings cause identity switches, and for a transformer tracker only when a GPU budget and accuracy demands justify it. The learned end of this spectrum is developed in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.1: Reading the Kalman Gain <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using Listing 15.6.1, predict qualitatively what happens to the gain $K$ and the trajectory smoothness in three regimes: (a) $R$ very large relative to $Q$ (a very noisy detector), (b) $Q$ very large relative to $R$ (an erratically maneuvering object), and (c) the occlusion frames where no measurement arrives. For each, state whether the filter follows measurements or its own prediction, and explain in one sentence why <code>trace(P)</code> grows during occlusion and shrinks once detections resume.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.2: A Working Two-Object Tracker <span class="exercise-type coding">Coding</span></div>
+<p>Combine Listings 15.6.1 and 15.6.2 into a minimal multi-object tracker. Run a detector (or background-subtraction blobs from <a href="section-15.4.html">Section 15.4</a>) on a clip with two or three moving objects; maintain one Kalman filter per track; each frame, predict, associate by IoU with <code>linear_sum_assignment</code>, update matched tracks, birth tracks for unmatched detections, and delete tracks unmatched for more than three frames. Draw each track's persistent ID. Then engineer a crossing of two same-sized objects and report how often the IDs switch. Explain why an appearance term (DeepSORT) would reduce the switches.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.6.3: Greedy Versus Optimal Assignment <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct a 3-track by 3-detection cost matrix on which greedy nearest-neighbor assignment (repeatedly take the globally cheapest remaining pair) gives a strictly higher total cost than the Hungarian optimum. Solve both by hand and with <code>scipy.optimize.linear_sum_assignment</code>, and report the cost gap. Then argue, in terms of this example, why a multi-object tracker in a crowded scene benefits from optimal assignment, and describe a situation where the practical difference is negligible (so greedy is acceptable for speed).</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.5.html">&#8592; Section 15.5: Object Tracking: Mean-Shift, Correlation Filters &amp; Re-Detection</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="../module-16-classical-recognition/index.html">Chapter 16: Classical Recognition Pipelines &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

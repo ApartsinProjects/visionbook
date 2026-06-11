@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.5: The Training Loop: Losses, Metrics &amp; Checkpointing. The canonical PyTorch training loop with train and validation phases, loss and metric tracking, early stopping, and saving the best model." name="description"/>
+<title>Section 18.5: The Training Loop: Losses, Metrics &amp; Checkpointing | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>The Training Loop: Losses, Metrics &amp; Checkpointing</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Every epoch I do the same five things in the same order. People call it a loop. I call it a discipline, and it is the only reason any of you trust the number at the end."</p>
+<cite>A Training Loop That Never Skips a Step</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The training loop is the one piece of code that recurs, lightly disguised, in every deep learning project in this book: for each batch, zero the gradients, run the forward pass, compute the loss, run backward, and step the optimizer, wrapped in train and validation phases that track metrics and checkpoint the best model.</strong> This section assembles that loop from the parts built in Sections 18.1 through 18.4, and once you can write it from memory, every later chapter becomes a story about what to plug into it.</p>
+</div>
+<p>
+We now have all the parts. <a href="section-18.1.html">Section 18.1</a> gave us a model, <a href="section-18.2.html">Section 18.2</a> the optimizer and loss, <a href="section-18.3.html">Section 18.3</a> the PyTorch abstractions, and <a href="section-18.4.html">Section 18.4</a> the data stream. The training loop is the conductor that brings them together. It is short, perhaps forty lines, and it is the single most important code in this entire book to understand cold, because the convolutional networks of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>, the transformers of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, and even the diffusion models of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> are all trained by this same loop with a different model and loss swapped in.
+</p>
+<h2>1. The Five-Step Core <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+At the heart of training is a five-step ritual performed once per batch, in this exact order. Zero the gradients (because they accumulate, as <a href="section-18.3.html">Section 18.3</a> warned). Run the forward pass to get predictions. Compute the scalar loss. Run <code>loss.backward()</code> to fill every parameter's gradient. Call <code>optimizer.step()</code> to update the parameters. Figure 18.5.1 lays out the full loop, with this core nested inside the epoch and phase structure.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The training loop structure. An outer epoch loop contains a training phase and a validation phase. The training phase runs the five-step core per batch. The validation phase runs forward only under no-grad, computes metrics, and checkpoints the model when validation improves.">
+  <g font-family="sans-serif" font-size="12">
+    <rect x="20" y="20" width="740" height="280" rx="8" fill="none" stroke="#5a626c" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <text x="40" y="42" font-weight="bold" fill="#5a626c">for epoch in range(num_epochs):</text>
+
+    <!-- train phase -->
+    <rect x="45" y="56" width="340" height="150" rx="6" fill="#eef6fb" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="215" y="78" text-anchor="middle" font-weight="bold" fill="#1b4f72">TRAIN phase: model.train()</text>
+    <rect x="65" y="90" width="300" height="100" rx="5" fill="#d4e6f1" stroke="#2980b9"/>
+    <text x="215" y="108" text-anchor="middle" fill="#1b4f72">for batch in train_loader:</text>
+    <text x="80" y="128" fill="#1b4f72">1. optimizer.zero_grad()</text>
+    <text x="80" y="144" fill="#1b4f72">2. logits = model(x)</text>
+    <text x="80" y="160" fill="#1b4f72">3. loss = criterion(logits, y)</text>
+    <text x="80" y="176" fill="#1b4f72">4. loss.backward()  5. optimizer.step()</text>
+
+    <!-- val phase -->
+    <rect x="405" y="56" width="335" height="150" rx="6" fill="#eafaf1" stroke="#1e8449" stroke-width="1.5"/>
+    <text x="572" y="78" text-anchor="middle" font-weight="bold" fill="#145a32">VALIDATION: model.eval()</text>
+    <rect x="425" y="90" width="295" height="100" rx="5" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="572" y="108" text-anchor="middle" fill="#145a32">with torch.no_grad():</text>
+    <text x="440" y="128" fill="#145a32">forward only, NO backward</text>
+    <text x="440" y="144" fill="#145a32">accumulate loss + accuracy</text>
+    <text x="440" y="160" fill="#145a32">if val_acc &gt; best:</text>
+    <text x="455" y="176" fill="#145a32">save checkpoint</text>
+
+    <text x="40" y="232" font-weight="bold" fill="#9c4a00">scheduler.step()</text>
+    <text x="200" y="232" fill="#5a626c">adjust the learning rate for the next epoch</text>
+    <text x="40" y="262" font-weight="bold" fill="#c0392b">early stop</text>
+    <text x="200" y="262" fill="#5a626c">if validation has not improved for N epochs, halt</text>
+    <text x="40" y="288" fill="#5a626c">at the end: load the best checkpoint, evaluate once on the test set</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 18.5.1</strong> The canonical training loop. The outer epoch loop contains a train phase (blue) running the five-step core per batch, and a validation phase (green) that runs forward only under <code>no_grad</code>, tracks metrics, and checkpoints when validation improves. The scheduler advances the learning rate, early stopping halts a stalled run, and the test set is evaluated exactly once at the very end.</figcaption>
+</figure>
+<h2>2. The Complete Loop in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The code below is the whole loop, assembled from the chapter's parts and runnable end to end. It separates the train and validation phases, toggles <code>model.train()</code> and <code>model.eval()</code> as <a href="section-18.3.html">Section 18.3</a>'s practical example taught, wraps validation in <code>torch.no_grad()</code>, tracks both loss and accuracy, and saves the model whenever validation accuracy reaches a new best. Read it as the reference implementation: every training script in Part III is a variation on it.
+</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+def run_epoch(model, loader, criterion, optimizer, device, train):
+    model.train() if train else model.eval()
+    total_loss, correct, n = 0.0, 0, 0
+    with torch.set_grad_enabled(train):      # build the graph only in the train phase; restored on exit
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)    # move batch to GPU
+            if train:
+                optimizer.zero_grad()            # 1. reset accumulated gradients
+            logits = model(x)                    # 2. forward pass
+            loss = criterion(logits, y)          # 3. scalar loss
+            if train:
+                loss.backward()                  # 4. fill .grad on every parameter
+                optimizer.step()                 # 5. update parameters
+            total_loss += loss.item() * x.size(0)
+            correct += (logits.argmax(1) == y).sum().item()
+            n += x.size(0)
+    return total_loss / n, correct / n       # average loss, accuracy
+
+def train_model(model, train_loader, val_loader, epochs=20,
+                lr=3e-4, device="cuda", patience=5):
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    best_acc, stale = 0.0, 0
+    for epoch in range(epochs):
+        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
+        va_loss, va_acc = run_epoch(model, val_loader,   criterion, optimizer, device, train=False)
+        scheduler.step()                     # advance the LR schedule
+        if va_acc &gt; best_acc:                # checkpoint the best model only
+            best_acc, stale = va_acc, 0
+            torch.save({"model": model.state_dict(), "epoch": epoch,
+                        "val_acc": va_acc}, "best.pt")
+        else:
+            stale += 1
+            if stale &gt;= patience:            # early stopping
+                print(f"early stop at epoch {epoch}; best val acc {best_acc:.4f}")
+                break
+        print(f"epoch {epoch:02d}  train {tr_acc:.4f}  val {va_acc:.4f}")
+    return best_acc</code></pre>
+<div class="code-caption">The complete training loop: <code>run_epoch</code> handles both phases via a <code>train</code> flag, and <code>train_model</code> wires the AdamW optimizer and cosine schedule from <a href="section-18.2.html">Section 18.2</a>, checkpoints the best validation accuracy, and stops early when validation stalls for <code>patience</code> epochs.</div>
+<p>
+A few details earn their place. <code>loss.item()</code> pulls a Python float off the GPU tensor and detaches it from the graph (calling it inside the loop without <code>.item()</code> would silently retain the entire graph and leak memory). Multiplying by <code>x.size(0)</code> before summing correctly weights the final partial batch when averaging. And the checkpoint saves the <code>state_dict</code> (the parameter tensors) rather than the whole model object, which is the portable, version-robust way PyTorch recommends; you reload it into a freshly constructed model with <code>model.load_state_dict(torch.load("best.pt")["model"])</code>.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Train-Validation Gap Is Your Diagnostic Dashboard</div>
+<p>The two numbers printed each epoch, training accuracy and validation accuracy, tell you almost everything about the health of a run. If both are low and flat, the model is <em>underfitting</em>: too small, too regularized, or the learning rate is wrong. If training accuracy climbs toward perfect while validation stalls or falls, the model is <em>overfitting</em>: it is memorizing the training set, and you need more data, more augmentation (<a href="section-18.4.html">Section 18.4</a>), or more regularization. A healthy run shows both rising together with validation a little below training. You learn to read these two curves the way a pilot reads an instrument panel, and <a href="../module-21-training-recipes/index.html">Chapter 21</a> turns that reading into a systematic recipe.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>A network that scores 100 percent on training and 60 percent on validation has not learned to see; it has memorized the answer key and panics at the actual exam. This is overfitting, and the train-validation gap is the lie detector that catches it. The two curves are a tiny soap opera you check every epoch: rising together is romance, training racing ahead while validation sulks is betrayal. <strong>Trust the validation number, never the training one</strong>, because the only grade that counts is the one on data the model has never met.</p>
+</div>
+<h2>3. Choosing the Loss and the Metric <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+The <strong>loss</strong> is what the optimizer minimizes; the <strong>metric</strong> is what you actually care about, and they are often different. For multi-class classification the loss is cross-entropy (<a href="section-18.2.html">Section 18.2</a>); for multi-label problems it is binary cross-entropy per label; for regression it is mean squared or L1 error. The metric, by contrast, is chosen for human interpretability and business relevance: accuracy when classes are balanced, but per-class precision, recall, and F1 when they are not, exactly the lesson from the imbalanced-data practical example in <a href="section-18.4.html">Section 18.4</a>. You minimize cross-entropy because it is smooth and differentiable, but you report F1 because that is what tells you whether the defect detector works. As the book proceeds, the metrics specialize, mean average precision for object detection in <a href="../module-23-object-detection/index.html">Chapter 23</a> and intersection-over-union for segmentation in <a href="../module-24-segmentation/index.html">Chapter 24</a>, but the loss-versus-metric distinction is constant.
+</p>
+<h2>4. Checkpointing, Resuming, and Early Stopping <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Two failure modes motivate checkpointing. First, the best model is rarely the last one: a run that trains for 20 epochs may peak at epoch 12 and degrade afterward, so saving only the final weights throws away the best result, which is why the loop above saves on every validation improvement. Second, long runs crash, machines preempt, and spot instances vanish; a periodic full checkpoint (model, optimizer state, scheduler state, and epoch number) lets you resume exactly where you left off rather than restarting from scratch. The optimizer state matters because Adam's momentum buffers (<a href="section-18.2.html">Section 18.2</a>) are part of the training state; resuming without them restarts the optimizer cold. <strong>Early stopping</strong>, halting when validation has not improved for a patience window, both saves compute and acts as a regularizer by preventing the overfitting phase, and the loop above implements it in four lines.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PyTorch Lightning Absorbs the Boilerplate</div>
+<p>The loop above is worth writing once by hand to understand it, but in production you rarely re-derive it. PyTorch Lightning reduces the entire <code>train_model</code> function to a <code>LightningModule</code> with a <code>training_step</code> and <code>validation_step</code>, then a <code>Trainer(max_epochs=20, precision="16-mixed")</code> that handles the epoch loop, device placement, the AMP scaling of <a href="section-18.6.html">Section 18.6</a>, checkpointing, early-stopping callbacks, multi-GPU distribution, and logging, perhaps 50 lines of careful boilerplate collapsed to a handful and a config. The catch is that when something breaks you must know what it automated, which is exactly why this section builds the loop transparently first. torchmetrics similarly replaces hand-rolled accuracy and F1 accumulation with correct, distributed-aware metric objects.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Run That Trained All Weekend and Saved the Wrong Epoch</div>
+<p><strong>Who:</strong> A research engineer at a medical-imaging startup training a tissue classifier on a tight GPU budget.</p>
+<p><strong>Situation:</strong> A 60-epoch run finished over a weekend. The script saved the model at the end of training, and Monday's evaluation showed disappointing test accuracy, several points below what the validation prints had shown midway through.</p>
+<p><strong>Problem:</strong> The validation accuracy had peaked around epoch 30 and then slowly declined as the model overfit the training set for the remaining 30 epochs. Saving only the final weights captured the overfit model, not the best one. The good model had existed on Saturday and been overwritten.</p>
+<p><strong>Decision:</strong> The engineer rewrote the loop to checkpoint on every validation improvement (the <code>if va_acc &gt; best_acc</code> pattern above) and added early stopping with a patience of 8 epochs, so future runs would both keep the best model and stop wasting compute once it stopped improving.</p>
+<p><strong>Result:</strong> Re-running recovered the epoch-30-quality model, which matched the validation prints, and the early-stopping cut the wasted weekend compute in half. The fix was a dozen lines and saved both accuracy and GPU hours on every subsequent run.</p>
+<p><strong>Lesson:</strong> "Save the model" must mean "save the <em>best</em> model", validated on held-out data, not "save whatever weights happen to be in memory when the loop exits." Checkpoint on improvement, and the best result is never more than one validation pass old.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Smarter Stopping and Weight Averaging</div>
+<p>The plain best-checkpoint-plus-early-stopping recipe is being refined. Stochastic Weight Averaging (Izmailov et al.) and its later variants average the weights from several late-training checkpoints into a single model that often generalizes better than any individual one, and Model Soups (Wortsman et al., 2022) average independently fine-tuned models for a free accuracy bump that remains a standard 2024 to 2026 trick on vision benchmarks. Exponential moving averages of the weights, long standard in generative training, are now common in supervised vision too. On the stopping side, learning-curve extrapolation and budget-aware schedulers decide when to halt a run that is unlikely to improve, freeing compute for more promising configurations. All of these sit on top of the same loop; they change which weights you keep, not how you compute the gradient.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.5.1: Read the Two Curves <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following train and validation accuracy trajectories, diagnose the condition and prescribe the next action: (a) train 0.55, val 0.54, both flat for ten epochs; (b) train 0.99, val 0.71, with val falling after epoch 15; (c) train 0.88, val 0.86, both still rising at the last epoch; (d) train and val both oscillating wildly between epochs. For each, name underfitting, overfitting, undertraining, or instability, and state the single most likely fix, linking each to the relevant earlier section.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.5.2: Add Resumption to the Loop <span class="exercise-type coding">Coding</span></div>
+<p>Extend <code>train_model</code> to support crash recovery. Save a full checkpoint (model, optimizer, scheduler state dicts, and epoch) every epoch to <code>last.pt</code>, and at startup, if <code>last.pt</code> exists, reload all four and resume from the saved epoch. Verify correctness by training for five epochs, killing the process, restarting, and confirming the loss continues smoothly rather than spiking, which would indicate the optimizer momentum buffers were not restored. Explain why restoring the optimizer state, not just the model weights, is necessary for a clean resume.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.5.3: Loss Down, Metric Flat <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct an imbalanced binary dataset (95 percent class 0). Train the chapter's MLP and log both the cross-entropy loss and three metrics each epoch: accuracy, class-1 recall, and class-1 F1. Produce a run where the loss falls steadily and accuracy stays high while class-1 recall stays near zero. Explain why minimizing cross-entropy can drive the loss down without improving the metric you care about, and state what change to the data pipeline (link to <a href="section-18.4.html">Section 18.4</a>) or the loss would break the pathology.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-18.4.html">&#8592; Section 18.4: Datasets, DataLoaders &amp; Input Pipelines</a>
+<a href="index.html">Chapter 18</a>
+<a class="next" href="section-18.6.html">Section 18.6: GPUs, Mixed Precision &amp; Reproducibility &#8594;</a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

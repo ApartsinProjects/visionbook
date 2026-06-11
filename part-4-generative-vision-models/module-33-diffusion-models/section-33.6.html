@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.6: Guidance. How to steer diffusion generation toward a class or a prompt: classifier guidance using the gradient of a noise-robust classifier, and the now-dominant classifier-free guidance that trains one network on both conditional and unconditional objectives and extrapolates between them at sampling time." name="description"/>
+<title>Section 33.6: Guidance | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Guidance: Classifier &amp; Classifier-Free</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Left to my own devices I will draw you something plausible. Whisper a label in my ear and turn the dial up, and I will draw you something unmistakable, occasionally at the cost of subtlety."</p>
+<cite>A Conditional Generator With a Volume Knob</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Guidance is the mechanism that lets you steer a diffusion model toward a condition (a class, a text prompt) and dial how strongly it obeys: classifier guidance nudges each sampling step along the gradient of a separately-trained classifier, while classifier-free guidance, which now dominates, trains one network to predict noise both with and without the condition and then extrapolates away from the unconditional prediction at sampling time.</strong> The single scalar guidance scale is the "prompt strength" or "CFG" slider in every image tool: turn it up for tighter adherence and higher fidelity, down for more diversity and fewer artifacts. This section derives both methods from the score view of <a href="section-33.3.html">Section 33.3</a> and shows the few lines of code that implement the version everyone uses.</p>
+</div>
+
+<p>
+So far the chapter has built <em>unconditional</em> generators that sample some image from the data distribution. Useful generation is almost always conditional: you want a photo of a specific class, or an image matching a text prompt. <a href="section-33.2.html">Section 33.2</a> showed how to condition the network by feeding it an extra input, the network simply takes the class or text embedding alongside the noisy image. But conditioning alone is often too weak; the model treats the condition as a gentle suggestion and produces only loosely related images. Guidance is the technique that amplifies the condition's influence. We start with the original classifier guidance to build intuition from the score, then derive classifier-free guidance, the method that powers modern systems, and discuss the fidelity-diversity trade-off the guidance scale controls.
+</p>
+
+<h2>1. Conditioning vs Guidance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To condition a diffusion model, you give the denoiser the condition $c$ as an additional input: $\epsilon_\theta(x_t, t, c)$. For a class label, $c$ is an embedding added to the timestep embedding; for text, $c$ is a sequence of token embeddings consumed by the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">cross-attention</a> layers of the U-Net, the same attention mechanism from <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>, where the image features form the queries and the text tokens form the keys and values. This is genuine conditioning, and a well-trained conditional model does respond to $c$. The problem is calibration: maximum-likelihood training spreads probability over everything consistent with $c$, which is a lot, so samples often capture the gist of the condition but not its full specificity. Guidance sharpens the conditional distribution, biasing samples toward regions where the condition is strongly satisfied, at some cost to diversity. The next two subsections give two ways to do it.
+</p>
+
+<h2>2. Classifier Guidance <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The score view of <a href="section-33.3.html">Section 33.3</a> makes guidance almost obvious. We want to sample from the conditional distribution $p(x \mid c)$, whose score is $\nabla_x \log p(x_t \mid c)$. By Bayes' rule, $\log p(x_t \mid c) = \log p(x_t) + \log p(c \mid x_t) - \log p(c)$, and taking the gradient (the last term vanishes since it does not depend on $x$):
+</p>
+
+<div class="math-block">
+$$\nabla_x \log p(x_t \mid c) = \underbrace{\nabla_x \log p(x_t)}_{\text{unconditional score}} + \underbrace{\nabla_x \log p(c \mid x_t)}_{\text{classifier gradient}}.$$
+</div>
+
+<p>
+The first term is the score the diffusion model already estimates (via its noise prediction, per the identity in <a href="section-33.3.html">Section 33.3</a>), the same gradient-of-log-density object you met in the energy-based models of <a href="../module-30-generative-foundations/index.html">Chapter 30</a>. The second term is the gradient of a <strong>classifier</strong> that predicts the condition from the noisy image. So Dhariwal and Nichol's classifier guidance trains a separate classifier on noisy images and, at each sampling step, adds a multiple $s$ of its gradient to the score:
+</p>
+
+<div class="math-block">
+$$\tilde\epsilon_\theta(x_t, t, c) = \epsilon_\theta(x_t, t) - s\,\sqrt{1 - \bar\alpha_t}\ \nabla_x \log p_\phi(c \mid x_t).$$
+</div>
+
+<p>
+The guidance scale $s$ controls how hard the classifier pushes. This works and was how the first diffusion models beat GANs on conditional ImageNet, but it has two real drawbacks: you must train and maintain a separate classifier, and that classifier has to be trained on <em>noisy</em> images at every noise level, which off-the-shelf classifiers are not. That friction motivated the alternative that replaced it.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Classifier guidance is closely related to the adversarial-example phenomenon from the security literature: you are following the gradient of a classifier to push an image toward a target class. The difference is intent. An adversarial attack nudges an image just enough to fool a classifier while looking unchanged to humans; classifier guidance nudges a noisy image so the <em>generator</em> produces something the classifier confidently labels. Same gradient, opposite goals, and the same reason both need a classifier that is robust to the input distribution it is shown.</p>
+</div>
+
+<h2>3. Classifier-Free Guidance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Classifier-free guidance (CFG) removes the external classifier entirely with a beautiful trick. During training, the model is shown the condition most of the time but, with some probability (say 10 to 20 percent), the condition is dropped and replaced by a special null token $\varnothing$. The single network thus learns both the conditional noise $\epsilon_\theta(x_t, t, c)$ and the unconditional noise $\epsilon_\theta(x_t, t, \varnothing)$. At sampling time, you compute both and extrapolate: push away from the unconditional prediction in the direction of the conditional one.
+</p>
+
+<div class="math-block">
+$$\tilde\epsilon_\theta(x_t, t, c) = \epsilon_\theta(x_t, t, \varnothing) + w\,\big(\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \varnothing)\big).$$
+</div>
+
+<p>
+Here $w$ is the guidance scale (in the diffusers and Stable Diffusion world it is the <code>guidance_scale</code> parameter, typically 5 to 12 for text-to-image). At $w = 1$ you recover plain conditional sampling; $w = 0$ is unconditional; larger $w$ exaggerates the difference between conditional and unconditional, sharpening adherence to the prompt. The reason this works is that the difference $\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \varnothing)$ is an implicit estimate of the classifier gradient $\nabla_x \log p(c \mid x_t)$ from subsection 2, obtained without any classifier. Figure 33.6.1 shows the extrapolation geometrically.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 660 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vector diagram: unconditional prediction and conditional prediction, with the guided prediction extrapolated beyond the conditional along their difference">
+<style>
+.gl{font:12px sans-serif;fill:#1a1a1a;}
+.gs{font:10.5px sans-serif;fill:#555;}
+.vuncond{stroke:#8a7a6a;stroke-width:2.4;marker-end:url(#gah1);fill:none;}
+.vcond{stroke:#2c6fb5;stroke-width:2.4;marker-end:url(#gah2);fill:none;}
+.vguid{stroke:#2f9e5c;stroke-width:2.8;marker-end:url(#gah3);fill:none;}
+.vdiff{stroke:#aaa;stroke-width:1.6;stroke-dasharray:5 4;fill:none;}
+</style>
+<defs>
+<marker id="gah1" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8a7a6a"/></marker>
+<marker id="gah2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2c6fb5"/></marker>
+<marker id="gah3" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+</defs>
+<circle cx="90" cy="220" r="5" fill="#1a1a1a"/>
+<text class="gl" x="90" y="245" text-anchor="middle">x_t</text>
+<line class="vuncond" x1="90" y1="220" x2="300" y2="150"/>
+<text class="gl" x="200" y="200" fill="#8a7a6a">uncond eps(., null)</text>
+<line class="vcond" x1="90" y1="220" x2="360" y2="110"/>
+<text class="gl" x="250" y="95" fill="#2c6fb5">cond eps(., c)</text>
+<line class="vdiff" x1="300" y1="150" x2="360" y2="110"/>
+<line class="vguid" x1="90" y1="220" x2="500" y2="55"/>
+<text class="gl" x="430" y="70" fill="#2f9e5c">guided (w &gt; 1)</text>
+<text class="gs" x="430" y="88" fill="#2f9e5c">extrapolated beyond cond</text>
+</svg>
+<figcaption><strong>Figure 33.6.1:</strong> Classifier-free guidance as vector extrapolation. From the current point $x_t$, the network gives an unconditional noise estimate (gray) and a conditional one (blue). Their difference (dashed) is the implicit classifier direction. The guided estimate (green) starts at the unconditional prediction and moves $w$ times the difference, so for $w > 1$ it overshoots beyond the conditional prediction, exaggerating the condition. The guidance scale $w$ is the length of that green arrow.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+
+@torch.no_grad()
+def cfg_predict(unet, x_t, t, cond_emb, null_emb, guidance_scale=7.5):
+    """Classifier-free guidance: one network, two conditionings, extrapolate."""
+    # Batch the conditional and unconditional inputs together for one forward pass
+    x_in = torch.cat([x_t, x_t], dim=0)
+    t_in = torch.cat([t, t], dim=0)
+    c_in = torch.cat([null_emb, cond_emb], dim=0)        # uncond first, cond second
+    eps_uncond, eps_cond = unet(x_in, t_in, c_in).sample.chunk(2)
+    # Extrapolate away from the unconditional toward the conditional
+    return eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+# To DISABLE the condition during training, randomly replace cond_emb with null_emb:
+# if torch.rand(1) < 0.1: cond_emb = null_emb     # ~10% null-conditioning dropout</code></pre>
+<div class="code-caption">Classifier-free guidance at sampling time. Conditional and unconditional predictions are computed in a single batched forward pass, then combined; the commented line shows the only training change needed, randomly dropping the condition. This replaces the entire <code>cfg_predict</code> output for <code>eps</code> in any sampler from Section 33.4.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Slider Trades Fidelity for Diversity</div>
+<p>
+The guidance scale $w$ is the most consequential single knob in conditional generation. Low $w$ (near 1) gives diverse, sometimes loosely-related samples that better match the true data distribution. High $w$ (8 to 15) gives samples that adhere tightly to the prompt with saturated, high-contrast, "obviously generated" looks, and at very high $w$ the images become oversaturated and artifact-ridden because the extrapolation leaves the data manifold. Every "prompt strength," "CFG scale," or "guidance" slider you have ever seen in an image tool is this $w$. Understanding that it is an extrapolation, not a probability, explains why turning it to maximum does not give "maximum quality" but rather maximum distortion.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: guidance_scale in diffusers Pipelines</div>
+<p>Every conditional pipeline in <code>diffusers</code> implements classifier-free guidance internally and exposes it as the single argument <code>guidance_scale</code>: <code>pipe(prompt, guidance_scale=7.5)</code>. The batched two-pass forward, the null-embedding handling, and the per-step combination of subsection 3 are all done for you, roughly the 15 lines above plus the sampler integration, reduced to one keyword. The null embedding for text models is the encoding of the empty string, which the pipeline computes automatically. Newer pipelines add refinements like guidance rescaling (to counter the oversaturation at high $w$) and per-step guidance schedules; these too are config flags rather than code you write. Implement <code>cfg_predict</code> once to see the mechanism; set <code>guidance_scale</code> in practice.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tuning Guidance for a Product-Photo Generator</div>
+<p><strong>Who:</strong> an e-commerce team generating on-brand product backgrounds with a fine-tuned latent diffusion model, 2024. <strong>Situation:</strong> they exposed the model to non-technical merchandisers who typed a short prompt and expected a usable image. <strong>Problem:</strong> at the default guidance scale of 7.5 many outputs were oversaturated and had the tell-tale over-contrast look that made products appear unnatural, while merchandisers who lowered it too far got images that ignored the requested style. <strong>Decision:</strong> the team measured prompt adherence (via a <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">CLIPScore</a>, previewed in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>) and human preference across a sweep of $w$ from 3 to 12, found the sweet spot near 5, and enabled guidance rescaling to tame the high-$w$ saturation. They then hid the slider and shipped the tuned value as a fixed default. <strong>Result:</strong> output quality became consistent, support tickets about "weird colors" dropped, and merchandisers stopped needing to understand a parameter they had no intuition for. <strong>Lesson:</strong> the guidance scale needs tuning per model and per use case, and for non-expert users the right move is often to measure the optimum once and hide the knob, rather than exposing a parameter whose behavior surprises everyone who turns it up.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Fixing Guidance's Side Effects</div>
+<p>Classifier-free guidance is indispensable but its oversaturation and reduced-diversity side effects at high scales spurred a wave of 2023 to 2025 refinements. Guidance rescaling (Lin et al., 2023) renormalizes the guided prediction to fix the over-bright outputs. Dynamic and interval guidance apply CFG only during the middle sampling steps, where it helps, and skip it at the ends, where it mostly adds artifacts; the 2024 finding that guidance is harmful at the highest noise levels led to "guidance intervals" that improved quality at no cost. Autoguidance (Karras et al., 2024) replaces the unconditional model with a weaker version of the model itself, improving samples without a class condition at all. And a parallel line removes the need for guidance during sampling by distilling a guided teacher into a student that bakes the guidance in, which is essential for the few-step models of <a href="section-33.5.html">Section 33.5</a> since running two forward passes per step defeats the speedup. Guidance is mature, but how to get its benefits without its distortions is still actively researched.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.1: From Bayes to the CFG Formula <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the Bayes decomposition in subsection 2 and the score-noise identity from <a href="section-33.3.html">Section 33.3</a>, argue in a short paragraph why the difference $\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \varnothing)$ plays the role of the classifier gradient $\nabla_x \log p(c \mid x_t)$. Then explain why $w = 1$ in the CFG formula corresponds to ordinary conditional sampling and what $w > 1$ does to the implied conditional distribution.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.2: Sweep the Guidance Scale <span class="exercise-type coding">Coding</span></div>
+<p>Using a text-to-image pipeline from <code>diffusers</code>, generate the same prompt and seed at <code>guidance_scale</code> in {1, 3, 5, 7.5, 12, 20}. Arrange the images in a row and describe how prompt adherence, contrast/saturation, and diversity (run a few seeds at each scale) change as the scale rises. Identify the scale at which oversaturation becomes objectionable, and confirm the Key Insight's claim that maximum scale is not maximum quality.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.3: The Cost of Two Forward Passes <span class="exercise-type analysis">Analysis</span></div>
+<p>Classifier-free guidance requires a conditional and an unconditional network evaluation at every sampling step, doubling the compute per step relative to unguided sampling. For a 20-step DDIM sampler from <a href="section-33.4.html">Section 33.4</a>, compute the total number of network evaluations with and without CFG. Then explain in one paragraph why this doubling is a serious problem for the one- to four-step models of <a href="section-33.5.html">Section 33.5</a>, and what guidance distillation does about it. Relate the trade-off to the two-tier deployment idea from <a href="section-33.4.html">Section 33.4</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.5.html">&#8592; Section 33.5: Flow Matching &amp; Consistency Models</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.7.html">Section 33.7: Latent Diffusion &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

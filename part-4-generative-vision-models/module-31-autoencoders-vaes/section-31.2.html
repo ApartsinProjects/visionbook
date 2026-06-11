@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.2: Denoising &amp; Sparse Autoencoders. Two non-generative autoencoder variants that learn better representations: the denoising autoencoder that reconstructs clean images from corrupted ones (the conceptual ancestor of diffusion), and the sparse autoencoder whose activation penalty became the leading 2024 interpretability tool. Built from scratch in PyTorch." name="description"/>
+<title>Section 31.2: Denoising &amp; Sparse Autoencoders | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders</a></div>
+<h1>Denoising &amp; Sparse Autoencoders</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Hand me a smudged photograph and I will tell you what it was supposed to be. I have seen ten thousand clean ones; the smudge is the only part I have never been allowed to keep."</p>
+<cite>A Denoising Autoencoder Who Has Made Peace With Noise</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You can make an autoencoder learn a far better representation without touching its bottleneck, simply by changing the task it is trained on: corrupt the input and ask it to reconstruct the clean original, or penalize how many code units fire at once.</strong> The denoising autoencoder learns features that are robust because they must survive noise, and in doing so it secretly learns the gradient of the data distribution, which is the exact quantity diffusion models will spend <a href="../module-33-diffusion-models/index.html">Chapter 33</a> estimating. The sparse autoencoder learns features that are interpretable because only a few are allowed to be active for any input, a property that lay mostly dormant for a decade and then, in 2023 and 2024, became the leading method for cracking open what large models represent. Neither variant is generative in the sampling sense, but both sharpen the central lesson of the chapter: the constraint you impose on the code is what decides what the code learns.</p>
+</div>
+
+<p>
+In <a href="section-31.1.html">Section 31.1</a> you built a plain autoencoder and saw that its undercomplete bottleneck forces the code to capture structure. This section keeps the encoder-decoder skeleton but swaps the constraint. Instead of relying on a narrow bottleneck, the denoising autoencoder uses a corruption process, and the sparse autoencoder uses an activation penalty. Both ideas predate deep learning's modern era, both turned out to matter far more than their inventors expected, and both connect directly forward to material later in this book. We take them one at a time.
+</p>
+
+<h2>1. The Denoising Autoencoder <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The denoising autoencoder (DAE) changes one line of the training procedure. Before passing an image to the encoder, corrupt it: add Gaussian noise, set a random fraction of pixels to zero, or blur it. Crucially, the reconstruction target stays the <em>clean</em> original. The network sees $\tilde{x} = x + \text{noise}$ and is scored on how well its output $\hat{x}$ matches the uncorrupted $x$. The objective is
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{DAE}}(x) = \mathbb{E}_{\tilde{x} \sim C(\tilde{x} \mid x)} \big[\, \lVert x - g(f(\tilde{x})) \rVert^2 \,\big]$$
+</div>
+
+<p>
+where $C$ is the corruption distribution. This is the classical denoising of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> turned into a learning problem: where Chapter 7 hand-designed a Gaussian or non-local-means filter to remove noise, the DAE learns the denoiser from examples. To undo corruption the network cannot copy pixels through (the pixels are wrong); it must understand what a clean image looks like and project the noisy input back onto that manifold. That projection is exactly the structure we want the code to capture, and it is why a denoising autoencoder learns robust, transferable features even when its bottleneck is generous or absent.
+</p>
+
+<p>
+The implementation reuses the encoder and decoder from <a href="section-31.1.html">Section 31.1</a> verbatim. The only change is that we add noise to the input inside the training loop while keeping the clean image as the target, as the comments in the next block make explicit.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+model = Autoencoder(code_dim=32)         # same architecture as Section 31.1
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.MSELoss()
+noise_std = 0.4                          # corruption strength
+
+for epoch in range(5):
+    for x, _ in loader:                  # x is the CLEAN image, in [0, 1]
+        x_noisy = (x + noise_std * torch.randn_like(x)).clamp(0, 1)  # corrupt
+        x_hat, _ = model(x_noisy)        # encode/decode the CORRUPTED input
+        loss = loss_fn(x_hat, x)         # but score against the CLEAN target
+        opt.zero_grad(); loss.backward(); opt.step()
+# At test time, feed a noisy digit and the DAE returns a clean one,
+# having learned what "a digit" looks like rather than how to copy pixels.</code></pre>
+<div class="code-caption">The denoising autoencoder, one line different from Section 31.1. The input is corrupted with Gaussian noise but the loss compares against the clean original, forcing the network to learn the structure of clean digits rather than an identity copy.</div>
+
+<p>
+The masking-noise variant, where a random fraction of input pixels are zeroed rather than perturbed, is worth a special mention because you have already met its descendant. Training a network to fill in missing pixels is exactly the pretext task of the Masked Autoencoder (MAE) from <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, which masks 75 percent of image patches and reconstructs them with a vision transformer. MAE is, in the most literal sense, a denoising autoencoder whose corruption is aggressive masking and whose backbone is a <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">vision transformer</a>. Figure 31.2.1 shows the corrupt-then-restore loop that unifies them.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Denoising autoencoder pipeline: clean image is corrupted, encoded, decoded, and the output is compared to the clean original">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.dclean{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.dnoise{fill:#f7f1e0;stroke:#b8902b;stroke-width:1.5;}
+.dnet{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.dout{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.dar{stroke:#777;stroke-width:1.5;marker-end:url(#dah);fill:none;}
+.dcmp{stroke:#c0392b;stroke-width:1.5;stroke-dasharray:5 3;marker-end:url(#dah);fill:none;}
+</style>
+<defs><marker id="dah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="dclean" x="20" y="70" width="60" height="60"/>
+<text class="dl" x="50" y="62" text-anchor="middle">clean x</text>
+<line class="dar" x1="80" y1="100" x2="110" y2="100"/>
+<rect class="dnoise" x="112" y="70" width="60" height="60"/>
+<text class="dl" x="142" y="62" text-anchor="middle">corrupt</text>
+<text class="ds" x="142" y="146" text-anchor="middle">x&#771; = x + noise</text>
+<line class="dar" x1="172" y1="100" x2="202" y2="100"/>
+<rect class="dnet" x="204" y="75" width="70" height="50"/>
+<text class="dl" x="239" y="96" text-anchor="middle">encoder</text>
+<text class="dl" x="239" y="110" text-anchor="middle">+ decoder</text>
+<line class="dar" x1="274" y1="100" x2="304" y2="100"/>
+<rect class="dout" x="306" y="70" width="60" height="60"/>
+<text class="dl" x="336" y="62" text-anchor="middle">output x&#770;</text>
+<path class="dcmp" d="M336,138 C336,185 50,185 50,138"/>
+<text class="ds" x="200" y="200" text-anchor="middle" fill="#c0392b">loss compares x&#770; to the CLEAN x, not to x&#771;</text>
+<text class="ds" x="540" y="80" text-anchor="middle">The network learns to move</text>
+<text class="ds" x="540" y="96" text-anchor="middle">a corrupted point back toward</text>
+<text class="ds" x="540" y="112" text-anchor="middle">the clean-data manifold:</text>
+<text class="ds" x="540" y="128" text-anchor="middle">it estimates the score &#8711; log p(x).</text>
+</svg>
+<figcaption><strong>Figure 31.2.1:</strong> The denoising autoencoder loop. A clean image is corrupted, passed through the encoder-decoder, and the reconstruction is compared against the clean original (not the corrupted input). Because the network must move a noisy point back toward the clean-data manifold, it implicitly learns the direction of increasing data density, the score $\nabla_x \log p(x)$ that diffusion models build on.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Denoising Learns the Score, and the Score Is Diffusion</div>
+<p>There is a precise and consequential result here. Training a denoising autoencoder with small Gaussian noise makes its reconstruction-minus-input vector proportional to $\nabla_x \log p(x)$, the gradient of the log data density, also called the <strong>score</strong>. In plain terms, the DAE learns which direction to nudge a corrupted image to make it more like real data. A diffusion model is nothing but a denoiser trained at <em>many</em> noise levels at once, run iteratively: corrupt all the way to pure noise, then denoise step by step back to an image. The single-step denoiser of this section is the seed; <a href="../module-33-diffusion-models/index.html">Chapter 33</a> grows it into the dominant generative model of the era. The link between denoising and the score was sketched in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>; here you have built the object that realizes it.</p>
+</div>
+
+<h2>2. The Sparse Autoencoder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The sparse autoencoder takes the opposite tack from the bottleneck. Instead of making the code small, make it <em>large</em>, often larger than the input (overcomplete), but add a penalty that forces only a few code units to be active (nonzero) for any given input. The intuition is that each input should be explained as a combination of a handful of reusable parts drawn from a big dictionary, the way a face is a few specific features chosen from a vast catalog of possible features. The objective adds a sparsity term to the reconstruction loss:
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{sparse}}(x) = \lVert x - g(f(x)) \rVert^2 + \lambda \, \lVert z \rVert_1$$
+</div>
+
+<p>
+where $\lVert z \rVert_1 = \sum_i |z_i|$ is the L1 norm of the code and $\lambda$ controls how aggressively sparsity is enforced. The L1 penalty is the same convexity trick that drives lasso regression: it pushes small activations exactly to zero rather than merely shrinking them, so the learned code is genuinely sparse, with most units off and a few strongly on. Because the constraint, not the dimension, does the regularizing, the bottleneck can be wide, and a wide-but-sparse code often learns more interpretable features than a narrow dense one. The next block adds the penalty to the training loop.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class SparseAutoencoder(nn.Module):
+    def __init__(self, in_dim=784, code_dim=1024):   # overcomplete: 1024 > 784
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(in_dim, code_dim), nn.ReLU())
+        self.decoder = nn.Linear(code_dim, in_dim)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z), z
+
+model = SparseAutoencoder()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+lam = 1e-3                                # sparsity weight lambda
+
+for epoch in range(10):
+    for x, _ in loader:
+        x_hat, z = model(x)
+        recon = ((x - x_hat) ** 2).mean()
+        sparsity = z.abs().mean()         # L1 penalty drives most units to zero
+        loss = recon + lam * sparsity
+        opt.zero_grad(); loss.backward(); opt.step()
+    frac_active = (z > 1e-3).float().mean().item()
+    print(f"epoch {epoch}: active units = {frac_active:.1%}")
+# epoch 0: active units = 41.2%
+# ...
+# epoch 9: active units = 6.8%   <- only a handful of the 1024 units fire per input</code></pre>
+<div class="code-caption">A sparse autoencoder with a 1024-unit overcomplete code and an L1 activation penalty. Despite having more code units than input pixels, the penalty keeps only a small fraction active per input, so each digit is explained by a few reusable dictionary features.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Classical Sparse Dictionaries in scikit-learn</div>
+<p>If your goal is the sparse dictionary itself rather than a trainable encoder, scikit-learn's <code>DictionaryLearning</code> and <code>SparseCoder</code> solve the classical version of this objective (a linear dictionary with sparse codes) in a handful of lines, with no PyTorch, no GPU, and no training loop. <code>DictionaryLearning(n_components=256, alpha=1.0).fit(X)</code> learns the dictionary and <code>.transform(X)</code> gives the sparse codes, replacing roughly thirty lines of model and loop. The neural sparse autoencoder earns its keep only when you need a nonlinear encoder or want to scale to the activation streams of a large pretrained model, which is exactly the interpretability use case below.</p>
+</div>
+
+<h2>3. Sparse Autoencoders for Interpretability <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+For roughly a decade the sparse autoencoder was a respectable but minor member of the representation-learning toolkit. Then it found an unexpected and important second career. The problem it solves there is <strong>superposition</strong>: a trained neural network packs far more concepts into its activation vectors than it has neurons, so a single neuron lights up for many unrelated things and is impossible to interpret. The activations are dense and entangled. A sparse autoencoder trained on those activations learns to re-express each dense activation vector as a sparse combination of a much larger set of learned features, and those features turn out to be far more human-interpretable, one feature firing for "text in French," another for "the Golden Gate Bridge," another for a specific code pattern.
+</p>
+
+<p>
+This is the technique behind the 2023 to 2024 wave of mechanistic-interpretability results, most prominently Anthropic's dictionary-learning work that recovered millions of monosemantic features from a production language model. The autoencoder is overcomplete by a large factor (tens of thousands of features for a few thousand activation dimensions), trained with exactly the L1 penalty of subsection 2, on the cached activations of a frozen model. The next block sketches the setup; the only conceptual change from subsection 2 is what the data is.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+# `acts` is a large tensor of cached activations from a frozen model,
+# shape (num_tokens, d_model), e.g. d_model = 768.
+class InterpSAE(nn.Module):
+    def __init__(self, d_model=768, expansion=16):     # 16x overcomplete
+        super().__init__()
+        self.enc = nn.Linear(d_model, d_model * expansion)
+        self.dec = nn.Linear(d_model * expansion, d_model)
+
+    def forward(self, a):
+        features = torch.relu(self.enc(a))   # sparse, interpretable feature set
+        return self.dec(features), features
+
+sae = InterpSAE()
+# Train to reconstruct `acts` with a strong L1 penalty on `features`.
+# After training, each large feature dimension tends to fire for ONE
+# human-recognizable concept; inspecting the inputs that maximize a
+# feature reveals what it detects. This is dictionary learning on a model's mind.</code></pre>
+<div class="code-caption">A sparse autoencoder repurposed for interpretability. Trained on a frozen model's cached activations with a heavy L1 penalty and a large overcomplete factor, its features become monosemantic, each one firing for a single recognizable concept that a researcher can name.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Decade-Long Nap of the Sparse Autoencoder</div>
+<p>The sparse autoencoder spent roughly ten years as the polite acquaintance at the representation-learning party that everyone vaguely remembered inviting. It was respectable, it had a clean objective, and almost nobody used it. Then interpretability researchers needed a tool to pry apart the tangled activations of giant models, looked around, and found this exact L1-penalized network sitting in the corner, perfectly suited to the job it was never originally hired for. The lesson, if there is one, is that a good idea with a sparsity penalty can lie dormant for a decade and still wake up as the protagonist.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sparse Autoencoders as the Microscope of 2024 to 2026</div>
+<p>The sparse autoencoder is, as of 2026, the dominant tool for reading the internal representations of large models. Anthropic's "Towards Monosemanticity" (2023) and the follow-up "Scaling Monosemanticity" (2024) recovered tens of millions of interpretable features from production-scale models, and the same recipe is now applied to vision and multimodal backbones to ask what a CLIP or a DINOv2 model represents internally. The active frontier is making the features cleaner and cheaper: gated and top-k sparse autoencoders (2024) replace the L1 penalty with an explicit activation count to reduce a known shrinkage bias, and JumpReLU variants sharpen the on-off decision. The link to this section is exact: every one of these systems is the overcomplete, L1-penalized autoencoder you just built, trained on activations instead of pixels. The humble sparse autoencoder became a microscope for neural networks.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Denoising a Microscopy Pipeline on a Budget</div>
+<p><strong>Who:</strong> a biology lab with a low-light fluorescence microscope and no machine-learning staff, 2024. <strong>Situation:</strong> their images were grainy because longer exposures bleached the samples, so every frame carried heavy shot noise. <strong>Problem:</strong> off-the-shelf denoisers trained on natural photos washed out the faint structures the biologists cared about, and they had no clean ground-truth images to train a supervised denoiser. <strong>Decision:</strong> they trained a convolutional denoising autoencoder using a self-supervised scheme, treating one noisy capture as the input and a second independent noisy capture of the same field as the target, so the network learned to predict the signal common to both while the independent noise averaged out. <strong>Result:</strong> the DAE produced markedly cleaner images that preserved the faint structures, trained entirely on their own noisy data with no clean references. <strong>Lesson:</strong> the denoising autoencoder's defining feature, that it learns the clean-data manifold from corrupted examples, makes it the right tool exactly when clean training data does not exist, a situation more common in scientific imaging than in consumer photography.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.1: Corruption as Regularizer <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A denoising autoencoder can have a bottleneck that is wide enough to copy the input through, yet it does not learn the identity. Explain in three or four sentences why the corruption prevents the identity shortcut even when the architecture would otherwise allow it. Then explain the connection to dropout: in what sense is a denoising autoencoder applying a form of noise that plays the same regularizing role, and where in the network does each apply its noise?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.2: A Denoiser Across Noise Levels <span class="exercise-type coding">Coding</span></div>
+<p>Train the denoising autoencoder of subsection 1 on MNIST, but instead of a fixed <code>noise_std</code>, sample the noise standard deviation uniformly from $[0.0, 0.8]$ for each batch. At test time, feed digits corrupted at several noise levels and display the reconstructions. Then concatenate the chosen noise level as an extra input feature to the encoder and retrain. Compare reconstructions with and without the noise-level conditioning, and explain in a paragraph why telling the network how much noise it is facing helps, connecting this directly to the noise-level conditioning that <a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s diffusion U-Net requires.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.2.3: Reading the Dictionary <span class="exercise-type analysis">Analysis</span></div>
+<p>Train the sparse autoencoder of subsection 2 on MNIST with three values of $\lambda$ (for example $10^{-4}$, $10^{-3}$, $10^{-2}$). For each, measure the average fraction of active code units and the reconstruction MSE, and visualize the decoder weight vector of ten randomly chosen code units as $28 \times 28$ images (the "dictionary atoms"). Describe how the atoms change as $\lambda$ grows: do they become more localized and stroke-like, and at what point does sparsity start to hurt reconstruction? Relate the trade-off to the interpretability use case of subsection 3, where cleaner features are worth some reconstruction error.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-31.1.html">&#8592; Section 31.1: Autoencoders: Compression as Representation</a>
+<a href="index.html">Chapter 31</a>
+<a class="next" href="section-31.3.html">Section 31.3: The VAE: ELBO, Reparameterization &amp; Amortized Inference &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

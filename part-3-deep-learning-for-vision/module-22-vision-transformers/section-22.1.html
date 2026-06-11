@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.1: Attention &amp; the Transformer Block, Vision Edition. Scaled dot-product attention from the dot product up, multi-head attention, the full pre-norm transformer block, and why global learned mixing differs from a convolution, built from scratch in PyTorch." name="description"/>
+<title>Section 22.1: Attention &amp; the Transformer Block, Vision Edition | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Vision Transformers</a></div>
+<h1>Attention &amp; the Transformer Block, Vision Edition</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A convolution asks each pixel, politely, what its neighbors are doing. Attention hands every patch a megaphone and a contact list. The room gets loud, but at least nobody is left out of the conversation."</p>
+<cite>An Attention Head That Reads the Whole Image at Once</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Self-attention is a learned, content-dependent averaging: every element of a sequence computes a similarity to every other element, turns those similarities into weights with a softmax, and forms its new representation as a weighted sum of all the others.</strong> Unlike the fixed weights of a convolution, the attention weights are recomputed for every input from the data itself, and unlike the convolution they reach across the entire sequence in a single layer. This section builds that operation from the dot product up, scales it to multiple heads, and wraps it in the residual-and-normalize block that makes deep stacks trainable. Everything in the rest of the chapter is this block applied to patches.</p>
+</div>
+
+<p>
+In the previous chapters you built vision entirely out of convolutions. This section steps outside that world to construct the one new primitive the chapter needs. The transformer was introduced for language in 2017, but the operation at its core, self-attention, is not linguistic at all; it is a general way to let the elements of any set exchange information. Our plan is to derive it carefully on a generic sequence of tokens, implement each piece in PyTorch with the tools from <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a>, and only then, in <a href="section-22.2.html">Section 22.2</a>, decide that the tokens are image patches. Keeping the derivation token-agnostic is deliberate: the same block will reappear for segmentation masks, video frames, and text conditioning later in the book, and you want to recognize it as one idea, not five.
+</p>
+
+<h2>1. From Dot Product to Attention <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Start with the most basic question attention answers: given a sequence of $N$ vectors, how should each one update itself using information from the others? A reasonable answer is "average in the others, but weight each by how relevant it is to me." The dot product is our relevance measure. If two vectors point in similar directions, their dot product is large; if they are orthogonal, it is zero. So a first sketch of attention is: for token $i$, compute the dot product with every token $j$, normalize those scores into weights that sum to one, and form the output as the weighted sum of all tokens.
+</p>
+
+<p>
+The transformer refines this in one important way. Rather than dotting the raw tokens against each other, it first projects each token through three separate learned linear maps to produce a <strong>query</strong>, a <strong>key</strong>, and a <strong>value</strong>. The query is "what am I looking for", the key is "what do I offer", and the value is "what I will actually contribute if you attend to me." The relevance of token $j$ to token $i$ is the dot product of $i$'s query with $j$'s key; the output for $i$ is the weighted sum of every token's value. Splitting one vector into these three roles lets the network learn to ask and answer different things, which a single shared representation cannot do.
+</p>
+
+<p>
+Written compactly, with all queries stacked into a matrix $Q$, all keys into $K$, and all values into $V$, the entire operation is
+</p>
+
+<div class="math-block">
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+</div>
+
+<p>
+where $d_k$ is the dimension of the query and key vectors. The matrix $QK^\top$ holds every query-key dot product, one row per query; the softmax is applied along each row so the weights for one query sum to one; multiplying by $V$ forms the weighted sums. The division by $\sqrt{d_k}$ is the "scaled" in scaled dot-product attention, and it matters more than it looks. The dot product of two random $d_k$-dimensional vectors has variance proportional to $d_k$, so for large $d_k$ the scores grow large, the softmax saturates into a near one-hot spike, and its gradient nearly vanishes. Dividing by $\sqrt{d_k}$ holds the score variance near one and keeps the softmax in its responsive range. Figure 22.1.1 traces these matrices through the computation.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scaled dot-product attention dataflow from input tokens through query key value projections to weighted output">
+<style>
+.al{font:12px sans-serif;fill:#1a1a1a;}
+.as{font:10px sans-serif;fill:#555;}
+.ain{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.aqkv{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.aop{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.aout{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.aar{stroke:#777;stroke-width:1.5;marker-end:url(#aah);fill:none;}
+</style>
+<defs><marker id="aah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="ain" x="12" y="120" width="60" height="56"/>
+<text class="al" x="42" y="112" text-anchor="middle">tokens X</text>
+<text class="as" x="42" y="192" text-anchor="middle">N x d</text>
+<line class="aar" x1="74" y1="135" x2="118" y2="70"/>
+<line class="aar" x1="74" y1="148" x2="118" y2="148"/>
+<line class="aar" x1="74" y1="161" x2="118" y2="226"/>
+<rect class="aqkv" x="120" y="48" width="52" height="40"/>
+<text class="al" x="146" y="72" text-anchor="middle">Q=XW_q</text>
+<rect class="aqkv" x="120" y="128" width="52" height="40"/>
+<text class="al" x="146" y="152" text-anchor="middle">K=XW_k</text>
+<rect class="aqkv" x="120" y="208" width="52" height="40"/>
+<text class="al" x="146" y="232" text-anchor="middle">V=XW_v</text>
+<line class="aar" x1="174" y1="68" x2="232" y2="110"/>
+<line class="aar" x1="174" y1="148" x2="232" y2="130"/>
+<rect class="aop" x="234" y="100" width="78" height="40"/>
+<text class="al" x="273" y="118" text-anchor="middle">QKᵀ / √d_k</text>
+<text class="as" x="273" y="134" text-anchor="middle">N x N scores</text>
+<line class="aar" x1="314" y1="120" x2="356" y2="120"/>
+<rect class="aop" x="358" y="100" width="74" height="40"/>
+<text class="al" x="395" y="118" text-anchor="middle">softmax</text>
+<text class="as" x="395" y="134" text-anchor="middle">rows sum to 1</text>
+<line class="aar" x1="434" y1="120" x2="476" y2="135"/>
+<line class="aar" x1="174" y1="228" x2="476" y2="160"/>
+<rect class="aout" x="478" y="120" width="64" height="48"/>
+<text class="al" x="510" y="148" text-anchor="middle">weighted</text>
+<text class="al" x="510" y="162" text-anchor="middle">sum · V</text>
+<line class="aar" x1="544" y1="144" x2="586" y2="144"/>
+<rect class="aout" x="588" y="124" width="60" height="40"/>
+<text class="al" x="618" y="148" text-anchor="middle">output</text>
+<text class="as" x="618" y="180" text-anchor="middle">N x d</text>
+</svg>
+<figcaption><strong>Figure 22.1.1:</strong> Scaled dot-product attention. Each token is projected into a query, a key, and a value. The query-key dot products (scaled by $\sqrt{d_k}$) become a softmax-normalized $N \times N$ weight matrix, and the output is the weighted sum of the values. Every output token is a content-dependent mixture of all input tokens.</figcaption>
+</figure>
+
+<p>
+The code below implements exactly this formula on a batch of sequences. Read it against the figure: <code>Q @ K.transpose</code> is the score matrix, the scaling and softmax follow, and the final matmul with <code>V</code> produces the output.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(Q, K, V):
+    """Q, K, V: (batch, seq_len, d_k). Returns (batch, seq_len, d_k) and weights."""
+    d_k = Q.size(-1)
+    scores = Q @ K.transpose(-2, -1) / d_k ** 0.5   # (batch, seq, seq)
+    weights = F.softmax(scores, dim=-1)             # each query row sums to 1
+    output = weights @ V                            # (batch, seq, d_k)
+    return output, weights
+
+# A toy batch: 1 sequence of 4 tokens, each of dimension 8.
+torch.manual_seed(0)
+X = torch.randn(1, 4, 8)
+out, attn = scaled_dot_product_attention(X, X, X)  # self-attention: Q=K=V=X
+print("output shape:", out.shape)       # output shape: torch.Size([1, 4, 8])
+print("attention rows sum to:", attn.sum(-1))  # tensor([[1., 1., 1., 1.]])</code></pre>
+<div class="code-caption">Scaled dot-product attention in five lines. Passing the same tensor as Q, K, and V makes it self-attention; the printed row sums confirm each query distributes a total weight of one across all four tokens.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attention Is Content-Dependent, Convolution Is Not</div>
+<p>A convolution kernel holds a fixed set of weights, learned once and applied identically to every position of every image. Self-attention computes its weights on the fly from the input itself, so the same layer mixes a portrait differently than it mixes a landscape, and it does so across the whole image rather than a small window. This is the single most important difference in the chapter. It is the source of the transformer's flexibility and, as we will see in <a href="section-22.5.html">Section 22.5</a>, the source of its appetite for data: weights that are not built in must be learned.</p>
+</div>
+
+<h2>2. Multi-Head Attention <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A single attention operation forces every token to summarize all of its relationships into one weighted average. That is limiting: a patch of an image might want to attend to texture in one sense and to global shape in another, and one softmax cannot represent both at once. Multi-head attention solves this by running several attention operations in parallel, each with its own learned query, key, and value projections, on lower-dimensional slices of the representation. Each head can specialize, one tracking local edges, another long-range layout, and their outputs are concatenated and passed through a final linear projection.
+</p>
+
+<p>
+Concretely, with model dimension $d$ and $h$ heads, each head works in dimension $d_k = d / h$. We project the input to $Q$, $K$, $V$ of full width $d$, reshape into $h$ heads of width $d_k$, run attention independently per head, concatenate back to width $d$, and apply an output projection $W_O$. The math is
+</p>
+
+<div class="math-block">
+$$\text{MultiHead}(X) = \big[\,\text{head}_1; \ldots; \text{head}_h\,\big]\, W_O, \qquad \text{head}_i = \text{Attention}(XW_{q}^i, XW_{k}^i, XW_{v}^i)$$
+</div>
+
+<p>
+The implementation below packs all heads into single weight matrices for efficiency and reshapes to expose the head dimension, which is how every production library does it.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.d_k = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3)   # one matrix produces Q, K, V together
+        self.proj = nn.Linear(dim, dim)      # output projection W_O
+
+    def forward(self, x):
+        B, N, D = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.d_k)
+        qkv = qkv.permute(2, 0, 3, 1, 4)     # (3, B, heads, N, d_k)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        scores = q @ k.transpose(-2, -1) / self.d_k ** 0.5
+        attn = F.softmax(scores, dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, D)  # merge heads
+        return self.proj(out)
+
+mha = MultiHeadAttention(dim=64, num_heads=8)
+x = torch.randn(2, 16, 64)               # batch 2, 16 tokens, dim 64
+print("output shape:", mha(x).shape)     # output shape: torch.Size([2, 16, 64])</code></pre>
+<div class="code-caption">Multi-head self-attention with all heads fused into one <code>qkv</code> projection. The 64-dimensional input is split into 8 heads of width 8, attended independently, and recombined, preserving the input shape so the block can be stacked.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Fused Call Replaces the Whole Block</div>
+<p>The roughly fifteen lines above exist so you understand the mechanics. In production, PyTorch's <code>scaled_dot_product_attention</code> fuses the scale, softmax, and value matmul into a single kernel that is dramatically faster and far more memory-efficient (it dispatches to FlashAttention when the hardware allows), turning the body of <code>forward</code> into one line:</p>
+<pre><code class="language-python">from torch.nn.functional import scaled_dot_product_attention as sdpa
+# q, k, v shaped (B, heads, N, d_k); fused scale + softmax + matmul:
+out = sdpa(q, k, v)   # no explicit scores tensor materialized in memory</code></pre>
+<div class="code-caption">The fused production call. With pre-shaped <code>(B, heads, N, d_k)</code> tensors, <code>sdpa</code> collapses the scale, softmax, and value matmul of the hand-rolled block into one FlashAttention-backed kernel that never materializes the full score matrix.</div>
+<p>The library handles the $\sqrt{d_k}$ scaling, an optional causal or padding mask, and the memory-efficient streaming softmax that never builds the full $N \times N$ score matrix. For long sequences this is the difference between fitting in GPU memory and not, and it is why you should reach for <code>sdpa</code> (or <code>nn.MultiheadAttention</code>) rather than the hand-rolled version once you have understood it.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>If multi-head attention sounds like a committee, that is almost exactly what trained heads turn out to be. Probing studies find that different heads quietly specialize: some become "positional" heads that mostly attend to the patch just above or beside the query, some lock onto the class token, and a few learn nothing useful and could be pruned away with no loss of accuracy. The committee even has its slackers. The one-line mnemonic worth keeping is that one head is a single opinion; $h$ heads are a panel that votes in parallel and then files a joint report through $W_O$.</p>
+</div>
+
+<h2>3. The Transformer Block: Residuals, Norm, and an MLP <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Attention by itself is one operation; a transformer is a stack of <strong>blocks</strong>, and each block surrounds attention with three things you already know from <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a> and <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>: a residual connection, layer normalization, and a small feed-forward network (an MLP). The residual connection lets the input flow around each sub-layer, so gradients reach early layers cleanly and very deep stacks remain trainable, exactly the function residuals serve in the ResNet of <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. Layer normalization stabilizes the scale of activations across the feature dimension. The MLP, applied independently to each token, gives the block the non-linear capacity to transform what attention has gathered.
+</p>
+
+<p>
+Modern transformers use the <strong>pre-norm</strong> arrangement: the normalization is applied <em>before</em> each sub-layer rather than after, which makes optimization far more forgiving and removes the need for the learning-rate warmup tricks that the original post-norm design required. A pre-norm block computes
+</p>
+
+<div class="math-block">
+$$x' = x + \text{MHA}(\text{LN}(x)), \qquad y = x' + \text{MLP}(\text{LN}(x'))$$
+</div>
+
+<p>
+Read that as: normalize, attend, add back; normalize, transform, add back. The residual stream (the running sum $x$) is never overwritten, only added to, which is why information from the patch embedding can reach the final layer directly. Figure 22.1.2 shows the two-sublayer block, and the code that follows assembles it from the multi-head attention of subsection 2.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 640 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pre-norm transformer block with two residual sublayers, attention and MLP">
+<style>
+.bl{font:12px sans-serif;fill:#1a1a1a;}
+.bs{font:10px sans-serif;fill:#555;}
+.bnorm{fill:#fff6e0;stroke:#d6a32b;stroke-width:1.5;}
+.battn{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.bmlp{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.badd{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.bar{stroke:#777;stroke-width:1.5;marker-end:url(#bah);fill:none;}
+.bres{stroke:#8e44ad;stroke-width:1.5;stroke-dasharray:4 3;marker-end:url(#bah);fill:none;}
+</style>
+<defs><marker id="bah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="bl" x="40" y="125" text-anchor="middle">input x</text>
+<circle cx="40" cy="135" r="4" fill="#8e44ad"/>
+<line class="bar" x1="44" y1="135" x2="90" y2="135"/>
+<rect class="bnorm" x="92" y="115" width="56" height="40"/>
+<text class="bl" x="120" y="139" text-anchor="middle">LayerNorm</text>
+<line class="bar" x1="148" y1="135" x2="178" y2="135"/>
+<rect class="battn" x="180" y="110" width="78" height="50"/>
+<text class="bl" x="219" y="131" text-anchor="middle">Multi-Head</text>
+<text class="bl" x="219" y="146" text-anchor="middle">Attention</text>
+<line class="bar" x1="258" y1="135" x2="290" y2="135"/>
+<circle class="badd" cx="302" cy="135" r="14"/>
+<text class="bl" x="302" y="140" text-anchor="middle">+</text>
+<path class="bres" d="M40,118 C40,70 302,70 302,117"/>
+<line class="bar" x1="316" y1="135" x2="346" y2="135"/>
+<rect class="bnorm" x="348" y="115" width="56" height="40"/>
+<text class="bl" x="376" y="139" text-anchor="middle">LayerNorm</text>
+<line class="bar" x1="404" y1="135" x2="430" y2="135"/>
+<rect class="bmlp" x="432" y="110" width="66" height="50"/>
+<text class="bl" x="465" y="131" text-anchor="middle">MLP</text>
+<text class="bs" x="465" y="146" text-anchor="middle">4x expand</text>
+<line class="bar" x1="498" y1="135" x2="528" y2="135"/>
+<circle class="badd" cx="540" cy="135" r="14"/>
+<text class="bl" x="540" y="140" text-anchor="middle">+</text>
+<path class="bres" d="M302,152 C302,200 540,200 540,152"/>
+<line class="bar" x1="554" y1="135" x2="600" y2="135"/>
+<text class="bl" x="612" y="139" text-anchor="middle">y</text>
+<text class="bs" x="170" y="62" text-anchor="middle">dashed purple = residual (identity) path</text>
+</svg>
+<figcaption><strong>Figure 22.1.2:</strong> The pre-norm transformer block. Each of the two sub-layers (attention, then MLP) is preceded by a LayerNorm and wrapped in a residual connection (dashed purple). The running sum, the residual stream, flows along the top, gathering each sub-layer's additive contribution without ever being overwritten.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch.nn as nn
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = MultiHeadAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden), nn.GELU(),   # GELU is the ViT-standard activation
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim), nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))   # pre-norm attention sub-layer + residual
+        x = x + self.mlp(self.norm2(x))    # pre-norm MLP sub-layer + residual
+        return x
+
+block = TransformerBlock(dim=64, num_heads=8)
+import torch
+print("block output:", block(torch.randn(2, 16, 64)).shape)  # torch.Size([2, 16, 64])</code></pre>
+<div class="code-caption">A complete pre-norm transformer block. The two <code>x = x + ...</code> lines are the residual stream of Figure 22.1.2; the MLP expands the dimension fourfold with a GELU non-linearity before projecting back, the standard ViT feed-forward.</div>
+
+<p>
+That block is the entire reusable engine of the chapter. Stack $L$ of these, feed them a sequence of token vectors, and you have a transformer encoder. The only thing left, the thing that turns this language-shaped machine into a vision model, is deciding what the tokens are and how to inject the spatial information that the permutation-invariant attention throws away. That is the subject of <a href="section-22.2.html">Section 22.2</a>.
+</p>
+
+<h2>4. Why This Is Not a Convolution <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+It is worth making the contrast with the convolution precise, because the whole chapter turns on it. A convolution has three properties baked in by its very structure: <strong>locality</strong> (each output depends only on a small input neighborhood), <strong>weight sharing</strong> (the same kernel slides over every position, so the operation is translation-equivariant), and a <strong>fixed receptive field</strong> that grows only by stacking layers. These are inductive biases: assumptions about images that are true often enough to be enormously helpful, and that let a CNN learn from tens of thousands of images.
+</p>
+
+<p>
+Self-attention discards all three. There is no locality: token $i$ attends to all $N$ tokens equally at the start, and the layer's effective neighborhood is the whole image from the very first block. There is weight sharing of a different kind, the projection matrices are shared across positions, but the attention pattern itself is not fixed, it is recomputed per input. And the receptive field is global immediately, not grown over depth. A ViT therefore starts with almost no built-in knowledge that nearby pixels are related; it must learn that fact, if it is useful, from data. The cost is paid in two currencies. First, data: <a href="section-22.3.html">Section 22.3</a> is entirely about how to pay it. Second, compute: because every token attends to every other, the cost of self-attention is quadratic in the number of tokens.
+</p>
+
+<div class="math-block">
+$$\text{cost of self-attention} \;\sim\; O(N^2 \cdot d), \qquad \text{cost of a convolution} \;\sim\; O(N \cdot k^2 \cdot d)$$
+</div>
+
+<p>
+For a $224 \times 224$ image cut into $16 \times 16$ patches, $N = 196$ tokens, and $N^2$ is manageable. Push to high-resolution dense prediction with thousands of tokens and the quadratic term dominates, which is precisely the problem the windowed attention of <a href="section-22.4.html">Section 22.4</a> exists to solve. The practical example below shows how this quadratic wall bites a real team.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Quadratic Wall in a Document Pipeline</div>
+<p><strong>Who:</strong> a four-person team building a layout-analysis model for scanned legal documents, 2024. <strong>Situation:</strong> their first prototype was a plain ViT, and it worked beautifully on $224 \times 224$ thumbnails of each page. <strong>Problem:</strong> the fine print they actually needed to read disappeared at that resolution, so they raised the input to $1024 \times 1024$. With $16 \times 16$ patches that is $4096$ tokens, and the $N^2$ attention matrix became roughly $4096^2 \approx 16.8$ million entries per head per layer; training crashed with out-of-memory errors and inference slowed to a crawl. <strong>Decision:</strong> rather than buy bigger GPUs, they switched the backbone to a Swin Transformer, whose window attention (the subject of <a href="section-22.4.html">Section 22.4</a>) computes attention inside $7 \times 7$ windows and shifts them between layers, making the cost linear in the token count. <strong>Result:</strong> the high-resolution model trained on the same hardware, and accuracy on small text rose sharply because the model could finally see it. <strong>Lesson:</strong> the global reach of plain self-attention is a feature at $196$ tokens and a liability at $4096$; knowing the $O(N^2)$ scaling tells you in advance which design to pick before you hit the memory error.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Attention Without the Quadratic Cost</div>
+<p>Removing the $O(N^2)$ bottleneck is an active research front. FlashAttention (Dao et al., 2022, arXiv:2205.14135) and its 2023 to 2024 successors do not change the math but compute exact attention with an IO-aware streaming algorithm that never materializes the full score matrix, cutting memory from quadratic to linear and giving large speedups; it is the kernel behind PyTorch's <code>scaled_dot_product_attention</code>. A parallel line replaces softmax attention with cheaper approximations: linear attention and state-space models such as the Mamba and Vision Mamba (Vim, 2024) family recast sequence mixing as a recurrence with linear cost, and have started to match ViTs on classification while scaling to far longer token sequences. Whether these alternatives or windowed attention (Section 22.4) become the default for high-resolution vision is one of the open questions of 2025 and 2026.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.1.1: The Role of the Scale Factor <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose you removed the $1/\sqrt{d_k}$ factor from scaled dot-product attention and used a large head dimension such as $d_k = 256$. Explain in two or three sentences what happens to the magnitude of the dot-product scores, to the shape of the softmax output, and to the gradients flowing back through the softmax. Then describe a single experiment with the toy code in subsection 1 that would let you observe the softmax saturating: what would you measure, and what would you expect to see as $d_k$ grows?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.1.2: Visualize an Attention Map <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>MultiHeadAttention</code> class to also return the per-head attention weights (shape <code>(B, heads, N, N)</code>). Construct a sequence of 9 tokens arranged conceptually as a $3 \times 3$ grid, run one untrained block, and use <code>matplotlib.imshow</code> to display the $9 \times 9$ attention matrix for one head as a heatmap. The pattern will be near-uniform because the weights are random; now hand-set one query's key projection so it strongly matches one specific key, re-run, and confirm that the corresponding row of the heatmap spikes. This is the same visualization researchers use to interpret where a trained ViT looks.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.1.3: Counting the Cost <span class="exercise-type analysis">Analysis</span></div>
+<p>For a ViT processing a $384 \times 384$ image with $16 \times 16$ patches, compute the number of tokens $N$ and the number of entries in a single head's score matrix. Repeat for $48 \times 48$ patches. Using the $O(N^2 d)$ versus $O(N k^2 d)$ formulas of subsection 4, estimate the ratio of self-attention cost to convolution cost (take $k = 3$, $d = 768$) at each patch size, and write one paragraph explaining why larger patches make a ViT cheaper but coarser, connecting the trade-off to the receptive-field discussion of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 22 Index</a>
+<a href="index.html">Chapter 22</a>
+<a class="next" href="section-22.2.html">Section 22.2: ViT: Images as Sequences of Patches &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

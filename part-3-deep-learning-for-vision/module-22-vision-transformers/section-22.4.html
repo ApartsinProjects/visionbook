@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.4: Hierarchical Designs: Swin &amp; Pyramid Transformers. Window attention and shifted windows that recover global reach at near-linear cost, patch merging that builds a feature pyramid, and why hierarchical transformers became the default backbone for detection and segmentation." name="description"/>
+<title>Section 22.4: Hierarchical Designs: Swin &amp; Pyramid Transformers | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Vision Transformers</a></div>
+<h1>Hierarchical Designs: Swin &amp; Pyramid Transformers</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Global attention is wonderful until someone hands you a four-megapixel slide and asks for every cell nucleus. Suddenly talking to everyone at once is not enlightenment; it is a quadratic bill. So I learned to whisper in small rooms, then occasionally rearrange the furniture."</p>
+<cite>A Swin Transformer Who Discovered Windows</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The plain ViT keeps one resolution and global attention at every layer, which is both quadratically expensive at high resolution and a poor fit for dense tasks that need multi-scale features; hierarchical transformers fix both by computing attention inside small local windows (linear cost) and by merging patches between stages to build a feature pyramid, recovering global reach by shifting the window grid between layers.</strong> The result is a transformer backbone that looks structurally like a ResNet, four stages of decreasing resolution and increasing channels, and that plugs directly into the detection and segmentation heads of <a href="../module-23-object-detection/index.html">Chapter 23</a> and <a href="../module-24-segmentation/index.html">Chapter 24</a>. This section reintroduces, in learned form, the image-pyramid idea you first met classically in <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>.</p>
+</div>
+
+<p>
+<a href="section-22.1.html">Section 22.1</a> warned that self-attention costs $O(N^2)$ in the number of tokens, and the document-pipeline example showed that wall in action. <a href="section-22.2.html">Section 22.2</a> noted the second problem: the plain ViT never changes resolution, so it has no natural way to produce the coarse-to-fine feature maps that object detectors and segmenters feed on. A ResNet hands a detector feature maps at 1/4, 1/8, 1/16, and 1/32 of the input resolution; a plain ViT hands it $196$ tokens at one scale and nothing else. Both problems have the same root, global single-scale attention, and Swin Transformer solves both with two ideas borrowed straight from the convolutional world: locality and a pyramid.
+</p>
+
+<h2>1. Window Attention: Locality, Reintroduced <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The first idea is to stop attending globally. Swin partitions the feature map into non-overlapping windows (the default is $7 \times 7$ patches per window) and computes self-attention only <em>within</em> each window. A token attends to the $48$ others in its window, not to all several thousand in the image. This is a deliberate reintroduction of the locality bias that the plain ViT threw away, and it changes the cost from quadratic in the total token count to linear. If the image has $N$ tokens and each window holds $M$ tokens, global attention costs $O(N^2)$ while window attention costs $O(N \cdot M)$, and since $M$ is a small fixed constant the cost grows linearly with image size.
+</p>
+
+<div class="math-block">
+$$\text{global MSA} \sim O(N^2 d), \qquad \text{window MSA} \sim O(N \cdot M \cdot d), \quad M = 49 \text{ (fixed)}$$
+</div>
+
+<p>
+The catch is obvious: if every layer attends only within fixed windows, information never crosses a window boundary, and the model loses the global reach that made attention attractive in the first place. A token in the top-left window can never learn anything about the bottom-right. Swin's second idea solves exactly this.
+</p>
+
+<h2>2. Shifted Windows: Global Reach on a Budget <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The trick that gives Swin its name is the <strong>shifted window</strong>. In every other block, the window grid is displaced by half a window (in the default, by $3$ patches down and right) before attention is computed. Tokens that sat in separate windows in the previous block now share a window in this one, so information leaks across the old boundaries. Alternating a regular-window block with a shifted-window block, then stacking many such pairs, lets information propagate across the entire image after a few layers, while every individual attention computation stays local and cheap. It is the same logic as a CNN's growing receptive field, the field expands with depth, but achieved by relocating the windows rather than by enlarging a kernel. Figure 22.4.1 shows the shift.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 620 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Regular window partition in one block and a half-window shifted partition in the next, letting tokens cross old boundaries">
+<style>
+.wl{font:12px sans-serif;fill:#1a1a1a;}
+.ws{font:10px sans-serif;fill:#555;}
+.wcell{fill:#eef4fb;stroke:#cdd7e2;stroke-width:0.6;}
+.wwin{fill:none;stroke:#2c6fb5;stroke-width:2.4;}
+.wwin2{fill:none;stroke:#8e44ad;stroke-width:2.4;}
+.war{stroke:#777;stroke-width:1.6;marker-end:url(#wah);fill:none;}
+</style>
+<defs><marker id="wah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="wl" x="120" y="28" text-anchor="middle">Block L: regular windows</text>
+<g transform="translate(40,40)">
+<g>
+<rect class="wcell" x="0" y="0" width="160" height="160"/>
+<line x1="40" y1="0" x2="40" y2="160" stroke="#cdd7e2"/>
+<line x1="80" y1="0" x2="80" y2="160" stroke="#cdd7e2"/>
+<line x1="120" y1="0" x2="120" y2="160" stroke="#cdd7e2"/>
+<line x1="0" y1="40" x2="160" y2="40" stroke="#cdd7e2"/>
+<line x1="0" y1="80" x2="160" y2="80" stroke="#cdd7e2"/>
+<line x1="0" y1="120" x2="160" y2="120" stroke="#cdd7e2"/>
+</g>
+<rect class="wwin" x="0" y="0" width="80" height="80"/>
+<rect class="wwin" x="80" y="0" width="80" height="80"/>
+<rect class="wwin" x="0" y="80" width="80" height="80"/>
+<rect class="wwin" x="80" y="80" width="80" height="80"/>
+</g>
+<text class="ws" x="120" y="222" text-anchor="middle">attention only inside blue windows</text>
+<line class="war" x1="216" y1="120" x2="268" y2="120"/>
+<text class="ws" x="242" y="110" text-anchor="middle">shift</text>
+<text class="wl" x="420" y="28" text-anchor="middle">Block L+1: shifted by half a window</text>
+<g transform="translate(300,40)">
+<g>
+<rect class="wcell" x="0" y="0" width="160" height="160"/>
+<line x1="40" y1="0" x2="40" y2="160" stroke="#cdd7e2"/>
+<line x1="80" y1="0" x2="80" y2="160" stroke="#cdd7e2"/>
+<line x1="120" y1="0" x2="120" y2="160" stroke="#cdd7e2"/>
+<line x1="0" y1="40" x2="160" y2="40" stroke="#cdd7e2"/>
+<line x1="0" y1="80" x2="160" y2="80" stroke="#cdd7e2"/>
+<line x1="0" y1="120" x2="160" y2="120" stroke="#cdd7e2"/>
+</g>
+<rect class="wwin2" x="40" y="40" width="80" height="80"/>
+<rect class="wwin2" x="-30" y="40" width="70" height="80"/>
+<rect class="wwin2" x="120" y="40" width="70" height="80"/>
+<rect class="wwin2" x="40" y="-30" width="80" height="70"/>
+<rect class="wwin2" x="40" y="120" width="80" height="70"/>
+</g>
+<text class="ws" x="420" y="222" text-anchor="middle">purple windows straddle old boundaries</text>
+</svg>
+<figcaption><strong>Figure 22.4.1:</strong> The shifted-window mechanism. Block $L$ attends within the regular (blue) window grid; block $L{+}1$ shifts the grid by half a window so the new (purple) windows straddle the previous boundaries, letting tokens that were isolated in block $L$ exchange information. Alternating the two reaches global context at linear cost.</figcaption>
+</figure>
+
+<p>
+The code below implements the core of window attention: partition into windows, attend within each, and reverse the partition. The shift itself is a <code>torch.roll</code> applied before partitioning and undone after, which Swin combines with a small attention mask so the rolled-around edges do not attend across the wrap. We show the window mechanics and describe the shift in comments to keep the example focused.
+</p>
+
+<pre><code class="language-python">import torch
+
+def window_partition(x, window_size):
+    """x: (B, H, W, C) -> (num_windows*B, window_size, window_size, C)."""
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
+    return windows
+
+def window_reverse(windows, window_size, H, W):
+    """Inverse of window_partition: (num_windows*B, ws, ws, C) -> (B, H, W, C)."""
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, -1)
+
+# A shifted-window block first rolls the feature map, then partitions:
+#   x = torch.roll(x, shifts=(-shift, -shift), dims=(1, 2))   # cyclic shift
+#   windows = window_partition(x, window_size)                # attend per window
+#   ... multi-head attention inside each window (with a roll-aware mask) ...
+#   x = window_reverse(attn_windows, window_size, H, W)
+#   x = torch.roll(x, shifts=(shift, shift), dims=(1, 2))     # undo the shift
+
+x = torch.randn(2, 56, 56, 96)               # a Swin stage-1 feature map
+w = window_partition(x, window_size=7)
+print("windows:", w.shape)                   # windows: torch.Size([128, 7, 7, 96])</code></pre>
+<div class="code-caption">Window partition and its inverse, plus the cyclic-shift wrapper that turns a regular-window block into a shifted-window one. Each $56 \times 56$ feature map yields $64$ windows of $7 \times 7$ tokens per image; attention runs inside each $49$-token window.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The shift is implemented not by re-cutting the grid but by sliding the whole feature map with a single <code>torch.roll</code>, attending in the same fixed windows, then rolling it back. The tokens move; the windows stay put. It is the computational equivalent of leaving the dinner tables bolted to the floor and asking half the guests to swap seats between courses, which is cheaper than rearranging the furniture. The signature phrase for the section: <em>whisper in small rooms, then shuffle the seating.</em></p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Swin Buys Back the Convolution's Two Free Lunches</div>
+<p>The plain ViT gave up locality (paying in data) and gave up multi-scale structure (paying in dense-task performance). Swin buys both back without abandoning attention. Window attention restores locality and makes the cost linear; the shifted windows recover global reach over depth, just as a CNN's receptive field grows over depth; and patch merging (subsection 3) restores the pyramid. The honest reading is that the most successful "vision transformer" reintroduced the very inductive biases the original ViT was celebrated for discarding. Attention is the engine, but the convolutional priors turned out to be worth keeping.</p>
+</div>
+
+<h2>3. Patch Merging: Building the Pyramid <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The second structural fix is to change resolution between stages, the way a CNN does with strided pooling. Swin is organized into four stages. Between stages, a <strong>patch-merging</strong> layer concatenates each group of $2 \times 2$ neighboring tokens into one and applies a linear projection, halving the spatial resolution in each dimension and (typically) doubling the channel count. So the token grid goes $56 \times 56 \to 28 \times 28 \to 14 \times 14 \to 7 \times 7$ across the four stages, with channels $96 \to 192 \to 384 \to 768$, exactly the spatial-down, channels-up rhythm of <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. The four resulting feature maps are a genuine feature pyramid, directly usable by a Feature Pyramid Network detection head or a segmentation decoder.
+</p>
+
+<p>
+This is the learned descendant of the Gaussian and Laplacian pyramids of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. There, you built a pyramid by repeated blurring and downsampling to analyze an image at multiple scales; here, the network builds its own multi-scale hierarchy by merging tokens, and it learns what to keep at each scale rather than using a fixed Gaussian. Figure 22.4.2 contrasts the flat plain-ViT processing with Swin's four-stage pyramid.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 640 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Plain ViT keeps constant resolution while Swin halves resolution and doubles channels across four stages">
+<style>
+.sl{font:12px sans-serif;fill:#1a1a1a;}
+.ss{font:10px sans-serif;fill:#555;}
+.svit{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
+.sswin{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.sar{stroke:#777;stroke-width:1.4;marker-end:url(#sah);fill:none;}
+</style>
+<defs><marker id="sah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="sl" x="150" y="26" text-anchor="middle">Plain ViT: one resolution, all layers</text>
+<rect class="svit" x="40" y="42" width="44" height="44"/>
+<rect class="svit" x="120" y="42" width="44" height="44"/>
+<rect class="svit" x="200" y="42" width="44" height="44"/>
+<rect class="svit" x="280" y="42" width="44" height="44"/>
+<line class="sar" x1="84" y1="64" x2="118" y2="64"/>
+<line class="sar" x1="164" y1="64" x2="198" y2="64"/>
+<line class="sar" x1="244" y1="64" x2="278" y2="64"/>
+<text class="ss" x="182" y="104" text-anchor="middle">14x14 tokens at every block (no pyramid)</text>
+<text class="sl" x="200" y="150" text-anchor="middle">Swin: four stages, resolution down, channels up</text>
+<rect class="sswin" x="40" y="166" width="56" height="56"/>
+<text class="ss" x="68" y="236" text-anchor="middle">56x56, 96</text>
+<line class="sar" x1="96" y1="194" x2="124" y2="194"/>
+<rect class="sswin" x="126" y="174" width="44" height="44"/>
+<text class="ss" x="148" y="236" text-anchor="middle">28x28, 192</text>
+<line class="sar" x1="170" y1="194" x2="198" y2="194"/>
+<rect class="sswin" x="200" y="180" width="32" height="32"/>
+<text class="ss" x="216" y="236" text-anchor="middle">14x14, 384</text>
+<line class="sar" x1="232" y1="194" x2="260" y2="194"/>
+<rect class="sswin" x="262" y="184" width="22" height="22"/>
+<text class="ss" x="273" y="236" text-anchor="middle">7x7, 768</text>
+<text class="ss" x="430" y="194" text-anchor="middle">patch merging between stages</text>
+<text class="ss" x="430" y="210" text-anchor="middle">= a learned feature pyramid</text>
+</svg>
+<figcaption><strong>Figure 22.4.2:</strong> Flat versus hierarchical. The plain ViT (top) processes the same $14 \times 14$ token grid at every block. Swin (bottom) merges $2 \times 2$ token groups between four stages, halving resolution and doubling channels, producing the multi-scale feature pyramid that dense-prediction heads require.</figcaption>
+</figure>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained Swin Backbone in Two Lines</div>
+<p>Implementing the four stages, patch merging, relative position bias, and the shift masking correctly is several hundred lines. Both <code>timm</code> and torchvision ship Swin with pretrained weights and expose the pyramid feature maps for use as a detection or segmentation backbone:</p>
+<pre><code class="language-python">import timm
+# features_only=True returns the four pyramid feature maps, ready for an FPN
+backbone = timm.create_model("swin_base_patch4_window7_224",
+                             pretrained=True, features_only=True)
+feats = backbone(torch.randn(1, 3, 224, 224))
+print([f.shape for f in feats])   # four maps at strides 4, 8, 16, 32</code></pre>
+<div class="code-caption">A pretrained Swin-Base backbone in feature-extraction mode. <code>features_only=True</code> returns the four pyramid feature maps at strides 4, 8, 16, and 32, the multi-scale input a detection or segmentation head consumes directly.</div>
+<p>The library handles window partition and reverse, the cyclic shift and its attention mask, the relative position bias table, patch merging, and the stage configuration. The <code>features_only=True</code> flag is the production hook that makes Swin a drop-in backbone for the detectors of <a href="../module-23-object-detection/index.html">Chapter 23</a> and the segmenters of <a href="../module-24-segmentation/index.html">Chapter 24</a>, where a single-scale plain ViT cannot directly fit.</p>
+</div>
+
+<h2>4. The Pyramid Transformer Family <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Swin is the most influential hierarchical transformer, but it is one member of a family that all reach the same destination, a multi-scale, near-linear-cost transformer backbone, by different routes. The Pyramid Vision Transformer (PVT, 2021) shrinks the token sequence stage by stage and uses spatial-reduction attention, which downsamples the keys and values before attention so the cost drops without windowing. Twins and other designs interleave local window attention with a cheap global attention to combine fine and coarse mixing. The Multiscale Vision Transformer (MViT) line, used heavily for video in <a href="../module-26-video-understanding/index.html">Chapter 26</a>, pools the queries, keys, and values to build the pyramid inside the attention itself.
+</p>
+
+<p>
+The common thread is unmistakable. Every successful hierarchical transformer reintroduces some combination of locality, downsampling, and multi-scale structure, the priors a CNN has built in, while keeping attention as the mixing operator. This convergence is the central evidence for the argument of <a href="section-22.5.html">Section 22.5</a>: the future is not "attention replaces convolution" but "attention and convolutional priors combine." The practical example shows a team navigating exactly this design choice.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing a Backbone for Aerial Segmentation</div>
+<p><strong>Who:</strong> a mapping company segmenting buildings, roads, and vegetation from high-resolution aerial imagery, 2024. <strong>Situation:</strong> their tiles were $1024 \times 1024$ and the task was dense per-pixel segmentation, so they needed feature maps at several scales. <strong>Problem:</strong> a plain ViT-Base gave them a single $64 \times 64$ token grid (with $16 \times 16$ patches) and no pyramid, so their FPN-style decoder had nothing multi-scale to consume, and raising the resolution hit the $O(N^2)$ wall from <a href="section-22.1.html">Section 22.1</a>. <strong>Decision:</strong> they swapped to a Swin-Base backbone with <code>features_only=True</code>, which produced feature maps at strides 4, 8, 16, and 32, feeding the decoder directly, and whose window attention kept the $1024 \times 1024$ tiles within memory. <strong>Result:</strong> segmentation of thin structures like roads improved markedly because the stride-4 map preserved fine detail, and the model trained on the same GPUs that had refused the high-resolution plain ViT. <strong>Lesson:</strong> for dense prediction at high resolution the backbone choice is dictated less by raw classification accuracy than by whether it produces a usable pyramid at affordable cost, which is precisely what the hierarchical designs of this section were built to deliver.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Do You Even Need Windows?</div>
+<p>By 2023 to 2025 two counter-currents complicated the hierarchical story. First, ConvNeXt (Liu et al., 2022, arXiv:2201.03545) and ConvNeXt V2 (2023) showed a pure CNN, modernized with transformer-era training and design choices, matches Swin on the same detection and segmentation benchmarks, suggesting the hierarchy mattered more than the attention. Second, the "plain ViT as a backbone" line, especially ViTDet (Li et al., 2022, arXiv:2203.16527), demonstrated that a single-scale plain ViT can be turned into a strong detector by building a simple pyramid only at the very end, with a few deconvolution and pooling layers, rather than baking the hierarchy into every stage. The unresolved 2025 question is how much of Swin's advantage came from windowed attention versus from simply having a pyramid at all, and ViTDet's success argues that the pyramid, however it is produced, is the load-bearing ingredient.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.4.1: Why the Shift Is Necessary <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Imagine a Swin variant that uses window attention but never shifts the windows. Describe what happens to information flow across window boundaries as you stack more blocks, and argue why this network's effective receptive field would stay stuck at the window size no matter how deep it is. Then explain, using Figure 22.4.1, how a single half-window shift between two blocks lets a token in one window influence a token in a diagonally adjacent window after just two layers. Relate the argument to the growing-receptive-field discussion of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.4.2: Measure the Cost Curve <span class="exercise-type coding">Coding</span></div>
+<p>Write a small script that, for token-grid sizes from $14 \times 14$ up to $112 \times 112$, computes (a) the number of score-matrix entries for global attention ($N^2$) and (b) the number for $7 \times 7$ window attention (number of windows times $49^2$). Plot both against grid size on a log-y axis. Confirm that global attention curves up quadratically while window attention is a straight line (linear). Then estimate at which grid size the global attention matrix would exceed, say, 8 GB of memory in float32 for a single head, and connect the answer to the document-pipeline and aerial examples.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.4.3: Inspect the Pyramid <span class="exercise-type analysis">Analysis</span></div>
+<p>Load a pretrained Swin backbone with <code>features_only=True</code> as in the library shortcut and run it on a $224 \times 224$ image. Print the shape of each of the four feature maps and verify the strides (4, 8, 16, 32) and the channel doubling. For one map at an intermediate stage, visualize a few channels as heatmaps and describe qualitatively what scale of structure each stage seems to capture (fine edges versus object-level regions). Compare this to the multi-scale Gaussian pyramid of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> and note one difference between a fixed Gaussian pyramid and this learned one.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.3.html">&#8592; Section 22.3: Data-Efficient Training: DeiT</a>
+<a href="index.html">Chapter 22</a>
+<a class="next" href="section-22.5.html">Section 22.5: CNNs vs ViTs: Inductive Bias, Scale &amp; Hybrids &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

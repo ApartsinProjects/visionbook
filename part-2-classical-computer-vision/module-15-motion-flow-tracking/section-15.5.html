@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.5: Object Tracking with Mean-Shift, Correlation Filters and Re-Detection. Single-object tracking by appearance: histogram mean-shift and CamShift, the correlation-filter family (MOSSE, KCF, CSRT), drift, and tracking-by-detection." name="description"/>
+<title>Section 15.5: Object Tracking: Mean-Shift, Correlation Filters &amp; Re-Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Object Tracking: Mean-Shift, Correlation Filters &amp; Re-Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You showed me one box on one frame and walked away. I have followed that box across the room, behind a pillar, and out the door. We are practically family now. I would recognize it anywhere. Probably."</p>
+<cite>A Single-Object Tracker With Mild Abandonment Issues</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Tracking is the art of answering "where did <em>this specific thing</em> go?" using its appearance, frame after frame, far faster than you could detect it from scratch each time.</strong> Detection (<a href="section-15.4.html">Section 15.4</a> and, in its learned form, <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>) finds objects with no memory of the past. A tracker is given a target on one frame and exploits temporal continuity: the object is somewhere near where it was, and it still looks roughly like it did. Two classical lineages dominate single-object tracking. Mean-shift climbs to the mode of an appearance distribution, following a color histogram up its own density. Correlation filters learn a tiny template and slide it across a search window using the convolution theorem, locating the object in a single fast Fourier transform. Both are built to drift, and the cure, periodic re-detection, is the seed of the tracking-by-detection paradigm that <a href="section-15.6.html">Section 15.6</a> and modern multi-object trackers make rigorous.</p>
+</div>
+
+<p>
+In the previous section a static background let us label every new pixel as foreground without knowing what it was. Tracking flips the question: we are handed an initial bounding box around one object on frame zero, and we must report its box on every subsequent frame, with no detector in the loop and no assumption that the camera or background is fixed. The object's identity is implicit in its appearance, and the tracker's job is to relocate that appearance frame to frame. Because it never re-searches the whole image, a good tracker runs at hundreds of frames per second, which is precisely why trackers exist alongside detectors rather than being replaced by them.
+</p>
+
+<h2>1. Mean-Shift: Climbing an Appearance Density <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The mean-shift tracker (Comaniciu, Ramesh, and Meer, 2000) models the target by a <strong>color histogram</strong> built from the initial box, then, on each new frame, finds the nearby window whose histogram best matches the target's. The elegant part is how it searches. Rather than testing every candidate window, it treats the problem as climbing a density. Compute, for every pixel in the search region, a <em>weight</em> equal to how much that pixel's color contributes to the target histogram, this is the <strong>back-projection</strong> of the histogram onto the image, a probability map of "target-ness". The center of mass of that weighted region is a better estimate of the object center than the current window; shift the window to it and repeat. Each shift moves uphill on the appearance density, and the iteration converges to a local mode in a handful of steps.
+</p>
+<p>
+Formally, mean-shift seeks the window location $\mathbf{y}$ maximizing the similarity (the Bhattacharyya coefficient) between the target histogram $\mathbf{q}$ and the candidate histogram $\mathbf{p}(\mathbf{y})$. The update is the kernel-weighted mean of pixel positions $\mathbf{x}_i$:
+</p>
+<p>
+$$ \mathbf{y}_{\text{new}} = \frac{\sum_i \mathbf{x}_i \, w_i \, g\!\left(\left\lVert \frac{\mathbf{y} - \mathbf{x}_i}{h} \right\rVert^2\right)}{\sum_i w_i \, g\!\left(\left\lVert \frac{\mathbf{y} - \mathbf{x}_i}{h} \right\rVert^2\right)}, \qquad w_i = \sqrt{\frac{q_{b(\mathbf{x}_i)}}{p_{b(\mathbf{x}_i)}(\mathbf{y})}}, $$
+</p>
+<p>
+where $b(\mathbf{x}_i)$ is the histogram bin of pixel $\mathbf{x}_i$ and $g$ is the derivative of the spatial kernel. Listing 15.5.1 uses OpenCV's <code>meanShift</code> on a hue back-projection; the plain mean-shift window is fixed in size, so an object approaching the camera eventually outgrows its box.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+cap = cv2.VideoCapture("ball.mp4")
+ok, frame = cap.read()
+x, y, w, h = cv2.selectROI("init", frame, False)      # user draws target box
+roi = frame[y:y+h, x:x+w]
+
+# target model: hue histogram, masked to confident saturation/value
+hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+mask = cv2.inRange(hsv_roi, (0, 60, 32), (180, 255, 255))
+hist = cv2.calcHist([hsv_roi], [0], mask, [16], [0, 180])
+cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
+
+track_window = (x, y, w, h)
+term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)  # stop rule
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # back-project: probability each pixel belongs to the target color model
+    prob = cv2.calcBackProject([hsv], [0], hist, [0, 180], scale=1)
+    # climb the probability density to the nearest mode
+    _, track_window = cv2.meanShift(prob, track_window, term)
+
+    px, py, pw, ph = track_window
+    cv2.rectangle(frame, (px, py), (px+pw, py+ph), (0, 255, 0), 2)
+    cv2.imshow("mean-shift", frame)
+    if cv2.waitKey(30) == 27:
+        break
+</code></pre>
+<div class="code-caption"><strong>Listing 15.5.1:</strong> Mean-shift tracking on a hue histogram. The target is summarized as a color distribution; <code>calcBackProject</code> turns each frame into a target-probability map, and <code>meanShift</code> climbs that map to the nearest mode. The window size never changes, the central limitation this code makes visible.</div>
+
+<p>
+The fixed-window limitation is exactly what <strong>CamShift</strong> (Continuously Adaptive Mean-Shift) fixes: after each mean-shift convergence it resizes the window to match the spread of the back-projection (and reports an orientation from the second moments), so the box grows as the object nears and shrinks as it recedes. Swapping <code>cv2.meanShift</code> for <code>cv2.CamShift</code> in Listing 15.5.1 yields a rotating, scaling box. Both share one structural weakness: a pure color model has no notion of shape or texture, so any same-colored distractor (a second red shirt) can capture the window. This is the appearance-ambiguity problem that the correlation filters of the next section attack with a spatially structured template.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Mean-Shift Is Gradient Ascent Without a Learning Rate</div>
+<p>The reason mean-shift converges so reliably is that the kernel-weighted mean shift vector always points uphill on the density estimate, and its magnitude automatically shrinks near the mode, so it behaves like gradient ascent with an adaptive, parameter-free step size. You never tune a learning rate; the data sets the step. This same mode-seeking procedure is a general clustering algorithm (it reappears as a segmentation method in <a href="../module-11-classical-segmentation/index.html">Chapter 11</a>), and recognizing the tracker as "mode-seeking on a per-frame appearance density" is what lets you reason about when it will fail: whenever the true target is not the nearest mode to the current window.</p>
+</div>
+
+<h2>2. Correlation Filters: Tracking in the Fourier Domain <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The correlation-filter family is the great speed story of classical tracking. The idea: learn a small <strong>filter</strong> $\mathbf{h}$ such that correlating it with the target patch produces a sharp peak at the object's center, and correlating it with off-center patches produces near-zero response. Then on each new frame, correlate the filter with a search window; the location of the peak is the new object position. Correlation in the spatial domain is expensive, but the <strong>convolution theorem</strong> from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> turns it into a single elementwise multiply in the frequency domain. A full search over every shift of the window costs one forward FFT, one multiply, and one inverse FFT, which is why MOSSE (Bolme et al., 2010) tracks at over 600 frames per second on a CPU.
+</p>
+<p>
+The filter is learned to map the target patch $\mathbf{f}$ to a desired Gaussian-shaped response $\mathbf{g}$ peaked at the center. In the Fourier domain (capital letters denote transforms, $\odot$ elementwise product, $^*$ complex conjugate) the optimal filter that minimizes squared output error is
+</p>
+<p>
+$$ H^* = \frac{G \odot F^*}{F \odot F^* + \lambda}, $$
+</p>
+<p>
+a closed-form ratio regularized by $\lambda$. MOSSE updates the numerator and denominator with a running average each frame, so the filter adapts as the object's appearance changes. The Kernelized Correlation Filter (KCF, Henriques et al., 2015) extends this with a kernel trick and multi-channel features (such as histogram-of-oriented-gradients descriptors from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>) while keeping the closed-form Fourier solution, giving a large accuracy jump for a small cost. CSRT (Lukezic et al., 2017) adds a spatial reliability map and channel weights for the best accuracy in the OpenCV family, at lower frame rates. Figure 15.5.1 shows the per-frame correlation-tracking loop.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The correlation-filter tracking loop: a search patch is FFT'd, multiplied elementwise by the learned filter, inverse-FFT'd to a response map whose peak gives the new location, which then crops a new patch used to update the filter, closing the loop.">
+  <defs>
+    <marker id="arr155" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+    <marker id="arr155b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b9770e"/>
+    </marker>
+  </defs>
+  <rect x="20" y="95" width="110" height="56" rx="8" fill="#eaf2f8" stroke="#2471a3" stroke-width="1.5"/>
+  <text x="75" y="118" font-family="sans-serif" font-size="12" fill="#1a5276" text-anchor="middle" font-weight="bold">crop search</text>
+  <text x="75" y="134" font-family="sans-serif" font-size="12" fill="#1a5276" text-anchor="middle" font-weight="bold">patch</text>
+  <rect x="165" y="95" width="95" height="56" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="212" y="120" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">FFT</text>
+  <text x="212" y="136" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">to frequency</text>
+  <rect x="295" y="95" width="120" height="56" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="355" y="118" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">multiply by</text>
+  <text x="355" y="134" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">filter H</text>
+  <rect x="450" y="95" width="110" height="56" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="505" y="118" font-family="sans-serif" font-size="12" fill="#2c3e50" text-anchor="middle">inverse FFT</text>
+  <text x="505" y="134" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">response map</text>
+  <rect x="595" y="95" width="120" height="56" rx="8" fill="#e8f8f5" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="655" y="118" font-family="sans-serif" font-size="12" fill="#196f3d" text-anchor="middle" font-weight="bold">peak = new</text>
+  <text x="655" y="134" font-family="sans-serif" font-size="12" fill="#196f3d" text-anchor="middle" font-weight="bold">location</text>
+  <!-- forward arrows -->
+  <line x1="130" y1="123" x2="159" y2="123" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr155)"/>
+  <line x1="260" y1="123" x2="289" y2="123" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr155)"/>
+  <line x1="415" y1="123" x2="444" y2="123" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr155)"/>
+  <line x1="560" y1="123" x2="589" y2="123" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr155)"/>
+  <!-- update loop: new location -> crop next frame's patch and update filter -->
+  <path d="M 655 151 L 655 205 L 75 205 L 75 153" fill="none" stroke="#b9770e" stroke-width="2" marker-end="url(#arr155b)"/>
+  <text x="365" y="225" font-family="sans-serif" font-size="12" fill="#7d6608" text-anchor="middle">update filter from the new patch, advance to the next frame</text>
+</svg>
+<figcaption><strong>Figure 15.5.1</strong> The correlation-filter tracking loop. Each frame, a search patch around the last known position is transformed to the frequency domain (Chapter 4's FFT), multiplied by the learned filter, and inverse-transformed to a response map. The map's peak is the new object location; the patch there updates the filter, so the model adapts as the object's appearance changes.</figcaption>
+</figure>
+
+<p>
+OpenCV's tracking module exposes these as drop-in trackers behind a uniform interface. Listing 15.5.2 initializes a CSRT tracker from a single box and runs it across a video, including the critical check on the boolean returned by <code>update</code>, which signals that the tracker has lost confidence.
+</p>
+
+<pre><code class="language-python">import cv2
+
+cap = cv2.VideoCapture("walk.mp4")
+ok, frame = cap.read()
+box = cv2.selectROI("init", frame, False)   # (x, y, w, h) of the target
+
+# CSRT: most accurate OpenCV tracker; KCF is faster, MOSSE fastest of all
+tracker = cv2.TrackerCSRT_create()
+tracker.init(frame, box)
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    found, box = tracker.update(frame)       # one FFT-based localization
+    if found:
+        x, y, w, h = [int(v) for v in box]
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+    else:
+        cv2.putText(frame, "LOST", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        # a real system would now trigger re-detection (Section 4 below)
+    cv2.imshow("CSRT", frame)
+    if cv2.waitKey(1) == 27:
+        break
+</code></pre>
+<div class="code-caption"><strong>Listing 15.5.2:</strong> A CSRT correlation-filter tracker initialized from one box. The <code>found</code> flag from <code>update</code> is the tracker's own confidence signal; ignoring it is the most common production bug, because a silent tracker that has locked onto the background reports a confident box forever.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Five Trackers Behind One Interface</div>
+<p>Implementing MOSSE from scratch (real FFTs, complex conjugates, the regularized division, the running numerator and denominator update) is about 120 lines, and KCF or CSRT several times that with the kernel trick, feature channels, and spatial reliability map. OpenCV's <code>cv2.legacy</code> and main tracking modules give you <code>TrackerMOSSE</code>, <code>TrackerKCF</code>, <code>TrackerCSRT</code>, plus the learned <code>TrackerDaSiamRPN</code> and <code>TrackerNano</code>, all behind the same <code>init</code> / <code>update</code> pair. Swapping trackers to trade speed for accuracy is a one-word edit. Build MOSSE once to see the convolution theorem do real work; use the library trackers in anything that ships.</p>
+</div>
+
+<h2>3. Drift, Occlusion, and Scale: Why Trackers Fail <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Every appearance tracker shares a fatal tendency called <strong>drift</strong>. Because the model updates itself from its own predictions, any small localization error contaminates the next template: the filter learns a bit of background, which pulls the next prediction slightly off, which puts more background in the template, and the tracker slides off the object over tens of frames. Three situations turn slow drift into outright loss. <strong>Occlusion</strong>: the object disappears behind a pillar, the tracker latches onto the occluder, and when the object reappears it is gone. <strong>Scale change</strong>: a fixed-size template (plain MOSSE, plain KCF) loses an object that approaches or recedes; CSRT and KCF-with-scale-pyramid mitigate this but do not cure it. <strong>Fast motion or blur</strong>: the object leaves the search window between frames and the peak lands on whatever was nearby.
+</p>
+<p>
+The classical defenses are pragmatic. Monitor the peak response strength (a confident track has a sharp, tall peak; the Peak-to-Sidelobe Ratio quantifies this) and freeze or shrink the learning rate when confidence drops, so the model does not learn the occluder. Search a slightly larger window after a low-confidence frame. And, crucially, do not trust a tracker indefinitely: pair it with a detector that periodically re-anchors the target.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Tracker That Followed a Cloud</div>
+<p>Drift has no shame. A correlation filter that loses its target onto a passing shadow, a reflection, or a patch of similarly colored carpet will keep reporting a crisp, confident bounding box around the wrong thing, frame after frame, with the serene certainty of someone who took the wrong exit and is sure the highway will come back. The tracker is not lying to you; it genuinely cannot tell. This is exactly why Listing 15.5.2 checks the <code>found</code> flag: a tracker that has quietly locked onto the background is the most dangerous kind, because it never stops sounding sure of itself.</p>
+</div>
+
+<h2>4. Tracking-by-Detection and Re-Detection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The robust pattern that dominates production is <strong>tracking-by-detection</strong>: run a detector (a background-subtraction blob detector from <a href="section-15.4.html">Section 15.4</a>, or a learned object detector from <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>) periodically or every frame, and use a fast tracker to bridge the gaps and to associate detections across frames. The historically influential TLD framework (Kalal et al., 2012, "Tracking-Learning-Detection") made the loop explicit: a tracker follows the object frame to frame, a detector scans for the object independently, and a learning component reconciles the two, correcting the tracker when the detector finds the object elsewhere and expanding the detector's model from the tracker's confident frames. The detector provides the long-term memory the tracker lacks; the tracker provides the speed and inter-frame continuity the detector lacks.
+</p>
+<p>
+This division of labor is the conceptual bridge to multi-object tracking. Once a detector emits a fresh set of boxes every frame, the tracking problem becomes <em>data association</em>: which of this frame's detections continue which of last frame's tracks? Answering that with a motion model and an assignment algorithm is precisely the subject of <a href="section-15.6.html">Section 15.6</a>, and the Kalman filter there supplies the motion prediction that tells the associator where each tracked object should appear before any detection is even examined.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Broadcast Tracker That Would Not Let Go</div>
+<p><strong>Who:</strong> An engineer at a sports-broadcast graphics vendor building an automatic "spotlight" that keeps a highlighted ring under a selected player.</p>
+<p><strong>Situation:</strong> An operator clicks one player at kickoff; the system must keep the ring locked under that player for the rest of the play, at 50 frames per second, on broadcast hardware, with no GPU budget for per-frame detection.</p>
+<p><strong>Problem:</strong> A KCF tracker locked on beautifully until two same-jersey teammates crossed. The filter, having no team-versus-individual discrimination, drifted onto the wrong player at the crossing and stayed there, with a confident-looking box, for the rest of the play. Pure appearance tracking had no way to know it had swapped targets.</p>
+<p><strong>Decision:</strong> Keep the fast KCF tracker for inter-frame speed, but add a cheap re-detection anchor: every 15 frames, run a lightweight jersey-number and pose check inside the tracked box and a small neighborhood. When the Peak-to-Sidelobe Ratio dropped or the jersey check disagreed with the locked identity, the system paused learning and re-searched the neighborhood for the correct player, snapping the box back. The motion model (Section 15.6) predicted which of two crossing players was the target based on pre-crossing velocity.</p>
+<p><strong>Result:</strong> Identity swaps at player crossings fell from roughly one per two plays to under one per twenty, while staying inside the 50-frames-per-second budget, because the expensive checks ran only every 15 frames and only the cheap tracker ran in between.</p>
+<p><strong>Lesson:</strong> A pure appearance tracker will confidently follow the wrong object after a crossing or occlusion and never know. The fix is not a better tracker but a slower, smarter re-detection anchor plus a motion prior, which is exactly the tracking-by-detection architecture and the precise motivation for the data-association machinery of the next section.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Transformer Trackers and Promptable Video (2024-2026)</div>
+<p>Single-object tracking is now led by transformer architectures that fuse template and search-region features with attention rather than correlation. The benchmark line runs through SiamRPN++ and the discriminative DiMP family to fully transformer trackers (TransT, MixFormer, OSTrack, and successors such as the SAMURAI motion-aware variant of 2024), which top the GOT-10k, LaSOT, and TrackingNet benchmarks by wide margins over KCF and CSRT, at the cost of needing a GPU. The 2024 game-changer for general video is Segment Anything 2 (SAM 2, <a href="https://arxiv.org/abs/2408.00714" target="_blank" rel="noopener">arXiv:2408.00714</a>): prompt one mask on one frame and it tracks the object pixel-accurately through the clip with a memory module that handles occlusion and reappearance, effectively a promptable, class-agnostic tracker. For 2026 practice, the split is by hardware: correlation filters remain the right tool for embedded, no-GPU, hundreds-of-FPS settings, while a transformer tracker or SAM 2 is the default when a GPU is available and accuracy matters. The learned successors that fully absorb this section's ideas live in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.1: When Is the Target Not the Nearest Mode? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Mean-shift converges to the nearest mode of the per-frame appearance density. Construct three concrete scenarios in which the nearest mode to the current window is <em>not</em> the true target: a same-colored distractor entering the search region, a fast-moving target that leaves the basin of attraction between frames, and a target that changes color (a person stepping from sun into shadow). For each, state whether CamShift's scale and orientation adaptation helps, and why a color-histogram model is fundamentally vulnerable to the first case.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.2: Speed Versus Accuracy Across the Tracker Family <span class="exercise-type coding">Coding</span></div>
+<p>On a single annotated clip with known ground-truth boxes, run <code>TrackerMOSSE</code>, <code>TrackerKCF</code>, and <code>TrackerCSRT</code> from the same initial box. For each, measure average frames per second and the mean intersection-over-union against ground truth (reuse the IoU idea from <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>). Plot accuracy versus speed. Then introduce a partial occlusion partway through the clip and report which tracker recovers and which permanently loses the target. Relate the recovery behavior to each tracker's learning-rate and confidence handling.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.5.3: Building a Re-Detection Anchor <span class="exercise-type analysis">Analysis</span></div>
+<p>Extend Listing 15.5.2 with a re-detection loop. Compute the Peak-to-Sidelobe Ratio of the correlation response each frame (or use the <code>found</code> flag as a proxy). When confidence drops below a threshold, freeze the tracker's appearance update and re-run an independent detector (background-subtraction blobs from <a href="section-15.4.html">Section 15.4</a>, or a class detector) in an enlarged neighborhood, re-initializing the tracker on the best matching detection. Quantify how this changes long-term success rate on a clip with one full occlusion, and discuss the failure mode where re-detection re-anchors onto the wrong object.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.4.html">&#8592; Section 15.4: Background Subtraction &amp; Change Detection</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="section-15.6.html">Section 15.6: Kalman Filters &amp; Multi-Object Data Association &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.3: Pooling, Receptive Fields &amp; Feature Hierarchies. Max and average pooling, the receptive-field recurrence, effective versus theoretical receptive fields, global pooling for invariance, and how stacked layers build an edges-to-parts-to-objects hierarchy." name="description"/>
+<title>Section 19.3: Pooling, Receptive Fields &amp; Feature Hierarchies | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Convolutional Neural Networks</a></div>
+<h1>Pooling, Receptive Fields &amp; Feature Hierarchies</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I summarize. You hand me a four-by-four neighborhood and ask what is there; I hand back the single loudest pixel and walk off. The details you lost were details you did not need."</p>
+<cite>A Max-Pooling Layer With Strong Opinions</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A single convolution sees only its kernel; a deep stack sees an entire scene, because each layer's window opens onto windows of the layer below, and those windows compound.</strong> This section makes that compounding precise with the receptive-field recurrence, introduces pooling as a complementary way to summarize and shrink feature maps, and shows how repeated convolution and downsampling assemble the edges-to-textures-to-parts-to-objects hierarchy that is the reason CNNs work. By the end you will be able to compute, for any layer, exactly how much of the input it can possibly respond to.</p>
+</div>
+
+<p>
+<a href="section-19.2.html">Section 19.2</a> gave you the convolutional layer and the output-size formula, but left one question dangling: a $3 \times 3$ kernel touches only nine input pixels, so how can a CNN ever recognize an object that spans hundreds of pixels? The answer is depth. Each layer reads from the layer below, whose every activation already summarized a patch of the layer below that, and so on down to the pixels. Tracking how far back into the input a given activation reaches is the job of the receptive field, the central quantity of this section. Along the way we add pooling, the older sibling of strided convolution, and end with the feature hierarchy that ties the whole chapter together.
+</p>
+
+<h2>1. Pooling: Summarize and Shrink <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>pooling layer</strong> replaces each small window of a feature map with a single summary value, with no learnable weights. The two standard summaries are the maximum (<strong>max pooling</strong>) and the mean (<strong>average pooling</strong>). A $2 \times 2$ max pool with stride 2 takes each non-overlapping $2 \times 2$ block and keeps only its largest activation, halving the resolution along each axis and discarding three quarters of the values. Pooling has two purposes: it downsamples, reducing the compute and memory of later layers, and it builds a small amount of local translation invariance, because the maximum over a window does not change if the peak shifts by one pixel within that window. Figure 19.3.1 shows a $2 \times 2$ max pool side by side with average pooling on the same input.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 4 by 4 input feature map is reduced to 2 by 2 by max pooling, which keeps the largest value in each 2 by 2 block, and by average pooling, which keeps the mean of each block.">
+  <!-- input 4x4 -->
+  <text x="130" y="28" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle" font-weight="bold">Input 4x4</text>
+  <g stroke="#90a4ae" stroke-width="1" fill="#ffffff">
+    <rect x="40" y="45" width="180" height="180"/>
+    <line x1="85" y1="45" x2="85" y2="225"/><line x1="130" y1="45" x2="130" y2="225"/><line x1="175" y1="45" x2="175" y2="225"/>
+    <line x1="40" y1="90" x2="220" y2="90"/><line x1="40" y1="135" x2="220" y2="135"/><line x1="40" y1="180" x2="220" y2="180"/>
+  </g>
+  <!-- shade the four 2x2 blocks -->
+  <rect x="40" y="45" width="90" height="90" fill="#3498db" fill-opacity="0.10"/>
+  <rect x="130" y="45" width="90" height="90" fill="#e67e22" fill-opacity="0.10"/>
+  <rect x="40" y="135" width="90" height="90" fill="#27ae60" fill-opacity="0.10"/>
+  <rect x="130" y="135" width="90" height="90" fill="#9b59b6" fill-opacity="0.10"/>
+  <g font-family="monospace" font-size="13" fill="#2c3e50" text-anchor="middle">
+    <text x="62" y="73">1</text><text x="107" y="73">3</text><text x="152" y="73">2</text><text x="197" y="73">0</text>
+    <text x="62" y="118">4</text><text x="107" y="118">2</text><text x="152" y="118">1</text><text x="197" y="118">5</text>
+    <text x="62" y="163">0</text><text x="107" y="163">1</text><text x="152" y="163">6</text><text x="197" y="163">2</text>
+    <text x="62" y="208">2</text><text x="107" y="208">3</text><text x="152" y="208">1</text><text x="197" y="208">0</text>
+  </g>
+  <!-- max pool -->
+  <text x="420" y="28" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle" font-weight="bold">Max pool 2x2</text>
+  <g stroke="#90a4ae" stroke-width="1" fill="#ffffff">
+    <rect x="370" y="55" width="100" height="100"/>
+    <line x1="420" y1="55" x2="420" y2="155"/><line x1="370" y1="105" x2="470" y2="105"/>
+  </g>
+  <g font-family="monospace" font-size="14" fill="#2c3e50" text-anchor="middle" font-weight="bold">
+    <text x="395" y="86">4</text><text x="445" y="86">5</text><text x="395" y="136">3</text><text x="445" y="136">6</text>
+  </g>
+  <!-- avg pool -->
+  <text x="620" y="28" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle" font-weight="bold">Avg pool 2x2</text>
+  <g stroke="#90a4ae" stroke-width="1" fill="#ffffff">
+    <rect x="570" y="55" width="100" height="100"/>
+    <line x1="620" y1="55" x2="620" y2="155"/><line x1="570" y1="105" x2="670" y2="105"/>
+  </g>
+  <g font-family="monospace" font-size="13" fill="#2c3e50" text-anchor="middle">
+    <text x="595" y="86">2.5</text><text x="645" y="86">2.0</text><text x="595" y="136">1.5</text><text x="645" y="136">2.25</text>
+  </g>
+  <path d="M 230 135 L 360 105" stroke="#2c3e50" stroke-width="1.6" fill="none" marker-end="url(#a193)"/>
+  <path d="M 230 135 L 560 105" stroke="#2c3e50" stroke-width="1.6" fill="none" marker-end="url(#a193)"/>
+  <defs><marker id="a193" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/></marker></defs>
+  <text x="380" y="270" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">Max keeps the strongest response in each block; average keeps the mean. Both halve resolution.</text>
+</svg>
+<figcaption><strong>Figure 19.3.1</strong> Pooling a $4 \times 4$ map to $2 \times 2$. Max pooling reports the largest value in each colored $2 \times 2$ block (4, 5, 3, 6), preserving the strongest feature response; average pooling reports the block mean (2.5, 2.0, 1.5, 2.25), smoothing the map. Neither has learnable parameters.</figcaption>
+</figure>
+
+<p>
+Max pooling dominated early architectures because the strongest response in a window is usually the most informative ("is the edge present somewhere here?"), while average pooling blurs and can dilute a sharp detection. Modern networks frequently skip pooling entirely in favor of strided convolution from <a href="section-19.2.html">Section 19.2</a>, which downsamples and learns its summary jointly. But pooling never disappeared: <strong>global average pooling</strong>, which collapses an entire $H \times W$ feature map to one number per channel, is the standard final step before a classifier head, because it produces a fixed-length vector regardless of input size and gives the whole-image translation invariance that <a href="section-19.1.html">Section 19.1</a> distinguished from equivariance.
+</p>
+
+<h2>2. The Receptive Field <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>receptive field</strong> of an activation is the set of input pixels that can influence its value. For the first convolutional layer it is just the kernel size; a $3 \times 3$ filter has a $3 \times 3$ receptive field. The interesting case is deeper layers, where the receptive field grows because each activation reads a window of the previous layer, and each of those activations already had its own receptive field below. The growth follows a clean recurrence. Writing $r_{\ell}$ for the receptive field of layer $\ell$, $k_{\ell}$ for its kernel size, and $j_{\ell-1}$ for the <em>jump</em> (the input-pixel spacing between adjacent activations entering layer $\ell$, equal to the product of all strides up to layer $\ell - 1$):
+</p>
+<p>
+$$ r_{\ell} \;=\; r_{\ell-1} \;+\; (k_{\ell} - 1)\, j_{\ell-1}, \qquad j_{\ell} \;=\; j_{\ell-1}\, s_{\ell}, $$
+</p>
+<p>
+starting from $r_0 = 1$ and $j_0 = 1$. The jump multiplies by each layer's stride, and the receptive field grows by $(k-1)$ times the current jump at each layer. The crucial consequence: stride accelerates receptive-field growth, because once the jump is large, each new layer reaches across more input pixels. This is why striding (or pooling) is not just about saving compute; it is the main lever for seeing far.
+</p>
+
+<p>
+The code below walks the recurrence over a small stack and prints the receptive field after each layer, so you can see it balloon once stride enters.
+</p>
+
+<pre><code class="language-python">def receptive_field(layers):
+    """layers: list of (kernel_size, stride). Returns RF after each layer."""
+    r, j = 1, 1                       # start: one pixel sees itself, jump 1
+    out = []
+    for k, s in layers:
+        r = r + (k - 1) * j           # grow RF by (k-1)*current_jump
+        j = j * s                     # jump scales by this layer's stride
+        out.append((r, j))
+    return out
+
+# A small VGG-style stack: 3x3 convs with a stride-2 downsample every few layers.
+stack = [(3, 1), (3, 1), (3, 2),     # block 1, then halve
+         (3, 1), (3, 1), (3, 2),     # block 2, then halve
+         (3, 1), (3, 1), (3, 2)]     # block 3, then halve
+
+for i, (r, j) in enumerate(receptive_field(stack), 1):
+    print(f"after layer {i}: receptive field {r}x{r}, jump {j}")
+# after layer 1: receptive field 3x3, jump 1
+# after layer 2: receptive field 5x5, jump 1
+# after layer 3: receptive field 7x7, jump 2
+# after layer 4: receptive field 11x11, jump 2
+# after layer 5: receptive field 15x15, jump 2
+# after layer 6: receptive field 19x19, jump 4
+# after layer 7: receptive field 27x27, jump 4
+# after layer 8: receptive field 35x35, jump 4
+# after layer 9: receptive field 43x43, jump 8</code></pre>
+<div class="code-caption">The receptive-field recurrence in code: nine $3 \times 3$ layers with three stride-2 downsamples grow each activation's reach from $3 \times 3$ to $43 \times 43$ input pixels. Notice how the jump (and therefore the per-layer growth) accelerates after every strided layer.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two 3x3 Layers Equal One 5x5, Cheaper</div>
+<p>The recurrence shows that two stacked $3 \times 3$ convolutions have a $5 \times 5$ receptive field, and three have a $7 \times 7$ one. This is the design principle behind VGG (<a href="../module-20-cnn-architectures/index.html">Chapter 20</a>): a stack of small kernels matches the reach of one large kernel while using fewer parameters ($2 \times 9 = 18$ versus $25$ for a single $5 \times 5$) and inserting a nonlinearity between them, which makes the function richer. The small-kernel stack was the default for years, and it is exactly the receptive-field arithmetic of this section that justifies it.</p>
+</div>
+
+<h2>3. Effective Versus Theoretical Receptive Field <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The recurrence computes the <em>theoretical</em> receptive field, the pixels that <em>could</em> influence an activation. The pixels that <em>actually</em> influence it meaningfully form a much smaller region. Luo et al. showed that influence falls off roughly like a Gaussian from the center of the receptive field, so the <strong>effective receptive field</strong> is far smaller than the nominal one, often only a fraction of its diameter, and it grows only as the square root of the number of layers rather than linearly. The reason is statistical: the center pixel reaches the output through exponentially many paths, the corner pixels through very few, so the corners contribute little even though they are technically connected.
+</p>
+<p>
+The practical lesson is sobering and useful. A network whose theoretical receptive field covers the whole image may, in effect, attend to only a central blob, which is one reason segmentation and detection architectures deliberately enlarge the effective field with dilation (<a href="section-19.2.html">Section 19.2</a>), with explicit large kernels, or with the global context of attention in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. When a CNN inexplicably ignores context that is clearly present in the input, a too-small effective receptive field is a prime suspect.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Network That Claims It Can See</div>
+<p>The receptive field is the network bragging about how far it <em>could</em> see; the effective receptive field is how far it actually bothers to look. The corners of a big receptive field are like the back row of a lecture hall: technically attending, contributing almost nothing. So when you compute a glorious $483 \times 483$ theoretical reach and the model still cannot tell forest from farmland, do not be shocked. Keep this slogan on a sticky note: <strong>nominal reach is a promise; the Gaussian decides what it keeps</strong>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Buying Receptive Field Directly</div>
+<p>The gap between theoretical and effective receptive field motivated a wave of 2022-2026 designs that enlarge reach without simply stacking more layers. RepLKNet (Ding et al., CVPR 2022, arXiv:2203.06717) uses $31 \times 31$ depthwise kernels to expand the effective field in a single layer, reporting that effective receptive field, not raw depth, tracks downstream accuracy. PeLK (Chen et al., CVPR 2024, arXiv:2403.07589) pushes to $101 \times 101$ "peripheral" kernels with parameter sharing modeled on human peripheral vision. State-space vision models such as VMamba (Liu et al., 2024, arXiv:2401.10166) achieve a global receptive field in linear time, a third route alongside large kernels and attention. The receptive-field arithmetic you computed by hand in this section is precisely the quantity these architectures compete to enlarge efficiently.</p>
+</div>
+
+<h2>4. The Feature Hierarchy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Putting convolution, nonlinearity, and downsampling together produces the structure that gives the chapter its theme: a <strong>feature hierarchy</strong>. The first layer, with a small receptive field, can only respond to local patterns, and it reliably learns oriented edges and color blobs, the same primitives the Sobel and Gabor filters of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> compute by hand. The second layer reads combinations of first-layer features over a slightly larger field and learns corners, junctions, and simple textures. Deeper layers, with receptive fields spanning a large fraction of the image, compose those into object parts (an eye, a wheel, a doorknob), and the deepest layers respond to whole objects and scenes. Figure 19.3.2 sketches this climb.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A four-stage pipeline: pixels feed an early layer that detects edges, then a mid layer that detects textures and corners, then a deeper layer that detects object parts, then the deepest layer that detects whole objects. Receptive field and abstraction both grow left to right.">
+  <defs><marker id="a194" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#2c3e50"/></marker></defs>
+  <!-- stages -->
+  <g font-family="sans-serif" text-anchor="middle">
+    <rect x="30" y="80" width="120" height="80" rx="8" fill="#d6eaf8" stroke="#2980b9"/>
+    <text x="90" y="108" font-size="13" font-weight="bold" fill="#1f618d">Early layers</text>
+    <text x="90" y="128" font-size="11" fill="#2c3e50">edges, color</text>
+    <text x="90" y="144" font-size="11" fill="#5a626c">RF ~ 5px</text>
+
+    <rect x="200" y="80" width="120" height="80" rx="8" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="260" y="108" font-size="13" font-weight="bold" fill="#196f3d">Mid layers</text>
+    <text x="260" y="128" font-size="11" fill="#2c3e50">textures, corners</text>
+    <text x="260" y="144" font-size="11" fill="#5a626c">RF ~ 20px</text>
+
+    <rect x="370" y="80" width="120" height="80" rx="8" fill="#fcf3cf" stroke="#b9770e"/>
+    <text x="430" y="108" font-size="13" font-weight="bold" fill="#9a7d0a">Deep layers</text>
+    <text x="430" y="128" font-size="11" fill="#2c3e50">object parts</text>
+    <text x="430" y="144" font-size="11" fill="#5a626c">RF ~ 80px</text>
+
+    <rect x="540" y="80" width="140" height="80" rx="8" fill="#fadbd8" stroke="#c0392b"/>
+    <text x="610" y="108" font-size="13" font-weight="bold" fill="#943126">Deepest layers</text>
+    <text x="610" y="128" font-size="11" fill="#2c3e50">whole objects</text>
+    <text x="610" y="144" font-size="11" fill="#5a626c">RF ~ whole image</text>
+  </g>
+  <path d="M 150 120 L 198 120" stroke="#2c3e50" stroke-width="2" marker-end="url(#a194)"/>
+  <path d="M 320 120 L 368 120" stroke="#2c3e50" stroke-width="2" marker-end="url(#a194)"/>
+  <path d="M 490 120 L 538 120" stroke="#2c3e50" stroke-width="2" marker-end="url(#a194)"/>
+  <text x="355" y="50" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">Abstraction and receptive field both grow with depth</text>
+  <text x="355" y="210" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">Each stage composes the features of the stage before it over a larger window.</text>
+  <text x="355" y="230" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">The same conv-nonlinearity-downsample block, repeated, produces the whole climb.</text>
+</svg>
+<figcaption><strong>Figure 19.3.2</strong> The feature hierarchy. Repeating the convolution-nonlinearity-downsample block grows the receptive field and, with it, the abstraction of the features: edges, then textures and corners, then object parts, then whole objects. This emergent ladder, learned from data, is the core reason deep CNNs recognize complex scenes, and Section 19.6 will visualize it in a trained network.</figcaption>
+</figure>
+
+<p>
+This hierarchy is not imposed; it emerges from training. Nobody tells layer one to learn edges, yet it almost always does, because edges are the most useful local primitive and the receptive field at that depth permits nothing more global. The hierarchy is also the foundation of <strong>transfer learning</strong> in <a href="../module-21-training-recipes/index.html">Chapter 21</a>: because early-layer features (edges, textures) are generic across tasks, a network trained on one large dataset can be reused on another by keeping its early layers and retraining only the later, task-specific ones. We will see the learned edge detectors directly in <a href="section-19.6.html">Section 19.6</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Model That Could Not See the Forest</div>
+<p><strong>Who:</strong> A remote-sensing team classifying satellite tiles as forest, farmland, urban, or water for a land-use monitoring service.</p>
+<p><strong>Situation:</strong> Their compact CNN scored well on farmland and water but confused fragmented forest with farmland on large $512 \times 512$ tiles, despite the two looking obviously different to a human eye scanning the whole tile.</p>
+<p><strong>Problem:</strong> The network was shallow and used only stride-1 convolutions with one early pool. Its theoretical receptive field was about $40 \times 40$ pixels, and the effective field smaller still, so each output decision was made from a tiny patch where fragmented forest and tilled farmland are genuinely ambiguous. The global texture that distinguishes them was outside what any neuron could see.</p>
+<p><strong>Decision:</strong> Rather than naively stacking more layers, the team added two stride-2 downsamples early and a pair of dilation-2 convolutions deeper, enlarging the receptive field to roughly the full tile while keeping the parameter count nearly flat.</p>
+<p><strong>Result:</strong> Forest-versus-farmland confusion dropped by 60 percent, and overall tile accuracy rose four points. A receptive-field calculation done on a napkin, the recurrence of this section, predicted the fix before any retraining.</p>
+<p><strong>Lesson:</strong> When a model fails on a distinction that requires global context, compute the receptive field before adding capacity. The problem is often not that the network is too small but that it cannot see far enough, and stride or dilation fixes that more cheaply than depth.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pooling and Global Pooling in One Call</div>
+<p>The four-line max-pool loop you might write from Figure 19.3.1 is <code>nn.MaxPool2d(kernel_size=2, stride=2)</code>, and average pooling is <code>nn.AvgPool2d(2, 2)</code>. The classifier-head global pool that turns any $C \times H \times W$ map into a $C$-vector regardless of resolution is one call, <code>nn.AdaptiveAvgPool2d(1)</code>, which internally chooses the window to hit the requested output size. Computing the receptive field of a real torchvision model by hand is also unnecessary: libraries such as <code>torchinfo</code> print per-layer output shapes, and the <code>pytorch-receptive-field</code> utility walks the recurrence of this section automatically for an arbitrary module.</p>
+</div>
+
+<p>
+You can now reason about a CNN's geometry end to end: how big each layer's output is (the formula of <a href="section-19.2.html">Section 19.2</a>) and how far back into the image it reaches (the recurrence here). One obstacle still stands between this understanding and a working network: deep stacks are hard to optimize, because activation statistics drift as signals pass through many layers. <a href="section-19.4.html">Section 19.4</a> introduces batch normalization, the technique that tamed that drift and made the deep hierarchies of this section trainable in practice.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.3.1: Receptive Field by Hand <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the recurrence in this section, compute the receptive field of the final activation in this stack, layer by layer: a $5 \times 5$ stride-1 convolution, then a $2 \times 2$ stride-2 max pool, then two $3 \times 3$ stride-1 convolutions. Show the jump after each step. Then state how the answer would change if you swapped the $5 \times 5$ first layer for two stacked $3 \times 3$ layers, and explain which choice has fewer parameters.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.3.2: Max Versus Average, Empirically <span class="exercise-type coding">Coding</span></div>
+<p>Create a $1 \times 1 \times 8 \times 8$ tensor that is all zeros except for a single large value (a "spike"). Apply both <code>nn.MaxPool2d(2, 2)</code> and <code>nn.AvgPool2d(2, 2)</code>, print both outputs, and shift the spike by one pixel within its pooling window to show that max pooling's output is unchanged while average pooling's is. Write one sentence explaining why this makes max pooling locally translation-invariant and why that is sometimes undesirable for dense prediction.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.3.3: Diagnose the Blind Network <span class="exercise-type analysis">Analysis</span></div>
+<p>A classifier of $256 \times 256$ medical images uses eight stride-1 $3 \times 3$ convolutions and no downsampling, ending in global average pooling. It performs well on small lesions but poorly on diffuse, large-scale findings. Compute the theoretical receptive field of the last convolutional layer, argue why the effective receptive field is even smaller (cite the Gaussian-falloff result), and propose two distinct architectural changes that would let the network perceive large-scale structure without a large increase in parameters.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.2.html">&#8592; Section 19.2: Convolution Layers</a>
+<a href="index.html">Chapter 19</a>
+<a class="next" href="section-19.4.html">Section 19.4: Batch Normalization &amp; Friends &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

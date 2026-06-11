@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.1: Spatial Control with ControlNet and conditioning adapters. The trainable encoder copy and zero-convolution injection that pin layout to an edge map, depth map, or pose skeleton; the T2I-Adapter and IP-Adapter families; and the conditioning-scale dial that trades obedience against creativity." name="description"/>
+<title>Section 35.1: Spatial Control: ControlNet &amp; Conditioning Adapters | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Controllable Generation &amp; Image Editing</a></div>
+<h1>Spatial Control: ControlNet &amp; Conditioning Adapters</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Tell me what to draw and I will improvise wildly. Show me where to draw it and I will suddenly become very professional."</p>
+<cite>A Diffusion U-Net With a Newfound Respect for Structure</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Spatial control adds a second conditioning channel alongside the text prompt: a structural map (edges, depth, or a pose skeleton) that the diffusion model is trained to honor pixel by pixel, while the prompt still decides texture, color, and content.</strong> ControlNet achieves this without retraining or damaging the base model by cloning the U-Net's encoder into a trainable branch and wiring it back in through zero-initialized convolutions, so that at the start of training the control branch contributes exactly nothing and the model behaves identically to the original. As training proceeds, the branch learns to nudge the generation toward the supplied structure. The whole idea is a surgical addition to a frozen network, and once you see the zero-convolution trick you will recognize it as a general recipe for adding capabilities to large pretrained models without breaking them.</p>
+</div>
+
+<p>
+In <a href="../module-34-text-to-image/index.html">Chapter 34</a> the only handle on a generation was the text prompt, and a prompt is a poor instrument for geometry. You can write "a cathedral" but not "this exact silhouette"; you can write "a person waving" but not "this precise pose." Spatial control closes that gap. Given a structural map derived from a reference (or drawn by hand), a controlled model produces an image whose layout matches the map and whose content matches the prompt. This section builds the mechanism: first the ControlNet architecture and its zero-convolution trick, then the conditioning signals (edges, depth, pose) that come straight from earlier chapters, then the lighter adapter alternatives, and finally the conditioning-scale dial that decides how strictly the model obeys.
+</p>
+
+<h2>1. The Problem: Prompts Cannot Specify Geometry <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Recall from <a href="../module-34-text-to-image/index.html">Section 34.2</a> how text reaches the image: the prompt is encoded into a sequence of token embeddings, and cross-attention layers in the U-Net let every spatial location query those embeddings. This is a powerful but fundamentally <em>global</em> and <em>semantic</em> channel. The word "left" in a prompt nudges a soft statistical prior; it does not place a pixel. If you need the horizon at row 200, a hand in the lower-right quadrant, or the same composition as a reference photo, no amount of prompt wording reliably delivers it, because the conditioning signal carries meaning, not coordinates.
+</p>
+
+<p>
+The fix is to add a conditioning signal that <em>is</em> spatial: a map with the same height and width as the latent grid, where each location carries a structural hint. An edge map says "there is a boundary here." A depth map says "this region is near, that one is far." A pose skeleton says "the elbow is at this coordinate." The model is then trained so that the generated image respects the map. Figure 35.1.1 contrasts the two conditioning channels.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two conditioning paths into a U-Net: a global text path through cross-attention and a spatial control path through a trainable branch">
+<style>
+.l1{font:12px sans-serif;fill:#1a1a1a;}
+.l2{font:10.5px sans-serif;fill:#555;}
+.bx{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.bc{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.bg{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.5;}
+.ar{stroke:#444;stroke-width:1.6;marker-end:url(#a1);fill:none;}
+</style>
+<defs>
+<marker id="a1" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+</defs>
+<rect class="bx" x="290" y="110" width="140" height="60"/>
+<text class="l1" x="360" y="138" text-anchor="middle">Diffusion U-Net</text>
+<text class="l2" x="360" y="155" text-anchor="middle">(frozen base)</text>
+<rect class="bc" x="40" y="30" width="150" height="46"/>
+<text class="l1" x="115" y="50" text-anchor="middle">Text prompt</text>
+<text class="l2" x="115" y="66" text-anchor="middle">"a cathedral, dusk"</text>
+<rect class="bg" x="40" y="200" width="150" height="46"/>
+<text class="l1" x="115" y="220" text-anchor="middle">Control map</text>
+<text class="l2" x="115" y="236" text-anchor="middle">edges / depth / pose</text>
+<path class="ar" d="M190,53 C 240,53 250,118 288,124"/>
+<text class="l2" x="245" y="80" text-anchor="middle" fill="#d6802b">cross-attention (semantic)</text>
+<path class="ar" d="M190,223 C 240,223 250,160 288,156"/>
+<text class="l2" x="245" y="200" text-anchor="middle" fill="#2f9e5c">spatial branch (geometric)</text>
+<rect class="bx" x="540" y="110" width="120" height="60"/>
+<text class="l1" x="600" y="145" text-anchor="middle">Latent</text>
+<path class="ar" d="M430,140 L538,140"/>
+<text class="l2" x="485" y="130" text-anchor="middle">decode &#8594; image</text>
+</svg>
+<figcaption><strong>Figure 35.1.1:</strong> Two conditioning channels into the same diffusion U-Net. The text prompt (orange) enters through cross-attention and controls semantics: what objects, what style, what mood. The control map (green) enters through a spatial branch and controls geometry: where edges, surfaces, and limbs sit. ControlNet is the machinery that implements the green path without disturbing the frozen base model.</figcaption>
+</figure>
+
+<h2>2. ControlNet: A Trainable Copy of the Encoder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The naive way to add spatial conditioning would be to fine-tune the whole U-Net on (control map, image) pairs. This is expensive and risky: with limited control data you can damage the rich generative prior that took millions of images to learn, a catastrophic-forgetting failure of exactly the kind <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a> warned about during transfer learning. ControlNet sidesteps the risk with a clean architectural move. It <strong>freezes</strong> the original U-Net entirely and creates a <strong>trainable copy of just the encoder half</strong> (the downsampling blocks). The control map is fed into this copy. The copy's outputs are added back into the frozen U-Net's decoder at the corresponding resolutions.
+</p>
+
+<p>
+The crucial detail is how the copy connects to the frozen network. Each connection passes through a <strong>zero convolution</strong>: a $1 \times 1$ convolution whose weights and bias are initialized to zero. Because a zero-initialized layer outputs zero regardless of input, at the very first training step the control branch adds nothing, and the controlled model produces exactly what the original model would. Let $\mathcal{F}$ be a frozen block with parameters $\Theta$, let $\mathcal{F}_c$ be its trainable copy with parameters $\Theta_c$, and let $\mathcal{Z}(\cdot;\,\cdot)$ be a zero convolution. The controlled output of a block on feature $x$ with control input $c$ is
+</p>
+
+<div class="math-block">
+$$y_c = \mathcal{F}(x;\Theta) + \mathcal{Z}\!\big(\mathcal{F}_c(x + \mathcal{Z}(c;\Theta_{z1});\,\Theta_c);\,\Theta_{z2}\big).$$
+</div>
+
+<p>
+At initialization both zero convolutions output zero, so $y_c = \mathcal{F}(x;\Theta)$ exactly: the network is unchanged. Gradients still flow into the zero convolutions (their input is nonzero), so they begin to learn immediately, but they grow from a safe starting point rather than injecting random noise into a delicate pretrained model. This is why ControlNet trains stably on datasets of only tens of thousands of pairs and rarely degrades the base model's quality. Figure 35.1.2 shows the wiring.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ControlNet architecture: frozen U-Net on the left, trainable encoder copy on the right connected through zero convolutions">
+<style>
+.t1{font:12px sans-serif;fill:#1a1a1a;}
+.t2{font:10px sans-serif;fill:#555;}
+.frz{fill:#eef0f3;stroke:#8a8f98;stroke-width:1.4;}
+.trn{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.5;}
+.zc{fill:#fff4d6;stroke:#c79a1e;stroke-width:1.4;}
+.aa{stroke:#2f9e5c;stroke-width:1.5;marker-end:url(#az);fill:none;}
+.ab{stroke:#8a8f98;stroke-width:1.5;marker-end:url(#ag);fill:none;}
+</style>
+<defs>
+<marker id="az" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+<marker id="ag" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8a8f98"/></marker>
+</defs>
+<text class="t1" x="150" y="22" text-anchor="middle">Frozen U-Net</text>
+<rect class="frz" x="100" y="35" width="100" height="34"/><text class="t2" x="150" y="56" text-anchor="middle">Encoder block</text>
+<rect class="frz" x="100" y="135" width="100" height="34"/><text class="t2" x="150" y="156" text-anchor="middle">Mid block</text>
+<rect class="frz" x="100" y="235" width="100" height="34"/><text class="t2" x="150" y="256" text-anchor="middle">Decoder block</text>
+<line class="ab" x1="150" y1="69" x2="150" y2="133"/>
+<line class="ab" x1="150" y1="169" x2="150" y2="233"/>
+<text class="t1" x="560" y="22" text-anchor="middle">Trainable copy</text>
+<rect class="zc" x="500" y="35" width="120" height="26"/><text class="t2" x="560" y="52" text-anchor="middle">zero conv (input)</text>
+<rect class="trn" x="510" y="78" width="100" height="34"/><text class="t2" x="560" y="99" text-anchor="middle">Encoder copy</text>
+<rect class="zc" x="500" y="130" width="120" height="26"/><text class="t2" x="560" y="147" text-anchor="middle">zero conv (output)</text>
+<rect class="trn" x="510" y="172" width="100" height="34"/><text class="t2" x="560" y="193" text-anchor="middle">Encoder copy</text>
+<rect class="zc" x="500" y="224" width="120" height="26"/><text class="t2" x="560" y="241" text-anchor="middle">zero conv (output)</text>
+<rect class="trn" x="430" y="285" width="180" height="26"/><text class="t2" x="520" y="302" text-anchor="middle">control map (edges/depth/pose)</text>
+<line class="aa" x1="560" y1="285" x2="560" y2="206"/>
+<line class="aa" x1="560" y1="61" x2="560" y2="78"/>
+<line class="aa" x1="560" y1="112" x2="560" y2="130"/>
+<path class="aa" d="M500,143 C 360,143 320,152 202,152"/>
+<path class="aa" d="M500,237 C 360,237 320,252 202,252"/>
+<text class="t2" x="340" y="138" text-anchor="middle" fill="#2f9e5c">add into frozen blocks</text>
+</svg>
+<figcaption><strong>Figure 35.1.2:</strong> ControlNet wiring. The base U-Net (gray) is frozen. A trainable copy of the encoder (green) processes the control map and injects its features into the frozen decoder through zero convolutions (yellow), which start at zero so the controlled model initially equals the base model. Only the green and yellow parameters receive gradients.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Zero Initialization Is the Whole Trick</div>
+<p>
+A randomly initialized control branch would, on step one, add structured noise to every layer of a finely-tuned generator and the loss would spike, often unrecoverably. Zero initialization makes the addition start as a no-op and grow only as the data justifies it. This is a general pattern, not a ControlNet quirk: adapters, the residual scaling of deep transformers, and gated additions all rely on starting a new pathway near zero so it cannot harm what already works. When you add a capability to a large pretrained model, initialize the new path so it begins as the identity.
+</p>
+</div>
+
+<h2>3. Conditioning Signals: Edges, Depth, Pose <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A ControlNet is trained for one type of control map, so there is a ControlNet for Canny edges, another for depth, another for OpenPose skeletons, and so on. The beautiful part is that the maps themselves come directly from techniques earlier in this book. The Canny edge map is exactly the <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Canny detector of Chapter 9</a>; the depth map is the output of a <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">monocular depth network from Chapter 27</a>; the pose skeleton is a keypoint detector. The code below uses diffusers to run a Canny-conditioned ControlNet end to end: detect edges, then generate an image that follows them.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+import torch
+from PIL import Image
+from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
+
+# 1. Build the Canny control map from a reference image (Chapter 9 detector).
+ref = cv2.imread("reference.jpg")
+edges = cv2.Canny(ref, 100, 200)                 # low/high hysteresis thresholds
+edges = np.stack([edges] * 3, axis=-1)           # ControlNet expects 3 channels
+control = Image.fromarray(edges)
+
+# 2. Load a Canny ControlNet alongside a base Stable Diffusion model.
+controlnet = ControlNetModel.from_pretrained(
+    "lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16)
+pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", controlnet=controlnet,
+    torch_dtype=torch.float16).to("cuda")
+
+# 3. Generate: the prompt sets content, the edge map sets layout.
+image = pipe(
+    "a sandstone temple at golden hour, photorealistic",
+    image=control,
+    num_inference_steps=30,
+    controlnet_conditioning_scale=1.0,            # full obedience to edges
+).images[0]
+image.save("controlled.png")</code></pre>
+<div class="code-caption">A complete Canny-conditioned ControlNet run in diffusers. The output keeps the exact silhouette and edges of <code>reference.jpg</code> but renders it as a sandstone temple, because the edge map fixes geometry while the prompt supplies material and lighting.</div>
+
+<p>
+Swapping the control type is a two-line change: load <code>sd-controlnet-depth</code> with a depth map, or <code>sd-controlnet-openpose</code> with a pose skeleton. The depth ControlNet is the practitioner's favorite for relighting and style transfer because depth preserves three-dimensional structure while letting surfaces change freely; the pose ControlNet is the standard tool for putting a character in a chosen stance. Because the maps are the very outputs you learned to compute in Parts II and III, the controllable generator is the point where the classical and deep pipelines of this book feed into the generative one.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most-shared ControlNet demo in early 2023 was not a cathedral or a portrait. It was the trick of hiding a QR code in an image: feed the black-and-white QR pattern as a control map at moderate conditioning scale, prompt for a landscape, and the model paints a scene whose light and dark regions happen to scan as a working QR code. It is a perfect illustration of the conditioning-scale dial in subsection 5, strong enough that a phone can read it, weak enough that it still looks like a mountain.</p>
+</div>
+
+<h2>4. Lighter Alternatives: T2I-Adapter and IP-Adapter <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+ControlNet clones half the U-Net, which roughly doubles the parameters that must be loaded and run. Two adapter families trade a little control fidelity for a much smaller footprint. <strong>T2I-Adapter</strong> uses a small standalone convolutional network (a few million parameters, not a U-Net copy) that extracts features from the control map and adds them into the encoder once, rather than at every block. It is cheaper to train and to run and is strong enough for edge, depth, and sketch control, though slightly less precise than ControlNet on hard structural constraints.
+</p>
+
+<p>
+<strong>IP-Adapter</strong> ("image prompt adapter") solves a different problem: conditioning on an <em>image</em> rather than a structural map. It encodes a reference image with CLIP (the <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">CLIP encoder of Chapter 25</a>) and adds a <strong>decoupled cross-attention</strong> path, a second set of attention layers that attend to the image embedding in parallel with the text cross-attention. This lets you say "generate in the style of this picture" or "keep this face" by supplying an example image alongside the text. The decoupling is what makes it compose cleanly: the text path and the image path each have their own attention, so the model can follow a prompt and a reference image at once. The snippet shows IP-Adapter style conditioning.
+</p>
+
+<pre><code class="language-python">from diffusers import StableDiffusionPipeline
+from diffusers.utils import load_image
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+
+# Attach an IP-Adapter: a decoupled image cross-attention path.
+pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models",
+                     weight_name="ip-adapter_sd15.bin")
+pipe.set_ip_adapter_scale(0.6)                   # how strongly the image prompt acts
+
+style_ref = load_image("style_reference.png")    # the image to imitate
+image = pipe(
+    prompt="a fox sitting in a forest clearing",
+    ip_adapter_image=style_ref,                  # image conditioning, not a control map
+    num_inference_steps=30,
+).images[0]</code></pre>
+<div class="code-caption">IP-Adapter conditioning. The text prompt sets the subject (a fox) while <code>style_reference.png</code> supplies the visual style through a decoupled cross-attention path. The <code>ip_adapter_scale</code> dial controls how much the reference image pulls the result, the image-domain analogue of the conditioning scale in subsection 5.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: One Pipeline, Many Controls</div>
+<p>Implementing ControlNet from scratch means cloning the encoder, wiring zero convolutions into every skip connection, and writing a training loop over control-image pairs, easily three hundred lines plus a training run. In diffusers it is two lines: <code>ControlNetModel.from_pretrained(...)</code> and <code>StableDiffusionControlNetPipeline.from_pretrained(..., controlnet=cn)</code>. To stack multiple controls (say edges and depth together), pass a list of ControlNets and a list of conditioning scales; the library handles the per-block addition and the scale weighting internally, including the SDXL and SD3 variants where the block resolutions differ. Build the zero-convolution mechanism once to understand it; in production you load a pretrained ControlNet and supply a map.</p>
+</div>
+
+<h2>5. The Conditioning-Scale Dial <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Every control method exposes a single most important hyperparameter at inference time: how strongly the control signal acts. In ControlNet it is <code>controlnet_conditioning_scale</code>, a multiplier $\lambda$ applied to the control branch's contribution before it is added into the frozen U-Net. Writing the controlled block output with the scale made explicit,
+</p>
+
+<div class="math-block">
+$$y_c = \mathcal{F}(x;\Theta) + \lambda \cdot \mathcal{Z}\!\big(\mathcal{F}_c(\cdot);\,\Theta_{z2}\big).$$
+</div>
+
+<p>
+At $\lambda = 0$ the control branch is silent and you get an ordinary text-to-image generation. At $\lambda = 1$ the model follows the structure as trained. Pushing beyond $1$ forces ever-stricter adherence to the map, at the cost of artifacts where the prompt and the structure disagree (the model is being asked to satisfy a geometry that its content prior resists). Below $1$ the structure becomes a suggestion the model may bend. The right value depends on the task: a precise architectural render wants $\lambda$ near $1.0$, while loose compositional guidance often looks best near $0.5$. There is also a <em>guidance start and end</em> control that applies the conditioning only during a window of the sampling steps, since the early steps fix coarse layout and the late steps add detail.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Furniture Catalog Replaces a Photo Studio</div>
+<p><strong>Who:</strong> the content team at a mid-size online furniture retailer, 2024. <strong>Situation:</strong> every product needed a dozen lifestyle shots (the same sofa in a loft, a cottage, a minimalist apartment), and renting and styling physical sets cost thousands per product. <strong>Problem:</strong> plain text-to-image could produce beautiful rooms but never <em>their</em> sofa; the geometry and proportions drifted every time, and customers complained that the photo did not match the delivered item. <strong>Decision:</strong> they ran a depth ControlNet conditioned on a single clean studio render of each sofa, varying only the prompt to change the surrounding room and lighting. The depth map pinned the sofa's exact three-dimensional shape while the prompt redecorated everything around it. <strong>Result:</strong> consistent product geometry across every lifestyle variation, with conditioning scale tuned to about $1.1$ so the sofa stayed rigid while the room stayed free, cutting per-product photography cost by an order of magnitude. <strong>Lesson:</strong> when one element must stay fixed and the rest must vary, spatial conditioning on the fixed element is far more reliable than trying to describe it in words.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Control Beyond Side Branches</div>
+<p>The 2023 ControlNet design adds a cloned encoder, which is heavy. The frontier through 2024 and 2025 is making control cheaper and more general. ControlNet-LoRA and the unified ControlNet++ line shrink the branch with low-rank factorization. ControlNeXt (2024, arXiv:2408.06070) replaces the encoder copy with a tiny convolutional selector and a normalization-based injection, cutting trainable parameters by up to ninety percent while matching quality. On the architecture side, the diffusion-transformer models of <a href="../module-34-text-to-image/index.html">Section 34.3</a> (SD3, FLUX) fold control directly into the token stream: instead of a side branch, control tokens are concatenated to the sequence, and methods like OmniControl and the in-context conditioning of FLUX.1 Kontext treat structure, reference image, and instruction as different token types that the same attention handles uniformly. The trajectory is clear: control is migrating from a bolted-on branch toward a native input modality of the generator.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.1.1: Why Zero, Not Small? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>ControlNet initializes the connecting convolutions to exactly zero, not to small random values. Explain in two or three sentences why a small-but-nonzero initialization would still risk damaging the frozen base model on the first few training steps, and why zero is uniquely safe. Then argue why gradients can still flow into a zero-initialized convolution even though its output is zero, by considering what the convolution's input is.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.1.2: Sweep the Conditioning Scale <span class="exercise-type coding">Coding</span></div>
+<p>Using the Canny ControlNet code in subsection 3, fix a reference image, a prompt, and a random seed, then generate at <code>controlnet_conditioning_scale</code> in $\{0.0, 0.3, 0.6, 1.0, 1.4\}$. Lay the five results out in a row. Describe how the output transitions from "ignores the edges" to "rigidly traces the edges, with artifacts," and identify which value gives the best balance for your image. Repeat with the depth ControlNet and note how the sweet spot differs.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 35.1.3: ControlNet vs T2I-Adapter Tradeoff <span class="exercise-type analysis">Analysis</span></div>
+<p>You are deploying a control-conditioned generator to a service that must run on a single 12 GB GPU and serve many concurrent users. Compare ControlNet and T2I-Adapter on parameter count, inference memory, and structural fidelity, citing the mechanism of each (encoder clone with per-block injection versus a small standalone network injected once). Recommend one for this deployment and one situation where you would switch to the other, and justify each choice in a short paragraph.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 35 Index</a>
+<a href="index.html">Chapter 35</a>
+<a class="next" href="section-35.2.html">Section 35.2: Personalization &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

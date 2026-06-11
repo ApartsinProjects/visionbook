@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.6: Evaluating Generators: A First Look. Why pixel metrics fail for generation, the feature-space idea behind Inception Score and Frechet Inception Distance, precision and recall for distributions, and the honest limits of every automatic metric." name="description"/>
+<title>Section 30.6: Evaluating Generators: A First Look | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Foundations of Generative Modeling</a></div>
+<h1>Evaluating Generators: A First Look</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They could not agree whether my pictures were good, so they asked a third network what it thought, summarized its opinion as one number, and have been arguing about that number ever since. I find this more dignified than asking me. I would only have said they were all my favorites."</p>
+<cite>A Generator Awaiting Its Frechet Distance</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>When a model invents images, there is no ground-truth picture to compare against, so the pixel metrics from the start of the book do not apply. The field's answer is to compare distributions in the feature space of a pretrained network: measure how close the cloud of generated images is to the cloud of real images, and decompose that closeness into fidelity and coverage.</strong> This section explains why PSNR and SSIM cannot score generation, builds the intuition behind the two classic metrics, Inception Score and Frechet Inception Distance, introduces precision and recall as the distribution-level analogues of the trilemma's fidelity and diversity axes, and is honest about what every automatic metric still misses. It is the on-ramp to the full evaluation treatment in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>; here we establish the vocabulary and the warnings.</p>
+</div>
+
+<p>
+The trilemma of <a href="section-30.5.html">Section 30.5</a> told you what to care about, fidelity, diversity, speed, but speed is easy to measure (count the passes) while fidelity and diversity are not. This final section of the chapter tackles the measurement problem for those two. We start by ruling out the obvious tools, explain the feature-space move that makes generative evaluation possible at all, walk through the metrics you will see in every paper of the part, and close on their genuine limitations. The metrics arc of the book, PSNR and SSIM in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, IoU and mAP in <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>, reaches its generative form here: distribution distances in feature space.
+</p>
+
+<h2>1. Why Pixel Metrics Fail for Generation <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+PSNR and SSIM, the metrics you learned in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, both compare a candidate image against a specific reference image. That works for restoration, where you denoise or super-resolve a known target and ask how close you got. It is meaningless for generation, because a generated image has no reference: a model asked to produce "a face" can produce any of billions of valid faces, none of which is the right answer. There is no target to subtract. Even worse, a per-pixel comparison would punish a perfectly plausible generated face for not matching some arbitrary real face pixel for pixel, while rewarding a blurry average of many faces (which minimizes pixel error but looks terrible). The mismatch is fundamental, as the snippet below illustrates: two equally valid generated samples have a large pixel distance from each other, so pixel distance cannot be the score.
+</p>
+
+<pre><code class="language-python">import torch
+
+# Two equally valid "generated faces" (here, two different real samples stand in).
+face_a = torch.rand(3, 64, 64)
+face_b = torch.rand(3, 64, 64)            # an entirely different but equally valid face
+
+# Pixel metrics demand a reference and punish any difference from it.
+mse = ((face_a - face_b) ** 2).mean()
+psnr = 10 * torch.log10(1.0 / mse)
+print(f"PSNR between two valid faces: {psnr:.1f} dB")   # PSNR between two valid faces: ~7-8 dB (terrible)
+
+# The blurry AVERAGE of many faces minimizes pixel error but is not a face at all.
+mean_face = torch.stack([torch.rand(3, 64, 64) for _ in range(50)]).mean(0)
+print("mean-face std (lower = blurrier):", round(mean_face.std().item(), 3))
+# A low-variance, washed-out image "wins" on pixel error while looking nothing like a sample.</code></pre>
+<div class="code-caption">Why pixel metrics break for generation. Two equally valid faces score a terrible PSNR against each other because there is no shared reference, and the blurry pixel-wise average of many faces, which no one would accept as a sample, actually minimizes pixel error. Generation must be scored at the level of the distribution, not the individual pixel.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The blurry mean-of-fifty-faces wins on pixel error and would lose any beauty contest ever held. This is the metric equivalent of answering "what is the average of all songs?" with thirty seconds of beige hum: technically minimal in distance to everything, recognizable as nothing. Pixel error is happy. Everyone else has left the room.</p>
+</div>
+
+<h2>2. The Feature-Space Move <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The breakthrough that made generative evaluation tractable is to stop comparing individual images and start comparing <em>distributions</em>, in the feature space of a pretrained classifier rather than in raw pixels. Run every real image and every generated image through a fixed network (historically Inception-v3 trained on ImageNet, the same backbone family from <a href="../../part-3-deep-learning-for-vision/module-20-cnn-architectures/index.html">Chapter 20</a>) and collect the high-level feature vectors from a late layer. These features capture semantic content, what is in the image, while discarding the pixel-exact arrangement that pixel metrics fixate on. Now you have two clouds of feature vectors, one from real images and one from generated images, and a good generator is one whose cloud sits on top of the real cloud. Figure 30.6.1 shows the idea: evaluation becomes a question about the overlap of two point clouds in feature space.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Real and generated images each passed through a frozen feature network, producing two point clouds whose overlap is measured">
+<style>
+.et{font:13px sans-serif;fill:#1a1a1a;}
+.es{font:11px sans-serif;fill:#555;}
+.ebox{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.ereal{fill:#2f9e5c;}
+.egen{fill:#d6802b;}
+.ear{stroke:#777;stroke-width:1.4;fill:none;marker-end:url(#eah);}
+.ecloud{fill:none;stroke:#aaa;stroke-width:1;stroke-dasharray:4 3;}
+</style>
+<defs><marker id="eah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="es" x="60" y="60" text-anchor="middle">real</text>
+<text class="es" x="60" y="200" text-anchor="middle">generated</text>
+<rect x="30" y="68" width="60" height="40" fill="#fff" stroke="#2f9e5c" stroke-width="1.3"/>
+<rect x="30" y="150" width="60" height="40" fill="#fff" stroke="#d6802b" stroke-width="1.3"/>
+<line class="ear" x1="92" y1="88" x2="150" y2="120"/>
+<line class="ear" x1="92" y1="170" x2="150" y2="150"/>
+<rect class="ebox" x="152" y="110" width="92" height="50"/>
+<text class="et" x="198" y="132" text-anchor="middle">frozen</text>
+<text class="es" x="198" y="150" text-anchor="middle">feature net</text>
+<line class="ear" x1="244" y1="135" x2="300" y2="135"/>
+<text class="et" x="500" y="40" text-anchor="middle">feature space: compare the two clouds</text>
+<ellipse class="ecloud" cx="500" cy="150" rx="120" ry="80"/>
+<circle class="ereal" cx="470" cy="120" r="4"/><circle class="ereal" cx="510" cy="140" r="4"/><circle class="ereal" cx="490" cy="170" r="4"/><circle class="ereal" cx="540" cy="160" r="4"/><circle class="ereal" cx="455" cy="155" r="4"/><circle class="ereal" cx="525" cy="115" r="4"/>
+<circle class="egen" cx="480" cy="135" r="4"/><circle class="egen" cx="515" cy="155" r="4"/><circle class="egen" cx="500" cy="180" r="4"/><circle class="egen" cx="460" cy="130" r="4"/>
+<text class="es" x="500" y="255" text-anchor="middle">green = real features, orange = generated features; overlap = good generator</text>
+</svg>
+<figcaption><strong>Figure 30.6.1:</strong> Generative evaluation in feature space. Both real and generated images pass through a frozen pretrained feature network; the result is two clouds of feature vectors. A good generator's cloud (orange) sits on top of the real cloud (green). Every classic metric in this section is a different way of quantifying how well those two clouds match, in mean and covariance (FID), in confidence and variety (Inception Score), or in per-point overlap (precision and recall).</figcaption>
+</figure>
+
+<h2>3. Inception Score and Frechet Inception Distance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>Inception Score (IS)</strong>, the first widely adopted metric, uses only the generated images. It runs each generated image through the Inception classifier and rewards two properties at once: each image should be confidently classified (sharp, recognizable content gives a peaked label distribution $p(y \mid \mathbf{x})$), and the set of images should span many classes (high diversity gives a spread-out marginal $p(y)$). It combines them as the KL divergence between the per-image label distribution and the marginal, exponentiated. Its fatal flaw is that it never looks at the real data at all, so it cannot detect that your faces look like ImageNet dogs, only that they are confident and varied.
+</p>
+
+<p>
+The <strong>Frechet Inception Distance (FID)</strong> fixed that by comparing generated features to <em>real</em> features directly. It models each cloud of feature vectors as a multivariate Gaussian, estimates the mean and covariance of the real features $(\boldsymbol{\mu}_r, \boldsymbol{\Sigma}_r)$ and of the generated features $(\boldsymbol{\mu}_g, \boldsymbol{\Sigma}_g)$, and computes the Frechet (Wasserstein-2) distance between those two Gaussians:
+</p>
+
+<div class="math-block">
+$$\mathrm{FID} = \|\boldsymbol{\mu}_r - \boldsymbol{\mu}_g\|^2 + \operatorname{tr}\!\left(\boldsymbol{\Sigma}_r + \boldsymbol{\Sigma}_g - 2\big(\boldsymbol{\Sigma}_r \boldsymbol{\Sigma}_g\big)^{1/2}\right).$$
+</div>
+
+<p>
+Lower is better; FID is zero only when the two feature distributions have identical mean and covariance. The first term penalizes a shift in average content; the second penalizes a mismatch in spread and correlation, which is sensitive to both blur (collapses covariance) and mode collapse (shrinks the generated cloud). FID has been the default generative-image metric since 2017, and you will see it in nearly every paper in the rest of the part. The code below computes it from two sets of feature vectors, exactly the computation behind the libraries.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy import linalg
+
+def frechet_distance(feat_real, feat_gen):
+    """FID between two arrays of feature vectors, shape (n, d) each."""
+    mu_r, mu_g = feat_real.mean(0), feat_gen.mean(0)
+    cov_r = np.cov(feat_real, rowvar=False)
+    cov_g = np.cov(feat_gen, rowvar=False)
+    diff = mu_r - mu_g
+    covmean = linalg.sqrtm(cov_r @ cov_g)              # matrix square root of the product
+    if np.iscomplexobj(covmean):                       # numerical cleanup
+        covmean = covmean.real
+    return diff @ diff + np.trace(cov_r + cov_g - 2 * covmean)
+
+# Toy demonstration: closer clouds -> lower FID.
+rng = np.random.default_rng(0)
+real = rng.normal(0, 1, size=(2000, 64))
+close = rng.normal(0.1, 1, size=(2000, 64))           # slightly shifted: small FID
+far   = rng.normal(2.0, 1.5, size=(2000, 64))         # shifted and wider: large FID
+print("FID (close):", round(frechet_distance(real, close), 2))   # FID (close): ~0.7
+print("FID (far):  ", round(frechet_distance(real, far), 2))     # FID (far):   ~150+</code></pre>
+<div class="code-caption">Computing FID from two clouds of feature vectors. The mean term captures a shift in average content; the covariance term, via the matrix square root, captures mismatch in spread and correlation. A generated cloud close to the real one scores near zero; one that is shifted and wrongly spread scores high. In practice the features come from Inception-v3, not random Gaussians, but the arithmetic is exactly this.</div>
+
+<h2>4. Precision and Recall: Splitting Fidelity From Coverage <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+FID is a single number, which means it inherits the ambiguity of <a href="section-30.5.html">Section 30.5</a>: a model can earn a mediocre FID either by producing low-fidelity samples or by missing modes, and FID alone cannot tell you which. The fix is to borrow <strong>precision and recall</strong> from classification and lift them to distributions. <strong>Precision</strong> is the fraction of generated samples that fall within the support of the real data, the fidelity axis: are your samples realistic? <strong>Recall</strong> is the fraction of real data modes that the generated samples cover, the diversity axis: do you produce the full variety? A mode-collapsed GAN has high precision (its few outputs are realistic) but low recall (it misses most of the data); an over-smoothed VAE may have high recall (it spreads everywhere) but lower precision (its samples drift outside the real support). This is the distribution-level version of the fidelity-versus-coverage split, and it is precisely why the medical-imaging team in <a href="section-30.5.html">Section 30.5</a> needed recall, not the eye test. We will formalize the $k$-nearest-neighbor manifold estimators that compute these in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Number Hides the Trade You Care About</div>
+<p>The recurring lesson of this chapter, that fidelity and diversity are independent axes, dictates how to evaluate. Any single scalar (likelihood, Inception Score, FID) compresses two genuinely different properties into one and can therefore be gamed or misread: a model can move its FID by trading fidelity for coverage without changing the number much. Reporting precision <em>and</em> recall (or a fidelity metric alongside a coverage metric) keeps the two axes separate, which is the only way to know whether a low FID came from sharper samples or from broader coverage. When you read or write a generative-model evaluation, insist on at least two numbers, one per axis. This is the same discipline that made you report both precision and recall, never accuracy alone, back in the detection metrics of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FID, IS, and KID in One Call</div>
+<p>The from-scratch FID above omits the Inception forward pass, the preprocessing, and numerical safeguards that real evaluation needs. The <code>torch-fidelity</code> library packages all of it, computing Inception Score, FID, and KID from two image folders in a single call:</p>
+<pre><code class="language-python">import torch_fidelity
+
+metrics = torch_fidelity.calculate_metrics(
+    input1="generated_images/",      # folder of generated samples
+    input2="real_images/",           # folder of real reference images
+    isc=True, fid=True, kid=True,    # Inception Score, FID, and KID at once
+    cuda=True,
+)
+print(metrics["frechet_inception_distance"])   # the FID, computed with proper Inception features</code></pre>
+<div class="code-caption">Inception Score, FID, and KID in one <code>torch-fidelity</code> call. Pointed at a folder of generated images and a folder of real ones, the library runs the Inception forward pass, handles resizing and value ranges, and computes all three metrics, the careful preprocessing the from-scratch <code>frechet_distance</code> deliberately omitted.</div>
+<p>What the from-scratch code only sketched, loading Inception-v3, extracting the correct feature layer, handling resizing and value ranges, and computing the matrix square root robustly, the library does correctly in one call, which is roughly a hundred lines of careful code you do not want to reimplement. The catch, discussed next, is that the result is only as trustworthy as the preprocessing the library standardizes.</p>
+</div>
+
+<h2>5. The Honest Limits of Automatic Metrics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Every metric in this section is useful and every one is flawed, and a competent practitioner knows the flaws. FID and IS depend on an ImageNet-trained Inception network, so they are biased toward ImageNet-like content and can misjudge domains far from it (medical scans, satellite imagery, line art). FID is sensitive to sample size (it is biased upward at small $n$) and, notoriously, to image preprocessing: the resizing filter and the exact value range can shift reported FID enough to flip a comparison, which is why the clean-fid project (Parmar et al., 2022) exists specifically to standardize these steps. None of these feature-based metrics measures whether an image is offensive, copyright-infringing, factually consistent with a text prompt, or aesthetically pleasing to a human; for text-to-image you additionally need a text-alignment metric such as CLIPScore (built on the CLIP embeddings from <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>), and for the qualities no automatic metric captures you still need human evaluation. The metric is a proxy; the eye and the human study remain the ground truth, a theme <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> develops in full alongside safety and governance.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Leaderboard That Lied</div>
+<p><strong>Who:</strong> a research team comparing their new image generator against published baselines for a paper. <strong>Situation:</strong> their model reported a markedly better FID than a strong published competitor, and they were ready to claim state of the art. <strong>Problem:</strong> a reviewer noted that the team had resized images with a different filter than the competitor's published pipeline used. <strong>Decision:</strong> rather than argue, the team recomputed every model's FID through the standardized clean-fid pipeline, identical resizing and value range for all entries, so the only thing that varied was the generator. <strong>Result:</strong> their advantage shrank dramatically and, on two of the four datasets, reversed. The original gap had been mostly an artifact of preprocessing, not of model quality. They reported the clean-fid numbers, a more honest and smaller claim, and added precision and recall so readers could see the fidelity-coverage breakdown. <strong>Lesson:</strong> a generative metric is a measurement instrument, and like any instrument it must be calibrated identically across the things it compares. An apples-to-oranges FID is worse than no FID, because it looks authoritative. Standardize the pipeline, report more than one number, and treat the metric as a proxy that human judgment must still check.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond Inception Features</div>
+<p>The 2023 to 2026 frontier in generative evaluation is the move away from the aging ImageNet-Inception backbone toward richer feature spaces and better-aligned judges. FID computed on self-supervised DINOv2 features (the backbone from <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>) correlates better with human judgment than Inception-FID and is less biased toward ImageNet classes; CMMD (Jayasumana et al., 2024) replaces the Gaussian assumption and Inception features with a CLIP-based maximum-mean-discrepancy that is unbiased at small sample sizes, directly addressing FID's two worst flaws. For text-to-image, the field increasingly uses vision-language models as automatic judges of prompt alignment and quality, and human-preference reward models (trained on millions of pairwise human votes) now stand in for the human study during development. The arc that began with PSNR comparing two pixels and matured into FID comparing two feature clouds is still moving, toward features that match human perception and judges that understand the prompt, the full subject of <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>6. Closing the Foundations <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+This section completes the foundations of the part. You can now define what it means to model $p(\mathbf{x})$, name and place the five families that do it, work in a latent space, reason about energies and scores, judge any generator on the quality-diversity-speed triangle, and measure two of those three axes with feature-space metrics while knowing exactly where those metrics lie to you. Every remaining chapter of Part IV is the detailed construction of one box on the map, and you now carry the vocabulary and the warnings to read each one critically. The next chapter takes the very first box, the latent-variable model of <a href="section-30.3.html">Section 30.3</a>, and turns it into a working, trainable system: the autoencoder and the variational autoencoder.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.6.1: Why Not PSNR? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>In one paragraph, explain to a colleague who knows PSNR and SSIM (from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>) but not generation why those metrics cannot score an unconditional image generator. Address both halves of the problem: the absence of a reference image, and the way a per-pixel metric rewards blurry averages. Then state in one sentence what the feature-space metrics replace the reference with.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.6.2: Compute FID on a Real Dataset <span class="exercise-type coding">Coding</span></div>
+<p>Using <code>torch-fidelity</code> (or the from-scratch <code>frechet_distance</code> with your own Inception feature extractor), compute FID in three settings on a small dataset such as CIFAR-10: (a) real-versus-real using two disjoint halves of the real data (this is the achievable floor, it will be small but nonzero), (b) real-versus-real with one half corrupted by Gaussian blur, and (c) real-versus-noise using random images. Report the three numbers and write two sentences explaining the ordering and what the nonzero floor in (a) tells you about FID's sample-size sensitivity.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.6.3: Diagnose From the Numbers <span class="exercise-type analysis">Analysis</span></div>
+<p>Three generators report the following: Generator X has low FID, high precision, low recall; Generator Y has low FID, lower precision, high recall; Generator Z has high FID but high precision and high recall. Using the definitions from Sections 3 and 4 and the trilemma from <a href="section-30.5.html">Section 30.5</a>, describe in words what each generator's samples most likely look like as a set, which one you would choose for synthetic data augmentation and which for a single hero image, and explain how Generator Z can have high FID despite good precision and recall (hint: consider what a feature-space mean-and-covariance shift can capture that per-point support overlap cannot).</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-30.5.html">&#8592; Section 30.5: Sampling, Likelihood &amp; the Trilemma</a>
+<a href="index.html">Chapter 30</a>
+<a class="next" href="../module-31-autoencoders-vaes/index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

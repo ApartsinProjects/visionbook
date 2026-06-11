@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.4: Batch Normalization &amp; Friends. Why deep CNNs were hard to train, the batch-norm forward pass, learnable scale and shift, train-versus-eval running statistics, the smoother loss landscape, and when to use layer, group, or instance normalization instead." name="description"/>
+<title>Section 19.4: Batch Normalization &amp; Friends | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: Convolutional Neural Networks</a></div>
+<h1>Batch Normalization &amp; Friends</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Before I arrived, every layer shouted at a different volume and the gradients gave up. Now everyone speaks at mean zero, variance one. Training finished early and the loss landscape sent flowers."</p>
+<cite>A Batch-Normalization Layer, Quietly Taking Credit</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Batch normalization standardizes each layer's activations to zero mean and unit variance across the batch, then lets the network rescale them with two learnable parameters, and this single trick is what made deep CNNs train reliably and fast.</strong> The original "internal covariate shift" explanation has been disputed, but the empirical effect is not in doubt: networks with batch norm tolerate higher learning rates, are far less sensitive to initialization, and converge in a fraction of the epochs. This section derives the operation, explains its tricky train-versus-eval split, and tells you when to reach for its layer, group, and instance normalization cousins instead.</p>
+</div>
+
+<p>
+By <a href="section-19.3.html">Section 19.3</a> you can design a CNN with the right shapes and receptive fields, but if you stacked a dozen of those layers around 2014 and trained them with the loop from <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a>, you would likely watch the loss stall or diverge. The reason is that as activations flow through many layers, their scale and distribution drift unpredictably, so a learning rate that suits one layer destroys another, and gradients vanish or explode. Batch normalization, introduced by Ioffe and Szegedy in 2015, attacked this directly and was so effective that it became near-universal almost overnight. It is also the stabilizer behind the depth of every architecture in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. This section is the one piece of machinery, beyond the convolution itself, that you must understand to train the network in <a href="section-19.5.html">Section 19.5</a>.
+</p>
+
+<h2>1. The Problem: Drifting Statistics in Deep Stacks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Consider what a layer experiences during training. Its input is the output of the layer below, whose weights are changing every step. So the distribution of inputs that any given layer sees is a moving target: its mean and variance shift from batch to batch and epoch to epoch as the lower layers learn. Ioffe and Szegedy named this <strong>internal covariate shift</strong> and argued it forces each layer to continuously re-adapt to its input's changing statistics, which slows learning. Whether or not that is the true mechanism (later work by Santurkar et al. argued the real benefit is a smoother loss landscape), the symptom is real: deep networks were brittle, needed careful initialization and small learning rates, and trained slowly.
+</p>
+
+<h2>2. The Batch-Norm Operation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Batch normalization inserts a layer that, for each feature (each channel, in a CNN), standardizes the activations over the current mini-batch. For a batch of activations $\{x_1, \ldots, x_m\}$ for one feature, it computes the batch mean and variance, normalizes, then applies a learnable scale $\gamma$ and shift $\beta$:
+</p>
+<p>
+$$ \mu_B = \frac{1}{m}\sum_{i=1}^{m} x_i, \qquad \sigma_B^2 = \frac{1}{m}\sum_{i=1}^{m}(x_i - \mu_B)^2, $$
+</p>
+<p>
+$$ \hat{x}_i = \frac{x_i - \mu_B}{\sqrt{\sigma_B^2 + \epsilon}}, \qquad y_i = \gamma\,\hat{x}_i + \beta. $$
+</p>
+<p>
+The first three quantities standardize the feature to zero mean and unit variance, with a small $\epsilon$ (typically $10^{-5}$) guarding against division by zero. The last step is the subtle and important one: $\gamma$ and $\beta$ are learnable, so the network can <em>undo</em> the normalization if it wants, recovering any mean and scale, including the identity. Normalization does not lock the activations to zero mean and unit variance; it gives the optimizer a well-conditioned starting point and lets it choose the final scale through two cheap parameters per channel. For a CNN, the statistics are pooled over the batch <em>and</em> the spatial dimensions, so a layer with $C$ channels has exactly $C$ values of $\gamma$ and $C$ of $\beta$.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pipeline showing batch-norm steps: raw activations with varying scale enter, are standardized to zero mean unit variance, then rescaled by learnable gamma and shifted by beta to produce the output.">
+  <defs><marker id="a195" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#2c3e50"/></marker></defs>
+  <g font-family="sans-serif" text-anchor="middle">
+    <rect x="20" y="80" width="140" height="70" rx="8" fill="#fadbd8" stroke="#c0392b"/>
+    <text x="90" y="108" font-size="13" font-weight="bold" fill="#943126">Raw activations</text>
+    <text x="90" y="128" font-size="11" fill="#5a626c">drifting mean, scale</text>
+
+    <rect x="220" y="80" width="160" height="70" rx="8" fill="#d6eaf8" stroke="#2980b9"/>
+    <text x="300" y="104" font-size="13" font-weight="bold" fill="#1f618d">Standardize</text>
+    <text x="300" y="123" font-size="11" fill="#2c3e50">subtract mean,</text>
+    <text x="300" y="139" font-size="11" fill="#2c3e50">divide by std</text>
+
+    <rect x="440" y="80" width="160" height="70" rx="8" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="520" y="104" font-size="13" font-weight="bold" fill="#196f3d">Scale &amp; shift</text>
+    <text x="520" y="123" font-size="11" fill="#2c3e50">multiply by gamma,</text>
+    <text x="520" y="139" font-size="11" fill="#2c3e50">add beta (learned)</text>
+
+    <rect x="640" y="80" width="60" height="70" rx="8" fill="#fcf3cf" stroke="#b9770e"/>
+    <text x="670" y="112" font-size="12" font-weight="bold" fill="#9a7d0a">Out</text>
+    <text x="670" y="130" font-size="11" fill="#5a626c">y</text>
+  </g>
+  <path d="M 160 115 L 218 115" stroke="#2c3e50" stroke-width="2" marker-end="url(#a195)"/>
+  <path d="M 380 115 L 438 115" stroke="#2c3e50" stroke-width="2" marker-end="url(#a195)"/>
+  <path d="M 600 115 L 638 115" stroke="#2c3e50" stroke-width="2" marker-end="url(#a195)"/>
+  <text x="360" y="50" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">Batch norm: standardize first, then let the network re-scale however it likes</text>
+  <text x="360" y="195" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">The learnable gamma and beta mean batch norm can represent the identity, so it never reduces capacity.</text>
+</svg>
+<figcaption><strong>Figure 19.4.1</strong> The two stages of batch normalization. Incoming activations with arbitrary, drifting statistics are first standardized to zero mean and unit variance using batch statistics, then rescaled by a learnable $\gamma$ and shifted by a learnable $\beta$. Because $\gamma$ and $\beta$ can recover any scale and mean, the layer never costs the network expressive power.</figcaption>
+</figure>
+
+<h2>3. Train Versus Eval: The Running Statistics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Batch norm has a behavior that catches almost everyone once: it acts differently in training and inference, and forgetting to flip the switch is a classic bug. During training it uses the <em>current batch's</em> mean and variance, which is fine because a training batch is large and representative. At inference you may need to classify a single image, where a "batch mean" is meaningless, and you want a deterministic output that does not depend on which other images happen to share the batch. So during training the layer also accumulates a running estimate of the mean and variance (an exponential moving average), and at inference it uses those fixed running statistics instead of the batch.
+</p>
+
+<p>
+In PyTorch this is governed by the module's mode: <code>model.train()</code> uses batch statistics and updates the running averages; <code>model.eval()</code> freezes and uses the running averages. The code below shows both the manual computation and the failure mode of forgetting <code>eval()</code>.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+bn = nn.BatchNorm2d(num_features=4)        # 4 channels -> 4 gammas, 4 betas
+x = torch.randn(16, 4, 8, 8) * 3 + 5       # batch with mean ~5, std ~3
+
+# --- training mode: normalize with batch stats, update running stats ---
+bn.train()
+y = bn(x)
+# Per-channel mean ~0 and variance ~1 after normalization (gamma=1, beta=0 init).
+print(y.mean(dim=(0, 2, 3)).round(decimals=3))   # ~ tensor([0., 0., 0., 0.])
+print(y.var(dim=(0, 2, 3), unbiased=False).round(decimals=2))  # ~ tensor([1., 1., 1., 1.])
+
+# --- the classic bug: a single image in TRAIN mode ---
+bn.train()
+single_train = bn(x[:1])     # batch size 1: variance is computed over 1 sample -> unstable
+# --- the fix: eval mode uses the stored running statistics, deterministic ---
+bn.eval()
+single_eval = bn(x[:1])      # uses running mean/var accumulated during training
+print(torch.allclose(single_train, single_eval))   # Expected output: False</code></pre>
+<div class="code-caption">Batch norm in both modes: training normalizes with batch statistics (output mean ~0, variance ~1), while a single image in train mode is unstable; switching to <code>eval()</code> uses the accumulated running statistics for a deterministic result. The <code>False</code> result is the symptom of the most common batch-norm bug.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: model.eval() Is Not Optional</div>
+<p>Forgetting <code>model.eval()</code> before validation or deployment is the single most common batch-norm mistake, and it produces a maddening symptom: training accuracy looks fine, validation accuracy is erratic or worse than random on small batches. The reason is that in train mode each validation batch is normalized by its own statistics, so the same image gets different predictions depending on its batch-mates. Always call <code>model.eval()</code> before evaluation and <code>model.train()</code> before resuming training. The same switch also controls dropout, so the rule is universal, not specific to batch norm.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The One-Line Bug That Files Itself Under "My Model Is Broken"</div>
+<p>Every practitioner eventually loses an afternoon to this: training looks great, validation is garbage, and the model gets blamed. The culprit is one missing <code>model.eval()</code>, so batch norm normalizes each validation batch by its own neighbors and the same image gets a different verdict depending on its lunch companions. The fix is a single line and the lesson is permanent. Tattoo it: <strong>train mode trusts the batch, eval mode trusts the memory</strong>. Forgetting to switch is not a deep-learning failure; it is a light-switch failure.</p>
+</div>
+
+<h2>4. Why It Works, and the Side Effects <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The honest modern view is that batch norm helps for reasons not fully captured by the original covariate-shift story. Santurkar et al. (2018) showed empirically that batch norm makes the loss landscape smoother (the gradients change more slowly and predictably), which is what permits the larger learning rates and faster convergence. Whatever the precise mechanism, batch norm brings several effects that are useful to know. It acts as a mild <strong>regularizer</strong>, because the batch statistics inject a small amount of noise that depends on the batch composition, which is why networks with batch norm sometimes need less dropout. It makes the network far more robust to the <strong>scale of initialization</strong>, since the first thing each layer does is renormalize. And it couples the examples in a batch, which is the root of its main weakness.
+</p>
+
+<p>
+That weakness is dependence on batch size. With a small batch (say 2 or 4 images, common when training high-resolution models or large detectors that barely fit in memory), the batch statistics are noisy estimates, and batch norm degrades or destabilizes. This is the practical reason its friends exist.
+</p>
+
+<h2>5. The Friends: Layer, Group, and Instance Normalization <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The normalization family differs only in <em>which axes</em> the mean and variance are computed over. Batch norm pools over the batch and spatial dimensions, per channel. The alternatives keep the standardize-then-rescale idea but change the pooling set so they do not depend on the batch. Table 19.4.1 lays them out, and Figure 19.4.2 sketches the axes each one normalizes.
+</p>
+
+<table>
+<caption><strong>Table 19.4.1</strong> The normalization family for a feature tensor of shape (batch $N$, channels $C$, height $H$, width $W$). All four standardize then apply learnable scale and shift; they differ only in the axes pooled to compute the statistics.</caption>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">Statistics pooled over</th><th scope="col">Batch-size dependent?</th><th scope="col">Typical use</th></tr>
+</thead>
+<tbody>
+<tr><td>Batch norm</td><td>$N, H, W$ (per channel)</td><td>Yes</td><td>CNN classifiers with reasonable batch size</td></tr>
+<tr><td>Layer norm</td><td>$C, H, W$ (per sample)</td><td>No</td><td>Transformers (Chapter 22), ConvNeXt</td></tr>
+<tr><td>Instance norm</td><td>$H, W$ (per sample, per channel)</td><td>No</td><td>Style transfer, generative models</td></tr>
+<tr><td>Group norm</td><td>$H, W$ over channel groups (per sample)</td><td>No</td><td>Detection, segmentation, small batches</td></tr>
+</tbody>
+</table>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four small cubes labeled batch norm, layer norm, instance norm, and group norm, each shading the axes over which statistics are pooled.">
+  <g font-family="sans-serif" text-anchor="middle">
+    <text x="90"  y="30" font-size="13" font-weight="bold" fill="#2c3e50">Batch norm</text>
+    <text x="270" y="30" font-size="13" font-weight="bold" fill="#2c3e50">Layer norm</text>
+    <text x="450" y="30" font-size="13" font-weight="bold" fill="#2c3e50">Instance norm</text>
+    <text x="630" y="30" font-size="13" font-weight="bold" fill="#2c3e50">Group norm</text>
+  </g>
+  <!-- four cubes, axis labels N (depth), C (width), HW (height) schematically -->
+  <!-- BN: one channel slab across all N -->
+  <g stroke="#34495e" stroke-width="1" fill="none">
+    <rect x="40" y="60" width="100" height="100"/>
+  </g>
+  <rect x="40" y="60" width="100" height="25" fill="#3498db" fill-opacity="0.4"/>
+  <text x="90" y="180" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">one channel,</text>
+  <text x="90" y="194" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">all samples</text>
+  <!-- LN: one sample, all channels -->
+  <g stroke="#34495e" stroke-width="1" fill="none"><rect x="220" y="60" width="100" height="100"/></g>
+  <rect x="220" y="60" width="30" height="100" fill="#27ae60" fill-opacity="0.4"/>
+  <text x="270" y="180" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">one sample,</text>
+  <text x="270" y="194" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">all channels</text>
+  <!-- IN: one sample, one channel -->
+  <g stroke="#34495e" stroke-width="1" fill="none"><rect x="400" y="60" width="100" height="100"/></g>
+  <rect x="400" y="60" width="30" height="25" fill="#e67e22" fill-opacity="0.5"/>
+  <text x="450" y="180" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">one sample,</text>
+  <text x="450" y="194" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">one channel</text>
+  <!-- GN: one sample, a group of channels -->
+  <g stroke="#34495e" stroke-width="1" fill="none"><rect x="580" y="60" width="100" height="100"/></g>
+  <rect x="580" y="60" width="55" height="100" fill="#9b59b6" fill-opacity="0.4"/>
+  <text x="630" y="180" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">one sample,</text>
+  <text x="630" y="194" font-family="sans-serif" font-size="10" fill="#5a626c" text-anchor="middle">channel group</text>
+  <text x="360" y="228" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">Shaded region = the values averaged to compute one mean and variance. Only batch norm pools across samples.</text>
+</svg>
+<figcaption><strong>Figure 19.4.2</strong> The four normalizations differ only in which values share a mean and variance (shaded). Batch norm pools each channel across the whole batch (and space), so it depends on batch size. Layer, instance, and group norm each pool within a single sample, making them batch-size independent and the right choice when batches are tiny or absent.</figcaption>
+</figure>
+
+<p>
+The practical decision tree is short. For a standard image classifier trained with a batch of 32 or more, use batch norm; it is the default and usually the best. For tiny batches (detection, segmentation, video, or 3D where each example is huge), use group norm, which Wu and He showed matches batch norm without the batch dependence. For transformers and ConvNeXt-style networks, use layer norm. For style transfer and many generative models, instance norm removes per-image contrast, which is exactly what those tasks want. <a href="../module-22-vision-transformers/index.html">Chapter 22</a> will lean on layer norm throughout, and the U-Net of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> typically uses group norm.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Detector That Hated Small Batches</div>
+<p><strong>Who:</strong> A team fine-tuning a high-resolution object detector for warehouse inventory on a single workstation GPU.</p>
+<p><strong>Situation:</strong> The detector's backbone used batch norm, inherited from its ImageNet pretraining. At $1280 \times 1280$ resolution, only two images fit in GPU memory per step.</p>
+<p><strong>Problem:</strong> Training was unstable and validation accuracy oscillated wildly between epochs. With a batch of two, the batch-norm statistics were computed from two images, so the per-step normalization was extremely noisy, and the running averages it accumulated were unreliable.</p>
+<p><strong>Decision:</strong> Replace every <code>BatchNorm2d</code> in the backbone with <code>GroupNorm</code> using 32 groups, a one-line swap per layer, and re-fine-tune. Group norm computes its statistics within each image, so a batch of two is no different from a batch of two hundred.</p>
+<p><strong>Result:</strong> Training stabilized immediately, validation accuracy stopped oscillating, and the final detector matched a version trained on a much larger machine with big-batch batch norm. The fix cost an afternoon and no extra hardware.</p>
+<p><strong>Lesson:</strong> Batch norm's batch dependence is invisible until your batch is small, and then it is the first thing to suspect. Knowing the normalization family lets you swap in a batch-independent variant the moment memory forces tiny batches, which is routine for detection, segmentation, and generation.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Line Each, Backward Pass Included</div>
+<p>The forward and backward passes of batch norm, including the running-statistics bookkeeping and the chain rule through the mean and variance, are roughly forty lines to implement correctly from scratch. PyTorch gives you <code>nn.BatchNorm2d(channels)</code>, <code>nn.GroupNorm(num_groups, channels)</code>, <code>nn.LayerNorm(shape)</code>, and <code>nn.InstanceNorm2d(channels)</code>, each one line, each with a tested, fused backward pass and the correct train/eval behavior. The conv-BN-ReLU block you will assemble in <a href="section-19.5.html">Section 19.5</a> is three such lines. Write the from-scratch version once to understand it, as the exercise below asks, then never again.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Do We Even Need Normalization?</div>
+<p>A persistent research thread asks whether normalization is essential or merely convenient. NFNets (Brock et al., ICML 2021, arXiv:2102.06171) removed batch norm entirely, using adaptive gradient clipping and scaled weight standardization to reach state-of-the-art ImageNet accuracy, showing the benefits can be obtained by other means. More recently, work on transformers has questioned layer norm too: "Transformers without Normalization" (Zhu et al., CVPR 2025, arXiv:2503.10622) replaces layer norm with a simple learnable tanh-based scaling ("Dynamic Tanh") and matches normalized baselines, suggesting normalization's role is partly to bound activations rather than to fix any covariate shift. The takeaway for a practitioner in 2026: normalization is a powerful default, not a law of nature, and the field is actively mapping what it actually provides.</p>
+</div>
+
+<p>
+With normalization in hand, every obstacle to training a deep CNN is cleared. You have the layer (<a href="section-19.2.html">Section 19.2</a>), the geometry (<a href="section-19.3.html">Section 19.3</a>), and now the stabilizer that lets the stack train. <a href="section-19.5.html">Section 19.5</a> assembles all of it into a complete convolutional network and trains it end to end on CIFAR-10, with the full data, optimization, and evaluation loop.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.1: What Can Batch Norm Represent? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, in terms of $\gamma$ and $\beta$, why adding a batch-norm layer never reduces the set of functions a network can represent, even though it forces zero mean and unit variance before the rescaling. Then explain why a convolutional layer immediately followed by batch norm makes the convolution's bias term redundant (so PyTorch users set <code>bias=False</code> on convolutions before batch norm), and say what happens to the convolution's overall scale.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.2: Implement Batch Norm From Scratch <span class="exercise-type coding">Coding</span></div>
+<p>Write a function <code>batchnorm2d_forward(x, gamma, beta, eps=1e-5)</code> that takes a tensor of shape (N, C, H, W) and returns the normalized, scaled, and shifted output, computing the mean and variance over the N, H, and W axes per channel. Validate it against <code>nn.functional.batch_norm</code> in training mode (pass <code>training=True</code>, <code>running_mean=None</code>, <code>running_var=None</code>) on a random tensor, and report the maximum absolute difference (it should be below 1e-5).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 19.4.3: Pick the Right Normalizer <span class="exercise-type analysis">Analysis</span></div>
+<p>For each scenario, state which normalization (batch, layer, group, or instance) you would use and why in one sentence: (a) an ImageNet classifier with batch size 64; (b) a semantic segmentation model where each $1024 \times 1024$ image fills the GPU so batch size is 1; (c) a vision transformer; (d) a neural style-transfer network that should ignore the source image's global contrast. Then explain why none of (b), (c), or (d) has the train-versus-eval running-statistics complication that batch norm does.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-19.3.html">&#8592; Section 19.3: Pooling &amp; Receptive Fields</a>
+<a href="index.html">Chapter 19</a>
+<a class="next" href="section-19.5.html">Section 19.5: A CNN from Scratch: CIFAR-10 End to End &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

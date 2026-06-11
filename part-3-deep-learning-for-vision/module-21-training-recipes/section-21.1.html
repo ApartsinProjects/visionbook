@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.1: Vision Datasets & the ImageNet Legacy. The canonical vision datasets, why ImageNet still governs pretrained weights and normalization statistics, building correct train/validation/test splits, and the data-leakage and bias traps that silently distort results." name="description"/>
+<title>Section 21.1: Vision Datasets &amp; the ImageNet Legacy | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Vision Datasets &amp; the ImageNet Legacy</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked why I subtract 0.485 from the red channel of every photo before I look at it. I told them a committee in 2009 measured the average redness of a million pictures, and I have simply never been given permission to stop."</p>
+<cite>A Normalization Layer Honoring an Old Tradition</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The dataset is the first and most consequential hyperparameter, and ImageNet, a benchmark from 2009, still silently governs your work through the pretrained weights you download and the exact normalization numbers your preprocessing must use.</strong> Nothing the model does downstream can repair a problem upstream in the data: a leaked test set, a biased sampling, or a mismatched preprocessing pipeline will quietly cap or wreck your results no matter how good the architecture is. This section maps the canonical datasets, explains why ImageNet's influence outlived the benchmark itself, shows how to build splits that do not lie to you, and names the leakage and bias traps that catch even careful teams.</p>
+</div>
+
+<p>
+You have spent three chapters building and arranging networks. Now we turn to what you feed them, and the order is deliberate: in this chapter data comes first because every later decision (augmentation, transfer, schedule) is downstream of it. In the previous chapter you loaded CIFAR-10 and ImageNet-pretrained backbones almost without comment. This section makes that data explicit. We will see why a handful of datasets became the field's shared yardsticks, why the statistics of one of them are wired into nearly every model you will ever use, and how a subtle split or sampling mistake can produce a validation number that looks wonderful and means nothing.
+</p>
+
+<h2>1. The Canonical Datasets <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A small set of datasets recur throughout deep computer vision, partly because they are good and partly because shared benchmarks let the field compare methods at all. Knowing their shape and their intended task tells you immediately whether a given dataset fits your problem and how long training will take. The most important ones span four orders of magnitude in size, from tiny digit images to millions of web photographs.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 21.1.1:</strong> <em>Canonical vision datasets and their typical roles.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Dataset</th>
+<th scope="col">Images</th>
+<th scope="col">Classes</th>
+<th scope="col">Resolution</th>
+<th scope="col">Primary task</th>
+</tr>
+</thead>
+<tr><td>MNIST</td><td>70,000</td><td>10</td><td>$28 \times 28$ gray</td><td>Digit classification (a sanity-check toy)</td></tr>
+<tr><td>CIFAR-10 / 100</td><td>60,000</td><td>10 / 100</td><td>$32 \times 32$ color</td><td>Small-image classification, fast experiments</td></tr>
+<tr><td>ImageNet-1k</td><td>~1.28M</td><td>1000</td><td>variable (~$469 \times 387$)</td><td>Classification and pretraining backbone</td></tr>
+<tr><td>COCO</td><td>~123,000</td><td>80</td><td>variable</td><td>Detection, segmentation, captioning</td></tr>
+<tr><td>ADE20K</td><td>~25,000</td><td>150</td><td>variable</td><td>Semantic segmentation</td></tr>
+<tr><td>LAION-5B</td><td>~5.85B pairs</td><td>open</td><td>variable web</td><td>Image-text pretraining (generative, CLIP)</td></tr>
+</table>
+</div>
+
+<p>
+Table 21.1.1 sketches a clear progression. MNIST and CIFAR are for fast iteration: a model trains in minutes, so they are where you debug a pipeline and test a hypothesis cheaply. ImageNet-1k is the pretraining workhorse, large enough that features learned on it transfer almost everywhere. COCO and ADE20K move beyond a single label per image to the box-, mask-, and pixel-level supervision you will need in <a href="../module-23-object-detection/index.html">Chapter 23</a> and <a href="../module-24-segmentation/index.html">Chapter 24</a>. The web-scale datasets like LAION power the foundation models of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and the text-to-image systems of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. The rule of thumb: prototype on CIFAR, transfer from ImageNet, evaluate on whatever benchmark your task community uses.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The original ImageNet was labeled by tens of thousands of Amazon Mechanical Turk workers across several years, with each candidate image-label pair voted on by multiple annotators. The full database contains over fourteen million images across twenty thousand categories; the famous "ImageNet" that everyone trains on is just the 1000-class ILSVRC subset. When a paper says "pretrained on ImageNet", it almost always means that thin 1.28-million-image slice, not the giant whole.</p>
+</div>
+
+<h2>2. Why ImageNet Still Governs Your Weights <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+ImageNet's challenge ended years ago, yet its fingerprints are on nearly every model you build. The reason is transfer learning, which <a href="section-21.3.html">Section 21.3</a> covers in full: because features learned on ImageNet's 1000 classes turn out to be broadly useful, almost every backbone in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> ships with ImageNet-pretrained weights, and you start there rather than from random. That single fact has a precise and easily-missed consequence: a pretrained model expects its inputs preprocessed exactly the way they were during pretraining, which means resized and center-cropped to the training resolution and normalized with ImageNet's per-channel mean and standard deviation.
+</p>
+
+<p>
+Those numbers are not arbitrary. They are the channel-wise statistics of the ImageNet training set, $\mu = (0.485, 0.456, 0.406)$ and $\sigma = (0.229, 0.224, 0.225)$ for the red, green, and blue channels of images scaled to $[0, 1]$. Normalization applies the per-channel transform $x' = (x - \mu) / \sigma$, the same standardization idea you met for histograms in <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, here applied so that the network sees inputs in the distribution it was trained on. Feed it raw 0-to-255 pixels instead and you hand it data from a completely different range; the result, as the practical example below shows, is often near-random output from an otherwise excellent model.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.io import read_image
+from torchvision.models import resnet50, ResNet50_Weights
+
+# The weights object carries the EXACT preprocessing it was trained with.
+weights = ResNet50_Weights.IMAGENET1K_V2
+model = resnet50(weights=weights).eval()
+
+preprocess = weights.transforms()
+print(preprocess)
+# Expected (abbreviated):
+# ImageClassification(
+#     crop_size=[224], resize_size=[232],
+#     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], ...)
+
+img = read_image("cat.jpg")               # uint8 tensor, shape (3, H, W)
+batch = preprocess(img).unsqueeze(0)      # resize, crop, scale to [0,1], normalize
+with torch.no_grad():
+    probs = model(batch).softmax(dim=1)
+top = probs.argmax(dim=1).item()
+print(weights.meta["categories"][top])   # e.g. "tabby, tabby cat"</code></pre>
+<div class="code-caption">The pretrained weights object owns its preprocessing. Calling <code>weights.transforms()</code> reproduces the exact resize, crop, scaling, and ImageNet normalization the model was trained on, which is the only safe way to feed it.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Preprocessing Is Part of the Model</div>
+<p>A pretrained network is a function of a precise input distribution, not just an architecture with weights. The resize resolution, the crop size, and the per-channel normalization are as much a part of the model as any convolution. The single most common cause of "my pretrained model gives garbage" is a preprocessing mismatch between training and inference, and the entire reason <code>weights.transforms()</code> exists is so you cannot get those numbers subtly wrong. Whenever you load pretrained weights, get the preprocessing from the weights, never from memory.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Hospital Model That Worked Everywhere But the Clinic</div>
+<p><strong>Who:</strong> a medical-imaging team adapting an ImageNet-pretrained backbone to classify retinal scans, 2024. <strong>Situation:</strong> validation accuracy was a strong 91% in the research notebook, and the model was handed to a clinic's image-viewer integration. <strong>Problem:</strong> in the clinic, accuracy collapsed to near chance, but only on images coming from one particular camera vendor. <strong>Decision:</strong> the engineer logged the raw pixel histogram of a misclassified clinic image and compared it to a training image. The training pipeline normalized with ImageNet statistics after scaling to $[0, 1]$, but the clinic integration had been wired to feed 16-bit DICOM pixel values (range $0$ to $65535$) straight in, skipping the scale step entirely. <strong>Result:</strong> inserting the correct scale-then-normalize step in the clinic path restored accuracy to the validation level without retraining a single weight. <strong>Lesson:</strong> the failure was not in the 25 million learned parameters, it was in two lines of preprocessing. When a strong model fails on real inputs, trace one image's pixel values end to end before you touch the weights.</p>
+</div>
+
+<h2>3. Splits That Do Not Lie <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The point of holding out data is to estimate how the model behaves on inputs it has never seen. That estimate is only honest if the held-out data is genuinely independent of training, and the standard three-way split exists to protect that independence. The training set fits the weights, the validation set tunes hyperparameters and triggers early stopping, and the test set is touched exactly once, at the very end, to report the final number. The moment you select a model based on its test score, the test set has informed your choices and is no longer an unbiased estimate; it has quietly become a second validation set.
+</p>
+
+<p>
+Figure 21.1.1 shows the three roles and the one-way flow of information that keeps each estimate honest.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Train validation test split showing one-way information flow">
+<style>
+.t{font:13px sans-serif;fill:#1a1a1a;}
+.s{font:11px sans-serif;fill:#555;}
+.trn{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.val{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.tst{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.flow{stroke:#777;stroke-width:1.5;marker-end:url(#a2);fill:none;}
+.warn{stroke:#c0392b;stroke-width:1.5;stroke-dasharray:5 4;marker-end:url(#a3);fill:none;}
+</style>
+<defs>
+<marker id="a2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="a3" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#c0392b"/></marker>
+</defs>
+<rect class="trn" x="30" y="60" width="180" height="70" rx="6"/>
+<text class="t" x="120" y="90" text-anchor="middle">Training set (~70-80%)</text>
+<text class="s" x="120" y="112" text-anchor="middle">fits the weights</text>
+<rect class="val" x="270" y="60" width="180" height="70" rx="6"/>
+<text class="t" x="360" y="90" text-anchor="middle">Validation set (~10-15%)</text>
+<text class="s" x="360" y="112" text-anchor="middle">tunes hyperparameters</text>
+<rect class="tst" x="510" y="60" width="180" height="70" rx="6"/>
+<text class="t" x="600" y="90" text-anchor="middle">Test set (~10-15%)</text>
+<text class="s" x="600" y="112" text-anchor="middle">reported once, at the end</text>
+<line class="flow" x1="212" y1="95" x2="266" y2="95"/>
+<text class="s" x="239" y="48" text-anchor="middle">select on</text>
+<line class="warn" x1="452" y1="95" x2="506" y2="95"/>
+<text class="s" x="479" y="48" text-anchor="middle">touch once</text>
+<text class="s" x="360" y="175" text-anchor="middle">Information flows left to right only.</text>
+<text class="s" x="360" y="195" text-anchor="middle">If you pick a model by its test score (red dashed), the test set is no longer independent.</text>
+</svg>
+<figcaption><strong>Figure 21.1.1:</strong> The three-way split and its one-way information flow. The training set fits weights, the validation set guides model selection, and the test set is evaluated exactly once. Selecting models on the test score (the red dashed path) silently converts the test set into a second validation set and inflates the reported number.</figcaption>
+</figure>
+
+<p>
+For small datasets where a single split is noisy, $k$-fold cross-validation reuses the data: partition into $k$ folds, train $k$ times each holding out one fold for validation, and average. The crucial subtlety, and the source of the most common silent bug, is <strong>grouping</strong>. If your data has natural groups (multiple photos of the same patient, several frames from the same video, augmented copies of one original), every member of a group must land entirely in one split. A naive random split that scatters a patient's scans across train and test lets the model recognize the patient rather than the disease, producing a beautiful test number that evaporates on a genuinely new patient. The code below contrasts the naive split with a group-aware one.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+
+# Suppose each row is one X-ray; patient_id groups multiple scans per person.
+X = np.arange(1000)
+patient_id = np.repeat(np.arange(200), 5)   # 200 patients, 5 scans each
+
+# WRONG: scatters a patient's scans across train and test (leakage).
+tr, te = train_test_split(X, test_size=0.2, random_state=0)
+
+# RIGHT: keeps every scan of a patient in exactly one split.
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=0)
+tr_idx, te_idx = next(gss.split(X, groups=patient_id))
+overlap = set(patient_id[tr_idx]) &amp; set(patient_id[te_idx])
+print("patients shared between train and test:", len(overlap))
+# Expected: patients shared between train and test: 0</code></pre>
+<div class="code-caption">Group-aware splitting prevents leakage. <code>GroupShuffleSplit</code> guarantees zero patients appear in both train and test, so the reported accuracy reflects generalization to new patients, not memorization of seen ones.</div>
+
+<h2>4. Leakage and Bias: The Silent Result-Wreckers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Data leakage is any path by which information from the evaluation set sneaks into training, and it is insidious precisely because it makes your metrics look better. Beyond the grouping leak above, three patterns recur. <strong>Augmentation leakage</strong>: if you augment first and split second, augmented copies of one image land on both sides; always split, then augment only the training side. <strong>Statistic leakage</strong>: if you compute normalization statistics over the entire dataset before splitting, the test set has informed the training preprocessing; compute statistics on the training split only. <strong>Temporal leakage</strong>: for time-ordered data (video, sensor streams), a random split lets the model peek at the future, so split by time instead.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Leakage Always Flatters You</div>
+<p>The diagnostic signature of leakage is a validation or test number that is suspiciously good, often better than published results on the same task, that then collapses in deployment. Healthy generalization is rarely a pleasant surprise. When a result looks too good, the first hypothesis should always be leakage, not genius. Trace exactly how a single test example could share information with training, and you will usually find the leak.</p>
+</div>
+
+<p>
+Dataset bias is the quieter cousin of leakage. A model learns whatever correlations are present, including ones you did not intend. The classic cautionary tale is a husky-versus-wolf classifier that achieved high accuracy by detecting snow in the background, because the wolf photos happened to be snowy, not by recognizing the animals at all. ImageNet itself carries geographic and cultural skew (its "groom" and "wedding" images over-represent Western ceremonies), which propagates into every model pretrained on it. The defenses are practical: inspect class balance, view random samples per class, check that the easy-to-vary nuisance factors (lighting, background, camera) are not aligned with the labels, and where possible test on data from a genuinely different source than you trained on.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Complete Data Pipeline in a Dozen Lines</div>
+<p>Building a dataset, a split, and a normalized loader from scratch is dozens of lines of file walking, indexing, and tensor wrangling. torchvision plus a folder convention reduce it to this:</p>
+<pre><code class="language-python">from torchvision import transforms, datasets
+from torch.utils.data import DataLoader, random_split
+
+tf = transforms.Compose([
+    transforms.Resize(232), transforms.CenterCrop(224),
+    transforms.ToTensor(),                                  # scales to [0,1]
+    transforms.Normalize([0.485, 0.456, 0.406],
+                          [0.229, 0.224, 0.225]),           # ImageNet stats
+])
+full = datasets.ImageFolder("data/train", transform=tf)     # class = subfolder name
+train, val = random_split(full, [0.8, 0.2])                 # split AFTER loading
+loader = DataLoader(train, batch_size=64, shuffle=True, num_workers=4)</code></pre>
+<p><code>ImageFolder</code> handles directory walking, label inference from folder names, lazy image decoding, and integration with multi-worker loading. The library manages the entire path from disk to a normalized batch tensor; you supply only the transform recipe and the split ratio. For grouped data, swap <code>random_split</code> for an index list built with <code>GroupShuffleSplit</code> as above.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Data-Centric AI and Auditing Benchmarks</div>
+<p>A major 2021-2026 shift has been the move from model-centric to data-centric thinking. Northcutt, Athalye, and Mueller's "Pervasive Label Errors" (arXiv:2103.14749) used confident-learning to find systematic label errors in the test sets of ImageNet, CIFAR, and other staples, with an estimated 6% label-error rate on the ImageNet validation set, errors large enough to reorder model leaderboards. Their cleanlab toolkit and the broader data-centric movement (championed by Andrew Ng's campaigns) argue that on mature tasks, cleaning and curating data yields larger gains than tweaking architectures. The practical upshot for this chapter: the dataset is not a fixed given to optimize against; it is an artifact you should audit, clean, and improve, a theme that returns when generative models become data engines in <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.1: Why These Exact Numbers? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The ImageNet normalization uses mean $(0.485, 0.456, 0.406)$ and standard deviation $(0.229, 0.224, 0.225)$. Explain in your own words (a) why the red mean is the largest of the three, relating it to typical natural-image color statistics, and (b) what numerically happens to a network's first-layer activations if you forget normalization and feed inputs in $[0, 1]$ instead of the standardized range. Connect your answer to the standardization idea from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.2: Build a Leak, Then Fix It <span class="exercise-type coding">Coding</span></div>
+<p>Create a synthetic dataset of 100 "patients", each with 5 near-duplicate images (add small noise to a base image). Train a simple classifier twice: once with a naive random split, once with <code>GroupShuffleSplit</code> keyed on patient id. Report both test accuracies. You should observe the naive split reporting markedly higher accuracy. Write two sentences explaining why the gap exists and which number you would trust to predict performance on a brand-new patient.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.1.3: Audit a Class for Bias <span class="exercise-type analysis">Analysis</span></div>
+<p>Pick any 2-class image dataset you can access (or two ImageNet classes). For each class, display 16 random samples and list the recurring backgrounds, lighting conditions, and framing. Identify at least one nuisance factor that is correlated with the label (a background, a watermark, a color cast) and propose a concrete test that would reveal whether your model is using that shortcut rather than the object itself. Relate your test to the husky-versus-wolf cautionary tale in subsection 4.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 21 Index</a>
+<a href="index.html">Chapter 21</a>
+<a class="next" href="section-21.2.html">Section 21.2: Data Augmentation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

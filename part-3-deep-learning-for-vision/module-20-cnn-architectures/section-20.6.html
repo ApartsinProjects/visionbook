@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.6: Choosing an Architecture in Practice. Reading the stats sheet (parameters, FLOPs, latency, accuracy), the accuracy-versus-cost frontier, picking a backbone with timm, transfer learning from pretrained weights, and a decision checklist for real projects." name="description"/>
+<title>Section 20.6: Choosing an Architecture in Practice | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: CNN Architectures: From LeNet to ConvNeXt</a></div>
+<h1>Choosing an Architecture in Practice</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The leaderboard crowns the network with the most accuracy. The pager at 3 a.m. crowns the network that fit in memory and answered in time. Choose the one that will not wake you up."</p>
+<cite>A Backbone That Has Been On Call</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>After a decade of designs, the practical bottleneck is no longer inventing an architecture but choosing one, and the right choice is almost never the most accurate network on a leaderboard but the cheapest network that clears your accuracy bar under your real latency, memory, and data constraints.</strong> This section turns the chapter's history into a decision procedure: read the four numbers that describe any model (parameters, FLOPs, latency, accuracy), find the accuracy-versus-cost frontier, start from a pretrained backbone almost always, and reach for transfer learning before you reach for training from scratch. The deliverable is a checklist you can apply to a real project on Monday.</p>
+</div>
+
+<p>
+You now know the great architectures and, more usefully, the bottleneck each removed. <a href="section-20.5.html">Section 20.5</a> left you with the entangled-recipe lesson: architecture and training are inseparable, and the modern workflow rarely starts from a blank network. This closing section is deliberately practical. It assumes you have a task, a hardware target, and a deadline, and it shows how to pick a backbone without re-deriving the field.
+</p>
+
+<h2>1. The Four Numbers on Every Stats Sheet <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Every architecture is summarized by four quantities, and confusing them is the most common selection error. <strong>Parameters</strong> count the weights; they determine model file size and a rough lower bound on memory, but not speed. <strong>FLOPs</strong> (floating-point operations, usually reported as multiply-adds per image) estimate compute, but as <a href="section-20.4.html">Section 20.4</a> warned, they correlate only loosely with wall-clock time because memory bandwidth, not arithmetic, often dominates. <strong>Latency</strong> is the measured time for one forward pass on your target hardware, the number that actually matters for a real-time system, and it must be measured, not predicted. <strong>Accuracy</strong> (top-1 on ImageNet, or your task's metric) is the headline, but it is meaningless without the cost it was bought at. Table 20.6.1 grounds these with representative figures.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 20.6.1:</strong> <em>Representative ImageNet backbones (approximate figures, 224x224 input). Use as relative guidance; exact numbers depend on weights and hardware.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Model</th>
+<th scope="col">Params (M)</th>
+<th scope="col">FLOPs (G)</th>
+<th scope="col">Top-1 (%)</th>
+<th scope="col">Typical use</th>
+</tr>
+</thead>
+<tr><td>MobileNetV3-Small</td><td>2.5</td><td>0.06</td><td>67.7</td><td>phones, embedded, edge cameras</td></tr>
+<tr><td>EfficientNet-B0</td><td>5.3</td><td>0.39</td><td>77.7</td><td>strong accuracy per FLOP, mobile</td></tr>
+<tr><td>ResNet-50</td><td>25.6</td><td>4.1</td><td>80.9</td><td>the default server backbone</td></tr>
+<tr><td>ConvNeXt-Tiny</td><td>28.6</td><td>4.5</td><td>82.1</td><td>modern accuracy, server</td></tr>
+<tr><td>ConvNeXt-Base</td><td>88.6</td><td>15.4</td><td>83.8</td><td>accuracy-first, ample compute</td></tr>
+</table>
+</div>
+
+<p>
+Read the table as a frontier, not a ranking. MobileNetV3-Small uses about seventy times fewer FLOPs than ConvNeXt-Base for thirteen fewer accuracy points, an excellent trade on a phone and a terrible one on a server with idle GPUs. The ResNet-50 row is bolded in your mind for a reason: it remains the field's reference point, well understood, widely supported, and with the modern weights of <a href="section-20.3.html">Section 20.3</a> still competitive. Figure 20.6.1 plots the frontier these rows trace.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Accuracy versus compute scatter showing the efficient frontier of vision backbones">
+<style>
+.t5{font:11px sans-serif;fill:#1a1a1a;}
+.s5{font:10px sans-serif;fill:#555;}
+.pt{fill:#2c6fb5;}
+.fr{stroke:#2f9e5c;stroke-width:1.8;fill:none;stroke-dasharray:6 3;}
+.dom{fill:#bbb;}
+</style>
+<line x1="70" y1="30" x2="70" y2="270" stroke="#999"/>
+<line x1="70" y1="270" x2="660" y2="270" stroke="#999"/>
+<text class="s5" x="40" y="276">66</text>
+<text class="s5" x="40" y="40">84</text>
+<text class="t5" x="20" y="160" transform="rotate(-90 20,160)" text-anchor="middle">top-1 accuracy (%)</text>
+<text class="t5" x="365" y="305" text-anchor="middle">compute (GFLOPs, log scale) &#8594;</text>
+<!-- points: x by log flops, y by accuracy. acc 66->270, 84->30 -->
+<circle class="pt" cx="110" cy="247" r="6"/><text class="s5" x="118" y="240">MobileNetV3-S (67.7%)</text>
+<circle class="pt" cx="230" cy="120" r="6"/><text class="s5" x="160" y="108">EfficientNet-B0 (77.7%)</text>
+<circle class="pt" cx="430" cy="84" r="6"/><text class="s5" x="360" y="74">ResNet-50 (80.9%)</text>
+<circle class="pt" cx="450" cy="68" r="6"/><text class="s5" x="458" y="64">ConvNeXt-T (82.1%)</text>
+<circle class="pt" cx="600" cy="44" r="6"/><text class="s5" x="500" y="36">ConvNeXt-B (83.8%)</text>
+<circle class="dom" cx="430" cy="150" r="6"/><text class="s5" x="438" y="166" fill="#888">a dominated model</text>
+<path class="fr" d="M 110 247 Q 230 120 430 84 T 600 44"/>
+<text class="s5" x="250" y="200" fill="#2f9e5c">efficient frontier</text>
+</svg>
+<figcaption><strong>Figure 20.6.1:</strong> The accuracy-versus-compute frontier. Models on the green frontier give the most accuracy for their compute; anything below and to the right (the gray point) is dominated, beaten on both axes by a frontier model. Architecture selection is choosing the frontier point that meets your accuracy bar at the lowest cost your budget allows.</figcaption>
+</figure>
+
+<h2>2. Picking a Backbone with timm <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+In practice you do not implement any of this chapter's networks; you select one from a library and load pretrained weights. The <code>timm</code> library is the standard catalogue, with hundreds of backbones, benchmarked accuracy and throughput tables, and a one-line model factory. The workflow is: filter the catalogue to candidates that fit your cost budget, load each pretrained, measure latency on your hardware, and pick the cheapest that clears your accuracy target after fine-tuning.
+</p>
+
+<pre><code class="language-python">import timm, torch, time
+
+# 1. List candidate backbones by name pattern:
+candidates = ["mobilenetv3_large_100", "efficientnet_b0", "resnet50", "convnext_tiny"]
+
+# 2. Load each pretrained and measure latency on YOUR hardware (the real metric):
+device = "cuda" if torch.cuda.is_available() else "cpu"
+x = torch.randn(1, 3, 224, 224, device=device)
+for name in candidates:
+    model = timm.create_model(name, pretrained=True).eval().to(device)
+    with torch.no_grad():
+        for _ in range(5):           # warm up (kernels compile, caches fill)
+            model(x)
+        t0 = time.perf_counter()
+        for _ in range(50):
+            model(x)
+        if device == "cuda":
+            torch.cuda.synchronize()
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    ms = (time.perf_counter() - t0) / 50 * 1000
+    print(f"{name:24s} {n_params:6.1f}M params  {ms:6.2f} ms/image")</code></pre>
+<div class="code-caption">A backbone bake-off in one loop. The warm-up runs matter: the first forward pass pays one-time compilation and allocation costs, so timing it would badly overstate latency. This is how you turn the abstract frontier of Figure 20.6.1 into numbers for your actual deployment target.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Re-Head a Backbone for Your Classes</div>
+<p>The single most common production task, taking an ImageNet backbone and adapting it to your own label set, is one argument in timm:</p>
+<pre><code class="language-python">import timm
+# Load a pretrained backbone but replace the 1000-class head with your own:
+model = timm.create_model("convnext_tiny", pretrained=True, num_classes=37)
+# timm swaps the classifier, keeps the pretrained trunk, ready to fine-tune.
+# Freeze the trunk for linear probing, or leave it trainable for full fine-tuning:
+for p in model.parameters(): p.requires_grad = False
+for p in model.get_classifier().parameters(): p.requires_grad = True</code></pre>
+<p>The library handles re-initializing the head to the right output dimension, leaving the pretrained trunk intact, and exposing <code>get_classifier()</code> so you can freeze or train it. This replaces the error-prone manual surgery of locating the final linear layer and reshaping it, and it is the launching point for the transfer-learning workflow of <a href="../module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<h2>3. Transfer Learning Is the Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The most important practical fact in this section is that you should almost never train an architecture from scratch. A backbone pretrained on a large dataset has already learned the general visual features (the edge, texture, and part detectors you visualized in <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>), and those features transfer to nearly any image task. Fine-tuning such a backbone on a few thousand of your own images routinely beats training the same architecture from random initialization on the same data, often by a wide margin, and trains in a fraction of the time. The transfer-learning arc of this book runs from here through the foundation backbones of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> to the fine-tuned generators of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>; this is its first concrete payoff.
+</p>
+
+<p>
+There are two transfer styles. <em>Linear probing</em> freezes the trunk and trains only a new head, fast and data-thrifty, best when your data is scarce or very similar to the pretraining domain. <em>Full fine-tuning</em> updates the whole network at a small learning rate, stronger when you have more data or a domain shift (medical scans, satellite imagery, microscopy). The decision and its details, learning-rate schedules, layer-wise rates, when to unfreeze, belong to <a href="../module-21-training-recipes/index.html">Chapter 21</a>, but the default posture is set here: start pretrained, fine-tune, only consider from-scratch if a strong reason demands it.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cheapest Sufficient Model Wins</div>
+<p>Leaderboards optimize a single axis: accuracy. Real systems optimize accuracy subject to latency, memory, power, cost, and maintainability constraints, and the winner is the cheapest model that satisfies all of them, not the most accurate one overall. A two-point accuracy gain that doubles latency and breaks your real-time budget is a loss. Train your instinct to ask "what is the least expensive model that clears the bar?" rather than "what is the most accurate model?", and most architecture decisions answer themselves.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>There is an unofficial law of applied vision: the model you end up shipping is a ResNet-50, no matter which paper you started the project intending to use. It is the off-white paint of backbones, never the most exciting choice in the room, supported everywhere, understood by everyone, and quietly correct far more often than the trend would predict. Reach for the shiny thing if you must, but do not be surprised when the bake-off sends you home with the ResNet.</p>
+</div>
+
+<h2>4. A Decision Checklist <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Putting the chapter together, here is a procedure for choosing an architecture for a new vision project. It is ordered so the cheapest, highest-leverage decisions come first.
+</p>
+
+<ol>
+<li><strong>State the hard constraints first.</strong> Target hardware, maximum latency, memory budget, and the minimum acceptable accuracy. These prune the candidate set before you look at any model.</li>
+<li><strong>Default to a pretrained backbone.</strong> Begin with a ResNet-50 or ConvNeXt-Tiny on a server, an EfficientNet-B0 or MobileNetV3 on a device. Only deviate with a reason.</li>
+<li><strong>Match the backbone to the budget using the frontier.</strong> Pick the frontier model (Figure 20.6.1) whose accuracy clears your bar at the lowest cost your hardware allows; do not overshoot.</li>
+<li><strong>Re-head and fine-tune, do not train from scratch.</strong> Use linear probing if data is scarce or in-domain, full fine-tuning if data is ample or out-of-domain.</li>
+<li><strong>Measure latency on the real target, not FLOPs.</strong> Run the bake-off above on the actual chip; FLOPs can mislead by an order of magnitude.</li>
+<li><strong>Match the recipe before comparing models.</strong> Per <a href="section-20.5.html">Section 20.5</a>, never compare two architectures trained with different recipes; hold the recipe fixed or your comparison is meaningless.</li>
+<li><strong>Only then consider exotic options.</strong> Vision transformers (<a href="../module-22-vision-transformers/index.html">Chapter 22</a>), quantization and pruning (<a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>), or a custom design, when a strong, pretrained CNN provably cannot meet the constraints.</li>
+</ol>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Defect Detector That Did Not Need a Transformer</div>
+<p><strong>Who:</strong> a manufacturing-vision team building a surface-defect classifier for an inline inspection camera, 2025. <strong>Situation:</strong> a vendor proposal recommended a large vision transformer, citing its ImageNet supremacy. <strong>Problem:</strong> the team had only about four thousand labeled defect images, a strict 15-millisecond-per-frame latency budget on an industrial edge box, and no GPU at the line. <strong>Decision:</strong> they followed the checklist: hard constraints first (CPU edge box, 15 ms, small dataset), so they took a pretrained EfficientNet-B0, re-headed it to their six defect classes, and full-fine-tuned it. <strong>Result:</strong> 96% accuracy after fine-tuning, 9 ms per frame on the edge CPU, trained in under an hour on a single workstation GPU. The transformer, tested for due diligence, needed far more data to match the accuracy and missed the latency budget badly. <strong>Lesson:</strong> the leaderboard champion is rarely the project champion. A pretrained efficient CNN, fine-tuned, is the correct first answer for the large majority of applied vision tasks, and the checklist gets you there without a month of experiments.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Backbone Is Becoming a Foundation Model</div>
+<p>The selection story is shifting under the field's feet from 2024 to 2026. Increasingly the strongest starting point is not an ImageNet-supervised backbone but a self-supervised foundation model (DINOv2, the SigLIP and CLIP image encoders, and successors), pretrained on hundreds of millions of unlabeled or weakly labeled images, whose frozen features rival fully fine-tuned task-specific networks (<a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>). Libraries like timm and Hugging Face now serve these alongside the classic CNNs, so the practical question is evolving from "which architecture?" to "which pretrained representation, and do I even need to fine-tune it?". The frontier-and-checklist discipline of this section still applies; what changes is that the cheapest sufficient model is more and more often a frozen foundation backbone with a small trained head. The architectures of this chapter remain the bodies of those foundation models, which is why understanding them is the durable skill.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.1: Read a Frontier <span class="exercise-type conceptual">Conceptual</span></div>
+<p>From Table 20.6.1, identify which models lie on the efficient frontier and which (if any) are dominated. For a hypothetical project requiring at least 80% top-1 accuracy with a strict server FLOP budget of 5 GFLOPs, state which single model you would choose and justify it in two sentences. Then state how your choice changes if the deployment target becomes a battery-powered phone with the same accuracy requirement, and explain why the answer flips.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.2: Run the Bake-Off <span class="exercise-type coding">Coding</span></div>
+<p>Run the timm latency bake-off above on your own machine for the four candidate backbones (add a warm-up as shown). Produce a table of parameters, your measured latency, and the published top-1 accuracy. Then plot accuracy against your measured latency (not FLOPs) and draw the frontier. Note any case where the FLOP ranking and your latency ranking disagree, and propose an explanation in terms of memory bandwidth and depthwise convolutions from <a href="section-20.4.html">Section 20.4</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.6.3: Transfer versus Scratch <span class="exercise-type analysis">Analysis</span></div>
+<p>On a small dataset (Oxford-IIIT Pets or Flowers-102), train a <code>resnet50</code> two ways: (a) re-headed from ImageNet-pretrained weights and fine-tuned, and (b) from random initialization, with the identical recipe and epoch budget for both. Plot validation accuracy versus epoch for each, and report the final gap and the epoch at which the pretrained model first exceeds the from-scratch model's best score. Quantify how much data and time transfer learning saved, and connect the result to the feature-reuse argument of subsection 3.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.5.html">&#8592; Section 20.5: ConvNeXt</a>
+<a href="index.html">Chapter 20</a>
+<a class="next" href="../module-21-training-recipes/index.html">Chapter 21: Training Recipes &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.4: Efficient Designs: MobileNet, ShuffleNet & EfficientNet. Architecture for a cost budget: depthwise-separable convolution, inverted residuals, grouped convolution with channel shuffle, squeeze-and-excitation, and EfficientNet's compound scaling." name="description"/>
+<title>Section 20.4: Efficient Designs: MobileNet, ShuffleNet &amp; EfficientNet | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: CNN Architectures: From LeNet to ConvNeXt</a></div>
+<h1>Efficient Designs: MobileNet, ShuffleNet &amp; EfficientNet</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Accuracy is easy when someone else pays the electricity bill. Run me on a phone in someone's pocket and suddenly every multiply-add is a moral decision."</p>
+<cite>A Network Learning to Live Within Its Means</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Once networks were accurate, the bottleneck moved from "can it learn?" to "can it run on a phone, a drone, or a doorbell?", and the efficient designs of this section attack the cost of the convolution itself rather than the depth or width around it.</strong> The central trick is factorization: a standard convolution mixes space and channels at once, which is wasteful, so depthwise-separable convolution splits it into a per-channel spatial filter and a $1 \times 1$ channel mix, cutting cost by roughly the kernel area. ShuffleNet pushes grouping further and shuffles channels to restore information flow; EfficientNet steps back and asks how to scale depth, width, and resolution together for a fixed budget. This is the section where architecture becomes an explicit cost-accuracy negotiation.</p>
+</div>
+
+<p>
+ResNet (<a href="section-20.3.html">Section 20.3</a>) made depth cheap to train but not cheap to run; a ResNet-50 needs about four billion multiply-adds per image, fine on a server, painful on a battery. From roughly 2017 onward the frontier of architecture research split: one branch chased ever-higher accuracy, the other asked how little compute could buy a usable model. This section follows the efficiency branch, and its ideas now sit inside almost every model that ships to a real device, the topic of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>.
+</p>
+
+<h2>1. Depthwise-Separable Convolution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A standard convolution with kernel size $K$, $C_{in}$ input channels, and $C_{out}$ output channels does two jobs in one shot: it filters spatially (the $K \times K$ window) and it combines channels (summing across all $C_{in}$ inputs for each output). Its cost per output pixel is $K^2 \cdot C_{in} \cdot C_{out}$ multiply-adds. MobileNet's insight is that these two jobs can be separated. First a <strong>depthwise convolution</strong> applies one $K \times K$ filter to each input channel independently, doing only spatial work, at cost $K^2 \cdot C_{in}$. Then a <strong>pointwise convolution</strong> (a $1 \times 1$ convolution, the channel mixer of <a href="section-20.2.html">Section 20.2</a>) combines channels, at cost $C_{in} \cdot C_{out}$. Figure 20.4.1 contrasts the two.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Standard convolution versus depthwise-separable convolution as a per-channel filter followed by a 1x1 mix">
+<style>
+.t3{font:12px sans-serif;fill:#1a1a1a;}
+.s3{font:10px sans-serif;fill:#555;}
+.std{fill:#fdeee3;stroke:#d6802b;stroke-width:1.3;}
+.dw{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.3;}
+.pw{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.3;}
+.a3{stroke:#777;stroke-width:1.4;marker-end:url(#ah6);fill:none;}
+</style>
+<defs><marker id="ah6" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="t3" x="150" y="22" text-anchor="middle">standard KxK convolution</text>
+<rect class="std" x="80" y="50" width="140" height="44"/>
+<text class="s3" x="150" y="70" text-anchor="middle">filter space AND channels</text>
+<text class="s3" x="150" y="86" text-anchor="middle">together, in one op</text>
+<text class="t3" x="150" y="130" text-anchor="middle" fill="#a33">cost: K&#178; &#183; C_in &#183; C_out</text>
+<text class="t3" x="520" y="22" text-anchor="middle">depthwise-separable</text>
+<rect class="dw" x="420" y="50" width="90" height="44"/>
+<text class="s3" x="465" y="68" text-anchor="middle">depthwise</text>
+<text class="s3" x="465" y="82" text-anchor="middle">KxK per channel</text>
+<line class="a3" x1="512" y1="72" x2="540" y2="72"/>
+<rect class="pw" x="542" y="50" width="90" height="44"/>
+<text class="s3" x="587" y="68" text-anchor="middle">pointwise</text>
+<text class="s3" x="587" y="82" text-anchor="middle">1x1 mix channels</text>
+<text class="t3" x="520" y="130" text-anchor="middle" fill="#296">cost: K&#178;&#183;C_in + C_in&#183;C_out</text>
+<text class="s3" x="520" y="160" text-anchor="middle">reduction &#8776; 1/C_out + 1/K&#178;  (about 8-9x for K=3)</text>
+<line class="a3" x1="240" y1="72" x2="410" y2="72"/>
+<text class="s3" x="325" y="64" text-anchor="middle">factorize</text>
+</svg>
+<figcaption><strong>Figure 20.4.1:</strong> Depthwise-separable convolution. A standard convolution (orange) filters space and mixes channels at once. The separable form does the spatial filtering per channel (green) and then mixes channels with a $1 \times 1$ convolution (blue). For a $3 \times 3$ kernel the cost falls by roughly eight to nine times with little accuracy loss.</figcaption>
+</figure>
+
+<p>
+The cost ratio of separable to standard is $\frac{K^2 C_{in} + C_{in} C_{out}}{K^2 C_{in} C_{out}} = \frac{1}{C_{out}} + \frac{1}{K^2}$. With a typical $K = 3$ and a few hundred output channels, the second term dominates and the reduction is about $1/9$, an order-of-magnitude saving for a small accuracy cost. In PyTorch, a depthwise convolution is simply a <code>Conv2d</code> with <code>groups</code> equal to the channel count.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class DepthwiseSeparable(nn.Module):
+    """MobileNet's core unit: depthwise 3x3 then pointwise 1x1, each with BN+ReLU."""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            # depthwise: groups=in_ch means one KxK filter per channel
+            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1,
+                      groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch), nn.ReLU(inplace=True),
+            # pointwise: 1x1 conv mixes channels and changes their count
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+dw = DepthwiseSeparable(64, 128)
+std = nn.Conv2d(64, 128, 3, padding=1)
+n_dw = sum(p.numel() for p in dw.parameters())
+n_std = sum(p.numel() for p in std.parameters())
+print(f"separable: {n_dw:,} params, standard: {n_std:,} params")
+# Expected: separable: 9,152 params, standard: 73,856 params  (~8x fewer)</code></pre>
+<div class="code-caption">Depthwise-separable convolution via <code>groups=in_ch</code>. The roughly eightfold parameter reduction against a standard $3 \times 3$ convolution is the entire reason MobileNet runs on phones.</div>
+
+<p>
+MobileNetV2 added a twist called the <strong>inverted residual</strong>. A normal ResNet bottleneck squeezes channels, works, then expands. The inverted residual does the opposite: it expands to a wide intermediate representation, applies the cheap depthwise convolution there, then projects back down, and the residual skip connects the two <em>narrow</em> ends. Doing the spatial work in the wide space preserves information, while keeping the skip-connected tensors thin saves memory, a clever rearrangement of the same parts.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Depthwise-separable convolution is the rare optimization that looks too good to be true and mostly is not: it deletes about nine out of every ten multiply-adds and barely dents accuracy. The catch is that a GPU does not always run it nine times faster. Each tiny per-channel filter reads and writes memory but does almost no arithmetic, so the chip spends its time shuffling bytes rather than multiplying, the memory-bandwidth wall the research-frontier callout returns to. You saved the FLOPs; the wall clock did not always get the memo.</p>
+</div>
+
+<h2>2. ShuffleNet: Grouping, Then Mixing <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+ShuffleNet pushes the cost-cutting further with <strong>grouped convolutions</strong>, where the input channels are split into $g$ groups and each group is convolved independently, cutting the $1 \times 1$ pointwise cost by a factor of $g$. The danger is that if every layer groups the same way, information never crosses between groups and the network fragments into $g$ independent sub-networks. ShuffleNet's fix is a parameter-free <strong>channel shuffle</strong>: after a grouped convolution, permute the channels so that the next group draws from all previous groups. Information flows across the whole width at zero extra cost, the same "cheap operation that restores a property an optimization broke" pattern you saw in ResNet's skip.
+</p>
+
+<pre><code class="language-python">import torch
+
+def channel_shuffle(x, groups: int):
+    """Permute channels so the next grouped conv mixes across all groups."""
+    b, c, h, w = x.shape
+    x = x.view(b, groups, c // groups, h, w)  # split channels into groups
+    x = x.transpose(1, 2).contiguous()        # swap group and per-group axes
+    return x.view(b, c, h, w)                 # flatten back, now interleaved
+
+x = torch.arange(8).view(1, 8, 1, 1).float()
+print(x.flatten().tolist())                   # [0, 1, 2, 3, 4, 5, 6, 7]
+print(channel_shuffle(x, groups=4).flatten().tolist())  # [0, 2, 4, 6, 1, 3, 5, 7]</code></pre>
+<div class="code-caption">Channel shuffle as three reshape and transpose operations. The output ordering interleaves the four groups, so a following grouped convolution sees a channel from every original group, restoring cross-group information flow.</div>
+
+<h2>3. Squeeze-and-Excitation: Cheap Attention on Channels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A third efficiency idea, used inside MobileNetV3 and EfficientNet, is the <strong>squeeze-and-excitation</strong> (SE) block. It learns a per-channel importance weight: squeeze each feature map to a single number with global average pooling, pass the resulting channel vector through a tiny two-layer network to produce a gate in $[0, 1]$ per channel, and multiply each channel by its gate. For almost no compute, the network learns to amplify informative channels and suppress noisy ones, a lightweight form of the attention you will study fully in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. SE is one of the highest accuracy-per-FLOP additions known, which is why it appears in nearly every efficient design after 2018.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Factorize the Expensive Operation</div>
+<p>Every design in this section is a variation on one move: take the costly dense mixing of space and channels and factor it into cheaper pieces that, recombined, do nearly the same job. Depthwise-separable splits space from channels; grouped convolution splits channels into independent groups; the $1 \times 1$ bottleneck reshapes cheaply between expensive steps. When you need to make any network cheaper, ask first "what is the single most expensive operation, and can I factor it?" That question, not a memorized block diagram, is the transferable skill.</p>
+</div>
+
+<h2>4. EfficientNet: Scale Everything Together <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The earlier designs cut the cost of a fixed network. EfficientNet asks the complementary question: given more compute, how should you grow a network? You can make it deeper (more layers), wider (more channels), or feed it higher-resolution images, and the field had historically scaled one of these at a time, by intuition. EfficientNet's <strong>compound scaling</strong> argues that the three should grow together in a fixed ratio, governed by a single coefficient $\phi$:
+</p>
+
+<div class="math-block">
+$$\text{depth} = \alpha^\phi, \quad \text{width} = \beta^\phi, \quad \text{resolution} = \gamma^\phi, \quad \text{subject to } \alpha \cdot \beta^2 \cdot \gamma^2 \approx 2$$
+</div>
+
+<p>
+The constraint keeps the total compute growing by roughly $2^\phi$ as $\phi$ increases, so each unit of $\phi$ doubles the budget and spreads it across all three dimensions in the empirically best proportion. Starting from a small base network (EfficientNet-B0, found by neural architecture search and built from inverted-residual SE blocks), increasing $\phi$ generates the B1 through B7 family, which traced an accuracy-per-FLOP frontier that dominated for years. The lesson reframes the depth-versus-width debate of <a href="section-20.2.html">Section 20.2</a>: the answer is not depth or width but a principled mixture, plus resolution.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Efficient Backbones, Pretrained</div>
+<p>MobileNet, ShuffleNet, and the EfficientNet family all ship pretrained, so the blocks above become a single call:</p>
+<pre><code class="language-python">import timm
+# Pick a model by its accuracy-latency tradeoff, all pretrained on ImageNet:
+mbv3 = timm.create_model("mobilenetv3_large_100", pretrained=True)  # ~5.5M params
+effb0 = timm.create_model("efficientnet_b0", pretrained=True)       # ~5.3M params
+# timm exposes FLOP and parameter stats for ranking candidates:
+print(sum(p.numel() for p in effb0.parameters()))  # ~5,288,548</code></pre>
+<p>The library handles the depthwise grouping, the inverted-residual and SE blocks, the exact channel-multiplier and resolution settings, and the pretrained weights, replacing a few hundred lines of careful block plumbing. <code>timm</code> also publishes a benchmarked results table so you can pick a model by measured accuracy and latency rather than guessing, exactly the selection process of <a href="section-20.6.html">Section 20.6</a>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Doorbell That Could Not Afford a ResNet</div>
+<p><strong>Who:</strong> a consumer hardware team adding person detection to a battery-powered video doorbell, 2025. <strong>Situation:</strong> their prototype ran a ResNet-50 backbone in the cloud, but round-trip latency and privacy concerns demanded on-device inference, and the doorbell's chip offered a small fraction of a server's compute with a strict power envelope. <strong>Problem:</strong> the ResNet model drained the battery in hours and missed the latency target by an order of magnitude. <strong>Decision:</strong> they swapped to a MobileNetV3-Small backbone with squeeze-and-excitation, accepting a two-point accuracy drop, and quantized it to 8-bit integers (the deployment techniques of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>). <strong>Result:</strong> inference fit the latency budget with room to spare, battery life met the year-long target, and the small accuracy loss was invisible in the field because the detection threshold dominated real-world performance anyway. <strong>Lesson:</strong> on a constrained device the right architecture is the one that fits the power and latency budget while clearing the accuracy bar, not the one that tops the ImageNet leaderboard. Efficiency is a first-class design goal, not a consolation prize.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Latency Is the Real Target</div>
+<p>A theme sharpening from 2022 to 2026 is that FLOP count is a poor proxy for actual speed: depthwise convolutions are FLOP-cheap but memory-bandwidth-bound, so a "more efficient" model on paper can run slower on real hardware. Designs like MobileOne (CVPR 2023) and FastViT (ICCV 2023, arXiv:2303.14189) optimize directly for measured on-device latency, using structural reparameterization to train with multi-branch blocks and then fold them into a single fast convolution at inference. The broader 2024 to 2026 trend is hardware-aware neural architecture search, where the cost term in the search is the latency measured on the exact target chip. The factorization ideas of this section remain the building blocks; what has changed is that the objective being minimized is now wall-clock time on silicon, the metric <a href="section-20.6.html">Section 20.6</a> urges you to measure.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.1: Derive the Separable Saving <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For a convolution with kernel $K = 3$, $C_{in} = 256$, and $C_{out} = 256$ on an $H \times W$ feature map, compute the multiply-add cost of (a) the standard convolution and (b) the depthwise-separable equivalent, both per output pixel. Express the ratio and confirm it matches $\frac{1}{C_{out}} + \frac{1}{K^2}$. Then explain why the saving grows as $C_{out}$ increases but is bounded below by $1/K^2$.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.2: Build and Time a Separable Block <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>DepthwiseSeparable</code> class above, build a small network for CIFAR-10 and a twin that replaces each separable block with a standard <code>Conv2d</code> of the same input and output channels. Train both to convergence and report (a) parameter counts, (b) wall-clock time per training epoch on your hardware, and (c) final test accuracy. Discuss the accuracy-versus-cost tradeoff you observe, and check whether the wall-clock speedup matches the FLOP speedup or falls short (the memory-bandwidth point from the research-frontier callout).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.4.3: Read the EfficientNet Frontier <span class="exercise-type analysis">Analysis</span></div>
+<p>From the timm or torchvision documentation, collect parameters, FLOPs, and ImageNet top-1 accuracy for EfficientNet-B0 through B4 and for ResNet-50 and ResNet-101. Plot accuracy against FLOPs (log scale) with both families on one chart. Identify which models lie on the upper-left frontier (more accuracy per FLOP) and which are dominated. Using the compound-scaling formula of subsection 4, explain why the EfficientNet points form a smooth curve while the ResNet points scaled by depth alone do not.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.3.html">&#8592; Section 20.3: ResNet</a>
+<a href="index.html">Chapter 20</a>
+<a class="next" href="section-20.5.html">Section 20.5: ConvNeXt: The CNN, Modernized &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

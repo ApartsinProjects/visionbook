@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.1: Video Diffusion: Architectures &amp; Temporal Consistency. Turning an image denoiser into a clip denoiser with temporal attention and 3D convolution, the video VAE, and the battle against flicker and identity drift." name="description"/>
+<title>Section 36.1: Video Diffusion: Architectures &amp; Temporal Consistency | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Video Diffusion: Architectures &amp; Temporal Consistency</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Drawing one cat is easy. Drawing the same cat sixty times in a row, without it sprouting a third ear in frame 31, turns out to be the entire job."</p>
+<cite>A U-Net That Learned to Count Frames</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A video model is an image diffusion model with one extra demand: every frame must agree with its neighbors, so the only architectural change that matters is adding a mechanism through which frames can talk to each other across time.</strong> That mechanism is temporal attention layered onto the spatial denoiser you built in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, plus a video autoencoder that compresses time as well as space. Everything hard about video generation, flicker, identity drift, motion that stutters, reduces to one phrase: temporal consistency, and this section is about how the architecture buys it.</p>
+</div>
+
+<p>
+In <a href="../module-33-diffusion-models/index.html">Chapter 33</a> you trained a model to take a noisy image and predict the noise, then ran that prediction in a loop to sculpt clean pixels out of Gaussian static. <a href="../module-34-text-to-image/index.html">Chapter 34</a> conditioned that loop on a text prompt through cross-attention. If you simply run such an image model independently on each frame of a video, you get a catastrophe that the field calls <em>flicker</em>: each frame is individually plausible, but the texture of a wall, the pattern on a shirt, the exact shade of the sky, all jitter chaotically from frame to frame because nothing forces consecutive frames to agree. The previous section's tools, optical flow and temporal modeling from <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>, told you how to <em>read</em> motion; this section is about how to <em>generate</em> it consistently.
+</p>
+
+<h2>1. From Image Denoiser to Video Denoiser <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A video is a tensor of shape $(B, F, C, H, W)$: batch, frames, channels, height, width. An image diffusion U-Net or DiT operates on $(B, C, H, W)$. The cheapest possible video model treats the frame axis as part of the batch, denoising every frame independently. This is the flicker baseline, and its failure is instructive: the denoiser has no pathway through which the pixel at $(t, x, y)$ can be influenced by the pixel at $(t-1, x, y)$. The fix is to add exactly such a pathway. Two designs dominate, and modern models use both.
+</p>
+
+<p>
+<strong>Temporal attention</strong> reshapes the tensor so that, for each fixed spatial location, the $F$ frames form a sequence, then applies self-attention along that sequence. A pixel in frame 30 can now look at the same pixel in frames 1 through 60 and copy or blend their values. <strong>Temporal (3D) convolution</strong> instead slides a small kernel along the time axis, mixing a frame with its immediate neighbors, cheaper than attention and excellent for local motion smoothness. The influential factorized design from Ho et al.'s Video Diffusion Models paper keeps the expensive spatial layers exactly as in the image model and interleaves cheap temporal layers between them, so an image checkpoint can be inflated into a video model by inserting and lightly training the temporal blocks.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A factorized spatiotemporal block: input video frames pass through a spatial self-attention layer that processes each frame independently, then a temporal attention layer that connects the same spatial location across all frames, then a feed-forward network">
+  <g font-family="sans-serif" font-size="13">
+    <!-- input -->
+    <text x="60" y="30" text-anchor="middle" font-weight="bold" fill="#1b4f72">video latents</text>
+    <rect x="20" y="45" width="20" height="40" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.2"/>
+    <rect x="44" y="45" width="20" height="40" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.2"/>
+    <rect x="68" y="45" width="20" height="40" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.2"/>
+    <text x="55" y="105" text-anchor="middle" font-size="11" fill="#5a626c">F frames</text>
+    <!-- arrow -->
+    <line x1="100" y1="65" x2="150" y2="65" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <!-- spatial attention -->
+    <rect x="155" y="35" width="150" height="60" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="230" y="60" text-anchor="middle" font-weight="bold" fill="#9c4a00">Spatial Attention</text>
+    <text x="230" y="80" text-anchor="middle" font-size="11" fill="#9c4a00">within each frame</text>
+    <line x1="305" y1="65" x2="355" y2="65" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <!-- temporal attention -->
+    <rect x="360" y="35" width="150" height="60" fill="#e8daef" stroke="#7d3c98" stroke-width="1.5" rx="6"/>
+    <text x="435" y="60" text-anchor="middle" font-weight="bold" fill="#512e5f">Temporal Attention</text>
+    <text x="435" y="80" text-anchor="middle" font-size="11" fill="#512e5f">across frames, per pixel</text>
+    <line x1="510" y1="65" x2="560" y2="65" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <!-- ffn -->
+    <rect x="565" y="35" width="120" height="60" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5" rx="6"/>
+    <text x="625" y="68" text-anchor="middle" font-weight="bold" fill="#145a32">Feed-Forward</text>
+    <line x1="685" y1="65" x2="735" y2="65" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="790" y="70" text-anchor="middle" font-weight="bold" fill="#1b4f72">consistent</text>
+    <!-- temporal reshape illustration -->
+    <text x="435" y="160" text-anchor="middle" font-size="11" fill="#5a626c">temporal attention reshapes (B,F,C,H,W) so each (x,y) is a length-F sequence</text>
+    <g>
+      <rect x="320" y="185" width="16" height="16" fill="#e8daef" stroke="#7d3c98"/>
+      <rect x="340" y="185" width="16" height="16" fill="#e8daef" stroke="#7d3c98"/>
+      <rect x="360" y="185" width="16" height="16" fill="#e8daef" stroke="#7d3c98"/>
+      <rect x="380" y="185" width="16" height="16" fill="#e8daef" stroke="#7d3c98"/>
+      <rect x="400" y="185" width="16" height="16" fill="#e8daef" stroke="#7d3c98"/>
+      <path d="M 328 220 C 360 250, 400 250, 408 220" fill="none" stroke="#7d3c98" stroke-width="1.5" marker-end="url(#ah2)"/>
+      <text x="368" y="265" text-anchor="middle" font-size="11" fill="#512e5f">attention along time at one spatial location</text>
+    </g>
+  </g>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5a626c"/></marker>
+    <marker id="ah2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#7d3c98"/></marker>
+  </defs>
+</svg>
+<figcaption><strong>Figure 36.1.1</strong>: A factorized spatiotemporal denoiser block. Spatial layers (orange) operate within each frame exactly as in the image model of Chapter 33; an inserted temporal-attention layer (purple) lets the same spatial location communicate across all frames. The cheap, surgical addition of the temporal layer is what converts an image denoiser into a video denoiser.</figcaption>
+</figure>
+
+<p>
+Figure 36.1.1 shows the factorized block. The code below implements a minimal version of the temporal-attention insert, the single most important component, as a module you can drop after any spatial attention layer.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from einops import rearrange
+
+class TemporalAttention(nn.Module):
+    """Self-attention along the time axis, applied per spatial location.
+    Drop this in after a spatial-attention block to make frames consistent."""
+    def __init__(self, dim, n_heads=8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x, num_frames):
+        # x arrives as (B*F, C, H, W); regroup so time becomes the sequence axis
+        bf, c, h, w = x.shape
+        x = rearrange(x, "(b f) c h w -> (b h w) f c", f=num_frames)  # tokens = frames
+        residual = x
+        x = self.norm(x)
+        x, _ = self.attn(x, x, x)          # each pixel attends across all F frames
+        x = residual + x                    # residual keeps the spatial signal intact
+        x = rearrange(x, "(b h w) f c -> (b f) c h w", h=h, w=w)
+        return x
+
+block = TemporalAttention(dim=320, n_heads=8)
+video = torch.randn(2 * 16, 320, 32, 32)   # batch 2, 16 frames, 320-ch latents
+out = block(video, num_frames=16)
+print(out.shape)   # torch.Size([32, 320, 32, 32]); shape preserved, frames now coupled</code></pre>
+<div class="code-caption">A standalone temporal-attention module: it regroups the frame axis into the attention sequence so each spatial location attends across all 16 frames, then restores the original layout. Inserting this after each spatial block is the core surgery that turns an image U-Net into a video U-Net.</div>
+
+<p>
+The shape gymnastics in the <code>rearrange</code> calls are the whole trick. Spatial attention treats $(H \cdot W)$ as the sequence and $F$ as batch; temporal attention swaps them, treating $F$ as the sequence and $(H \cdot W)$ as batch. The residual connection is essential: it guarantees that adding an untrained temporal layer to a pretrained image model is initially a near-identity operation, so the image model's quality is preserved while the temporal layer learns motion.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The entire difference between an image model and a video model is one <code>rearrange</code> that lets a pixel gossip with its past and future selves. Before temporal attention, each frame is a stranger on a train, politely ignoring everyone; after it, frame 31 finally hears that frame 30 already decided the cat has two ears, and quietly drops the third. Most of deep learning is finding the right axis to let two tensors talk.
+</p>
+</div>
+
+<h2>2. The Video VAE: Compressing Time <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Generating a 5-second clip at 24 frames per second and 512-by-512 resolution means 120 frames of roughly 786,000 pixels each: nearly 100 million numbers. Running diffusion directly in pixel space at that scale is infeasible, which is exactly the problem latent diffusion solved for images in <a href="../module-33-diffusion-models/index.html">Chapter 33</a> by working inside a VAE's compressed latent space. Video pushes the idea further: a <strong>video VAE</strong> compresses not only each frame spatially (the usual 8-by-8 factor) but also temporally, encoding several consecutive frames into one latent frame using 3D convolutions in the encoder and decoder.
+</p>
+
+<p>
+A typical modern video VAE applies a temporal compression of 4 on top of an 8-by-8 spatial compression. A 120-frame clip becomes about 30 latent frames; the $786{,}000 \times 3$ pixels per frame become $64 \times 64 \times 4 = 16{,}384$ latent values. The total compression factor is $8 \times 8 \times 4 = 256$, and the diffusion transformer then operates entirely on these compact spacetime latents. This is the same move that the latent-space view of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> made for single images, now extended along the clock.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Consistency Is Cheaper in Latent Space</div>
+<p>
+Temporal compression does double duty. It makes diffusion tractable, and it makes consistency easier to enforce. When four pixel-frames are squeezed into one latent frame, the VAE decoder is forced to reconstruct a smoothly interpolating quartet from a single code, so a great deal of short-range temporal coherence is baked into the decoder itself before the diffusion model does any work. The diffusion model then only has to keep the lower-rate latent frames consistent, a much easier problem than keeping 120 raw frames in lockstep. Compression and coherence are the same lever pulled once.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Load a Pretrained Video VAE in 3 Lines</div>
+<p>
+Building and training a 3D video VAE from scratch is hundreds of lines and weeks of GPU time. The diffusers library ships pretrained ones behind the same interface as the image VAE:
+</p>
+<pre><code class="language-python">from diffusers import AutoencoderKLTemporalDecoder
+# The temporal-decoder VAE shipped with Stable Video Diffusion.
+vae = AutoencoderKLTemporalDecoder.from_pretrained(
+    "stabilityai/stable-video-diffusion-img2vid-xt", subfolder="vae")
+latents = vae.encode(frames).latent_dist.sample()   # (B, F, 4, H/8, W/8)</code></pre>
+<div class="code-caption">Loading the pretrained temporal-decoder video VAE from Stable Video Diffusion: three lines replace a full 3D-convolutional autoencoder and its training loop.</div>
+<p>
+This replaces an entire 3D-convolutional encoder/decoder plus its adversarial and perceptual training loop, hundreds of lines and substantial compute, with a single <code>from_pretrained</code> call. The library handles the temporal decoding, the scaling factor, and the numerically stable tiled encode/decode for long clips internally.
+</p>
+</div>
+
+<h2>3. Temporal Consistency: The Central Battle <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+With architecture and VAE in place, the real engineering is fighting the failure modes of consistency. There are three, and they fail at different time scales.
+</p>
+
+<p>
+<strong>High-frequency flicker</strong> is the frame-to-frame jitter of texture and color. It is fought by the temporal attention and 3D convolution of Section 1, which directly couple adjacent frames. <strong>Identity drift</strong> is slower: over a few seconds, a face slowly morphs, a logo on a shirt mutates, a dog's breed changes. This is a long-range problem; local temporal layers cannot fix it because frame 1 and frame 120 never directly attend to each other unless the attention window spans the whole clip. <strong>Motion incoherence</strong> is the third: objects that teleport, limbs that pass through bodies, water that flows uphill. This is the deepest failure, and it is really the world-modeling problem that Sections 36.5 through 36.8 confront head-on; a video model that produces coherent motion has implicitly learned some physics.
+</p>
+
+<p>
+A practical and widely used diagnostic borrows directly from <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>: measure consistency with optical flow. Warp each frame forward into the next frame's coordinates using the predicted flow, and measure how much the warped frame disagrees with the actual next frame. Low warping error means the content moved coherently; high error means flicker or teleportation. This <strong>warping-error</strong> metric is the workhorse quantitative check, and it formalizes the loop closed by the cross-reference map: optical flow, introduced classically in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> and learned in Chapter 26, becomes the ruler for video generation here.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def temporal_warping_error(frames):
+    """Mean per-pixel error after warping each frame into the next via optical flow.
+    Low value = temporally consistent; high value = flicker or teleportation."""
+    gray = [cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in frames]
+    errors = []
+    for t in range(len(frames) - 1):
+        # dense Farneback flow from frame t to frame t+1
+        flow = cv2.calcOpticalFlowFarneback(
+            gray[t], gray[t + 1], None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        h, w = gray[t].shape
+        # build the sampling grid that pulls frame t forward by the flow
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = (grid_x + flow[..., 0]).astype(np.float32)
+        map_y = (grid_y + flow[..., 1]).astype(np.float32)
+        warped = cv2.remap(frames[t], map_x, map_y, cv2.INTER_LINEAR)
+        errors.append(np.abs(warped.astype(float) - frames[t + 1]).mean())
+    return float(np.mean(errors))
+
+# A perfectly consistent clip approaches the camera/codec noise floor;
+# an independently-denoised (flickering) clip scores several times higher.
+print(f"warping error: {temporal_warping_error(my_clip):.2f}")</code></pre>
+<div class="code-caption">A flow-based temporal-consistency metric: warp each frame into the next using Farneback optical flow and measure the residual. It reuses the dense-flow machinery of Chapter 15 and Chapter 26 as a quantitative ruler for generated video.</div>
+
+<p>
+The diffusers ecosystem will not compute this for you, so the snippet above is the kind of evaluation glue you write yourself; it is also the seed of the world-model evaluation in <a href="section-36.8.html">Section 36.8</a>, where physical-plausibility probes generalize this idea well beyond optical flow.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Flickering Product Demo</div>
+<p>
+A small e-commerce startup wanted to auto-generate short rotating-product videos from a single catalog photo, so shoppers could see a handbag from every angle. The first engineer wired up an image diffusion model and ran it frame by frame on a slowly rotating viewpoint condition. In the demo, each individual frame looked gorgeous, and the founder approved it on the spot. In the staging environment, played as actual video, the leather grain crawled, the stitching shimmered, and the brand logo subtly changed font every few frames. The decision: rather than chase a custom fix, the team switched to a pretrained image-to-video model (Stable Video Diffusion) whose temporal layers were trained on real motion, and added the flow-based warping-error metric to their nightly regression suite so a consistency regression could never again pass a still-frame review. The warping error dropped by roughly fourfold and the logo stabilized. The lesson the founder wrote on the whiteboard: <em>a video is not a stack of images; review it as a video, and measure it as a video.</em>
+</p>
+</div>
+
+<h2>4. Conditioning and the Image-to-Video Special Case <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Most practical video generation is <strong>conditioned</strong>: on a text prompt (text-to-video, the subject of <a href="section-36.2.html">Section 36.2</a>), on a starting image (image-to-video, which animates a photo), or on both. Image-to-video is the most reliable mode today and the most instructive. The conditioning image is encoded by the VAE and concatenated to the noisy latents of every frame, so the denoiser always has the ground-truth first frame to anchor against. This anchoring directly attacks identity drift: because every frame can attend back to a clean encoding of the subject, the face or logo has a fixed reference and wanders far less.
+</p>
+
+<p>
+The same classifier-free guidance you met in <a href="../module-34-text-to-image/index.html">Chapter 34</a> applies, with a twist: video models often expose a <em>motion-bucket</em> or guidance-strength control that trades off motion magnitude against stability. Crank it up and the video moves dramatically but risks incoherence; turn it down and you get a stable, nearly still clip. This is the controllability knob that <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>'s philosophy of steerable generation extends into the temporal domain, and it is the bridge to action-conditioned generation in the world-model sections, where the conditioning signal becomes a control input rather than a static image.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Move to Spacetime Transformers (2024-2026)</div>
+<p>
+The factorized U-Net of this section is being displaced by pure transformer backbones operating on spacetime patches, the architecture behind OpenAI's Sora (Brooks et al., 2024) and the open Stable Video Diffusion line (Blattmann et al., 2023). Three threads define the current frontier. First, <strong>full 3D attention</strong>: rather than factorizing space and time into separate layers, models such as the open-source CogVideoX and Mochi-1 (2024) attend jointly over all spacetime tokens, which improves long-range consistency at quadratic cost, met by aggressive latent compression. Second, <strong>longer horizons</strong>: autoregressive and rolling-window schemes (e.g. the diffusion-forcing line) generate minutes of video by conditioning each new window on the last, which is precisely the world-model framing of <a href="section-36.6.html">Section 36.6</a>. Third, <strong>flow-matching objectives</strong> (the score-and-flow arc you met in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>) are replacing the DDPM noise objective for faster, more stable video training. The throughline: video generation is converging architecturally with world simulation, and the line between them is blurring on purpose.
+</p>
+</div>
+
+<h2>5. Putting It Together <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The full video-diffusion recipe is now a short list, each item a piece you already understand from earlier chapters. Encode the clip into spacetime latents with a video VAE (the latent idea from Chapter 31). Add noise on a schedule (the forward process from Chapter 33). Denoise with a spatiotemporal transformer or U-Net whose spatial layers come straight from the image model and whose temporal layers (Section 1) couple the frames. Condition on text via cross-attention (Chapter 34) or on an image via concatenation (Section 4). Decode the denoised latents back to pixels with the video VAE. Evaluate consistency with a flow-based warping metric (Section 3). The novelty over an image model is entirely concentrated in the temporal layers and the temporal compression; the rest is diffusion you already built.
+</p>
+
+<p>
+That concentration is the reassuring takeaway and the bridge forward. You do not need a new theory of generation to make video; you need a way for frames to talk to each other and a compressed clock to do it efficiently. <a href="section-36.2.html">Section 36.2</a> scales exactly this recipe up, replacing the U-Net with a latent transformer and the fixed clip length with arbitrary spacetime patches, to reach the Sora-class systems and the open models you can run today.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> A colleague proposes generating video by running an image diffusion model independently on each frame, then applying a strong temporal smoothing filter (a moving average over frames) as a post-process to remove flicker. Explain why this fixes high-frequency flicker but cannot fix identity drift or motion incoherence, and connect your answer to the time scales of the three consistency failures in Section 3.</p>
+<p><span class="exercise-type">Coding.</span> Take the <code>temporal_warping_error</code> function from Section 3. Generate two synthetic 16-frame clips: one where a white square translates smoothly across a black background, and one where the same square jumps to random positions each frame. Verify that the smooth clip scores far lower. Then add per-frame Gaussian noise to the smooth clip and plot warping error versus noise standard deviation; at what noise level does the metric stop distinguishing smooth from random motion, and why?</p>
+<p><span class="exercise-type">Analysis.</span> Temporal attention over all $F$ frames costs $O(F^2)$ per spatial location. For a 120-frame clip, compare the FLOP cost of full temporal attention against a windowed scheme that attends only within a sliding window of 16 frames. Argue which consistency failure (flicker, identity drift, motion incoherence) each scheme handles well and which it sacrifices, and propose a hybrid that gets most of the benefit of both.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 36 Overview</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.2.html">Section 36.2: Text-to-Video Systems &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

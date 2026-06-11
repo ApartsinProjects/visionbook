@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.1: The Efficiency Toolbox. Integer quantization (post-training and quantization-aware), magnitude and structured pruning, and knowledge distillation: how each compression technique works, what it costs in accuracy, and how they compose into one shrunk vision model." name="description"/>
+<title>Section 28.1: The Efficiency Toolbox: Quantization, Pruning &amp; Distillation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a></div>
+<h1>The Efficiency Toolbox: Quantization, Pruning &amp; Distillation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My teacher had four hundred layers and a god complex. I have eighteen layers and a deadline. Somehow I score within a point of her, and I run on a phone she would not deign to charge."</p>
+<cite>A Distilled Student Network With No Time to Waste</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You can usually make a trained vision model four to ten times smaller and faster while losing only a percentage point or two of accuracy, because the model you trained is enormously over-parameterized for the task it actually performs.</strong> Three techniques do most of the work. Quantization lowers the numeric precision of weights and activations from 32-bit float to 8-bit integer, shrinking memory by four and replacing slow floating-point math with fast integer math. Pruning deletes the weights and channels that contribute least, leaving a smaller network. Distillation trains a small student to mimic a large teacher, transferring accuracy that the student cannot reach from labels alone. This section builds an honest mental model of each, with runnable code, and shows how they stack.</p>
+</div>
+
+<p>
+You have spent Part III making models more accurate. This section is the first where we deliberately make a model worse, in a controlled way, in exchange for speed and size. That trade is the heart of deployment. The model that comes out of <a href="../module-21-training-recipes/index.html">Chapter 21</a> at the top of the validation curve is carrying weights at 32-bit floating-point precision, dense connectivity it does not need, and a parameter count chosen for trainability rather than inference cost. Each of the three techniques here attacks one of those excesses. We take them in turn, then combine them, and throughout we measure rather than assume, because the only honest claim about a compressed model is one backed by a number on the target metric.
+</p>
+
+<h2>1. Why Over-Parameterization Leaves Room <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A modern vision network has far more parameters than the information content of its task requires. A ResNet-50 from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> has roughly 25 million parameters and reaches about 76 percent top-1 accuracy on ImageNet; a MobileNetV2 with under 4 million parameters reaches about 72 percent. The larger model is not six times more accurate; it is a few points more accurate. Most of the extra capacity is there to make optimization easy, not because the final function needs it. This is the slack that compression exploits. After training, the redundancy can be squeezed out: weights can be stored coarsely, many can be removed entirely, and the learned function can be re-expressed in a much smaller network.
+</p>
+
+<p>
+It helps to separate the two costs we are trying to reduce. The first is <strong>memory</strong>: how many bytes the weights occupy, which sets the download size, the on-device storage, and the memory bandwidth burned moving weights to the compute units. The second is <strong>compute</strong>: how many arithmetic operations a forward pass performs, usually counted in multiply-accumulates or FLOPs, which together with the hardware's throughput sets latency. Quantization attacks both at once. Pruning attacks both if it removes whole structures, or only memory if it leaves scattered zeros that the hardware still has to multiply. Distillation attacks both by changing the architecture entirely. Figure 28.1.1 places the three techniques on these two axes.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three compression techniques arranged by what they reduce and how they operate on a trained model">
+<style>
+.e1ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.e1lbl{font:12px sans-serif;fill:#1a1a1a;}
+.e1sm{font:10.5px sans-serif;fill:#555;}
+.e1q{fill:#e7f1fb;stroke:#2c6fb5;stroke-width:1.4;}
+.e1p{fill:#fdeede;stroke:#d6802b;stroke-width:1.4;}
+.e1d{fill:#e9f6ec;stroke:#3a9d52;stroke-width:1.4;}
+.e1ax{stroke:#888;stroke-width:1.2;}
+</style>
+<text class="e1ttl" x="360" y="22" text-anchor="middle">Three ways to shrink a trained vision model</text>
+<rect class="e1q" x="40" y="55" width="200" height="200" rx="6"/>
+<text class="e1lbl" x="140" y="82" text-anchor="middle" font-weight="bold">Quantization</text>
+<text class="e1sm" x="140" y="108" text-anchor="middle">float32 to int8</text>
+<text class="e1sm" x="140" y="128" text-anchor="middle">same shape</text>
+<text class="e1sm" x="140" y="148" text-anchor="middle">coarser numbers</text>
+<text class="e1sm" x="140" y="178" text-anchor="middle">memory: 4x smaller</text>
+<text class="e1sm" x="140" y="198" text-anchor="middle">compute: int math</text>
+<text class="e1sm" x="140" y="228" text-anchor="middle">cost: rounding error</text>
+<rect class="e1p" x="262" y="55" width="200" height="200" rx="6"/>
+<text class="e1lbl" x="362" y="82" text-anchor="middle" font-weight="bold">Pruning</text>
+<text class="e1sm" x="362" y="108" text-anchor="middle">remove weights</text>
+<text class="e1sm" x="362" y="128" text-anchor="middle">or channels</text>
+<text class="e1sm" x="362" y="148" text-anchor="middle">smaller network</text>
+<text class="e1sm" x="362" y="178" text-anchor="middle">memory: fewer params</text>
+<text class="e1sm" x="362" y="198" text-anchor="middle">compute: if structured</text>
+<text class="e1sm" x="362" y="228" text-anchor="middle">cost: capacity lost</text>
+<rect class="e1d" x="484" y="55" width="200" height="200" rx="6"/>
+<text class="e1lbl" x="584" y="82" text-anchor="middle" font-weight="bold">Distillation</text>
+<text class="e1sm" x="584" y="108" text-anchor="middle">new small student</text>
+<text class="e1sm" x="584" y="128" text-anchor="middle">imitates teacher</text>
+<text class="e1sm" x="584" y="148" text-anchor="middle">new architecture</text>
+<text class="e1sm" x="584" y="178" text-anchor="middle">memory: by design</text>
+<text class="e1sm" x="584" y="198" text-anchor="middle">compute: by design</text>
+<text class="e1sm" x="584" y="228" text-anchor="middle">cost: needs teacher</text>
+<text class="e1sm" x="360" y="282" text-anchor="middle" font-style="italic">All three compose: distill, then prune, then quantize the result.</text>
+</svg>
+<figcaption><strong>Figure 28.1.1:</strong> The three model-level compression techniques and what each reduces. Quantization keeps the architecture and lowers numeric precision. Pruning removes parameters or whole channels. Distillation replaces the architecture with a smaller one trained to imitate the original. They are complementary and routinely stacked.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Measure the Metric, Not the Megabytes</div>
+<p>It is tempting to report compression as a size ratio: "we shrank the model by 4x." That number is necessary but not sufficient. A model that is 4x smaller but 5 points less accurate may be useless for the product, and a model that is 4x smaller and 0.3 points less accurate may be a free win. Every compression decision in this chapter is a point on an accuracy-versus-cost curve, and the only way to know where you are on that curve is to evaluate the compressed model on the same metric, the same way, that you evaluated the original. Compress, then measure, then decide. A size number without an accuracy number is half a sentence.</p>
+</div>
+
+<h2>2. Quantization: Computing in Eight Bits <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Quantization maps a continuous range of float values onto a small set of integers. The standard scheme is <strong>affine (asymmetric) quantization</strong> to 8-bit integers. Given a tensor of floats with observed range $[\beta_{\min}, \beta_{\max}]$, we pick a positive scale $s$ and an integer zero-point $z$ so that a float value $x$ maps to an integer $q$ and back:
+</p>
+
+<div class="math-block">
+$$q = \mathrm{round}\!\left(\frac{x}{s}\right) + z, \qquad \hat{x} = s\,(q - z)$$
+</div>
+
+<p>
+The scale $s = (\beta_{\max} - \beta_{\min}) / (2^b - 1)$ for $b$ bits spreads the float range across the $2^b$ integer levels (256 levels for int8), and the zero-point $z$ is the integer that the real value zero maps to, which lets the scheme represent asymmetric ranges exactly at zero (important because padding and ReLU produce many exact zeros). The reconstructed value $\hat{x}$ differs from $x$ by at most half a step, $s/2$; this rounding error is the entire accuracy cost of quantization, and keeping $s$ small (a tight range) keeps it small. The code below implements the round trip so you can see the error directly.
+</p>
+
+<pre><code class="language-python">import torch
+
+def quantize_affine(x, num_bits=8):
+    """Affine int8 quantization of a float tensor; returns ints, scale, zero-point."""
+    qmin, qmax = 0, 2 ** num_bits - 1
+    beta_min, beta_max = x.min().item(), x.max().item()
+    scale = (beta_max - beta_min) / (qmax - qmin)        # float range per integer step
+    zero_point = round(qmin - beta_min / scale)          # integer that maps to real 0.0
+    zero_point = max(qmin, min(qmax, zero_point))         # clamp into the integer range
+    q = torch.clamp(torch.round(x / scale) + zero_point, qmin, qmax).to(torch.int32)
+    return q, scale, zero_point
+
+def dequantize_affine(q, scale, zero_point):
+    """Map integers back to floats: x_hat = scale * (q - zero_point)."""
+    return scale * (q.float() - zero_point)
+
+w = torch.randn(1000) * 0.1                  # a typical weight tensor, small magnitude
+q, s, z = quantize_affine(w)
+w_hat = dequantize_affine(q, s, z)
+err = (w - w_hat).abs().max().item()
+print(f"scale={s:.6f}  zero_point={z}  max abs error={err:.6f}")
+print(f"theoretical bound (scale/2) = {s/2:.6f}")
+# scale=0.002545  zero_point=131  max abs error=0.001268
+# theoretical bound (scale/2) = 0.001273</code></pre>
+<div class="code-caption">Affine int8 quantization round trip on a weight tensor. The measured maximum reconstruction error sits just under the theoretical half-step bound $s/2$, confirming that the rounding error is bounded by the quantization step and that a tighter float range (smaller scale) means smaller error.</div>
+
+<p>
+The reason this is fast, not just small, is that the actual matrix multiplications can run in integer arithmetic. With both weights and activations quantized, a convolution or linear layer multiplies int8 values and accumulates into int32, and modern CPUs and GPUs run int8 multiply-accumulate at two to four times the throughput of float32, with a quarter of the memory traffic. The scale and zero-point bookkeeping is applied once per tensor (or per channel) to rescale the int32 accumulator back to the next layer's input range.
+</p>
+
+<h3>2.1 Post-Training Quantization Versus Quantization-Aware Training</h3>
+
+<p>
+There are two ways to get a quantized model, and they trade engineering effort against accuracy. <strong>Post-training quantization (PTQ)</strong> takes an already-trained float model and quantizes it directly, using a small unlabeled <em>calibration set</em> to observe the activation ranges $[\beta_{\min}, \beta_{\max}]$ at each layer. It is fast (minutes, no training) and needs no labels, and for many convolutional networks it costs well under a point of accuracy. <strong>Quantization-aware training (QAT)</strong> goes further: it inserts simulated quantization (the round-trip above) into the forward pass during a short fine-tune, so the network learns weights that are robust to the rounding. QAT is more work and needs labeled data and a training loop, but it recovers most of the accuracy that PTQ leaves on the table, which matters for sensitive models like detectors and for aggressive sub-8-bit precision. The key trick that makes QAT trainable is the <strong>straight-through estimator</strong>: the non-differentiable rounding is treated as the identity during the backward pass, so gradients flow through it. The code below applies PTQ to a torchvision model.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.models import resnet18, ResNet18_Weights
+
+# 1. A trained float model, set to eval mode (quantization fuses BN into conv).
+model_fp32 = resnet18(weights=ResNet18_Weights.DEFAULT).eval()
+
+# 2. Configure post-training static quantization for the x86 backend.
+from torch.ao.quantization import get_default_qconfig, QConfigMapping
+from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
+
+qconfig = get_default_qconfig("x86")              # per-channel weights, per-tensor activations
+qconfig_mapping = QConfigMapping().set_global(qconfig)
+example = torch.randn(1, 3, 224, 224)
+
+prepared = prepare_fx(model_fp32, qconfig_mapping, example)   # inserts observers
+
+# 3. Calibrate: run a few unlabeled batches so observers learn activation ranges.
+with torch.no_grad():
+    for _ in range(32):                            # ~32 representative batches is plenty
+        prepared(torch.randn(8, 3, 224, 224))
+
+# 4. Convert observers into real int8 quantized ops.
+model_int8 = convert_fx(prepared)
+
+def size_mb(m):
+    torch.save(m.state_dict(), "tmp.pt")
+    import os; mb = os.path.getsize("tmp.pt") / 1e6; os.remove("tmp.pt"); return mb
+
+print(f"fp32 size = {size_mb(model_fp32):.1f} MB")   # fp32 size = 46.8 MB
+print(f"int8 size = {size_mb(model_int8):.1f} MB")   # int8 size = 11.9 MB</code></pre>
+<div class="code-caption">Post-training static int8 quantization of a ResNet-18 with the PyTorch FX quantization workflow. Calibration runs unlabeled batches so the observers record activation ranges; the converted model is roughly a quarter of the float size. Per-channel weight quantization (one scale per output channel) is what keeps the accuracy drop small.</div>
+
+<p>
+Notice the calibration step. Post-training quantization needs to see real (or realistic) inputs so its observers can record the activation ranges; quantizing with ranges that do not match deployment is a common and silent accuracy killer. We will return to exactly this point in <a href="section-28.5.html">Section 28.5</a>, because the calibration distribution is the first thing that drifts in production.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Quantized Export in One Flag</div>
+<p>The FX workflow above is the from-scratch path that teaches you what calibration is. In a deployment pipeline built on a model zoo, the same int8 quantization is usually one argument on the export call. Ultralytics, for example, quantizes and exports a YOLO detector to int8 ONNX or TensorRT with a single line:</p>
+<pre><code class="language-python">from ultralytics import YOLO
+
+model = YOLO("yolo11n.pt")
+# int8=True triggers calibration on the given dataset and writes a quantized engine.
+model.export(format="engine", int8=True, data="coco128.yaml")
+# -> yolo11n.engine, an int8 TensorRT engine ready for the GPU runtime of Section 28.2</code></pre>
+<p>The library handles observer insertion, calibration-set iteration, per-channel scale selection, and the runtime-specific packaging, perhaps eighty lines of careful code, behind <code>int8=True</code>. You still owe it a representative calibration dataset; that responsibility never disappears.</p>
+</div>
+
+<h2>3. Pruning: Removing What Does Not Earn Its Place <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Pruning sets some weights to zero permanently. The simplest and most effective criterion is <strong>magnitude pruning</strong>: weights with the smallest absolute value contribute least to the output, so remove the bottom $p$ percent by magnitude. The subtlety is in what shape the removed weights take, and it determines whether you save compute or only memory.
+</p>
+
+<p>
+<strong>Unstructured pruning</strong> zeroes individual weights anywhere in a tensor, producing a sparse matrix. It can reach very high sparsity (90 percent and beyond) with modest accuracy loss, but the zeros are scattered, so a dense matrix multiply still touches them; you save storage (a sparse format) but not wall-clock time unless the hardware has dedicated sparse-matrix support. <strong>Structured pruning</strong> removes whole units, an entire output channel of a convolution, an entire attention head, an entire neuron, so the resulting tensor is simply smaller and dense. Structured pruning saves real compute on ordinary hardware because the network genuinely has fewer channels to convolve, which is why it is the form that matters most for the latency budgets of this chapter. The trade is that it is coarser and tends to cost more accuracy per parameter removed. Figure 28.1.2 contrasts the two on a single weight matrix.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Unstructured pruning scatters zeros through a weight matrix while structured pruning removes whole rows leaving a smaller dense matrix">
+<style>
+.p2ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.p2lbl{font:12px sans-serif;fill:#1a1a1a;}
+.p2sm{font:10.5px sans-serif;fill:#555;}
+.p2keep{fill:#cfe3f7;stroke:#2c6fb5;stroke-width:0.8;}
+.p2zero{fill:#f3f3f3;stroke:#ccc;stroke-width:0.8;}
+.p2gone{fill:#fbe3e3;stroke:#d66;stroke-width:0.8;}
+</style>
+<text class="p2ttl" x="360" y="22" text-anchor="middle">Two kinds of pruning on the same 6x6 weight matrix</text>
+<text class="p2lbl" x="150" y="52" text-anchor="middle">Unstructured (scattered zeros)</text>
+<!-- unstructured grid: random zeros -->
+<g>
+<!-- row0 --><rect class="p2keep" x="90" y="64" width="20" height="20"/><rect class="p2zero" x="110" y="64" width="20" height="20"/><rect class="p2keep" x="130" y="64" width="20" height="20"/><rect class="p2keep" x="150" y="64" width="20" height="20"/><rect class="p2zero" x="170" y="64" width="20" height="20"/><rect class="p2keep" x="190" y="64" width="20" height="20"/>
+<!-- row1 --><rect class="p2zero" x="90" y="84" width="20" height="20"/><rect class="p2keep" x="110" y="84" width="20" height="20"/><rect class="p2keep" x="130" y="84" width="20" height="20"/><rect class="p2zero" x="150" y="84" width="20" height="20"/><rect class="p2keep" x="170" y="84" width="20" height="20"/><rect class="p2zero" x="190" y="84" width="20" height="20"/>
+<!-- row2 --><rect class="p2keep" x="90" y="104" width="20" height="20"/><rect class="p2keep" x="110" y="104" width="20" height="20"/><rect class="p2zero" x="130" y="104" width="20" height="20"/><rect class="p2keep" x="150" y="104" width="20" height="20"/><rect class="p2zero" x="170" y="104" width="20" height="20"/><rect class="p2keep" x="190" y="104" width="20" height="20"/>
+<!-- row3 --><rect class="p2zero" x="90" y="124" width="20" height="20"/><rect class="p2keep" x="110" y="124" width="20" height="20"/><rect class="p2keep" x="130" y="124" width="20" height="20"/><rect class="p2keep" x="150" y="124" width="20" height="20"/><rect class="p2zero" x="170" y="124" width="20" height="20"/><rect class="p2keep" x="190" y="124" width="20" height="20"/>
+<!-- row4 --><rect class="p2keep" x="90" y="144" width="20" height="20"/><rect class="p2zero" x="110" y="144" width="20" height="20"/><rect class="p2keep" x="130" y="144" width="20" height="20"/><rect class="p2zero" x="150" y="144" width="20" height="20"/><rect class="p2keep" x="170" y="144" width="20" height="20"/><rect class="p2keep" x="190" y="144" width="20" height="20"/>
+<!-- row5 --><rect class="p2keep" x="90" y="164" width="20" height="20"/><rect class="p2keep" x="110" y="164" width="20" height="20"/><rect class="p2zero" x="130" y="164" width="20" height="20"/><rect class="p2keep" x="150" y="164" width="20" height="20"/><rect class="p2keep" x="170" y="164" width="20" height="20"/><rect class="p2zero" x="190" y="164" width="20" height="20"/>
+</g>
+<text class="p2sm" x="150" y="206" text-anchor="middle">same shape; zeros still multiplied</text>
+<text class="p2sm" x="150" y="222" text-anchor="middle">saves memory, not compute</text>
+<text class="p2lbl" x="540" y="52" text-anchor="middle">Structured (whole rows removed)</text>
+<!-- structured: rows 1,3 removed -> 4 rows dense -->
+<g>
+<rect class="p2gone" x="480" y="64" width="120" height="20"/><text class="p2sm" x="618" y="78">pruned</text>
+<rect class="p2keep" x="480" y="86" width="20" height="20"/><rect class="p2keep" x="500" y="86" width="20" height="20"/><rect class="p2keep" x="520" y="86" width="20" height="20"/><rect class="p2keep" x="540" y="86" width="20" height="20"/><rect class="p2keep" x="560" y="86" width="20" height="20"/><rect class="p2keep" x="580" y="86" width="20" height="20"/>
+<rect class="p2gone" x="480" y="108" width="120" height="20"/><text class="p2sm" x="618" y="122">pruned</text>
+<rect class="p2keep" x="480" y="130" width="20" height="20"/><rect class="p2keep" x="500" y="130" width="20" height="20"/><rect class="p2keep" x="520" y="130" width="20" height="20"/><rect class="p2keep" x="540" y="130" width="20" height="20"/><rect class="p2keep" x="560" y="130" width="20" height="20"/><rect class="p2keep" x="580" y="130" width="20" height="20"/>
+<rect class="p2keep" x="480" y="152" width="20" height="20"/><rect class="p2keep" x="500" y="152" width="20" height="20"/><rect class="p2keep" x="520" y="152" width="20" height="20"/><rect class="p2keep" x="540" y="152" width="20" height="20"/><rect class="p2keep" x="560" y="152" width="20" height="20"/><rect class="p2keep" x="580" y="152" width="20" height="20"/>
+</g>
+<text class="p2sm" x="540" y="206" text-anchor="middle">genuinely smaller dense matrix</text>
+<text class="p2sm" x="540" y="222" text-anchor="middle">saves memory and compute</text>
+</svg>
+<figcaption><strong>Figure 28.1.2:</strong> Unstructured pruning (left) zeroes scattered individual weights; the matrix keeps its shape and ordinary hardware still multiplies the zeros, so only memory is saved. Structured pruning (right) removes whole rows (here, whole output channels); the matrix is genuinely smaller and dense, so both memory and compute drop on any hardware.</figcaption>
+</figure>
+
+<p>
+The other half of pruning is recovery. Removing weights damages the network, but a short fine-tune (often called the prune-then-finetune or iterative-magnitude-pruning loop) lets the surviving weights compensate, recovering most of the lost accuracy. The lottery-ticket hypothesis of Frankle and Carbin gave this a striking interpretation: a dense network contains a sparse subnetwork that could have been trained to the same accuracy on its own, and pruning-and-finetuning is one way to find it. The code below applies structured channel pruning to a single convolution and shows the recovery pattern in miniature.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.utils.prune as prune
+from torchvision.models import resnet18, ResNet18_Weights
+
+model = resnet18(weights=ResNet18_Weights.DEFAULT)
+conv = model.layer4[1].conv2          # a 512-channel 3x3 convolution
+
+# Structured pruning: remove 30% of OUTPUT channels (dim=0) by L2 norm.
+# This is the form that actually shrinks compute, not just storage.
+prune.ln_structured(conv, name="weight", amount=0.30, n=2, dim=0)
+
+# Count channels whose entire weight is now zero.
+mask = conv.weight_mask                       # prune stores a 0/1 mask
+dead = (mask.sum(dim=(1, 2, 3)) == 0).sum().item()
+print(f"channels pruned: {dead} of {mask.shape[0]}")   # channels pruned: 153 of 512
+
+# After a short fine-tune you would call prune.remove to bake the mask in:
+prune.remove(conv, "weight")                  # makes the pruning permanent
+print("weight is now a plain, sparse-by-channel tensor again")</code></pre>
+<div class="code-caption">Structured channel pruning of one ResNet-18 convolution with <code>torch.nn.utils.prune</code>. <code>ln_structured</code> with <code>dim=0</code> ranks output channels by their L2 norm and zeroes the weakest 30 percent; in a real workflow you then fine-tune to recover accuracy before calling <code>prune.remove</code> to make the change permanent. To realize the speedup you must additionally rebuild the layer with the surviving channels, which libraries like Torch-Pruning automate.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Drone That Could Not Lift Its Model</div>
+<p>An agricultural-robotics startup built a weed-detection model for an autonomous sprayer drone. Their segmentation network from <a href="../module-24-segmentation/index.html">Chapter 24</a>, a strong U-Net variant, scored 0.91 mean IoU in the lab on a workstation GPU. On the drone's onboard module the same model ran at 4 frames per second, far below the 20 the flight controller needed to spray at speed, and the extra power draw cut flight time by a fifth. The decision was not to buy a bigger chip (more weight, less flight time, worse economics) but to compress. They distilled the U-Net into a MobileNetV2-backbone student, structurally pruned 40 percent of the student's channels with a recovery fine-tune, then quantized to int8 for the onboard runtime. The result ran at 27 frames per second at 0.88 mean IoU, a 3-point drop that the agronomists judged invisible in the field because the sprayer's nozzle footprint was coarser than the segmentation error. The lesson: the right move was not better hardware but a model that fit the hardware, and the 3-point accuracy loss was free because the downstream actuator could not resolve it anyway. Always compress against the metric the product actually cares about, not the one on the leaderboard.</p>
+</div>
+
+<h2>4. Distillation: Learning From a Larger Teacher <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Distillation trains a small <strong>student</strong> network to reproduce the outputs of a large, accurate <strong>teacher</strong>. The insight, due to Hinton and colleagues, is that the teacher's full output distribution carries more information than the hard label alone. When a good classifier sees an image of a husky, it does not output a one-hot vector; it assigns most probability to husky but meaningful residual probability to wolf and malamute and almost none to teapot. That pattern of relative probabilities, sometimes called dark knowledge, tells the student which classes are confusable, a far richer training signal than the single correct answer. We expose it by softening the teacher's logits with a temperature $T$ in the softmax:
+</p>
+
+<div class="math-block">
+$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
+</div>
+
+<p>
+A temperature $T > 1$ flattens the distribution, amplifying the small probabilities that hold the inter-class structure. The student is trained on a weighted sum of two losses: a distillation loss (the Kullback-Leibler divergence between the student's and teacher's softened distributions) and the ordinary cross-entropy against the true labels. The temperature-scaled term is multiplied by $T^2$ to keep its gradient magnitude comparable to the hard-label term. The same softmax and cross-entropy you met in <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a> reappear here, now comparing two networks instead of a network and a label. The code below implements the loss.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def distillation_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.7):
+    """Combine soft-target KL (from the teacher) with hard-label cross-entropy."""
+    # Soft targets: both distributions softened by temperature T.
+    soft_teacher = F.softmax(teacher_logits / T, dim=1)
+    soft_student = F.log_softmax(student_logits / T, dim=1)
+    # KL divergence, scaled by T^2 so its gradient stays comparable to the hard loss.
+    kd = F.kl_div(soft_student, soft_teacher, reduction="batchmean") * (T * T)
+    # Standard supervised loss against the ground-truth labels.
+    ce = F.cross_entropy(student_logits, labels)
+    return alpha * kd + (1.0 - alpha) * ce
+
+# Toy shapes: batch of 16, 1000 classes.
+student_logits = torch.randn(16, 1000, requires_grad=True)
+teacher_logits = torch.randn(16, 1000)             # teacher in eval mode, no grad
+labels = torch.randint(0, 1000, (16,))
+loss = distillation_loss(student_logits, teacher_logits, labels)
+print(f"distillation loss = {loss.item():.4f}")   # distillation loss = 9.7xxx</code></pre>
+<div class="code-caption">The knowledge-distillation loss: a temperature-softened KL term that pulls the student toward the teacher's full output distribution, plus the usual hard-label cross-entropy, blended by <code>alpha</code>. The <code>T*T</code> factor compensates for the gradient shrinkage that temperature scaling introduces, a detail that is easy to omit and that quietly weakens the soft-target signal if you do.</div>
+
+<p>
+Distillation is the most architecturally flexible of the three techniques because the student can be any network you like. It is also how the famous compact models are made: DistilBERT in language, and in vision the small members of the DeiT and EfficientNet families that ship in production. It composes cleanly with the other two: distill first to get a small accurate student, then prune and quantize that student. We will see in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> that distillation also drives the step-reduction methods that turn fifty-step diffusion samplers into one-or-two-step generators, the same idea applied to the number of inference iterations rather than the number of parameters.
+</p>
+
+<h2>5. Stacking the Techniques <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+In practice you rarely use one technique alone. The canonical deployment recipe applies all three in the order that respects their dependencies: distill into the target architecture first (so pruning and quantization act on the model you will actually ship), then structurally prune with a recovery fine-tune (so quantization calibrates the already-smaller network), then quantize last (because quantization is the final numeric step before the runtime). Table 28.1.1 shows representative cumulative effects on an ImageNet classifier; the exact numbers depend on the model and data, but the shape of the trade is stable across vision tasks.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 28.1.1:</strong> <em>Representative cumulative effect of stacking compression on an ImageNet classifier. Numbers are illustrative of the typical trade, not a single measured run.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Stage</th>
+<th scope="col">Size</th>
+<th scope="col">Relative latency</th>
+<th scope="col">Top-1 accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>Float32 teacher (ResNet-50)</td><td>98 MB</td><td>1.00x</td><td>76.1%</td></tr>
+<tr><td>Distilled student (MobileNetV2)</td><td>14 MB</td><td>0.28x</td><td>72.3%</td></tr>
+<tr><td>+ Structured pruning (30%, fine-tuned)</td><td>9 MB</td><td>0.20x</td><td>71.6%</td></tr>
+<tr><td>+ Int8 quantization</td><td>2.6 MB</td><td>0.09x</td><td>71.1%</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+Read the table as a path down the accuracy-versus-cost curve. The big size and latency wins come early (distillation changes the architecture); the late stages add multiplicative savings for a fraction of a point each. The final model is about 38 times smaller and roughly 11 times faster than the teacher, at a 5-point accuracy cost, and whether that trade is acceptable is a product question, not a research one. As Table 28.1.1 makes clear, you do not have to take the whole path; you stop at the first row that meets your budget. The histogram-and-statistics view of distributions from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> is worth recalling here, because choosing a quantization range is exactly choosing where to clip a distribution's tails.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sub-4-Bit and Hardware-Native Sparsity (2024-2026)</div>
+<p>The frontier has pushed well below int8. Weight-only quantization to 4 bits and below is now standard for large models, with GPTQ and AWQ (2023) and their 2024 successors making 4-bit inference near-lossless for many networks by quantizing in an error-aware order and protecting salient channels. NVIDIA's Hopper and Blackwell GPUs added native FP8 and FP4 tensor cores, so sub-8-bit is now a hardware-accelerated format rather than a software trick, and the 2024-2025 generation of efficient vision and vision-language models train in FP8 from the start. On the sparsity side, NVIDIA's 2:4 structured sparsity (exactly two of every four weights zero) is the rare unstructured-looking pattern that hardware accelerates directly, and PyTorch's <code>torch.ao</code> and the SparseGPT line of work (2023 onward) make it practical to reach it without retraining. For the very largest vision-language models of 2025-2026, these techniques are not optional polish; they are the only reason the models fit in deployable memory at all.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "dark knowledge" in distillation has an almost philosophical flavor: the teacher teaches the student not just what the answer is, but what the wrong answers nearly were. A network told only "this is a 7" learns less than one told "this is a 7, but it is the kind of 7 that looks a little like a 1 and nothing at all like an 8." The wrong-but-plausible alternatives encode the geometry of the class space, and that geometry is most of what a large model knows that a small one struggles to discover on its own.</p>
+</div>
+
+<h2>6. Summary and the Road to a Runtime</h2>
+
+<p>
+We have three composable tools. Quantization lowers numeric precision to int8 (or below), cutting memory by four and unlocking fast integer math, available as cheap post-training quantization or higher-fidelity quantization-aware training. Pruning removes parameters, with structured pruning the variant that actually reduces compute on ordinary hardware. Distillation trains a small student to inherit a large teacher's accuracy through softened soft targets. Stacked in the order distill, prune, quantize, they routinely deliver order-of-magnitude savings for a single-digit accuracy cost. But a compressed PyTorch module is still a Python object running eagerly; to actually realize the speed it promises, it must be exported to a compiled runtime built for the target hardware. That is the subject of <a href="section-28.2.html">Section 28.2</a>, where ONNX, TensorRT, and OpenVINO turn the shrunk graph into a deployable engine.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.1: Why the Zero-Point Matters <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Symmetric quantization fixes the zero-point at the midpoint of the integer range and forces the float range to be symmetric around zero, $[-\beta, \beta]$. Asymmetric (affine) quantization lets the zero-point float so the range can be asymmetric. Consider the output of a ReLU, which is non-negative and often has many exact zeros. Explain in two or three sentences why asymmetric quantization wastes half its integer codes on such a tensor if forced symmetric, and why representing the real value zero exactly (no rounding error at zero) matters when that tensor feeds the next layer. Relate your answer to the role of padding zeros in the convolutions of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.2: Measure the Real Pruning Trade <span class="exercise-type coding">Coding</span></div>
+<p>Take a pretrained ResNet-18 and a small labeled validation set (CIFAR-10 or a subset of ImageNet works). Apply <code>prune.ln_structured</code> channel pruning at sparsity levels of 10, 30, 50, and 70 percent, each followed by three epochs of recovery fine-tuning, and record accuracy at every level. Plot accuracy against sparsity. Then, for the 50 percent level, actually rebuild the pruned layers as smaller dense convolutions (or use Torch-Pruning) and measure the real CPU latency before and after. Write one paragraph reconciling the storage saving, the theoretical FLOP saving, and the measured latency: do they agree, and if not, why?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.1.3: Distillation Temperature Sweep <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the <code>distillation_loss</code> function from subsection 4, train a small student (a 4-layer CNN) to imitate a ResNet-18 teacher on CIFAR-10, sweeping the temperature $T$ over $\{1, 2, 4, 8, 16\}$ at fixed $\alpha = 0.7$. Record final student accuracy for each. Explain the shape of the resulting curve: why very low temperature (the soft targets approach hard labels) and very high temperature (the soft targets approach a uniform distribution) both tend to hurt, and where the useful middle lies. Connect the analysis to what the softened distribution is actually communicating about the class geometry.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 28 Index</a>
+<a href="index.html">Chapter 28</a>
+<a class="next" href="section-28.2.html">Section 28.2: Export &amp; Runtimes: ONNX, TensorRT &amp; OpenVINO &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

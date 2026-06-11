@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.2: Action Recognition with 3D CNNs and two-stream networks. The 3D convolution as a spatiotemporal kernel, the appearance-plus-motion two-stream split, and the factorized R(2+1)D, I3D, and SlowFast designs that made 3D video networks efficient." name="description"/>
+<title>Section 26.2: Action Recognition: 3D CNNs &amp; Two-Stream Networks | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>Action Recognition: 3D CNNs &amp; Two-Stream Networks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You taught me to slide a little window over an image and call what I found an edge. So I slid a little box over a stack of images, and what I found was a wave goodbye. Same trick, one more dimension, infinitely more drama."</p>
+<cite>A 3D Convolution Kernel With a Flair for the Theatrical</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>There are exactly two ways to teach a convolutional network to see motion: make the convolution itself span time, or compute the motion separately and feed it in as a second input.</strong> The first idea is the 3D convolution, a direct generalization of the learnable 2D kernel of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> to a spatiotemporal cube that learns motion patterns the way a 2D kernel learns edges. The second is the two-stream network, which runs one pathway on raw frames for appearance and another on precomputed optical flow for motion, then fuses their verdicts. This section builds both from scratch, explains why the naive 3D convolution is so expensive, and walks through the factorized and multi-rate designs (R(2+1)D, I3D, SlowFast) that made spatiotemporal convolution the workhorse of action recognition for half a decade.</p>
+</div>
+
+<p>
+In <a href="section-26.1.html">Section 26.1</a> we turned a video into a clip tensor of shape $(C, T, H, W)$. Now we feed that tensor to a network that must output an action label. The chapter's central question, where to spend compute between the spatial and temporal axes, gets its first two concrete answers here. We start with the 3D convolution, see why it works and why it is costly, then study the orthogonal two-stream design that splits the problem in half. Both predate the video transformers of <a href="section-26.3.html">Section 26.3</a>, but neither is obsolete; the factorized 3D blocks and the SlowFast multi-rate idea remain in production systems and inform transformer design.
+</p>
+
+<h2>1. The 3D Convolution <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Recall the 2D convolution: a kernel of shape $(C_{in}, k_h, k_w)$ slides over the height and width of an image, and at each position it computes a dot product, producing one output value per spatial location per output channel. A 3D convolution does the identical thing with one more axis. Its kernel has shape $(C_{in}, k_t, k_h, k_w)$, and it slides over time as well as height and width. Where a 2D kernel sees a small spatial patch, a 3D kernel sees a small spatiotemporal cube: a patch of the image across several consecutive frames. A kernel that responds to a bright region moving rightward across three frames is detecting rightward motion, exactly as a Sobel kernel from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> detects a vertical edge, and just as in the 2D case those kernels are learned, not designed.
+</p>
+
+<p>
+The output of a 3D convolution is itself a 4D feature map $(C_{out}, T', H', W')$, so 3D convolutions stack exactly like 2D ones, building a hierarchy of increasingly abstract spatiotemporal features. The cost of the generalization is multiplicative. A 2D kernel has $C_{in} \cdot k_h \cdot k_w$ weights per output channel; the 3D version multiplies that by $k_t$, and the number of output positions is also multiplied by the temporal extent. For a typical $3 \times 3 \times 3$ kernel this is a $3\times$ increase in parameters and a substantial increase in compute and activation memory over the 2D equivalent. Figure 26.2.1 contrasts the two operations.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A 2D convolution kernel on one image versus a 3D convolution kernel spanning three stacked frames">
+<style>
+.cl{font:12px sans-serif;fill:#1a1a1a;}
+.cs{font:10px sans-serif;fill:#555;}
+.cimg{fill:#eef4fb;stroke:#2c6fb5;stroke-width:1.2;}
+.ck2{fill:none;stroke:#d6802b;stroke-width:2;}
+.ck3{fill:#fdeee3;stroke:#d6802b;stroke-width:2;opacity:0.85;}
+.cgrid{stroke:#bcd2ea;stroke-width:0.6;}
+</style>
+<text class="cl" x="160" y="24" text-anchor="middle">2D convolution: kernel over one frame</text>
+<rect class="cimg" x="70" y="50" width="180" height="180"/>
+<g class="cgrid">
+<line x1="100" y1="50" x2="100" y2="230"/><line x1="130" y1="50" x2="130" y2="230"/>
+<line x1="160" y1="50" x2="160" y2="230"/><line x1="190" y1="50" x2="190" y2="230"/>
+<line x1="220" y1="50" x2="220" y2="230"/>
+<line x1="70" y1="80" x2="250" y2="80"/><line x1="70" y1="110" x2="250" y2="110"/>
+<line x1="70" y1="140" x2="250" y2="140"/><line x1="70" y1="170" x2="250" y2="170"/>
+<line x1="70" y1="200" x2="250" y2="200"/>
+</g>
+<rect class="ck2" x="100" y="80" width="90" height="90"/>
+<text class="cs" x="160" y="250" text-anchor="middle">kernel k_h x k_w</text>
+<text class="cl" x="510" y="24" text-anchor="middle">3D convolution: kernel over a stack of frames</text>
+<rect class="cimg" x="420" y="86" width="150" height="150"/>
+<rect class="cimg" x="445" y="70" width="150" height="150"/>
+<rect class="cimg" x="470" y="54" width="150" height="150"/>
+<rect class="ck3" x="500" y="84" width="60" height="60"/>
+<rect class="ck3" x="475" y="100" width="60" height="60"/>
+<rect class="ck3" x="450" y="116" width="60" height="60"/>
+<text class="cs" x="510" y="256" text-anchor="middle">kernel k_t x k_h x k_w spans 3 frames</text>
+<line stroke="#d6802b" stroke-width="1" x1="450" y1="200" x2="560" y2="120" stroke-dasharray="3 2"/>
+<text class="cs" x="612" y="120" fill="#d6802b">time</text>
+</svg>
+<figcaption><strong>Figure 26.2.1:</strong> A 2D convolution kernel covers a spatial patch of one frame; a 3D convolution kernel covers the same patch across several consecutive frames, so it can respond to motion. The temporal extent $k_t$ multiplies both the parameter count and the compute relative to the 2D equivalent, which is the central cost of going from images to clips.</figcaption>
+</figure>
+
+<p>
+The PyTorch implementation needs only the 3D versions of the layers you already know. <code>nn.Conv3d</code>, <code>nn.BatchNorm3d</code>, and <code>nn.MaxPool3d</code> are drop-in temporal generalizations of their 2D counterparts. The minimal C3D-style block below takes a clip and produces a class logit, and the printed shape shows time being pooled away as the network deepens, exactly as height and width are pooled in a 2D CNN.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class Small3DCNN(nn.Module):
+    """A compact C3D-style action classifier over a (N, C, T, H, W) clip."""
+    def __init__(self, num_classes=400):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv3d(3, 32, kernel_size=3, padding=1), nn.BatchNorm3d(32), nn.ReLU(),
+            nn.MaxPool3d(kernel_size=(1, 2, 2)),            # pool space, keep time early
+            nn.Conv3d(32, 64, kernel_size=3, padding=1), nn.BatchNorm3d(64), nn.ReLU(),
+            nn.MaxPool3d(kernel_size=2),                    # now pool time and space
+            nn.Conv3d(64, 128, kernel_size=3, padding=1), nn.BatchNorm3d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool3d(1),                         # global spatiotemporal pool
+        )
+        self.head = nn.Linear(128, num_classes)
+
+    def forward(self, x):                                   # x: (N, 3, T, H, W)
+        z = self.features(x).flatten(1)                     # (N, 128)
+        return self.head(z)
+
+clip = torch.randn(2, 3, 16, 112, 112)                      # 2 clips, 16 frames
+print("logits:", Small3DCNN(num_classes=10)(clip).shape)    # logits: torch.Size([2, 10])</code></pre>
+<div class="code-caption">A minimal 3D CNN action classifier. The only change from a 2D CNN is that every layer is the <code>Conv3d</code> / <code>BatchNorm3d</code> / <code>MaxPool3d</code> family and the input carries a time axis; the first pool deliberately preserves time while reducing space, a common pattern that delays temporal collapse.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Motion Is Just an Edge in Spacetime</div>
+<p>The conceptual payoff of the 3D convolution is that motion stops being a special quantity you must compute and becomes an ordinary feature the network learns. A 2D kernel that fires on a light-to-dark transition is an edge detector; a 3D kernel that fires on a bright blob shifting position from frame to frame is a motion detector, and the network discovers both by the same gradient descent. This is the same lesson as <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>, where learned first-layer filters came to resemble the hand-designed Sobel and Gabor kernels of classical vision, now extended one dimension: the first-layer 3D filters of a trained C3D network resemble oriented spatiotemporal energy filters, the learned cousins of the classical motion-energy models.</p>
+</div>
+
+<h2>2. Why Naive 3D Is Expensive, and How to Factorize It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The $3\times$ parameter blow-up of full 3D convolution is real, and early 3D networks were both heavy and hard to train from scratch because video datasets were small relative to ImageNet. Two ideas solved this. The first, <strong>R(2+1)D</strong>, factorizes each 3D convolution into a 2D spatial convolution followed by a 1D temporal convolution. A full $k_t \times k_h \times k_w$ kernel is replaced by a $1 \times k_h \times k_w$ spatial kernel and a $k_t \times 1 \times 1$ temporal kernel applied in sequence. This has fewer parameters, and crucially it inserts a non-linearity between the spatial and temporal steps, giving the block more representational power than a single 3D convolution with the same receptive field. The math of the parameter saving is direct: a full kernel on $C$ channels uses $k_t k_h k_w C^2$ weights, while the factorized pair uses $k_h k_w C M + k_t M C$ weights, where the intermediate width $M$ is chosen to roughly match the original budget.
+</p>
+
+<p>
+The second idea, <strong>I3D</strong> (Inflated 3D), addresses the data problem rather than the parameter count. Instead of training a 3D network from scratch, it takes a 2D network already pretrained on ImageNet and inflates every 2D kernel into 3D by replicating it $k_t$ times along the new temporal axis and dividing by $k_t$ so the response to a static clip matches the 2D network's response to a single frame. The 3D network thus starts with strong spatial features and only needs to learn the temporal refinements, which is why I3D trained on the Kinetics dataset set the standard for years. The R(2+1)D factorization is shown below.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class R2Plus1DBlock(nn.Module):
+    """Factorize a 3D conv into spatial (2D) then temporal (1D) convolutions."""
+    def __init__(self, in_ch, out_ch, t_kernel=3, s_kernel=3):
+        super().__init__()
+        # choose the intermediate width M so total params ~ a full 3D conv
+        mid = (t_kernel * s_kernel * s_kernel * in_ch * out_ch) // \
+              (s_kernel * s_kernel * in_ch + t_kernel * out_ch)
+        self.spatial = nn.Conv3d(in_ch, mid, kernel_size=(1, s_kernel, s_kernel),
+                                 padding=(0, s_kernel // 2, s_kernel // 2))
+        self.bn1 = nn.BatchNorm3d(mid)
+        self.temporal = nn.Conv3d(mid, out_ch, kernel_size=(t_kernel, 1, 1),
+                                  padding=(t_kernel // 2, 0, 0))
+        self.bn2 = nn.BatchNorm3d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.spatial(x)))   # spatial mixing, then non-linearity
+        x = self.relu(self.bn2(self.temporal(x)))  # temporal mixing
+        return x
+
+block = R2Plus1DBlock(32, 64)
+print("out:", block(torch.randn(1, 32, 16, 28, 28)).shape)  # out: torch.Size([1, 64, 16, 28, 28])</code></pre>
+<div class="code-caption">The R(2+1)D block: one 3D convolution becomes a spatial-only convolution (kernel $1 \times 3 \times 3$) then a temporal-only convolution (kernel $3 \times 1 \times 1$), with a non-linearity between them. The extra non-linearity is what makes the factorized block more expressive than the full kernel it replaces, not merely cheaper.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained R(2+1)D in Three Lines</div>
+<p>Building and training a video backbone from scratch needs a Kinetics-scale dataset and days of GPU time. TorchVision ships R(2+1)D, S3D, and MViT pretrained on Kinetics, so transfer learning to your own action labels (the video analogue of the ImageNet transfer of <a href="../module-21-training-recipes/index.html">Chapter 21</a>) is three lines plus a new head:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
+
+weights = R2Plus1D_18_Weights.KINETICS400_V1
+model = r2plus1d_18(weights=weights)                 # pretrained on Kinetics-400
+model.fc = torch.nn.Linear(model.fc.in_features, 10) # swap in your 10-class head
+preprocess = weights.transforms()                    # the exact clip transforms used in training</code></pre>
+<p>The weights carry features learned from hundreds of thousands of clips, and <code>weights.transforms()</code> hands you the precise normalization, resize, and frame count the model expects, removing an entire class of silent train-test mismatch bugs. This replaces the roughly two hundred lines of a from-scratch backbone plus the dataset you do not have.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>I3D's inflation trick is delightfully literal: it takes a flat 2D kernel and copies it $k_t$ times along the new time axis, then divides by $k_t$ so a frozen, perfectly still clip gives exactly the same answer the 2D network gave a single photo. In other words, a freshly inflated I3D thinks every video is a slideshow of one repeated image until training teaches it that things actually move. It is the rare case where a network's first instinct about the world is "nothing ever changes", and we have to gently disabuse it.</p>
+</div>
+
+<h2>3. The Two-Stream Network <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The two-stream network takes the opposite bet from the 3D convolution. Rather than asking one network to learn appearance and motion jointly, it splits them into two independent pathways. The <strong>spatial stream</strong> is an ordinary 2D CNN that sees a single RGB frame and recognizes objects and scenes, the appearance cues. The <strong>temporal stream</strong> is a 2D CNN that sees a stack of optical flow fields, the dense pixel-motion vectors you first met classically in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> and will rebuild with RAFT in <a href="section-26.4.html">Section 26.4</a>. Because optical flow encodes motion explicitly, the temporal stream does not have to discover motion from raw pixels; it is handed the motion field and only has to recognize the pattern. The two streams' class scores are then fused, typically by averaging the softmax outputs. Figure 26.2.2 shows the architecture.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two-stream network: an RGB spatial stream and an optical-flow temporal stream whose scores are fused">
+<style>
+.tl{font:12px sans-serif;fill:#1a1a1a;}
+.ts{font:10px sans-serif;fill:#555;}
+.tin{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.tflow{fill:#fdeee3;stroke:#d6802b;stroke-width:1.4;}
+.tspat{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.4;}
+.ttemp{fill:#fbeef0;stroke:#c0392b;stroke-width:1.4;}
+.tfuse{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
+.tar{stroke:#777;stroke-width:1.5;marker-end:url(#tah);fill:none;}
+</style>
+<defs><marker id="tah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="tin" x="30" y="40" width="90" height="50"/>
+<text class="tl" x="75" y="62" text-anchor="middle">single</text>
+<text class="tl" x="75" y="78" text-anchor="middle">RGB frame</text>
+<line class="tar" x1="120" y1="65" x2="160" y2="65"/>
+<rect class="tspat" x="162" y="40" width="110" height="50"/>
+<text class="tl" x="217" y="62" text-anchor="middle">Spatial CNN</text>
+<text class="ts" x="217" y="78" text-anchor="middle">appearance</text>
+<line class="tar" x1="272" y1="65" x2="430" y2="120"/>
+<rect class="tflow" x="30" y="210" width="90" height="50"/>
+<text class="tl" x="75" y="232" text-anchor="middle">stacked</text>
+<text class="tl" x="75" y="248" text-anchor="middle">optical flow</text>
+<line class="tar" x1="120" y1="235" x2="160" y2="235"/>
+<rect class="ttemp" x="162" y="210" width="110" height="50"/>
+<text class="tl" x="217" y="232" text-anchor="middle">Temporal CNN</text>
+<text class="ts" x="217" y="248" text-anchor="middle">motion</text>
+<line class="tar" x1="272" y1="235" x2="430" y2="180"/>
+<rect class="tfuse" x="432" y="120" width="110" height="60"/>
+<text class="tl" x="487" y="146" text-anchor="middle">Fuse</text>
+<text class="ts" x="487" y="164" text-anchor="middle">average scores</text>
+<line class="tar" x1="542" y1="150" x2="586" y2="150"/>
+<rect class="tin" x="588" y="125" width="90" height="50"/>
+<text class="tl" x="633" y="155" text-anchor="middle">action label</text>
+</svg>
+<figcaption><strong>Figure 26.2.2:</strong> The two-stream network. A spatial CNN reads a single RGB frame for appearance; a temporal CNN reads a stack of precomputed optical-flow fields for motion. The two pathways are trained independently and their class scores are fused (here by averaging the softmax outputs). Splitting appearance from motion lets each stream specialize.</figcaption>
+</figure>
+
+<p>
+The implementation below wraps two image backbones and averages their logits. In practice the optical flow is precomputed offline and stored, because computing it per training step would dominate the cost; the flow stack is encoded as extra input channels (one pair of $x$ and $y$ displacement maps per frame interval). Note that the temporal stream's first convolution accepts $2L$ input channels for $L$ stacked flow frames, not 3, the one architectural difference from a standard image CNN.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torchvision.models as tvm
+
+class TwoStream(nn.Module):
+    def __init__(self, num_classes=400, flow_stack=10):
+        super().__init__()
+        # Spatial stream: a standard RGB ResNet.
+        self.spatial = tvm.resnet18(num_classes=num_classes)
+        # Temporal stream: same backbone, but first conv takes 2*flow_stack channels
+        # (x and y displacement for each of flow_stack frame intervals).
+        self.temporal = tvm.resnet18(num_classes=num_classes)
+        self.temporal.conv1 = nn.Conv2d(2 * flow_stack, 64, kernel_size=7,
+                                        stride=2, padding=3, bias=False)
+
+    def forward(self, rgb, flow):                  # rgb: (N,3,H,W), flow: (N,2L,H,W)
+        s = self.spatial(rgb).softmax(dim=1)       # appearance probabilities
+        t = self.temporal(flow).softmax(dim=1)     # motion probabilities
+        return 0.5 * (s + t)                        # late fusion by averaging
+
+model = TwoStream(num_classes=10, flow_stack=10)
+rgb = torch.randn(2, 3, 224, 224)
+flow = torch.randn(2, 20, 224, 224)                # 10 flow frames x (dx, dy)
+print("fused probs:", model(rgb, flow).shape)      # fused probs: torch.Size([2, 10])</code></pre>
+<div class="code-caption">A two-stream network from two ResNet-18 backbones. The only structural change is the temporal stream's first convolution, widened to accept $2L$ optical-flow channels. Late fusion averages the two softmax outputs; the streams never share weights and can be trained separately.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Two Streams Saved a Gym-Equipment Demo</div>
+<p><strong>Who:</strong> a small applied-vision team building a workout-coaching app that counts repetitions and names exercises from a phone camera, 2023. <strong>Situation:</strong> their single-frame classifier confused exercises that look identical in a still image, like the bottom of a squat versus the bottom of a deadlift, because the distinguishing information is the direction of movement. <strong>Problem:</strong> a full 3D network was too heavy for on-device inference and too data-hungry for their few thousand labeled clips. <strong>Decision:</strong> they built a lightweight two-stream model, using the phone's built-in hardware optical-flow estimate as the temporal input so no extra flow computation was needed, and a small MobileNet for each stream. <strong>Result:</strong> the motion stream resolved the squat-versus-deadlift confusion almost entirely, the model ran in real time on the phone, and the separately-trained streams let them debug each pathway in isolation. <strong>Lesson:</strong> when the ambiguity in your task is fundamentally about motion direction, an explicit motion input can be both cheaper and more sample-efficient than asking one large network to rediscover motion from pixels. The two-stream design is old, but the principle of handing a network the right precomputed signal is timeless.</p>
+</div>
+
+<h2>4. SlowFast: Spending the Budget Deliberately <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+SlowFast is the cleanest answer to the chapter's framing question. It observes that the two axes of video have different statistics: spatial appearance (what objects are present) changes slowly, while motion (how they move) changes quickly. So it uses two pathways at different frame rates. The <strong>Slow pathway</strong> processes few frames but with many channels, capturing rich spatial semantics; the <strong>Fast pathway</strong> processes many frames with few channels, capturing fine temporal detail cheaply. Lateral connections feed the Fast pathway's temporal information into the Slow pathway as the network deepens. The Fast pathway is deliberately lightweight (often about one-eighth the channels), so it adds fine motion sensitivity at a small fraction of the Slow pathway's cost. This is the explicit budget split the whole chapter circles around, and it consistently beat single-pathway 3D networks on Kinetics.
+</p>
+
+<pre><code class="language-python">import torch
+
+def sample_pathways(clip, slow_stride=8, fast_stride=2):
+    """From a (N,C,T,H,W) clip, build the Slow and Fast pathway inputs.
+
+    Slow: few frames, high spatial detail.  Fast: many frames, low channels.
+    """
+    slow = clip[:, :, ::slow_stride]                 # e.g. T=64 -> 8 frames
+    fast = clip[:, :, ::fast_stride]                 # e.g. T=64 -> 32 frames
+    return slow, fast
+
+clip = torch.randn(2, 3, 64, 224, 224)               # 64-frame clip
+slow, fast = sample_pathways(clip)
+print("slow pathway:", slow.shape)                   # slow pathway: torch.Size([2, 3, 8, 224, 224])
+print("fast pathway:", fast.shape)                   # fast pathway: torch.Size([2, 3, 32, 224, 224])
+print("fast/slow frame ratio:", fast.shape[2] // slow.shape[2])  # fast/slow frame ratio: 4</code></pre>
+<div class="code-caption">The SlowFast frame split. The Slow pathway subsamples the clip hard (here to 8 frames) and would carry many channels; the Fast pathway keeps four times as many frames but is built with few channels. The dual sampling is the whole idea, and a full SlowFast model adds lateral fusion between the two pathways.</div>
+
+<p>
+SlowFast, R(2+1)D, and I3D together define the convolutional era of action recognition. They share a thesis: motion is a learnable spatiotemporal pattern, and the engineering is about extracting it efficiently. The video transformers of <a href="section-26.3.html">Section 26.3</a> keep the thesis but replace the convolution's hard-wired locality with learned attention over space and time, just as the Vision Transformer of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> replaced the 2D convolution. The multi-rate insight of SlowFast does not disappear, though; it reappears as multi-scale temporal tokenization in modern video transformers.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Convolutional Video Networks Are Not Dead</div>
+<p>Although transformers dominate the leaderboards, efficient convolutional video networks remain competitive where compute is tight. X3D (Feichtenhofer, CVPR 2020) progressively expands a tiny 2D network along multiple axes (frames, resolution, width, depth) to find a Pareto-optimal video model, reaching strong Kinetics accuracy at a fraction of the FLOPs of I3D. The 2022 to 2024 wave of work, including UniFormer and the convolution-attention hybrids, deliberately reintroduces convolutional inductive bias into video transformers to recover data efficiency, echoing the CNN-versus-ViT hybrid story of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. And SlowFast's pathway idea lives on in the multi-rate token designs of recent video foundation models. The lesson of the last few years is that the spatial-versus-temporal budget question of this section is architecture-independent; transformers answer it differently than 3D convolutions, but they must still answer it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.1: Count the 3D Convolution Cost <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A full 3D convolution layer maps $C$ input channels to $C$ output channels with a $3 \times 3 \times 3$ kernel. Write the parameter count. Now compute the parameter count of the R(2+1)D factorization (a $1 \times 3 \times 3$ spatial convolution to an intermediate width $M$, then a $3 \times 1 \times 1$ temporal convolution back to $C$), for $C = 64$ and the $M$ that the code in subsection 2 computes. State the ratio and explain in two sentences why R(2+1)D can be both cheaper and more expressive than the full 3D convolution it replaces.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.2: Ablate the Temporal Stream <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>TwoStream</code> class from subsection 3, run the model on a clip three ways: spatial stream only, temporal stream only, and fused. Construct a tiny synthetic dataset of two "actions" that are identical in appearance but opposite in motion direction (for example, a bright bar sliding left versus right, with the optical flow computed as the per-pixel displacement). Train each configuration briefly and report accuracy. Confirm that the spatial-only stream is at chance while the temporal stream succeeds, demonstrating empirically why the motion pathway exists.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.2.3: Tune the SlowFast Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>Using <code>sample_pathways</code> from subsection 4, vary the Slow and Fast strides and, for each setting, estimate the relative FLOPs of the two pathways assuming the Fast pathway uses one-eighth the channels of the Slow pathway and FLOPs scale linearly with frame count and channel count. Tabulate frame counts and estimated FLOPs for three stride pairs. Then argue, from your numbers, why the standard configuration keeps the Fast pathway cheap despite it processing four to eight times as many frames, and relate this back to the temporal-redundancy measurement of <a href="section-26.1.html">Section 26.1</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.1.html">&#8592; Section 26.1: From Frames to Clips</a>
+<a href="index.html">Chapter 26</a>
+<a class="next" href="section-26.3.html">Section 26.3: Video Transformers &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

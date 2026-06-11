@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.2: Two-Stage Detectors: The R-CNN Family. The propose-then-classify lineage, from R-CNN through Fast R-CNN with RoI pooling to Faster R-CNN's learnable region proposal network, with anchors, RoI Align, and a runnable torchvision Faster R-CNN." name="description"/>
+<title>Section 23.2: Two-Stage Detectors: The R-CNN Family | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>Two-Stage Detectors: The R-CNN Family</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My method is simple. First I draw two thousand rectangles where something might be. Then I look at each one very carefully and decide what it is. It is slow, it is thorough, and it has never once been accused of missing the obvious."</p>
+<cite>A Region Proposal Network With a Strong Work Ethic</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Two-stage detectors solve the variable-output problem by splitting it in two: a first stage proposes a manageable set of regions that probably contain objects, and a second stage classifies and refines each proposed region as if it were an ordinary image patch.</strong> This propose-then-classify structure is the oldest deep-detection idea and still the most accurate template. The R-CNN family's three-step evolution is a clean lesson in removing redundancy: R-CNN ran a CNN on every proposal separately (crippling slow); Fast R-CNN ran the backbone once on the whole image and pooled features per proposal (much faster); Faster R-CNN replaced the external proposal algorithm with a small learnable region proposal network sharing the same backbone, making the whole detector a single end-to-end network. By the end of this section you will understand anchors, RoI Align, and the two-headed second stage, and you will run a pretrained Faster R-CNN in a few lines.</p>
+</div>
+
+<p>
+In <a href="section-23.1.html">Section 23.1</a> we established that a detector must emit a variable-length set of (box, class, confidence) triples and that mAP grades that set. The R-CNN family was the first deep approach to produce such a set, and it did so with an idea borrowed from common sense: do not try to classify every possible box in an image (there are millions), instead first find a few thousand regions that look like they might hold an object, then spend your expensive classifier only on those. That two-stage decomposition, propose then classify, is the subject of this section, and it remains the accuracy benchmark that the faster families of later sections are measured against.
+</p>
+
+<h2>1. R-CNN: Region Proposals Meet Deep Features <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The original R-CNN (Girshick et al., 2014) combined three off-the-shelf pieces. First, a class-agnostic region proposal algorithm called Selective Search generated roughly 2,000 candidate boxes per image by merging superpixels of similar color and texture, a purely classical grouping method in the spirit of the <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">classical segmentation</a> of Chapter 11. Second, each proposed region was cropped, warped to a fixed $224 \times 224$ size, and pushed through a CNN (an ImageNet-pretrained classifier, exactly the <a href="../module-21-training-recipes/index.html">transfer learning</a> idea of Chapter 21) to extract a feature vector. Third, a per-class linear support vector machine scored each feature vector, and a separate linear regressor refined the box coordinates.
+</p>
+
+<p>
+R-CNN nearly doubled the previous best detection mAP on PASCAL VOC, which is why it mattered. But it was painfully slow: 2,000 forward passes of a deep CNN per image, with no computation shared between overlapping proposals, took tens of seconds per image at test time and required caching gigabytes of features to disk during training. The next two papers are the story of removing that waste, and the lesson generalizes far beyond detection: when an expensive computation is repeated on overlapping inputs, share it.
+</p>
+
+<h2>2. Fast R-CNN: Share the Backbone, Pool the Features <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Fast R-CNN's insight was that the 2,000 proposals all live in the same image, so the backbone should run once on the whole image to produce a single convolutional feature map, and each proposal should simply read out the portion of that map covering its region. The operation that reads a fixed-size feature from a variable-size region is <strong>RoI pooling</strong> (region-of-interest pooling): project the proposal box onto the feature map, divide it into a fixed grid (say $7 \times 7$), and max-pool within each grid cell, producing a $7 \times 7$ feature regardless of the proposal's size. That fixed-size feature then goes to a small head with two outputs: a softmax over classes (including a background class) and a per-class box refinement.
+</p>
+
+<p>
+Sharing the backbone cut test time from tens of seconds to under a second and let the whole second stage train end-to-end with a single multi-task loss. That loss is the template every detector since has used: a classification term plus a localization term, the second applied only to non-background boxes.
+</p>
+
+<div class="math-block">
+$$L = L_{\text{cls}}(p, u) + \lambda\, [u \ge 1]\, L_{\text{loc}}(t^u, v)$$
+</div>
+
+<p>
+Here $p$ is the predicted class distribution, $u$ is the true class ($0$ for background), $t^u$ is the predicted box refinement for the true class, $v$ is the target refinement, $[u \ge 1]$ is $1$ for any object class and $0$ for background (so background boxes contribute no localization loss), and $\lambda$ balances the two terms. $L_{\text{loc}}$ is a smooth-L1 (Huber) loss on the four box-offset coordinates, which is robust to the outliers that a plain L2 would over-penalize.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: RoI Align Fixed a Quiet Bug</div>
+<p>RoI pooling quantizes twice: once when it rounds the proposal's floating-point coordinates to the integer feature-map grid, and again when it divides into pooling cells. Those roundings shift features by up to half a cell, which barely affects coarse classification but badly hurts the pixel-precise tasks to come. Mask R-CNN replaced it with <strong>RoI Align</strong>, which keeps the coordinates floating-point and uses bilinear interpolation to sample feature values at the exact sub-pixel locations, never rounding. This single change improved mask quality substantially and is now used even in box-only detectors. It is the same lesson as RoI pooling itself, do not throw away precision you do not have to, and it is why <code>torchvision.ops.roi_align</code> is the default you should reach for.</p>
+</div>
+
+<h2>3. Anchors: Turning a Grid into Box Candidates <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Faster R-CNN's contribution was to replace the slow external Selective Search with a learnable proposal network, and to make that work the field introduced the <strong>anchor box</strong>, an idea so central that the next two sections are partly defined by their relationship to it. An anchor is a reference box of a fixed size and aspect ratio, placed at every spatial location of the feature map. At each location you place several anchors (typically three scales times three aspect ratios, so nine anchors per location), tiling the image with a dense, fixed set of candidate boxes. The network does not predict boxes from nothing; it predicts, for each anchor, two things: an objectness score (does this anchor contain an object?) and four offsets that nudge the anchor toward a nearby ground-truth box.
+</p>
+
+<p>
+The offsets are parameterized relative to the anchor, which keeps the regression targets small and scale-invariant. For an anchor with center $(x_a, y_a)$, width $w_a$, and height $h_a$, the predicted box $(x, y, w, h)$ comes from network outputs $(t_x, t_y, t_w, t_h)$ via
+</p>
+
+<div class="math-block">
+$$x = x_a + t_x w_a, \quad y = y_a + t_y h_a, \quad w = w_a e^{t_w}, \quad h = h_a e^{t_h}$$
+</div>
+
+<p>
+The exponential on width and height guarantees a positive size and lets the network express large size changes with small outputs. Anchors are matched to ground truth by IoU (the metric from <a href="section-23.1.html">Section 23.1</a>): an anchor with IoU above $0.7$ to some ground-truth box is a positive example, below $0.3$ is a negative (background) example, and the rest are ignored during training. Figure 23.2.1 shows nine anchors tiled at one feature-map location.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A feature map grid with nine anchor boxes of three scales and three aspect ratios centered on one grid cell">
+<style>
+.al{font:12px sans-serif;fill:#1a1a1a;}
+.as{font:10px sans-serif;fill:#555;}
+.agrid{fill:none;stroke:#ddd;stroke-width:1;}
+.acell{fill:rgba(214,128,43,0.15);stroke:#d6802b;stroke-width:1.5;}
+.aanc{fill:none;stroke:#2c6fb5;stroke-width:1.5;}
+.aanc2{fill:none;stroke:#2f9e5c;stroke-width:1.5;}
+.aanc3{fill:none;stroke:#8e44ad;stroke-width:1.5;}
+</style>
+<g>
+<line class="agrid" x1="40" y1="40" x2="320" y2="40"/>
+<line class="agrid" x1="40" y1="100" x2="320" y2="100"/>
+<line class="agrid" x1="40" y1="160" x2="320" y2="160"/>
+<line class="agrid" x1="40" y1="220" x2="320" y2="220"/>
+<line class="agrid" x1="40" y1="40" x2="40" y2="220"/>
+<line class="agrid" x1="110" y1="40" x2="110" y2="220"/>
+<line class="agrid" x1="180" y1="40" x2="180" y2="220"/>
+<line class="agrid" x1="250" y1="40" x2="250" y2="220"/>
+<line class="agrid" x1="320" y1="40" x2="320" y2="220"/>
+</g>
+<rect class="acell" x="180" y="100" width="70" height="60"/>
+<circle cx="215" cy="130" r="3" fill="#d6802b"/>
+<rect class="aanc" x="190" y="115" width="50" height="30"/>
+<rect class="aanc" x="175" y="105" width="80" height="50"/>
+<rect class="aanc" x="160" y="90" width="110" height="80"/>
+<rect class="aanc2" x="200" y="100" width="30" height="60"/>
+<rect class="aanc3" x="170" y="120" width="90" height="20"/>
+<text class="as" x="215" y="86" text-anchor="middle">one grid cell</text>
+<text class="al" x="420" y="100">At every feature-map cell, place</text>
+<text class="al" x="420" y="124">k anchors (here k = 9):</text>
+<text class="as" x="420" y="150" fill="#2c6fb5">3 scales (square)</text>
+<text class="as" x="420" y="170" fill="#2f9e5c">tall aspect ratio</text>
+<text class="as" x="420" y="190" fill="#8e44ad">wide aspect ratio</text>
+<text class="as" x="420" y="218">Predict objectness + 4 offsets per anchor.</text>
+</svg>
+<figcaption><strong>Figure 23.2.1:</strong> Anchors tile the image. At each location of the feature map, $k$ reference boxes of varying scale and aspect ratio are placed; the network predicts an objectness score and four box offsets for each. A feature map of $H \times W$ cells with $k$ anchors yields $H \times W \times k$ candidate boxes, all evaluated in one forward pass.</figcaption>
+</figure>
+
+<h2>4. Faster R-CNN: The Region Proposal Network <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>region proposal network</strong> (RPN) is a tiny convolutional head that slides over the shared backbone feature map and, at every location, outputs the objectness scores and box offsets for the $k$ anchors there. It is a fully convolutional, class-agnostic object detector in its own right; its only job is to say "object here, roughly this box" or "background". Its top-scoring proposals (after a non-maximum suppression pass, described below) become the regions that the Fast R-CNN second stage then classifies into actual categories and refines. Because the RPN shares the backbone with the second stage, proposals are nearly free, and the whole detector is one network trained with a combined RPN-plus-detection loss. Figure 23.2.2 traces the data flow.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Faster R-CNN dataflow from image through shared backbone to region proposal network and the second-stage classification and box heads">
+<style>
+.fl{font:12px sans-serif;fill:#1a1a1a;}
+.fs{font:10px sans-serif;fill:#555;}
+.fbox{stroke-width:1.5;}
+.fimg{fill:#eaf2fb;stroke:#2c6fb5;}
+.fback{fill:#e7f5ec;stroke:#2f9e5c;}
+.frpn{fill:#fdeee3;stroke:#d6802b;}
+.froi{fill:#f3e8fb;stroke:#8e44ad;}
+.fhead{fill:#fff4e6;stroke:#b8860b;}
+.far{stroke:#777;stroke-width:1.5;marker-end:url(#fah);fill:none;}
+</style>
+<defs><marker id="fah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="fbox fimg" x="20" y="120" width="70" height="56"/>
+<text class="fl" x="55" y="152" text-anchor="middle">image</text>
+<line class="far" x1="92" y1="148" x2="128" y2="148"/>
+<rect class="fbox fback" x="130" y="116" width="90" height="64"/>
+<text class="fl" x="175" y="144" text-anchor="middle">backbone</text>
+<text class="fs" x="175" y="162" text-anchor="middle">feature map</text>
+<line class="far" x1="222" y1="135" x2="262" y2="100"/>
+<line class="far" x1="222" y1="160" x2="262" y2="200"/>
+<rect class="fbox frpn" x="264" y="74" width="96" height="54"/>
+<text class="fl" x="312" y="98" text-anchor="middle">RPN</text>
+<text class="fs" x="312" y="116" text-anchor="middle">proposals</text>
+<rect class="fbox froi" x="264" y="178" width="96" height="48"/>
+<text class="fl" x="312" y="200" text-anchor="middle">RoI Align</text>
+<text class="fs" x="312" y="216" text-anchor="middle">7x7 per RoI</text>
+<line class="far" x1="360" y1="100" x2="395" y2="160"/>
+<line class="far" x1="360" y1="202" x2="395" y2="170"/>
+<rect class="fbox fhead" x="396" y="140" width="96" height="54"/>
+<text class="fl" x="444" y="164" text-anchor="middle">2-layer head</text>
+<text class="fs" x="444" y="182" text-anchor="middle">fc + fc</text>
+<line class="far" x1="492" y1="155" x2="528" y2="120"/>
+<line class="far" x1="492" y1="178" x2="528" y2="210"/>
+<rect class="fbox fhead" x="530" y="96" width="120" height="44"/>
+<text class="fl" x="590" y="122" text-anchor="middle">class softmax</text>
+<rect class="fbox fhead" x="530" y="190" width="120" height="44"/>
+<text class="fl" x="590" y="216" text-anchor="middle">box refine</text>
+</svg>
+<figcaption><strong>Figure 23.2.2:</strong> Faster R-CNN. The backbone runs once; the RPN proposes regions from the shared feature map; RoI Align extracts a fixed $7 \times 7$ feature per proposal; a small head emits a class distribution and a refined box per proposal. Two stages, one backbone, one end-to-end network.</figcaption>
+</figure>
+
+<p>
+Both stages produce many overlapping boxes per object, so both apply <strong>non-maximum suppression</strong> (NMS): sort boxes by score, keep the top box, discard every remaining box whose IoU with it exceeds a threshold (commonly $0.5$ to $0.7$), and repeat. NMS is the duplicate-killer that the evaluation rule of Section 23.1 demanded, and it is the one piece of every detector in this section and the next that is not learned. The from-scratch implementation below is worth reading, because removing this hand-tuned step is precisely what DETR achieves in <a href="section-23.5.html">Section 23.5</a>.
+</p>
+
+<pre><code class="language-python">import torch
+
+def nms(boxes, scores, iou_thresh=0.5):
+    """boxes: (N, 4) corner format. scores: (N,). Returns kept indices, by score."""
+    keep = []
+    idxs = scores.argsort(descending=True)        # highest score first
+    while idxs.numel() > 0:
+        i = idxs[0].item()
+        keep.append(i)
+        if idxs.numel() == 1:
+            break
+        # IoU of the kept box against all remaining candidates.
+        x1 = boxes[idxs[1:], 0].clamp(min=boxes[i, 0])
+        y1 = boxes[idxs[1:], 1].clamp(min=boxes[i, 1])
+        x2 = boxes[idxs[1:], 2].clamp(max=boxes[i, 2])
+        y2 = boxes[idxs[1:], 3].clamp(max=boxes[i, 3])
+        inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+        area_r = ((boxes[idxs[1:], 2] - boxes[idxs[1:], 0]) *
+                  (boxes[idxs[1:], 3] - boxes[idxs[1:], 1]))
+        iou = inter / (area_i + area_r - inter)
+        idxs = idxs[1:][iou <= iou_thresh]         # drop boxes that overlap the kept one
+    return torch.tensor(keep)
+
+boxes = torch.tensor([[10, 10, 50, 50], [12, 11, 51, 49], [90, 90, 130, 130]],
+                     dtype=torch.float)
+scores = torch.tensor([0.9, 0.8, 0.7])
+print(nms(boxes, scores, 0.5).tolist())   # [0, 2]  (box 1 suppressed as a duplicate of 0)
+</code></pre>
+<div class="code-caption">Non-maximum suppression from scratch. Box 1 strongly overlaps the higher-scoring box 0 and is removed; box 2 is far away and survives. Every two-stage and one-stage detector runs a step like this; only DETR avoids it.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained Faster R-CNN in Five Lines</div>
+<p>You will rarely implement Faster R-CNN from scratch; torchvision ships it with COCO-pretrained weights and a fused, batched NMS. The whole detector, backbone, FPN, RPN, RoI Align, two-stage head, and NMS, is one call:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.detection import (
+    fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights)
+
+weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+model = fasterrcnn_resnet50_fpn_v2(weights=weights).eval()
+preprocess = weights.transforms()                # resize + normalize, COCO-style
+
+img = torch.rand(3, 800, 800)                    # a CHW float image in [0, 1]
+with torch.no_grad():
+    out = model([preprocess(img)])[0]            # dict: boxes, labels, scores
+keep = out["scores"] > 0.5
+print(out["boxes"][keep].shape, out["labels"][keep].tolist())
+</code></pre>
+<p>Roughly 1,500 lines of detector code, plus the custom NMS above, collapse into one constructor. The library handles the anchor generation across FPN levels, the proposal sampling and balancing during training, RoI Align, the batched class-wise NMS, and the COCO label map. The <code>weights.transforms()</code> object even carries the exact preprocessing the model was trained with, so you cannot accidentally feed it the wrong normalization.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When Two Stages Earned Their Keep</div>
+<p><strong>Who:</strong> a medical-imaging group screening retinal photographs for microaneurysms, tiny dark lesions a few pixels across, 2022. <strong>Situation:</strong> they first tried a fast one-stage detector because the radiologists wanted near-real-time feedback during clinics. <strong>Problem:</strong> the one-stage model's recall on the smallest lesions was unacceptable; missing a microaneurysm can mean missing early diabetic retinopathy, so even a small false-negative rate was a clinical non-starter. <strong>Decision:</strong> they switched to a Faster R-CNN with an FPN backbone and a low RPN objectness threshold, deliberately trading speed for the two-stage pipeline's higher recall on small objects, and accepted running detection asynchronously rather than live. <strong>Result:</strong> small-lesion recall rose enough to clear their clinical validation bar, and the slightly higher latency was invisible because results were attached to the patient record rather than shown live. <strong>Lesson:</strong> the two-stage family is slower but its separate proposal stage, especially with a feature pyramid, still leads on small-object recall; when a miss is far more costly than a delay, the older accurate template is the right tool, exactly the APs (small-object) gap that Section 23.1 told you to ask about.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Two-Stage Idea, Reborn</div>
+<p>Two-stage detection is older than the one-stage and transformer families, yet its core idea, refine a coarse proposal in a second pass, keeps returning in modern guise. Cascade R-CNN (2018, and still a strong 2024 baseline) stacks several second-stage heads at increasing IoU thresholds, each refining the previous, and remains near the top of the COCO accuracy charts. The DINO detector of <a href="section-23.5.html">Section 23.5</a>, the first DETR-family model to beat the best convolutional detectors, can be read as a learned two-stage method: its query-selection step proposes, and its decoder layers iteratively refine, just like a cascade. And open-vocabulary detectors such as Detic and OWL-ViT often keep a region-proposal stage and only swap the classifier for a CLIP text-image matcher, letting them detect categories never seen in the box annotations. The propose-then-classify decomposition has outlived every prediction of its obsolescence.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "R" in R-CNN stands for "Regions", not "Recurrent", a confusion that has tripped up countless newcomers who assumed any "R-something" network must involve recurrence. The naming proved durable enough that Mask R-CNN, the segmentation extension you will meet in <a href="../module-24-segmentation/index.html">Chapter 24</a>, kept the letter even though it adds a mask head rather than any new region machinery. The family tree is R-CNN, Fast R-CNN, Faster R-CNN, Mask R-CNN, with the adjectives racing ahead of the architecture changes.</p>
+</div>
+
+<h2>5. Why It Is Accurate but Slow <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The two-stage design is accurate for a structural reason: the second stage sees only a few hundred high-quality proposals, each already roughly localized, and can spend a heavyweight per-region head deciding the exact class and tightening the box. The proposals also rebalance the data; the RPN winnows millions of anchors down to a few thousand, and a sampling step keeps the ratio of foreground to background examples in the second stage near $1{:}3$ rather than the $1{:}1000$ that a one-stage detector must confront. That balance is why two-stage detectors did not need the focal loss that <a href="section-23.3.html">Section 23.3</a> invents to rescue one-stage training.
+</p>
+
+<p>
+The cost is the same structure. The per-region head runs hundreds of times per image, the proposal and NMS steps are sequential and hard to fully parallelize, and the whole pipeline has more moving parts (anchor matching, proposal sampling, two NMS passes) to tune. A Faster R-CNN runs at perhaps 5 to 15 frames per second on a strong GPU, fine for asynchronous analysis but too slow for a phone, a drone, or a self-driving car's perception loop. That speed ceiling is exactly the gap the one-stage detectors of the next section were built to close, and the focal-loss innovation that let them close it without surrendering accuracy is the story we turn to now.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.1: Why Background Boxes Skip the Localization Loss <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The Fast R-CNN multi-task loss multiplies the localization term by $[u \ge 1]$, switching it off for background proposals. In two or three sentences, explain why regressing a box for a background region is meaningless and what would go wrong with training if you removed that indicator and asked the network to localize background "objects" too. Relate your answer to what the box-refinement head is actually being asked to predict.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.2: Anchor Coverage <span class="exercise-type coding">Coding</span></div>
+<p>Write a function that, given an image size, a backbone stride (say 16), and a set of anchor scales and aspect ratios, generates every anchor box for the whole feature map in corner format. Then, given a single ground-truth box, compute the IoU of every anchor against it (reuse your vectorized <code>iou_matrix</code> from Exercise 23.1.2) and report the best IoU and how many anchors clear the 0.7 positive threshold. Experiment with anchor scales that are too small or too large for the object and observe the best IoU collapse; this is the manual tuning that anchor-free detectors in <a href="section-23.4.html">Section 23.4</a> were invented to eliminate.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.2.3: NMS Threshold Sweep <span class="exercise-type analysis">Analysis</span></div>
+<p>Run the pretrained torchvision Faster R-CNN from the library shortcut on a busy image with many overlapping objects (a crowd, a parking lot). Re-run NMS on its raw outputs at IoU thresholds of 0.3, 0.5, and 0.7 and count the surviving boxes at each. Explain the trade-off: a low NMS threshold suppresses aggressively (fewer duplicates but risks merging two genuinely adjacent objects into one), while a high threshold keeps more boxes (better for crowds but more duplicates). Connect this to a real scenario where merging two close objects would be a serious failure, such as counting people in a queue.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.1.html">&#8592; Section 23.1: The Detection Problem: Boxes, IoU &amp; mAP</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="section-23.3.html">Section 23.3: One-Stage Detectors: YOLO, SSD &amp; RetinaNet &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

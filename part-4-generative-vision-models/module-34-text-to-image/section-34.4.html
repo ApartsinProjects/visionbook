@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.4: Autoregressive and token-based image generation. Tokenize an image into discrete codes with a VQ autoencoder, then generate the codes with a transformer, either left to right like Parti or by parallel unmasking like MUSE, and how multimodal models fold image generation into one token stream." name="description"/>
+<title>Section 34.4: Autoregressive &amp; Token-Based Image Generation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Text-to-Image Systems</a></div>
+<h1>Autoregressive &amp; Token-Based Image Generation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to draw a picture, so naturally I spelled it. Two hundred and fifty-six little words, each one a patch of the sky, written left to right like any civilized sentence. The diffusion models think I am old-fashioned. I think they are just bad at reading."</p>
+<cite>An Autoregressive Image Model That Treats Pictures as Prose</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You can generate an image without diffusion at all: compress it into a grid of discrete tokens with a vector-quantized autoencoder, then generate those tokens with a transformer exactly the way a language model generates words.</strong> This token-based path comes in two flavors, left-to-right autoregression (Parti) and parallel masked prediction (MUSE), and it is the route by which a single multimodal model can read text and write images in one unified token stream. This section builds the discrete tokenizer, contrasts the two generation orders, and explains why this approach is resurging just as diffusion seemed to have won.</p>
+</div>
+
+<p>
+Every system so far in this chapter denoises a continuous latent. There is an entirely different way to generate an image, one that descends from language modeling rather than from the noise processes of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. The idea is to make an image <em>discrete</em>, a finite sequence of symbols from a fixed vocabulary, and then reuse the full transformer generation machinery of sequence models. This section is about that path: how it works, how it differs from diffusion, and why it matters more in 2026 than it did in 2023.
+</p>
+
+<h2>1. Making an Image Discrete: VQ Tokenization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The enabling trick is the vector-quantized autoencoder (VQ-VAE / VQGAN), a discrete cousin of the VAE you built in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>. An encoder maps the image to a grid of feature vectors; each vector is then snapped to its nearest entry in a learned <em>codebook</em> of, say, 8192 vectors. The image is now represented by a grid of integer indices, one per spatial location, exactly like a 16-by-16 sentence of 256 "visual words". A decoder reconstructs pixels from the quantized grid. The codebook lookup is the only difference from a continuous autoencoder, and it is what turns a picture into a sequence of tokens that a transformer can model.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VQ tokenization: an encoder produces a feature grid, each cell is quantized to its nearest codebook entry yielding integer token indices, and a decoder reconstructs the image">
+<style>
+.b{fill:#f4f5f7;stroke:#14385c;stroke-width:1.5;}
+.t{font-family:Georgia,serif;font-size:12px;fill:#111418;}
+.s{font-family:Georgia,serif;font-size:10.5px;fill:#5a626c;}
+.cell{fill:#fff;stroke:#5a626c;stroke-width:1;}
+.q{fill:#14385c;}
+.ar{stroke:#14385c;stroke-width:1.5;fill:none;marker-end:url(#m4);}
+</style>
+<defs><marker id="m4" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#14385c"/></marker></defs>
+<rect class="b" x="20" y="95" width="70" height="50"/>
+<text class="t" x="34" y="124">image</text>
+<rect class="b" x="130" y="95" width="80" height="50"/>
+<text class="t" x="142" y="118">encoder</text>
+<text class="s" x="148" y="136">CNN</text>
+<g transform="translate(255,90)">
+<rect class="cell" x="0" y="0" width="20" height="20"/><rect class="cell" x="20" y="0" width="20" height="20"/><rect class="cell" x="40" y="0" width="20" height="20"/>
+<rect class="cell" x="0" y="20" width="20" height="20"/><rect class="cell" x="20" y="20" width="20" height="20"/><rect class="cell" x="40" y="20" width="20" height="20"/>
+<rect class="cell" x="0" y="40" width="20" height="20"/><rect class="cell" x="20" y="40" width="20" height="20"/><rect class="cell" x="40" y="40" width="20" height="20"/>
+</g>
+<text class="s" x="252" y="170">feature grid</text>
+<text class="t" x="350" y="80">quantize to codebook</text>
+<g transform="translate(360,90)">
+<rect class="q" x="0" y="0" width="20" height="20"/><rect class="q" x="20" y="0" width="20" height="20"/><rect class="q" x="40" y="0" width="20" height="20"/>
+<rect class="q" x="0" y="20" width="20" height="20"/><rect class="q" x="20" y="20" width="20" height="20"/><rect class="q" x="40" y="20" width="20" height="20"/>
+<rect class="q" x="0" y="40" width="20" height="20"/><rect class="q" x="20" y="40" width="20" height="20"/><rect class="q" x="40" y="40" width="20" height="20"/>
+</g>
+<text class="s" x="345" y="170">token ids: 91, 12, 7, ...</text>
+<rect class="b" x="470" y="95" width="80" height="50"/>
+<text class="t" x="482" y="118">decoder</text>
+<text class="s" x="488" y="136">CNN</text>
+<rect class="b" x="590" y="95" width="80" height="50"/>
+<text class="t" x="600" y="124">recon</text>
+<path class="ar" d="M90,120 L128,120"/>
+<path class="ar" d="M210,120 L252,120"/>
+<path class="ar" d="M320,120 L358,120"/>
+<path class="ar" d="M422,120 L468,120"/>
+<path class="ar" d="M550,120 L588,120"/>
+</svg>
+<figcaption><strong>Figure 34.4.1:</strong> Vector-quantized tokenization. A convolutional encoder produces a feature grid; each cell is snapped to its nearest codebook vector, yielding a grid of integer token IDs. A decoder reconstructs the image from the quantized grid. The integer grid is what the generator transformer models, the same way a language model models word IDs.</figcaption>
+</figure>
+
+<p>
+Figure 34.4.1 makes the conversion concrete: a continuous image becomes a small grid of integers drawn from a fixed vocabulary. From here, generating an image is generating that grid of integers, and the entire generative problem reduces to a familiar sequence-modeling problem. The straight-through gradient estimator that lets the non-differentiable codebook lookup train end to end is the one piece of machinery beyond the ordinary VAE; the rest is the autoencoder you already know.
+</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class VectorQuantizer(nn.Module):
+    """Snap each encoder feature vector to its nearest codebook entry."""
+    def __init__(self, n_codes=8192, dim=256):
+        super().__init__()
+        self.codebook = nn.Embedding(n_codes, dim)
+
+    def forward(self, z):                 # z: (B, dim, H, W) encoder features
+        b, c, h, w = z.shape
+        flat = z.permute(0, 2, 3, 1).reshape(-1, c)            # (B*H*W, dim)
+        # nearest codebook vector by squared Euclidean distance
+        d = (flat.pow(2).sum(1, keepdim=True)
+             - 2 * flat @ self.codebook.weight.t()
+             + self.codebook.weight.pow(2).sum(1))
+        ids = d.argmin(1)                                      # token id per cell
+        zq = self.codebook(ids).view(b, h, w, c).permute(0, 3, 1, 2)
+        zq = z + (zq - z).detach()        # straight-through estimator for gradients
+        return zq, ids.view(b, h, w)
+
+vq = VectorQuantizer()
+z = torch.randn(1, 256, 16, 16)           # encoder output for one image
+zq, token_grid = vq(z)
+print("quantized features:", tuple(zq.shape))
+print("token grid:", tuple(token_grid.shape),
+      "-> sequence length:", token_grid.numel())</code></pre>
+<div class="code-caption">The vector-quantization step that turns continuous features into discrete tokens. Each of the 256 spatial cells is mapped to one of 8192 codebook indices; the straight-through estimator <code>z + (zq - z).detach()</code> copies gradients past the non-differentiable argmin. Expected output: <code>quantized features: (1, 256, 16, 16)</code>, <code>token grid: (1, 16, 16) -> sequence length: 256</code>.</div>
+
+<h2>2. Generating the Tokens, Left to Right: Parti <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With the image reduced to a sequence of 256 integers, text-to-image generation becomes machine translation: encode the prompt into text tokens, then generate the image tokens one at a time, each conditioned on the prompt and on the image tokens generated so far. Parti is the canonical autoregressive system. It is a standard encoder-decoder transformer, the same architecture used for translation, with the prompt as the source sequence and the image-token grid (flattened in raster order) as the target sequence. Generation is the autoregressive next-token loop of any language model: predict a distribution over the 8192 codebook entries, sample, append, repeat 256 times, then hand the completed grid to the VQ decoder for pixels.
+</p>
+
+<p>
+The appeal is unification: image generation reuses, verbatim, the transformer stack, the scaling laws, and the training infrastructure of language models. Parti scaled to 20 billion parameters and showed that image quality improves predictably with scale, just as in language. The cost is the same cost language models pay: generating $n$ tokens takes $n$ sequential forward passes. A 256-token image needs 256 steps, and higher resolutions explode quadratically, which is the weakness the next subsection attacks.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Diffusion and Autoregression Differ in Generation Order, Not in Goal</div>
+<p>
+Both paths learn the data distribution and sample from it. Diffusion refines all spatial positions simultaneously over many denoising steps; autoregression commits to one position at a time over many token steps. Diffusion's steps are parallel across space but serial in time; autoregression's steps are serial across space. This is why diffusion historically won on speed at high resolution (it does not pay a per-pixel sequential cost) while autoregression won on clean integration with language models. The masked approach of the next subsection is an attempt to get both.
+</p>
+</div>
+
+<h2>3. Generating in Parallel: MUSE and Masked Prediction <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+MUSE keeps the discrete tokens but throws out the left-to-right order. It is trained like the masked-language-modeling objective of BERT: hide a random subset of the image tokens and predict them all at once from the visible ones and the text. At generation time it starts from a fully masked grid and unmasks in a handful of rounds: predict every masked token in parallel, keep the most confident predictions, re-mask the rest, and repeat. A 256-token image that Parti generates in 256 sequential steps, MUSE produces in roughly 8 to 24 parallel rounds, an order-of-magnitude speedup. This parallel-unmasking schedule is the discrete-token analogue of the few-step samplers that accelerated diffusion in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.
+</p>
+
+<pre><code class="language-python">import torch
+
+def muse_decode(predict_logits, n_tokens=256, n_steps=12, vocab=8192,
+                text_cond=None):
+    """Iterative parallel unmasking. predict_logits: model -> (n_tokens, vocab)."""
+    MASK = vocab                                   # special mask id
+    tokens = torch.full((n_tokens,), MASK)         # start fully masked
+    for step in range(n_steps):
+        logits = predict_logits(tokens, text_cond)         # predict ALL positions
+        probs = logits.softmax(-1)
+        sampled = torch.multinomial(probs, 1).squeeze(-1)  # one sample per cell
+        conf = probs.gather(1, sampled[:, None]).squeeze(-1)
+        # keep an increasing fraction of the most confident predictions
+        keep = int(n_tokens * (step + 1) / n_steps)
+        masked = (tokens == MASK)
+        conf = torch.where(masked, conf, torch.full_like(conf, -1.0))
+        keep_idx = conf.topk(min(keep, masked.sum().item())).indices
+        tokens[keep_idx] = sampled[keep_idx]               # commit the confident ones
+    return tokens                                          # complete token grid</code></pre>
+<div class="code-caption">The MUSE parallel-unmasking decode loop. Unlike the 256 sequential steps of autoregression, this commits an increasing fraction of high-confidence tokens each round and finishes in a dozen passes. The confidence-based scheduling is what keeps quality high despite the parallelism.</div>
+
+<p>
+The MUSE decode in this listing is the practical reason token-based generation became competitive on speed: 12 parallel rounds instead of 256 serial steps. It pairs the language-model integration of autoregression with a sampling cost closer to fast diffusion, which is exactly the combination the field wanted.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pretrained Tokenizers and Generators</div>
+<p>
+You rarely train a VQ tokenizer from scratch; strong ones ship pretrained. The <code>diffusers</code> and <code>transformers</code> ecosystems expose VQ models and token-based generators you can load directly.
+</p>
+<pre><code class="language-python">from diffusers import VQModel
+import torch
+
+# A pretrained VQ tokenizer: encode an image to tokens, decode tokens to pixels.
+vq = VQModel.from_pretrained("CompVis/ldm-celebahq-256",
+                             subfolder="vqvae").eval()
+with torch.no_grad():
+    latents = vq.encode(torch.randn(1, 3, 256, 256)).latents
+    recon = vq.decode(latents).sample
+print("vq latents:", tuple(latents.shape))</code></pre>
+<div class="code-caption">A pretrained VQ tokenizer in three lines, replacing the dozens of lines of codebook, encoder, decoder, and straight-through training in subsection 1. The library handles the codebook, the quantization, and the reconstruction; you supply images.</div>
+</div>
+
+<h2>4. Why Tokens Are Resurging: Unified Multimodal Models <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Diffusion appeared to win the text-to-image race by 2023, so why does the token path matter? Because it is the only path that lets a single model both read and write images in one sequence. If an image is a sequence of tokens and text is a sequence of tokens, a single transformer can ingest interleaved text and image tokens and emit either, the foundation of modern multimodal models that answer questions about an image and then generate a new one in the same conversation. The features-and-descriptors thread of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, which learned in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a> to replace hand-crafted descriptors with learned ones, reaches its conclusion here: the universal representation is now a discrete token an LLM can manipulate. Diffusion still produces the highest single-image fidelity, but the token path owns the unified-model frontier, and the two are increasingly hybridized.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Around 2023 it was fashionable to write the autoregressive image model's obituary: too slow, too blurry, decisively beaten by diffusion. Then VAR won a NeurIPS best-paper award in 2024 by beating diffusion on ImageNet, and the largest multimodal models quietly went back to generating images as tokens so they could chat about them. The lesson is a recurring one in this field: an approach written off as obsolete is usually just one good idea away from a comeback, because the hardware and the tooling that grew up around the winner can often be borrowed by the loser. The mnemonic for the two paths: <em>diffusion polishes the whole canvas at once; tokens write it like a sentence.</em></p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Latency Budget That Killed Autoregression</div>
+<p><strong>Who:</strong> A team building an in-app avatar generator that had to return a 512-pixel image in under two seconds on a single mid-range GPU.</p>
+<p><strong>Situation:</strong> They prototyped with a clean autoregressive token model because it integrated neatly with their existing text-model serving stack and the team already understood the next-token loop.</p>
+<p><strong>Problem:</strong> A 512-pixel image at their tokenizer's compression needed 1024 tokens, and 1024 sequential transformer forward passes blew the two-second budget by a wide margin even with a KV cache. The serial-per-token cost of subsection 2 was the wall.</p>
+<p><strong>Decision:</strong> They switched the generator to a MUSE-style masked model with the same VQ tokenizer, so the tokenizer and decoder were unchanged and only the generation order changed. The parallel unmasking of subsection 3 brought 1024 tokens down to about 16 rounds.</p>
+<p><strong>Result:</strong> Latency dropped from roughly nine seconds to under one, comfortably inside budget, with a small quality cost they recovered by adding rounds where latency allowed. The tokenizer investment was preserved.</p>
+<p><strong>Lesson:</strong> Generation order is a swappable knob once the image is tokenized. If autoregression's per-token latency is the problem, masked parallel decoding often fixes it without touching the tokenizer or decoder, the same separation-of-concerns that the three-station view of Section 34.2 rewards.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tokens Strike Back in 2024 to 2026</div>
+<p>
+Token-based generation is having a renaissance. The native image generation in the largest 2024 to 2025 multimodal models treats image synthesis as token prediction inside the same model that handles text and vision, which is why those systems can edit an image by conversation. VAR (Visual Autoregressive modeling, NeurIPS 2024 best paper) replaced raster-order autoregression with next-<em>scale</em> prediction, generating a coarse token grid and then progressively finer ones, and beat diffusion on ImageNet generation while being faster. MAR (Li et al., 2024) showed autoregression does not even require discrete tokens, generating continuous tokens with a small per-token diffusion head, which directly hybridizes the two paths of this chapter. The 2023 consensus that diffusion had simply won looks premature; the discrete-token line, written off as slow, is back at the frontier on both quality and unification.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.4.1: Counting the Steps <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a tokenizer that compresses a $512 \times 512$ image to a $32 \times 32$ token grid. (a) How many tokens is that, and how many sequential forward passes does a pure autoregressive model need to generate it? (b) A MUSE-style model uses 16 unmasking rounds regardless of token count; how many forward passes does it need, and what is the speedup factor over autoregression? (c) A latent diffusion model uses 30 denoising steps on a continuous latent; compare its forward-pass count to both token methods and explain why diffusion's count does not grow with resolution the way autoregression's does.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.4.2: Inspecting the Codebook <span class="exercise-type coding">Coding</span></div>
+<p>Load a pretrained VQ tokenizer (the library shortcut model works). Encode a small set of images and record, for each, its grid of token IDs. (a) Plot a histogram of codebook usage across all images: are all 8192 (or however many) codes used, or is there severe codebook collapse where most images use a small subset? (b) Take one image, replace a 4-by-4 block of its token IDs with a single repeated code, decode, and observe what that one codebook entry "means" visually. (c) Relate codebook collapse to the mode-collapse problem of the GANs in <a href="../module-32-gans/index.html">Chapter 32</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.4.3: When Would You Choose Tokens? <span class="exercise-type analysis">Analysis</span></div>
+<p>You are architecting a system that must both answer questions about user-uploaded images and generate edited versions in the same chat turn. (a) Argue why a token-based generator integrates more naturally than a separate diffusion model, in terms of how many models you must serve and how the image flows between understanding and generation. (b) Identify the quality and latency costs you would accept for that integration. (c) Describe a hybrid (such as MAR's continuous-token diffusion head) that could keep the unified token interface while recovering diffusion's image fidelity, and explain what part of each path it borrows.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.3.html">&#8592; Section 34.3: The Model Landscape</a>
+<a href="index.html">Chapter 34</a>
+<a class="next" href="section-34.5.html">Section 34.5: Prompt Engineering &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

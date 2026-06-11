@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.4: Anchor-Free and Keypoint-Based Detection. Dropping the hand-tuned anchor box: FCOS predicting boxes per feature-map location with a center-ness branch, CenterNet detecting objects as heatmap peaks, the keypoint view of detection, and why anchor-free designs simplified the pipeline and became the basis of modern real-time detectors." name="description"/>
+<title>Section 23.4: Anchor-Free &amp; Keypoint-Based Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>Anchor-Free &amp; Keypoint-Based Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"For years they made me memorize a catalogue of rectangles before I was allowed to look at anything. Nine shapes per spot, all of them guesses about objects I had not yet seen. Then one day they said: just point at the thing and tell me how far the edges are. I have never felt so unburdened."</p>
+<cite>An Anchor Box, Finally Retired</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Anchor-free detectors throw away the hand-designed catalogue of reference boxes and instead predict an object directly from the feature-map location that falls on it: regress the four distances to the box edges, or find the object's center as a peak in a heatmap.</strong> The anchor box of the previous two sections is a powerful idea but a tuning burden: its scales and aspect ratios are hyperparameters you must match to your dataset, and they introduce a complex anchor-to-ground-truth matching step. Anchor-free methods like FCOS and CenterNet remove all of that, treating each feature-map pixel as a candidate that either sits on an object (and then says how big it is) or does not. The simplification was so clean that the modern YOLO line and most 2024-era real-time detectors are anchor-free. This section builds the two main flavors, per-location regression and center-heatmap peaks, and explains the center-ness trick that makes them accurate.</p>
+</div>
+
+<p>
+The anchor box served the detectors of <a href="section-23.2.html">Section 23.2</a> and <a href="section-23.3.html">Section 23.3</a> well, but Exercise 23.2.2 exposed its hidden cost: you must choose anchor scales and aspect ratios that cover your objects, and a poor choice silently caps the best achievable IoU. Worse, anchors introduce an intricate label-assignment step (which anchor is responsible for which object?) full of IoU thresholds and sampling ratios. Around 2019 the field asked whether anchors were necessary at all, given that a feature map already tiles the image with locations. The answer, delivered by FCOS and CenterNet, was no: a location can predict an object directly. This section is about how, and about why the resulting simplicity won.
+</p>
+
+<h2>1. FCOS: Per-Location Box Regression <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+FCOS (Fully Convolutional One-Stage detector, Tian et al., 2019) makes the simplest possible anchor-free choice. For every location $(x, y)$ on an FPN feature map, it asks two questions. First, classification: does this location fall inside some ground-truth object's box, and if so, of what class? Second, regression: if it does, how far is this location from the four edges of that box? The box is encoded as four positive distances $(l, t, r, b)$, the distances from the location to the left, top, right, and bottom edges. Decoding is trivial: for a location at $(x, y)$ the predicted box corners are $(x - l, y - t, x + r, y + b)$. There are no anchors, no aspect ratios, and no IoU-based anchor matching; a location is a positive training example simply if it lands inside a ground-truth box.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A ground-truth box with a feature-map location inside it, showing the four distances l, t, r, b to the box edges that FCOS regresses">
+<style>
+.cl{font:13px sans-serif;fill:#1a1a1a;}
+.cs{font:11px sans-serif;fill:#555;}
+.cbox{fill:rgba(47,158,92,0.08);stroke:#2f9e5c;stroke-width:2.5;}
+.cpt{fill:#d6802b;}
+.cdist{stroke:#2c6fb5;stroke-width:1.5;marker-end:url(#cah);}
+</style>
+<defs><marker id="cah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2c6fb5"/></marker></defs>
+<rect class="cbox" x="120" y="60" width="280" height="170"/>
+<text class="cl" x="124" y="52" fill="#2f9e5c">ground-truth box</text>
+<circle class="cpt" cx="250" cy="150" r="5"/>
+<text class="cl" x="256" y="142">location (x, y)</text>
+<line class="cdist" x1="250" y1="150" x2="124" y2="150"/>
+<text class="cs" x="180" y="166" text-anchor="middle">l</text>
+<line class="cdist" x1="250" y1="150" x2="250" y2="64"/>
+<text class="cs" x="262" y="105">t</text>
+<line class="cdist" x1="250" y1="150" x2="396" y2="150"/>
+<text class="cs" x="325" y="166" text-anchor="middle">r</text>
+<line class="cdist" x1="250" y1="150" x2="250" y2="226"/>
+<text class="cs" x="262" y="195">b</text>
+<text class="cl" x="450" y="110">box = (x - l, y - t,</text>
+<text class="cl" x="500" y="134">x + r, y + b)</text>
+<text class="cs" x="450" y="168">no anchors, no aspect ratios,</text>
+<text class="cs" x="450" y="188">just four positive distances.</text>
+</svg>
+<figcaption><strong>Figure 23.4.1:</strong> FCOS encodes a box by the four distances from a feature-map location to the box edges. Any location inside the object is a positive example that regresses $(l, t, r, b)$; the box is recovered by subtracting and adding these distances from the location's coordinates. No reference boxes are involved.</figcaption>
+</figure>
+
+<p>
+Two complications need handling. A location near the boundary of two overlapping objects could fall inside both; FCOS resolves this with the FPN, assigning each object size to a specific pyramid level so that conflicting boxes rarely land on the same level. The decode logic is so simple it fits in a few lines, shown below for one feature-map level.
+</p>
+
+<pre><code class="language-python">import torch
+
+def fcos_decode(locations, ltrb):
+    """locations: (N, 2) pixel coords of feature-map points.
+       ltrb: (N, 4) predicted distances to left, top, right, bottom edges.
+       Returns (N, 4) corner-format boxes."""
+    x, y = locations[:, 0], locations[:, 1]
+    l, t, r, b = ltrb[:, 0], ltrb[:, 1], ltrb[:, 2], ltrb[:, 3]
+    x1 = x - l
+    y1 = y - t
+    x2 = x + r
+    y2 = y + b
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+locs = torch.tensor([[250.0, 150.0]])
+ltrb = torch.tensor([[126.0, 86.0, 146.0, 76.0]])   # distances from the figure
+print(fcos_decode(locs, ltrb))   # [[124., 64., 396., 226.]]  recovers the GT box
+</code></pre>
+<div class="code-caption">FCOS box decoding from a location and its four edge distances. Compare the output to Figure 23.4.1's box: the distances directly reconstruct the corners, no anchor transform and no exponential needed.</div>
+
+<h2>2. The Center-ness Trick <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A subtle problem appears: locations near the edge of an object regress long, lopsided distances and produce sloppy boxes, yet during training they are treated as fully positive examples, so the model emits many low-quality boxes from off-center locations. FCOS fixes this with a third output, a <strong>center-ness</strong> score that the network predicts at each location and that measures how centered the location is within its object. Center-ness is defined from the regression targets as
+</p>
+
+<div class="math-block">
+$$\text{centerness} = \sqrt{\frac{\min(l, r)}{\max(l, r)} \cdot \frac{\min(t, b)}{\max(t, b)}}$$
+</div>
+
+<p>
+This is $1$ at the exact center of the box (where $l = r$ and $t = b$) and decays toward $0$ near the edges. At inference, the final box score is the geometric combination of the classification score and the center-ness, which down-weights the boxes predicted from off-center locations so that NMS keeps the well-centered, well-localized ones. Center-ness is a small branch with an outsized effect; it is the anchor-free analogue of the objectness score, and it is why FCOS matched anchor-based RetinaNet despite its radical simplification.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Label Assignment Is the Real Anchor Question</div>
+<p>The deepest lesson of the anchor-free turn is that anchors were never really about the box shapes; they were about <strong>label assignment</strong>, the rule that decides which predictions are responsible for which ground-truth objects during training. Anchor-based methods assign by IoU between anchors and objects; FCOS assigns by whether a location falls inside an object plus the FPN-level rule; CenterNet assigns only the single center location. The frontier of detection in the 2020s is precisely better assignment: methods like ATSS (adaptive training sample selection), OTA (optimal transport assignment), and the task-aligned assignment in YOLOv8 all keep the anchor-free box encoding but make the assignment dynamic and learned rather than fixed. When you read that a detector uses "SimOTA" or "TAL", that is the label-assignment rule, and it matters more to final accuracy than whether anchors are present.</p>
+</div>
+
+<h2>3. CenterNet: Objects as Heatmap Peaks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+CenterNet (Zhou et al., 2019, "Objects as Points") takes anchor-free thinking to its logical conclusion: represent each object by a single point, its center, and detect objects as peaks in a class-specific <strong>heatmap</strong>. The network outputs, for each class, a low-resolution heatmap whose value at a pixel is high where that class's object center is. Training renders each ground-truth center as a Gaussian blob on the heatmap (the same Gaussian kernel you met in the <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">spatial filtering</a> of Chapter 3) and regresses the network output toward it with a focal-style loss. Separate regression maps predict, at each center pixel, the object's width and height and a small offset that recovers the precision lost to the heatmap's downsampling. At inference, you simply take the local maxima of each heatmap (a $3 \times 3$ max-pool finds peaks), read off the size and offset at each peak, and you have your boxes, with no NMS at all, because a peak-picking heatmap inherently produces one detection per object.
+</p>
+
+<p>
+This framing is elegant and influential beyond box detection: the same heatmap-of-keypoints idea is how human pose estimation localizes joints (each joint is a keypoint peak), and CenterNet itself extends naturally to predicting any set of points per object. It connects detection to the <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">keypoint and descriptor</a> ideas of Chapter 10, where you found interest points as extrema of a response map; CenterNet learns the response map end-to-end and makes its peaks the object centers. Figure 23.4.2 contrasts the three detection paradigms of this chapter at the level of what each predicts per location.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three detection paradigms compared: anchor-based predicting offsets for reference boxes, FCOS predicting four edge distances, and CenterNet predicting a center heatmap peak with size">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.dtitle{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.dgrid{fill:none;stroke:#ddd;stroke-width:1;}
+.danc{fill:none;stroke:#2c6fb5;stroke-width:1.5;}
+.dfc{fill:none;stroke:#2f9e5c;stroke-width:1.5;}
+.dpt{fill:#d6802b;}
+.dheat{fill:rgba(214,128,43,0.5);}
+</style>
+<text class="dtitle" x="110" y="30" text-anchor="middle">anchor-based</text>
+<rect class="dgrid" x="50" y="50" width="120" height="120"/>
+<circle class="dpt" cx="110" cy="110" r="3"/>
+<rect class="danc" x="80" y="90" width="60" height="40"/>
+<rect class="danc" x="92" y="80" width="36" height="60"/>
+<text class="ds" x="110" y="190" text-anchor="middle">k anchors + offsets</text>
+<text class="dtitle" x="350" y="30" text-anchor="middle">FCOS</text>
+<rect class="dgrid" x="290" y="50" width="120" height="120"/>
+<rect class="dfc" x="300" y="65" width="100" height="90"/>
+<circle class="dpt" cx="350" cy="110" r="3"/>
+<line stroke="#2c6fb5" stroke-width="1.2" x1="350" y1="110" x2="300" y2="110"/>
+<line stroke="#2c6fb5" stroke-width="1.2" x1="350" y1="110" x2="350" y2="65"/>
+<line stroke="#2c6fb5" stroke-width="1.2" x1="350" y1="110" x2="400" y2="110"/>
+<line stroke="#2c6fb5" stroke-width="1.2" x1="350" y1="110" x2="350" y2="155"/>
+<text class="ds" x="350" y="190" text-anchor="middle">4 edge distances</text>
+<text class="dtitle" x="590" y="30" text-anchor="middle">CenterNet</text>
+<rect class="dgrid" x="530" y="50" width="120" height="120"/>
+<circle class="dheat" cx="590" cy="110" r="22"/>
+<circle class="dheat" cx="590" cy="110" r="13"/>
+<circle class="dpt" cx="590" cy="110" r="3"/>
+<text class="ds" x="590" y="190" text-anchor="middle">center peak + size</text>
+<text class="ds" x="360" y="250" text-anchor="middle">All three predict from feature-map locations; they differ only in what each location says about the object.</text>
+</svg>
+<figcaption><strong>Figure 23.4.2:</strong> Three paradigms, one feature map. Anchor-based detectors predict offsets for a catalogue of reference boxes per location; FCOS predicts four edge distances per location; CenterNet predicts a center heatmap and reads size at the peaks. The trend across the chapter is steadily less hand-designed structure per location.</figcaption>
+</figure>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Anchor-Free FCOS, Pretrained</div>
+<p>torchvision ships FCOS with COCO weights, so the anchor-free detector is the same one-line load as the anchor-based ones, and you get the center-ness branch and FPN for free:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.detection import fcos_resnet50_fpn, FCOS_ResNet50_FPN_Weights
+
+weights = FCOS_ResNet50_FPN_Weights.DEFAULT
+model = fcos_resnet50_fpn(weights=weights).eval()
+with torch.no_grad():
+    out = model([torch.rand(3, 800, 800)])[0]    # boxes, labels, scores
+keep = out["scores"] > 0.5
+print(out["boxes"][keep].shape)
+</code></pre>
+<p>The FCOS head, its center-ness branch, the per-location regression, the FPN-level size assignment, and the inference-time NMS are all inside the one constructor. Compared with hand-implementing the per-location assignment, center-ness computation, and decode (a few hundred lines, and easy to get the level-assignment rule subtly wrong), this is a single import that matches the published mAP exactly.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Anchors That Did Not Fit the Objects</div>
+<p><strong>Who:</strong> a logistics company detecting shipping labels and barcodes on parcels moving down a conveyor, 2023. <strong>Situation:</strong> their objects had extreme and varied aspect ratios, long thin barcodes, wide flat address labels, and they started with an anchor-based detector using the default COCO anchor shapes. <strong>Problem:</strong> the default anchors (tuned for COCO's people, cars, and animals) never reached a high IoU with the long thin barcodes, so the best achievable recall was capped no matter how long they trained, exactly the anchor-coverage failure of Exercise 23.2.2. They spent weeks hand-tuning anchor scales and ratios with marginal gains. <strong>Decision:</strong> they switched to an anchor-free FCOS-style detector, which has no aspect-ratio assumptions at all and regresses the four edge distances directly. <strong>Result:</strong> recall on the thin barcodes jumped immediately with no anchor tuning, and the team deleted the entire anchor-configuration code path. <strong>Lesson:</strong> when your objects' shapes fall outside the comfortable range of standard anchors (very thin, very wide, or a wide mix), the anchor-free encoding is not just simpler, it removes a hard ceiling that anchor tuning can only nibble at.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Anchor-Free Is Now the Default</div>
+<p>The anchor-free turn that FCOS and CenterNet started has effectively won the real-time end of detection. YOLOv8 (2023) and YOLO11 (2024) are anchor-free with a decoupled head, dynamic task-aligned label assignment, and a distribution-focal box regression that predicts a distribution over edge distances rather than a point estimate, sharpening localization. The 2024 to 2025 research conversation has moved almost entirely off anchors and onto label-assignment quality (ATSS, OTA, SimOTA, TOOD) and onto removing NMS: YOLOv10 (2024) uses a dual one-to-one and one-to-many assignment so it needs no NMS at inference, getting the NMS-free benefit of DETR without a transformer. The hand-tuned anchor box, which dominated detection from 2015 to 2019, is now mostly a teaching example and a legacy-config concern, exactly the trajectory this section traces.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>CenterNet's paper title, "Objects as Points", is almost a manifesto, and its central claim, that you can detect an object by finding one pixel, is deceptively radical given that the entire field had spent years drawing increasingly clever rectangles. The same one-point-per-object idea, with extra regressed points, immediately gave state-of-the-art human pose estimation, 3D bounding boxes, and even multi-object tracking, all from the modest observation that a thing has a center and a center is easy to find as a peak. Sometimes the simplest representation is the one nobody tried because it seemed too simple to work.</p>
+</div>
+
+<h2>4. Why the Simplification Mattered <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Anchor-free detection removed three sources of friction at once. It deleted the anchor hyperparameters (scales, ratios, counts) that had to be re-tuned per dataset. It deleted the anchor-to-ground-truth IoU matching step and its thresholds. And it reduced the number of predictions per location, which lightens the head and speeds inference. The accuracy turned out to be at least as good once center-ness or a good label-assignment rule replaced the role anchors had played in deciding which predictions to trust. The net effect is a cleaner, more portable detector that adapts to new object-shape distributions without engineering, which is why the family became the foundation of the modern real-time YOLOs.
+</p>
+
+<p>
+But notice what every detector in this chapter so far still shares: they all emit many overlapping candidate boxes and rely on a hand-designed NMS to clean up duplicates (CenterNet's peak-picking is the partial exception). NMS is a non-differentiable, separately-tuned post-process that sits outside the network and can merge or split genuine objects in crowded scenes. The next section presents DETR, which removes NMS entirely by training the network to predict a clean set in the first place, using the transformer you built in <a href="../module-22-vision-transformers/index.html">Chapter 22</a> and a matching loss that makes duplicate suppression part of learning rather than a postscript.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.1: What Center-ness Buys <span class="exercise-type conceptual">Conceptual</span></div>
+<p>FCOS treats every location inside an object as a positive example, yet multiplies the final score by center-ness at inference. In two or three sentences, explain what would go wrong at inference if you dropped the center-ness branch and ranked boxes by classification score alone, and why a box predicted from a corner location tends to be poorly localized. Relate your answer to which boxes NMS would then keep.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.2: Peak-Picking a Heatmap <span class="exercise-type coding">Coding</span></div>
+<p>Implement CenterNet-style peak extraction: given a single-channel heatmap tensor, find the local maxima by comparing it to its $3 \times 3$ max-pooled version (a pixel is a peak where it equals the pooled value) and keeping the top-k peaks above a threshold. Test it on a synthetic heatmap with three Gaussian blobs at known centers and confirm you recover exactly three peaks at the right locations. Explain in one sentence why this peak-picking makes a separate NMS step unnecessary for CenterNet.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.4.3: Anchor-Free vs Anchor-Based on Odd Shapes <span class="exercise-type analysis">Analysis</span></div>
+<p>Construct a small synthetic dataset of very thin horizontal bars (aspect ratio 10:1) on noise backgrounds, with known ground-truth boxes. Compute, for a standard COCO anchor set (three scales, aspect ratios 0.5, 1, 2), the best IoU any anchor achieves against a typical bar, and compare it to the IoU an FCOS-style per-location regression could in principle achieve (which is unbounded, since it regresses exact distances). Write a short analysis explaining why the logistics company in subsection 3 hit an accuracy ceiling with anchors and how the anchor-free encoding removed it.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.3.html">&#8592; Section 23.3: One-Stage Detectors: YOLO, SSD &amp; RetinaNet</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="section-23.5.html">Section 23.5: DETR: Detection as Set Prediction &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

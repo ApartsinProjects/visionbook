@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.6: GPUs, Mixed Precision &amp; Reproducibility. Device placement, automatic mixed precision with loss scaling, and the seeding discipline that makes a training run fast, memory-efficient, and trustworthy." name="description"/>
+<title>Section 18.6: GPUs, Mixed Precision &amp; Reproducibility | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>GPUs, Mixed Precision &amp; Reproducibility</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Run me twice and get two different answers, and you do not have a result; you have a rumor. Seed me properly and the rumor becomes evidence."</p>
+<cite>A Random Number Generator With a Strong Sense of Accountability</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Three practical disciplines separate a notebook demo from a real training run: putting the model and data on the GPU so the matrix multiplies run on the right hardware, using automatic mixed precision to roughly double speed and halve memory for free, and seeding every random source so a result you report can be reproduced.</strong> This section turns each into a few lines you add to the training loop of <a href="section-18.5.html">Section 18.5</a>, and explains the one subtlety, loss scaling, that mixed precision requires.</p>
+</div>
+<p>
+The training loop of the previous section is correct but, on a CPU, slow. Deep learning is fast because the GPU executes the same matrix operations on thousands of cores at once, and the convolutions of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> only become practical there. Three concerns dominate once you leave the toy regime: getting the computation onto the GPU at all, getting more of it per second and per gigabyte through reduced precision, and getting the <em>same</em> result twice so a number means something. None is conceptually deep, but each has a sharp edge that bites the unprepared, and getting all three right is what makes the rest of Part III reproducible on your own hardware. The same matrix-multiply hardware that accelerates a network was already lurking under the optimized filtering of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>; here we drive it deliberately, and <a href="../module-21-training-recipes/index.html">Chapter 21</a> folds these knobs into a full training recipe.
+</p>
+<h2>1. Device Placement <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+A tensor lives on a device, <code>cpu</code> or <code>cuda</code> (an NVIDIA GPU; Apple silicon exposes <code>mps</code>). An operation requires all its inputs on the same device, and the model's parameters and the input batch must agree, or PyTorch raises a device-mismatch error. The pattern is to detect the device once, move the model there at the start, and move each batch there inside the loop, exactly the two <code>.to(device)</code> calls already present in <a href="section-18.5.html">Section 18.5</a>. The code shows the canonical detection-and-placement idiom.
+</p>
+<pre><code class="language-python">import torch
+
+# detect the best available device once, at program start
+device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+print("training on:", device)
+
+model = torch.nn.Linear(784, 10).to(device)     # move ALL parameters to the device
+
+x = torch.randn(64, 784).to(device)             # the batch must live there too
+out = model(x)                                   # both on device -> runs on GPU
+print(out.device)                                # cuda:0  (or mps / cpu)
+
+# moving a result back to the CPU for logging or numpy:
+acc_value = out.argmax(1).float().mean().cpu().item()</code></pre>
+<div class="code-caption">The device idiom: detect the best device once, move the model's parameters there with <code>.to(device)</code>, move each batch there too, and pull scalars back to the CPU with <code>.cpu().item()</code> for logging, the only safe place to leave the GPU.</div>
+<p>
+The most common beginner error is forgetting to move the batch, which gives a clear "expected all tensors to be on the same device" message. The second is unnecessary transfers: moving tensors back and forth between CPU and GPU inside the inner loop is slow because the transfer crosses the PCIe bus. Keep data on the GPU for the whole forward and backward pass and only pull scalars (losses, metrics) back to the CPU, with <code>.item()</code>, for logging.
+</p>
+<h2>2. Mixed Precision: Speed and Memory for Almost Free <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+By default tensors are 32-bit floats (FP32). Modern GPUs compute far faster in 16-bit (FP16 or the more robust BF16) and store half the bytes, so using 16-bit where it is safe roughly doubles throughput and halves activation memory. <strong>Automatic mixed precision</strong> (AMP) does this selectively: it runs the matrix multiplies and convolutions in 16-bit (where the speedup lives and the precision loss is tolerable) while keeping numerically sensitive operations like the loss reduction and normalization statistics in FP32. The one wrinkle is that FP16 has a narrow range, and small gradients can <em>underflow</em> to zero, silently stalling learning. The fix is <strong>loss scaling</strong>: multiply the loss by a large factor before backward so the gradients land in FP16's representable range, then unscale them before the optimizer step. PyTorch automates the entire dance with two objects.
+</p>
+<pre><code class="language-python">import torch
+
+device = "cuda"
+model = torch.nn.Linear(784, 10).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+scaler = torch.amp.GradScaler(device)          # manages dynamic loss scaling
+
+x = torch.randn(64, 784, device=device)
+y = torch.randint(0, 10, (64,), device=device)
+
+optimizer.zero_grad()
+with torch.amp.autocast(device_type=device, dtype=torch.float16):
+    logits = model(x)                          # matmuls run in FP16
+    loss = torch.nn.functional.cross_entropy(logits, y)   # reduction stays FP32
+
+scaler.scale(loss).backward()                  # scale loss -&gt; gradients in FP16 range
+scaler.step(optimizer)                         # unscale, then optimizer.step()
+scaler.update()                                # adapt the scale factor for next step
+print(round(loss.item(), 4))</code></pre>
+<div class="code-caption">Automatic mixed precision in the training step: <code>autocast</code> runs the heavy matrix work in FP16 while keeping the loss reduction in FP32, and <code>GradScaler</code> applies dynamic loss scaling so small gradients do not underflow, replacing the FP32 forward and backward of <a href="section-18.5.html">Section 18.5</a> with four small changes.</div>
+<p>
+Folding these four lines into the <a href="section-18.5.html">Section 18.5</a> loop is the entire change needed to train in mixed precision: wrap the forward pass in <code>autocast</code>, and route the backward and step through the <code>scaler</code>. On a recent GPU the speedup is often 1.5 to 3 times with no measurable accuracy loss, and the halved memory lets you fit larger batches or models. BF16, available on newer hardware, has the same range as FP32 and so does not need the scaler at all, which is why it is increasingly the default for training large models. Figure 18.6.1 shows where the precisions differ.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bit layouts of FP32, FP16, and BF16 floating point formats, showing sign, exponent, and mantissa fields, with FP16 having a narrow exponent that risks underflow and BF16 matching FP32 range with fewer mantissa bits.">
+  <g font-family="sans-serif" font-size="12">
+    <!-- FP32 -->
+    <text x="20" y="44" font-weight="bold" fill="#1b4f72">FP32</text>
+    <rect x="90" y="30" width="20" height="24" fill="#aed6f1" stroke="#2980b9"/>
+    <rect x="110" y="30" width="160" height="24" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="270" y="30" width="380" height="24" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="100" y="74" text-anchor="middle" fill="#5a626c">1</text>
+    <text x="190" y="74" text-anchor="middle" fill="#5a626c">8 exp</text>
+    <text x="460" y="74" text-anchor="middle" fill="#5a626c">23 mantissa</text>
+
+    <!-- FP16 -->
+    <text x="20" y="124" font-weight="bold" fill="#1b4f72">FP16</text>
+    <rect x="90" y="110" width="20" height="24" fill="#aed6f1" stroke="#2980b9"/>
+    <rect x="110" y="110" width="100" height="24" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="210" y="110" width="200" height="24" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="100" y="154" text-anchor="middle" fill="#5a626c">1</text>
+    <text x="160" y="154" text-anchor="middle" fill="#5a626c">5 exp (narrow: underflow risk)</text>
+    <text x="310" y="154" text-anchor="middle" fill="#5a626c">10 mantissa</text>
+
+    <!-- BF16 -->
+    <text x="20" y="204" font-weight="bold" fill="#1b4f72">BF16</text>
+    <rect x="90" y="190" width="20" height="24" fill="#aed6f1" stroke="#2980b9"/>
+    <rect x="110" y="190" width="160" height="24" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="270" y="190" width="140" height="24" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="100" y="234" text-anchor="middle" fill="#5a626c">1</text>
+    <text x="190" y="234" text-anchor="middle" fill="#5a626c">8 exp (FP32 range)</text>
+    <text x="340" y="234" text-anchor="middle" fill="#5a626c">7 mantissa</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 18.6.1</strong> The three precisions, by bit layout. FP16 trades exponent bits for a narrow range, which is why its small gradients underflow and a loss scaler is needed. BF16 keeps FP32's 8-bit exponent (so the same range, no scaler required) at the cost of mantissa precision, which is why modern large-model training increasingly prefers it. AMP mixes these with FP32 automatically.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Precision Is a Lever, Not a Default</div>
+<p>The choice of numeric precision is one of the cheapest large wins in deep learning, and one of the most overlooked. Switching a working FP32 run to AMP typically costs four lines and gives back a 2x speedup and roughly half the memory, with accuracy within noise. The reason it is not simply the silent default is the underflow subtlety: get the loss scaling wrong, or use FP16 where you needed FP32, and training can diverge or quietly fail to learn. Treat precision as a knob you turn deliberately, verify the loss curve is unchanged after switching, and you get the speedup as a near-free lunch.</p>
+</div>
+<h2>3. Reproducibility: Making a Number Mean Something <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Randomness enters training from many sources: weight initialization, data shuffling in the DataLoader (<a href="section-18.4.html">Section 18.4</a>), dropout masks, and augmentation. Run the same script twice without controlling these and you get two different results, which makes it impossible to tell whether a change you made helped or whether you just got luckier on the second run. Reproducibility means pinning every random source so the run is repeatable. The minimum is seeding Python's <code>random</code>, NumPy, and PyTorch (CPU and CUDA); full determinism additionally requires telling cuDNN to use deterministic algorithms and disabling its autotuner. The code packages this into a reusable utility.
+</p>
+<pre><code class="language-python">import os, random
+import numpy as np
+import torch
+
+def set_seed(seed=42, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)                 # seeds CPU and all CUDA devices
+    if deterministic:
+        torch.use_deterministic_algorithms(True)   # error on nondeterministic ops
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False      # disable autotuner (it varies)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"   # needed for determinism
+
+def seed_worker(worker_id):
+    # give each DataLoader worker a derived, deterministic seed
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s); random.seed(s)
+
+set_seed(42)
+g = torch.Generator(); g.manual_seed(42)
+# pass worker_init_fn=seed_worker and generator=g to the training DataLoader
+print("seeded; runs are now repeatable")</code></pre>
+<div class="code-caption">A reusable seeding utility: <code>set_seed</code> pins every random source and optionally forces deterministic algorithms, while <code>seed_worker</code> and the generator make the DataLoader's per-worker shuffling repeatable, the missing piece most ad-hoc seeding scripts forget.</div>
+<p>
+Two honest caveats. Full determinism can be slightly slower (the cuDNN autotuner, disabled above, normally picks the fastest convolution algorithm per shape) and a handful of GPU operations have no deterministic implementation, in which case <code>use_deterministic_algorithms(True)</code> will tell you by raising an error rather than failing silently. The pragmatic stance for research is to always seed (so a result is repeatable on the same machine) and to report results across several seeds (so you can distinguish a real improvement from seed luck), the very practice the experiment-tracking culture of modern vision papers expects. Reproducibility across <em>different</em> GPUs or library versions is harder still and rarely bit-exact; the goal is repeatability on your own setup plus seed-averaged honesty in what you report.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>Every machine learning team eventually lives through the same tragedy in two acts. Act one: a new idea beats the baseline by 0.8 points, champagne is opened, the slide deck is written. Act two: someone reruns it with a different seed, the ranking flips, and the champagne goes flat. The villain was never the method; it was an unmeasured variance hiding behind a single lucky run. <strong>One run is an anecdote; the mean over five seeds is a result.</strong> Seed it, repeat it, then believe it.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Call for Seeding, One Flag for AMP</div>
+<p>Both disciplines in this section have one-liner front ends in the higher-level ecosystem. <code>pytorch_lightning.seed_everything(42, workers=True)</code> does everything <code>set_seed</code> plus <code>seed_worker</code> do, including the per-worker DataLoader seeding, in a single call. And mixed precision, the four-line scaler-and-autocast dance, becomes the single argument <code>Trainer(precision="16-mixed")</code> (or <code>"bf16-mixed"</code>) in Lightning, or <code>accelerator.prepare(...)</code> with a config in Hugging Face Accelerate. As in <a href="section-18.5.html">Section 18.5</a>, the value of writing the explicit version once is that when the abstraction misbehaves, an underflow that the scaler should have caught, a nondeterministic op the seeder could not pin, you know exactly which gear slipped.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Improvement That Was Pure Seed Luck</div>
+<p><strong>Who:</strong> A small applied-research group comparing a new augmentation policy against their baseline classifier for a wildlife-camera-trap project.</p>
+<p><strong>Situation:</strong> The new policy scored 91.4 percent against the baseline's 90.6 percent in a single run each, and the team prepared to ship it as a clear win.</p>
+<p><strong>Problem:</strong> Neither run was seeded, and nobody had measured run-to-run variance. When a skeptical reviewer asked for a repeat, the baseline scored 91.1 percent and the "improved" policy scored 90.5 percent, the ranking flipped. The 0.8-point gap was smaller than the noise between seeds.</p>
+<p><strong>Decision:</strong> The team adopted the <code>set_seed</code> utility, then ran each configuration across five seeds and compared the mean and spread rather than single runs. They reported the augmentation result only after the five-seed mean showed a gap larger than the measured standard deviation.</p>
+<p><strong>Result:</strong> Across five seeds the new policy genuinely helped, by a smaller and honest margin with non-overlapping spreads, and the team had a number they could defend. The original single-run "win" had been within the noise the whole time.</p>
+<p><strong>Lesson:</strong> An unseeded single-run comparison is not evidence; it is one sample of a noisy process. Seed for repeatability, then report across several seeds so the spread is visible. A difference smaller than the seed-to-seed variance is not a result, and reproducibility discipline is what tells the two apart.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: FP8, torch.compile, and the Precision Frontier</div>
+<p>The precision lever keeps moving down. NVIDIA's Hopper and Blackwell GPUs expose FP8 (8-bit floats) for training, and the Transformer Engine library plus native PyTorch FP8 support (maturing through 2024 to 2026) push large-model training to 8-bit matmuls with per-tensor scaling, another roughly 2x over BF16 where the hardware allows. On the reproducibility and speed side, <code>torch.compile</code> from <a href="section-18.3.html">Section 18.3</a> composes with AMP to fuse kernels and cut overhead further, and deterministic-mode coverage in PyTorch widens each release so fewer operations force the autotuner-off slowdown. The throughline from this section holds: choose precision deliberately, verify the loss curve is unchanged, and seed so the verification is trustworthy. The numbers in the formats get smaller; the discipline does not change.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.1: Why FP16 Needs a Scaler but BF16 Does Not <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the bit layouts of Figure 18.6.1, explain why FP16 gradients are prone to underflowing to zero while BF16 gradients are not, despite BF16 having fewer mantissa bits. Define what loss scaling does to the gradient distribution and why multiplying the loss by a constant before backward, then dividing the gradients by the same constant before the step, is mathematically equivalent to the unscaled update. State the one thing dynamic loss scaling adapts at runtime and what event triggers it to lower the scale.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.2: Measure the AMP Speedup <span class="exercise-type coding">Coding</span></div>
+<p>Take the training loop from <a href="section-18.5.html">Section 18.5</a> and add the AMP changes from subsection 2 behind a flag. On a GPU, train the chapter's MLP (or a small CNN if available) for a fixed number of steps with and without AMP, and report wall-clock time, peak GPU memory (<code>torch.cuda.max_memory_allocated</code>), and final training loss for both. Confirm the loss curves overlap within noise while time and memory drop, and report your measured speedup and memory ratio. If you have a BF16-capable GPU, repeat with <code>dtype=torch.bfloat16</code> and no scaler.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.6.3: How Much Does the Seed Matter <span class="exercise-type analysis">Analysis</span></div>
+<p>Train the chapter's MLP on Fashion-MNIST five times with five different seeds (using <code>set_seed</code>) and record the final validation accuracy each time. Report the mean and standard deviation. Then design a hypothetical "improvement" to the model (for example a wider hidden layer) and state how large its measured gain would have to be, relative to your measured seed-to-seed standard deviation, before you would believe it is real. Connect your reasoning to the seed-luck practical example and to the reporting discipline the chapter recommends.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-18.5.html">&#8592; Section 18.5: The Training Loop: Losses, Metrics &amp; Checkpointing</a>
+<a href="index.html">Chapter 18</a>
+<a class="next" href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks &#8594;</a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

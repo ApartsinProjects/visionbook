@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.3: Text-to-3D &amp; Image-to-3D Generation. Score distillation sampling that lifts a 2D diffusion prior into a 3D asset, the Janus failure, and the feed-forward revolution of large reconstruction models and Gaussian-splat generators." name="description"/>
+<title>Section 36.3: Text-to-3D &amp; Image-to-3D Generation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Text-to-3D &amp; Image-to-3D Generation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I was trained only to judge flat pictures. Then someone asked me to imagine the back of a teapot I had never seen, by complaining about every angle until the complaints stopped. Somehow it worked, which quietly worries me."</p>
+<cite>A 2D Diffusion Prior Pressed Into 3D Service</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You can generate a 3D object without a single 3D training example, by using a frozen 2D image diffusion model as a critic that scores rendered views of a 3D representation and pushes it toward looking right from every angle.</strong> That trick, score distillation, opened text-to-3D; its slowness and its multi-face artifacts then drove the field to feed-forward generators that produce a 3D asset in one forward pass. This section follows that arc from per-asset optimization to amortized generation, connecting it to the neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.</p>
+</div>
+
+<p>
+The neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>, NeRF and 3D Gaussian splatting, were ways to <em>fit</em> a representation to many photographs of one real scene. The question this section answers is different and harder: can we <em>generate</em> a brand-new 3D object from a text prompt or a single image, when we have no multi-view photographs of it at all? The obstacle is data. There are billions of captioned 2D images on the web (the fuel for <a href="../module-34-text-to-image/index.html">Chapter 34</a>'s text-to-image models) but only millions of 3D assets, far too few to train a text-to-3D model the way we trained text-to-image. The breakthrough was to borrow the 2D model's knowledge.
+</p>
+
+<h2>1. Score Distillation Sampling: 2D Knowledge, 3D Asset <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+DreamFusion (Poole et al., 2023) introduced <strong>Score Distillation Sampling</strong> (SDS). The idea is a closed loop. Hold a 3D representation, say a NeRF with parameters $\theta$, and a frozen pretrained text-to-image diffusion model. Render the NeRF from a random camera angle to get an image, add noise to it, and ask the diffusion model what noise it would predict. If the rendered view looks like a plausible sample from the prompt, the model's predicted noise matches the added noise and there is nothing to fix. If the view looks wrong, the mismatch between predicted and added noise is a gradient that says how to change the pixels to look more plausible, and that pixel gradient is backpropagated through the renderer into the 3D parameters $\theta$.
+</p>
+
+<p>
+Crucially, SDS skips the expensive Jacobian of the diffusion U-Net. The gradient of the SDS loss is approximately
+</p>
+
+<p>
+$$ \nabla_\theta \mathcal{L}_{\text{SDS}} \;\approx\; \mathbb{E}_{t,\,\epsilon}\!\left[\, w(t)\,\big(\hat{\epsilon}_\phi(\mathbf{x}_t, t, y) - \epsilon\big)\,\frac{\partial \mathbf{x}}{\partial \theta} \,\right], $$
+</p>
+
+<p>
+where $\mathbf{x}$ is the rendered image, $\mathbf{x}_t$ is its noised version at timestep $t$, $\hat{\epsilon}_\phi$ is the frozen diffusion model's noise prediction conditioned on prompt $y$, $\epsilon$ is the sampled noise, and $w(t)$ is a weighting. The term $(\hat{\epsilon}_\phi - \epsilon)$ is the residual that drives the 3D parameters; $\partial \mathbf{x} / \partial \theta$ is the differentiable renderer's Jacobian, exactly the volume-rendering gradient from <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>. Optimize $\theta$ to drive this loss down over thousands of random views and the NeRF converges to an object that looks correct from every direction.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def sds_loss(diffusion, rendered_img, text_emb, guidance_scale=100.0):
+    """Score Distillation Sampling gradient signal for optimizing a 3D model.
+    rendered_img: differentiable render of the current 3D representation."""
+    b = rendered_img.shape[0]
+    t = torch.randint(20, 980, (b,), device=rendered_img.device)   # random noise level
+    noise = torch.randn_like(rendered_img)
+    noisy = diffusion.add_noise(rendered_img, noise, t)            # forward diffusion
+    with torch.no_grad():
+        # classifier-free guidance: blend conditional and unconditional predictions
+        eps_cond = diffusion.unet(noisy, t, text_emb)
+        eps_uncond = diffusion.unet(noisy, t, diffusion.null_emb)
+        eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+    # the key SDS move: the gradient w.r.t. the image IS (eps_pred - noise);
+    # we attach it to the rendered image without differentiating the U-Net
+    grad = (eps_pred - noise)
+    target = (rendered_img - grad).detach()
+    return 0.5 * F.mse_loss(rendered_img, target, reduction="sum") / b
+
+# In the training loop: render the 3D model, compute sds_loss, backprop into theta.
+# Thousands of iterations over random camera poses sculpt a coherent 3D object.</code></pre>
+<div class="code-caption">The Score Distillation Sampling loss in PyTorch: the residual between the frozen diffusion model's predicted noise and the added noise becomes a gradient on the rendered image, which backpropagates through the differentiable renderer into the 3D parameters. The high guidance scale (around 100) is characteristic of SDS and explains its oversaturated look.</div>
+
+<p>
+The code above shows the trademark of SDS: a very high guidance scale (around 100, versus 7 for ordinary text-to-image) is needed to get usable gradients, which is why early SDS results look oversaturated and cartoonish. The <code>target = (rendered_img - grad).detach()</code> line is the elegant hack that turns the noise residual into something an ordinary MSE loss can backpropagate without ever differentiating through the diffusion U-Net itself.
+</p>
+
+<h2>2. The Janus Problem and Its Fixes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SDS has a notorious failure mode: the <strong>Janus problem</strong>, named for the two-faced Roman god. Because the frozen 2D diffusion model was trained mostly on front-facing photographs, it considers a face plausible from many angles, so the optimizer happily grows a face on the back of the head too. Generated animals get faces on both ends; generated objects acquire repeated frontal features. The root cause is that the 2D prior has no notion of viewpoint coherence; it scores each view independently.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The 2D critic was asked "does this look like a face?" from every angle and kept answering an enthusiastic "yes!", so the optimizer dutifully built a face everywhere a yes was available. Nobody ever told it that heads are supposed to have a back. The result is a generation that would be very useful for an owl and disastrous for almost anything else. The fix, whispering "you are looking at the back now" into the prompt, is essentially handing the critic a compass so it stops grading every view as if it were a headshot.
+</p>
+</div>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The Janus problem and its fix: on the left a 3D head optimized by naive score distillation grows a face on both the front and the back because the 2D prior scores each view as plausible; on the right, viewpoint-conditioned guidance tells the prior which side it is looking at, so only the front has a face">
+  <g font-family="sans-serif" font-size="13">
+    <text x="200" y="28" text-anchor="middle" font-weight="bold" fill="#922b21">Naive SDS: Janus artifact</text>
+    <ellipse cx="160" cy="120" rx="70" ry="60" fill="#fadbd8" stroke="#c0392b" stroke-width="1.6"/>
+    <circle cx="135" cy="105" r="6" fill="#922b21"/><circle cx="185" cy="105" r="6" fill="#922b21"/>
+    <path d="M 140 145 Q 160 160 180 145" fill="none" stroke="#922b21" stroke-width="2"/>
+    <text x="160" y="200" text-anchor="middle" font-size="11" fill="#922b21">front: a face (correct)</text>
+    <circle cx="95" cy="110" r="5" fill="#c0392b"/><circle cx="95" cy="130" r="5" fill="#c0392b"/>
+    <path d="M 80 118 Q 70 122 80 126" fill="none" stroke="#c0392b" stroke-width="1.6"/>
+    <text x="70" y="170" text-anchor="middle" font-size="10" fill="#c0392b">back: a second face!</text>
+    <line x1="300" y1="120" x2="380" y2="120" stroke="#5a626c" stroke-width="2" marker-end="url(#ah)"/>
+    <text x="340" y="108" text-anchor="middle" font-size="11" fill="#5a626c">add view</text>
+    <text x="340" y="138" text-anchor="middle" font-size="11" fill="#5a626c">conditioning</text>
+    <text x="600" y="28" text-anchor="middle" font-weight="bold" fill="#1e8449">View-aware: single face</text>
+    <ellipse cx="600" cy="120" rx="70" ry="60" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.6"/>
+    <circle cx="575" cy="105" r="6" fill="#145a32"/><circle cx="625" cy="105" r="6" fill="#145a32"/>
+    <path d="M 580 145 Q 600 160 620 145" fill="none" stroke="#145a32" stroke-width="2"/>
+    <text x="600" y="200" text-anchor="middle" font-size="11" fill="#145a32">front: a face</text>
+    <path d="M 530 100 Q 520 120 530 140" fill="none" stroke="#1e8449" stroke-width="2"/>
+    <text x="515" y="170" text-anchor="middle" font-size="10" fill="#145a32">back: a smooth head</text>
+  </g>
+  <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5a626c"/></marker></defs>
+</svg>
+<figcaption><strong>Figure 36.3.1</strong>: The Janus (two-faced) problem and its mitigation. Naive score distillation (left) lets the viewpoint-agnostic 2D prior grow a face on every side of a head. Conditioning the prior on the camera direction, with view-dependent prompt augmentation or a multi-view-aware diffusion model, tells it which side it is rendering, yielding a single coherent face (right).</figcaption>
+</figure>
+
+<p>
+Figure 36.3.1 contrasts the failure with the fix. The practical mitigations all inject viewpoint awareness. <strong>View-dependent prompting</strong> appends "back view", "side view" to the prompt depending on the sampled camera, the simplest fix. <strong>Multi-view diffusion models</strong> such as MVDream and Zero-1-to-3 are the deeper fix: they fine-tune the 2D prior on rendered multi-view data so it natively understands camera pose and produces view-consistent guidance. This is the same move that the cross-reference map traces: the camera geometry of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a> reenters as a conditioning signal for the diffusion prior.
+</p>
+
+<h2>3. The Feed-Forward Revolution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SDS produces beautiful results but is slow: each asset requires thousands of optimization steps, minutes to hours on a GPU, because the 3D representation is fit from scratch every time. The field's response was the same amortization move that turned slow per-image optimization into fast feed-forward networks throughout this book: train one network that maps an input directly to a 3D representation in a single forward pass.
+</p>
+
+<p>
+The Large Reconstruction Model (LRM, Hong et al., 2024) is the landmark. It is a transformer that takes a single image and outputs a triplane NeRF in about five seconds, trained on a large synthetic 3D dataset so that the 3D knowledge is in the weights rather than rediscovered per asset. DreamGaussian (Tang et al., 2024) made the representation a set of 3D Gaussians (the splatting primitive from <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>) and combined a fast SDS stage with mesh extraction, cutting generation to about two minutes. The 2024 to 2025 line, including InstantMesh, TripoSR, and the multi-view-to-3D pipelines, pushed single-image-to-3D into the sub-ten-second regime with mesh output ready for game engines.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Optimization Versus Amortization, Again</div>
+<p>
+Text-to-3D recapitulates a pattern you have now seen three times in this book. Classical calibration optimized parameters per scene; deep pose estimators amortized it into one forward pass (<a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>). NeRF optimized a radiance field per scene; feed-forward reconstruction amortized it (<a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>). Score distillation optimizes a 3D asset per prompt; large reconstruction models amortize it. The tradeoff is always the same: optimization is slower but needs no 3D-asset-specific training data and adapts to any input; amortization is fast but bounded by the diversity of its training set. Knowing which regime you are in tells you whether your bottleneck is GPU minutes (optimization) or training-data coverage (amortization).
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Generate a 3D Asset in a Few Lines with Shap-E</div>
+<p>
+Implementing SDS plus a NeRF backbone plus multi-view guidance is a multi-hundred-line system. For a quick text-to-3D asset, diffusers ships feed-forward generators behind the familiar pipeline interface:
+</p>
+<pre><code class="language-python">import torch
+from diffusers import ShapEPipeline
+from diffusers.utils import export_to_ply
+
+pipe = ShapEPipeline.from_pretrained("openai/shap-e", torch_dtype=torch.float16)
+pipe = pipe.to("cuda")
+# One forward pass produces a 3D latent decoded to a mesh, no per-asset optimization.
+images = pipe("a worn leather armchair", guidance_scale=15.0,
+              num_inference_steps=64).images
+# Shap-E decodes to an implicit function renderable as a mesh or NeRF.</code></pre>
+<div class="code-caption">Feed-forward text-to-3D with Shap-E: one pipeline call produces a 3D latent in seconds, with no per-asset score-distillation optimization loop.</div>
+<p>
+This replaces the entire SDS optimization loop, the differentiable renderer, the view-conditioned prompting, and the mesh extraction, hundreds of lines and minutes of per-asset GPU time, with one pipeline call that returns in seconds. For production-grade meshes, the same pattern applies to InstantMesh and TripoSR via their official repositories and the threestudio framework.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Game Studio's Asset Pipeline</div>
+<p>
+An indie game studio with three artists needed thousands of background props (crates, barrels, furniture, debris) for an open-world title and no budget to model each by hand. Their first attempt used DreamFusion-style SDS: the quality was acceptable but each prop took roughly fifteen minutes on their single workstation GPU, so a thousand props would have taken over ten days of continuous compute, and the Janus problem ruined every symmetric object. They re-architected around a feed-forward image-to-3D model: an artist sketched or generated a single concept image in seconds (a 2D text-to-image model from <a href="../module-34-text-to-image/index.html">Chapter 34</a>), then a single-image-to-mesh model produced a game-ready asset in under ten seconds. A thousand props became an afternoon. The artists' role shifted from modeling to art-directing and retopologizing the best outputs. The lesson the lead artist gave a conference talk on: <em>SDS taught the field that 3D generation was possible; feed-forward models made it a production tool, and the bottleneck moved from GPU time to curation.</em>
+</p>
+</div>
+
+<h2>4. Choosing a Representation <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The 3D output can take several forms, each from earlier in the book, and the choice matters downstream. A <strong>NeRF or triplane</strong> (Chapter 27) gives photorealistic novel views but is awkward to edit and slow to render in real time. <strong>3D Gaussians</strong> (Chapter 27) render in real time and are increasingly the default for generative pipelines, which is why <a href="section-36.4.html">Section 36.4</a> focuses on them. A <strong>textured mesh</strong> is what game engines and 3D printers actually consume, so most production pipelines extract a mesh as the final step. Modern systems often generate Gaussians or a NeRF first for fidelity, then convert to mesh for compatibility, a two-stage strategy DreamGaussian popularized.
+</p>
+
+<p>
+The unifying view is that text-to-3D is a generative wrapper around the representations of Chapter 27, and the same differentiable rendering that let those representations be fit from photos lets them be optimized by a diffusion critic or predicted by a feed-forward network. The next section takes the Gaussian-splatting representation specifically and asks what it means to make it fully generative, the bridge from per-asset generation to whole-scene generation.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Native 3D and 3D-Aware Video (2024-2026)</div>
+<p>
+Two frontiers are reshaping 3D generation. First, <strong>native 3D diffusion</strong>: as 3D datasets grow (Objaverse-XL and its successors), models such as the 3DGS-diffusion line and CLAY (2024) train diffusion directly on 3D representations rather than distilling from 2D, removing the Janus problem at its root by giving the model genuine 3D priors. Second, <strong>video-to-3D and 4D generation</strong>: because a video model (Sections 36.1 to 36.2) implicitly generates many consistent views, recent work (e.g. SV3D and the 4D Gaussian lines, 2024) uses a video diffusion model as the multi-view generator feeding a reconstruction model, unifying this chapter's first three sections, and extends to <em>dynamic</em> 3D (a moving 3D scene, sometimes called 4D), which is exactly the spatial substrate a world model needs. The convergence theme of the chapter recurs: video generation, 3D generation, and scene representation are merging into a single generative-geometry stack.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> Explain why Score Distillation Sampling needs no 3D training data at all, while a feed-forward large reconstruction model needs a large 3D dataset. Then explain the Janus problem in terms of what the frozen 2D prior does and does not know, and why a multi-view diffusion model fixes it where view-dependent prompting only partly does.</p>
+<p><span class="exercise-type">Coding.</span> Run the diffusers Shap-E snippet for three prompts of increasing symmetry (an asymmetric tool, a symmetric vase, a four-legged animal). Render each from front, side, and back. Document which outputs show Janus-like duplicated features and relate the pattern to object symmetry and to the training distribution of the underlying 2D prior.</p>
+<p><span class="exercise-type">Analysis.</span> A studio must generate 5,000 unique 3D props. Compare an SDS pipeline at 15 minutes per asset against a feed-forward pipeline at 10 seconds per asset, in total GPU wall-clock. Then argue the non-time tradeoffs: where would the feed-forward model's bounded training diversity hurt, and for which kinds of props would you still reach for per-asset SDS optimization despite its cost?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.2.html">&#8592; Section 36.2: Text-to-Video Systems</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.4.html">Section 36.4: Generative Neural Rendering &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

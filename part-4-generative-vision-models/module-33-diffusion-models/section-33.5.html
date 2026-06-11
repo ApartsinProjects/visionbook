@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.5: Flow Matching, Rectified Flow &amp; Consistency Models. The modern reframing that straightens the generative path: conditional flow matching as a simpler training objective, rectified flow's straight-line transport, and consistency models that map any point on a trajectory to its endpoint in one step." name="description"/>
+<title>Section 33.5: Flow Matching &amp; Consistency Models | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Flow Matching, Rectified Flow &amp; Consistency Models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Diffusion taught me to crawl from noise to data along a winding road. Flow matching handed me a ruler and said: why not walk in a straight line?"</p>
+<cite>A Velocity Field That Prefers the Shortest Path</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Flow matching reframes generation as learning a velocity field that transports a simple noise distribution to the data distribution along a chosen path, and when you choose the straightest possible path, the resulting model both trains more simply than diffusion and samples in very few steps; consistency models go further and learn to jump to the path's endpoint in a single step.</strong> These 2022 to 2024 ideas do not replace the diffusion machinery so much as clarify and generalize it: diffusion is one particular probability path, and flow matching exposes the freedom to pick a better one. The straight-line paths of rectified flow are why Stable Diffusion 3 and FLUX sample well in a handful of steps, and consistency models are why one-step generation works at all.</p>
+</div>
+
+<p>
+The probability-flow ODE of <a href="section-33.3.html">Section 33.3</a> showed that a diffusion model is, at heart, an ODE whose velocity field carries noise to data, and <a href="section-33.4.html">Section 33.4</a> showed that the curviness of that field is what forces many sampling steps. The natural question is whether we can <em>design</em> a straighter field rather than inheriting the curved one that the diffusion forward process happens to produce. Flow matching answers yes, and gives a training objective for an arbitrary path that is simpler than the variational bound of <a href="section-33.2.html">Section 33.2</a>. It is the modern descendant of the score-matching and energy-based view introduced in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>: where score matching learns the gradient of log-density, flow matching learns a velocity field directly, and the two meet in the probability-flow ODE. This section develops flow matching, specializes it to the straight-line rectified flow that modern systems use, and ends with consistency models, the most aggressive way to collapse the path to a single step.
+</p>
+
+<h2>1. Flow Matching: Learn the Velocity, Pick the Path <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A continuous flow is defined by a time-dependent velocity field $v_\theta(x, t)$: to generate, you start at a noise sample $x_0 \sim \mathcal N(0, I)$ at time $t = 0$ and integrate $dx/dt = v_\theta(x, t)$ up to $t = 1$, landing on a data sample. (We follow the flow-matching convention where $t = 0$ is noise and $t = 1$ is data, the reverse of the diffusion convention; only the labeling differs.) The question is how to train $v_\theta$ when we do not know the true velocity field. Flow matching's trick is to define the path between a specific noise sample $x_0$ and a specific data sample $x_1$ by a simple interpolation, and to regress the network onto the velocity of that conditional path, which we <em>can</em> compute. For the linear interpolation
+</p>
+
+<div class="math-block">
+$$x_t = (1 - t)\, x_0 + t\, x_1, \qquad \text{the conditional velocity is constant: } \frac{dx_t}{dt} = x_1 - x_0.$$
+</div>
+
+<p>
+The conditional flow matching loss simply asks the network to predict that velocity from the interpolated point and the time:
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{CFM}} = \mathbb{E}_{t,\, x_0,\, x_1}\left[\ \big\| v_\theta\big((1-t)x_0 + t x_1,\ t\big) - (x_1 - x_0) \big\|^2\ \right].$$
+</div>
+
+<p>
+This is strikingly simple: draw a noise sample, draw a data sample, pick a random $t$, interpolate, and regress the network onto the constant velocity $x_1 - x_0$. There is no schedule of $\beta_t$, no variational bound, no closed-form posterior. A deep theorem (the one flow matching contributes) guarantees that minimizing this <em>conditional</em> objective also learns the correct <em>marginal</em> velocity field that transports the whole noise distribution to the whole data distribution. The same network you have been building all chapter, the time-conditioned U-Net or the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">transformer backbone of Chapter 22</a>, plugs in unchanged; only the target and loss change. Figure 33.5.1 contrasts the curved diffusion path with the straight flow-matching path.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two trajectories from noise to data: a curved diffusion path and a straight rectified-flow path; the straight one needs fewer steps">
+<style>
+.ml{font:12px sans-serif;fill:#1a1a1a;}
+.ms{font:10.5px sans-serif;fill:#555;}
+.np{fill:#8a7a6a;}
+.dp{fill:#2c6fb5;}
+.curved{stroke:#d6802b;stroke-width:2.4;fill:none;}
+.straight{stroke:#2f9e5c;stroke-width:2.4;fill:none;}
+.cd{fill:#d6802b;}
+.sd{fill:#2f9e5c;}
+</style>
+<circle class="np" cx="70" cy="200" r="9"/>
+<text class="ml" x="70" y="230" text-anchor="middle">noise</text>
+<circle class="dp" cx="610" cy="80" r="9"/>
+<text class="ml" x="610" y="62" text-anchor="middle">data</text>
+<path class="curved" d="M78,198 C160,120 220,210 320,150 C420,95 500,150 602,84"/>
+<circle class="cd" cx="78" cy="198" r="3.5"/><circle class="cd" cx="180" cy="150" r="3.5"/><circle class="cd" cx="270" cy="170" r="3.5"/><circle class="cd" cx="360" cy="135" r="3.5"/><circle class="cd" cx="450" cy="118" r="3.5"/><circle class="cd" cx="540" cy="100" r="3.5"/><circle class="cd" cx="602" cy="84" r="3.5"/>
+<text class="ms" x="320" y="205" text-anchor="middle" fill="#d6802b">curved diffusion path: many steps</text>
+<path class="straight" d="M78,196 L602,86"/>
+<circle class="sd" cx="78" cy="196" r="4"/><circle class="sd" cx="340" cy="141" r="4"/><circle class="sd" cx="602" cy="86" r="4"/>
+<text class="ms" x="340" y="120" text-anchor="middle" fill="#2f9e5c">straight rectified-flow path: few steps</text>
+</svg>
+<figcaption><strong>Figure 33.5.1:</strong> Why straightness matters. The diffusion forward process induces a curved trajectory (orange) from noise to data, so an ODE solver needs many steps to track it accurately. Flow matching with a linear interpolation, and especially the rectified-flow refinement, produces a nearly straight trajectory (green) that a solver can traverse in very few steps, even one, with little error.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+
+def flow_matching_loss(model, x1):
+    """Conditional flow matching with linear (rectified-flow) paths.
+    x1 is a batch of real data; x0 is sampled noise."""
+    B = x1.size(0)
+    x0 = torch.randn_like(x1)                       # noise endpoint
+    t = torch.rand(B, *[1] * (x1.dim() - 1))        # uniform time in [0, 1]
+    xt = (1 - t) * x0 + t * x1                       # straight-line interpolation
+    target_velocity = x1 - x0                        # constant along the segment
+    pred = model(xt, t.view(B))                      # network predicts velocity
+    return ((pred - target_velocity) ** 2).mean()
+
+@torch.no_grad()
+def flow_sample(model, shape, steps=10):
+    """Generate by Euler-integrating the learned velocity field from t=0 to t=1."""
+    x = torch.randn(shape)
+    dt = 1.0 / steps
+    for i in range(steps):
+        t = torch.full((shape[0],), i * dt)
+        x = x + model(x, t) * dt                      # straight Euler step
+    return x</code></pre>
+<div class="code-caption">Flow matching training and sampling in full. The loss regresses the network onto the constant velocity $x_1 - x_0$ of a straight segment; sampling Euler-integrates that velocity from noise to data. Note the absence of any noise schedule, this is the entire algorithm.</div>
+
+<h2>2. Rectified Flow: Straightening the Path Further <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The linear interpolation in subsection 1 is straight for each <em>individual</em> noise-data pair, but the <em>marginal</em> field the network learns averages over all pairings and is generally still curved, because a given noise point is pulled toward many possible data points. <strong>Rectified flow</strong> fixes this with a reflow procedure: after training a first flow, generate noise-data pairs by actually running it, then retrain on those <em>self-generated</em> pairs. Because the pairs are now the ones the model itself transports, the optimal coupling becomes more straight-line, and after one or two reflow rounds the marginal trajectories are nearly straight. A straight marginal field is the holy grail for sampling: a straight line is solved exactly by a single Euler step. This is the theoretical reason a well-rectified flow can generate in one or two steps with quality that a diffusion model needs dozens to match. The architecture and the U-Net or DiT denoiser are unchanged; rectification is a training-procedure refinement layered on the flow-matching loss.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Diffusion Is a Curved Special Case</div>
+<p>
+Flow matching reveals that the diffusion of <a href="section-33.2.html">Section 33.2</a> is not the only way, nor the best-conditioned way, to connect noise and data; it is one particular (curved) probability path among infinitely many. The DDPM forward process corresponds to a specific noise schedule that bends the trajectory; the linear interpolation of flow matching corresponds to a straighter one. Once you see generation as "learn the velocity field of <em>some</em> path from noise to data," the design freedom, which path, which coupling, which time weighting, becomes explicit, and choosing well is what separates a model that needs 50 steps from one that needs 4. This generalization is why the field's framing shifted from "diffusion models" to "flow-based generative models" between 2022 and 2024.
+</p>
+</div>
+
+<h2>3. Consistency Models: One Step to the Endpoint <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Flow matching and rectified flow make the path straight; consistency models attack the problem from the other end by learning the <em>solution map</em> of the ODE directly. A consistency model $f_\theta(x_t, t)$ is trained so that for any point $x_t$ along a probability-flow trajectory (from <a href="section-33.3.html">Section 33.3</a>), it outputs the trajectory's endpoint, the clean data, regardless of $t$. The defining property is <strong>self-consistency</strong>: two points on the same trajectory must map to the same endpoint, $f_\theta(x_t, t) = f_\theta(x_{t'}, t')$. This is enforced by a loss that pushes the model's output at one timestep to agree with its output (from an exponential-moving-average copy of itself) at an adjacent timestep along the trajectory. The boundary condition $f_\theta(x_0, 0) = x_0$ anchors the map. Once trained, generation is a single network call: feed pure noise, get a sample. Multi-step sampling is also available, alternate denoising to the endpoint and re-noising, to trade a few extra steps for quality. Consistency models can be trained from scratch (consistency training) or distilled from a pretrained diffusion teacher (consistency distillation), and the latter is how the fast Stable Diffusion variants of <a href="section-33.4.html">Section 33.4</a> are made.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: Flow-Matching and LCM Pipelines in diffusers</div>
+<p>The reflow loop of rectified flow and the EMA self-consistency loss of consistency models are subtle to implement correctly, especially the EMA target update and the ODE-trajectory sampling for the consistency loss. The <code>diffusers</code> library ships the trained results as ready pipelines: <code>FluxPipeline</code> and <code>StableDiffusion3Pipeline</code> are rectified-flow models you can sample in a few steps, and <code>LatentConsistencyModelPipeline</code> plus the <code>LCMScheduler</code> give four-step consistency-model generation as a two-line load-and-call. For training, the library's flow-matching scheduler <code>FlowMatchEulerDiscreteScheduler</code> implements the straight-line sampling of subsection 1. This is hundreds of lines of training-loop and numerics replaced by a configured object; the from-scratch <code>flow_matching_loss</code> above is for understanding, the pipeline is for shipping.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Studio Adopts Rectified Flow for Faster Iteration</div>
+<p><strong>Who:</strong> a concept-art studio generating reference images for game environments, 2024. <strong>Situation:</strong> their artists ran a latent diffusion model at 30 to 50 steps and generated dozens of variations per concept, with the wait between variations breaking creative flow. <strong>Problem:</strong> the step count was the bottleneck, and naive step reduction on their existing model collapsed quality, exactly the cliff described in <a href="section-33.4.html">Section 33.4</a>. <strong>Decision:</strong> they migrated to a rectified-flow checkpoint (an SD3-class model) whose straightened trajectories held quality at far fewer steps, generating usable drafts in 4 to 8 steps and reserving a longer pass only for the chosen composition. <strong>Result:</strong> variation throughput multiplied, artists explored more of the design space per session, and the few-step drafts were good enough to make selection decisions without a slow render each time. <strong>Lesson:</strong> the path geometry is not an academic detail; a model trained with a straighter probability path delivers the same visual quality at a fraction of the steps, and for any workflow where iteration speed drives creative output, that geometry is the feature that matters.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Flow Matching Becomes the Default</div>
+<p>Between 2023 and 2025, flow matching went from an alternative formulation to the default training recipe for frontier generators. Stable Diffusion 3 (Esser et al., 2024, arXiv:2403.03206) is a rectified-flow transformer; the FLUX family from Black Forest Labs (2024) is flow-matching-based and set open-weight quality records; Meta's Movie Gen and several 2024 to 2025 <a href="../module-36-video-3d-world-generation/index.html">video models (Chapter 36)</a> use flow matching for its few-step sampling and clean scaling. On the consistency side, the 2024 improved consistency-training recipes (Song and Dhariwal) and consistency trajectory models narrowed the one-step quality gap, and latent consistency adapters made any Stable Diffusion checkpoint four-step-capable with a small LoRA. The throughline is that the straight-path and direct-endpoint ideas of this section are now the engine of real-time generation; if you build a new generator in 2025 or later, flow matching is the recipe you reach for first.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.1: Why a Straight Path Needs One Step <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The Euler ODE step is $x_{t+\Delta t} = x_t + v_\theta(x_t, t)\,\Delta t$. Explain in two or three sentences why, if the trajectory from noise to data is exactly a straight line with constant velocity, a single Euler step with $\Delta t = 1$ reaches the endpoint with zero error, whereas a curved trajectory accumulates error. Connect this to the reflow procedure of subsection 2 and to the step-skipping failure of <a href="section-33.4.html">Section 33.4</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.2: Flow Matching on the Moons <span class="exercise-type coding">Coding</span></div>
+<p>Reuse the 2D crescent-moons dataset and MLP from <a href="section-33.1.html">Section 33.1</a>, but train it with the <code>flow_matching_loss</code> above instead of the DDPM loss (the network now predicts velocity, not noise). Sample with <code>flow_sample</code> at 50, 10, 4, and 1 steps, plotting each. Compare the 4-step and 1-step flow-matching results to the DDPM model's quality at the same step counts and report which degrades more gracefully.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.3: Distillation vs Direct Training <span class="exercise-type analysis">Analysis</span></div>
+<p>Consistency models can be obtained by consistency <em>training</em> from scratch or by consistency <em>distillation</em> from a diffusion teacher, and the progressive distillation of <a href="section-33.4.html">Section 33.4</a> is a third route to few-step models. Write a short comparison (one to two paragraphs) of when each is preferable, addressing whether a pretrained teacher exists, total compute, and the quality ceiling. Conclude with which approach you would pick if you already had a strong 50-step latent diffusion model and wanted 4-step generation, and justify the choice.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.4.html">&#8592; Section 33.4: Fast Sampling</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.6.html">Section 33.6: Guidance &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

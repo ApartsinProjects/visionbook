@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.4: Deep Optical Flow with RAFT. The dense motion field reborn in the deep era: feature and context encoders, the all-pairs 4D correlation volume, the recurrent GRU update operator that iteratively refines flow, and the transformer-based successors." name="description"/>
+<title>Section 26.4: Deep Optical Flow: RAFT &amp; Beyond | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>Deep Optical Flow: RAFT &amp; Beyond</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Horn and Schunck handed me one equation and a prayer for smoothness. RAFT handed me a lookup table of every pixel against every other pixel and said, just keep guessing, but guess better each time. Reader, I have never been more confident about where things went."</p>
+<cite>An Optical Flow Field That Finally Stopped Smearing at the Edges</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Optical flow is the dense, per-pixel motion field between two frames, and RAFT computes it by precomputing the similarity of every pixel to every other pixel, then iteratively refining a flow estimate by repeatedly looking up that similarity table.</strong> The classical Lucas-Kanade and Horn-Schunck methods of <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> solved flow with brightness-constancy equations and smoothness priors, and they struggled with large motions and textureless regions. RAFT replaces the hand-designed energy with three learned components: a feature encoder, an all-pairs correlation volume that is the learned analogue of block matching, and a recurrent update operator that mimics a classical optimizer but with learned steps. The result set an accuracy standard that still anchors the field, and its design recurs in stereo, scene flow, and the transformer-based successors.</p>
+</div>
+
+<p>
+We now leave classification and tracking-of-labels behind for a pixel-level task. Optical flow estimates, for every pixel in frame one, the displacement vector to its corresponding location in frame two. You met it classically in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, and it returned as the input to the two-stream network of <a href="section-26.2.html">Section 26.2</a>. This section rebuilds it with deep learning. The structure of RAFT (Recurrent All-Pairs Field Transforms) is worth studying in detail not only because it is the dominant flow method but because its three-part design (encode, correlate, iteratively update) is a template you will see again in stereo depth in <a href="../module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.
+</p>
+
+<h2>1. The Flow Problem and the Classical Baseline <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Optical flow rests on the <strong>brightness constancy</strong> assumption: a point's intensity does not change as it moves between frames. Writing $I(x, y, t)$ for the image intensity and $(u, v)$ for the per-pixel displacement, a first-order Taylor expansion gives the classical optical flow constraint equation
+</p>
+
+<div class="math-block">
+$$I_x u + I_y v + I_t = 0,$$
+</div>
+
+<p>
+where $I_x, I_y$ are the spatial gradients and $I_t$ is the temporal gradient. This is one equation in two unknowns per pixel, the famous <strong>aperture problem</strong>: a single local window can only determine the motion component along the gradient, not the full vector. Classical methods resolve the ambiguity with extra assumptions: Lucas-Kanade assumes flow is constant in a small window (giving a solvable least-squares system), and Horn-Schunck adds a global smoothness penalty. Both break down on large displacements, where the Taylor expansion is invalid, and on textureless regions, where there is no gradient to constrain anything. RAFT keeps the brightness-constancy intuition but replaces the local linearization with a global correlation search.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>RAFT won the Best Paper award at ECCV 2020, an honor more often given to flashy new architectures than to optical flow, a problem many considered nearly solved. Part of what impressed reviewers was that the same network, with no architectural change, also achieved state-of-the-art results on stereo matching and even on visual odometry, just by reinterpreting what the two input frames mean. The "all-pairs correlation then iterative update" recipe turned out to be a general engine for dense correspondence, not a flow-specific trick, which is exactly why it is worth learning carefully.</p>
+</div>
+
+<h2>2. Feature Encoding and the All-Pairs Correlation Volume <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+RAFT begins by running both frames through a shared convolutional <strong>feature encoder</strong> that maps each frame to a dense feature map at one-eighth resolution, so each spatial location carries a learned descriptor rather than a raw pixel. This is the learned replacement for the hand-crafted descriptors of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>; matching learned features is far more robust than matching raw intensities, which is what brightness constancy assumed.
+</p>
+
+<p>
+The heart of RAFT is the <strong>correlation volume</strong>. For every feature in frame one, RAFT computes the dot-product similarity to every feature in frame two, producing a 4D volume $C(i, j, k, l)$ that holds the similarity of pixel $(i, j)$ in frame one to pixel $(k, l)$ in frame two. This is the all-pairs comparison that gives RAFT its name, and it is the global, large-displacement-capable analogue of the local block matching used in classical stereo and flow. RAFT then builds a small pyramid of this volume by pooling the second-frame dimensions, so the lookup can read both fine and coarse correspondence. Figure 26.4.1 shows the pipeline.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RAFT pipeline: two frames encoded to features, all-pairs correlation volume, recurrent GRU update producing iterative flow estimates">
+<style>
+.rl{font:12px sans-serif;fill:#1a1a1a;}
+.rs{font:10px sans-serif;fill:#555;}
+.rin{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.renc{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.4;}
+.rcorr{fill:#fdeee3;stroke:#d6802b;stroke-width:1.4;}
+.rgru{fill:#fbeef0;stroke:#c0392b;stroke-width:1.4;}
+.rflow{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
+.rar{stroke:#777;stroke-width:1.5;marker-end:url(#rah);fill:none;}
+.rloop{stroke:#c0392b;stroke-width:1.5;marker-end:url(#rah);fill:none;stroke-dasharray:4 3;}
+</style>
+<defs><marker id="rah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="rin" x="20" y="50" width="70" height="40"/>
+<text class="rs" x="55" y="74" text-anchor="middle">frame 1</text>
+<rect class="rin" x="20" y="110" width="70" height="40"/>
+<text class="rs" x="55" y="134" text-anchor="middle">frame 2</text>
+<line class="rar" x1="90" y1="70" x2="120" y2="85"/>
+<line class="rar" x1="90" y1="130" x2="120" y2="105"/>
+<rect class="renc" x="122" y="70" width="80" height="50"/>
+<text class="rl" x="162" y="90" text-anchor="middle">feature</text>
+<text class="rl" x="162" y="106" text-anchor="middle">encoder</text>
+<line class="rar" x1="202" y1="95" x2="232" y2="95"/>
+<rect class="rcorr" x="234" y="62" width="96" height="66"/>
+<text class="rl" x="282" y="86" text-anchor="middle">all-pairs</text>
+<text class="rl" x="282" y="102" text-anchor="middle">correlation</text>
+<text class="rs" x="282" y="118" text-anchor="middle">4D volume</text>
+<line class="rar" x1="330" y1="95" x2="380" y2="120"/>
+<rect class="renc" x="122" y="190" width="80" height="44"/>
+<text class="rl" x="162" y="217" text-anchor="middle">context enc.</text>
+<line class="rar" x1="202" y1="212" x2="380" y2="160"/>
+<rect class="rgru" x="382" y="120" width="100" height="60"/>
+<text class="rl" x="432" y="146" text-anchor="middle">GRU update</text>
+<text class="rs" x="432" y="164" text-anchor="middle">operator</text>
+<path class="rloop" d="M432,180 C432,225 332,225 300,180"/>
+<text class="rs" x="350" y="232" text-anchor="middle" fill="#c0392b">lookup correlation at current flow, refine</text>
+<line class="rar" x1="482" y1="150" x2="528" y2="150"/>
+<rect class="rflow" x="530" y="120" width="100" height="60"/>
+<text class="rl" x="580" y="146" text-anchor="middle">flow field</text>
+<text class="rs" x="580" y="164" text-anchor="middle">f1, f2, ... fN</text>
+<text class="rs" x="282" y="160" text-anchor="middle" fill="#d6802b">similarity of every</text>
+<text class="rs" x="282" y="174" text-anchor="middle" fill="#d6802b">pixel pair</text>
+</svg>
+<figcaption><strong>Figure 26.4.1:</strong> The RAFT pipeline. A shared feature encoder maps both frames to learned features; the all-pairs correlation volume holds the similarity of every pixel pair; a recurrent GRU update operator repeatedly looks up the correlation around the current flow estimate and refines it, emitting a sequence of increasingly accurate flow fields. The dashed loop is the iterative refinement that gives RAFT its accuracy.</figcaption>
+</figure>
+
+<p>
+The code below builds the all-pairs correlation volume from two feature maps. It is a single batched matrix multiplication, the same dot-product-as-similarity operation that powered attention in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, applied here between two images rather than within one sequence.
+</p>
+
+<pre><code class="language-python">import torch
+
+def correlation_volume(fmap1, fmap2):
+    """All-pairs correlation between two feature maps.
+
+    fmap1, fmap2: (N, D, H, W) learned features.
+    Returns (N, H, W, H, W): similarity of every pixel in 1 to every pixel in 2.
+    """
+    N, D, H, W = fmap1.shape
+    f1 = fmap1.view(N, D, H * W)                 # (N, D, HW)
+    f2 = fmap2.view(N, D, H * W)                 # (N, D, HW)
+    corr = torch.matmul(f1.transpose(1, 2), f2)  # (N, HW, HW) dot products
+    corr = corr / (D ** 0.5)                      # scale, as in attention
+    return corr.view(N, H, W, H, W)
+
+f1 = torch.randn(1, 64, 32, 32)                   # 1/8-resolution features
+f2 = torch.randn(1, 64, 32, 32)
+vol = correlation_volume(f1, f2)
+print("correlation volume:", vol.shape)           # correlation volume: torch.Size([1, 32, 32, 32, 32])</code></pre>
+<div class="code-caption">The all-pairs correlation volume as one scaled matrix multiplication. Every pixel of frame one is dotted against every pixel of frame two, exactly the similarity computation behind attention, giving a 4D table the update operator queries. Computing it at one-eighth resolution keeps the $H^2 W^2$ size manageable.</div>
+
+<h2>3. The Recurrent Update Operator <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+RAFT's third component is what makes it accurate. Rather than predicting flow in one shot, it starts from zero flow and applies a <strong>recurrent update operator</strong>, a convolutional GRU, that refines the estimate over a fixed number of iterations. At each step the operator does three things: it looks up the correlation volume at the pixels indicated by the current flow estimate (so it reads how well the current correspondence matches), it combines that lookup with context features from the first frame, and it predicts a residual update $\Delta f$ that is added to the current flow. Crucially, all iterations share weights, so the network learns a single update rule applied repeatedly, mimicking the iterations of a classical optimizer but with a learned step. The training loss supervises every intermediate flow, with later iterations weighted more, which teaches the operator to converge.
+</p>
+
+<p>
+The simplified update step below shows the structure: lookup, combine, predict residual, add. A real RAFT uses a more elaborate lookup with a local neighborhood and a multi-level correlation pyramid, but the recurrence is exactly this.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class FlowUpdate(nn.Module):
+    """One shared-weight RAFT-style update: predict a residual flow and add it."""
+    def __init__(self, hidden=128, corr_dim=81, ctx_dim=128):
+        super().__init__()
+        # GRU-like gate over hidden state h, fed correlation lookup + context + flow
+        self.enc = nn.Sequential(nn.Conv2d(corr_dim + 2, 64, 3, padding=1), nn.ReLU())
+        self.gru = nn.GRUCell(64 + ctx_dim, hidden)
+        self.flow_head = nn.Conv2d(hidden, 2, 3, padding=1)   # predicts (du, dv)
+
+    def forward(self, h, flow, corr_lookup, context):
+        N, _, H, W = flow.shape
+        inp = torch.cat([corr_lookup, flow], dim=1)            # what the lookup said
+        inp = self.enc(inp).flatten(2).transpose(1, 2)         # (N, HW, 64)
+        ctx = context.flatten(2).transpose(1, 2)               # (N, HW, ctx_dim)
+        h_flat = h.flatten(2).transpose(1, 2).reshape(-1, h.shape[1])
+        h_new = self.gru(torch.cat([inp, ctx], -1).reshape(-1, inp.shape[-1] + ctx.shape[-1]),
+                         h_flat).view(N, H, W, -1).permute(0, 3, 1, 2)
+        delta = self.flow_head(h_new)                          # residual update
+        return h_new, flow + delta                             # refined flow
+
+# One iteration on toy tensors (corr lookup window of 9x9 = 81 channels):
+upd = FlowUpdate()
+h = torch.zeros(1, 128, 32, 32)
+flow = torch.zeros(1, 2, 32, 32)
+corr_lookup = torch.randn(1, 81, 32, 32)
+context = torch.randn(1, 128, 32, 32)
+h, flow = upd(h, flow, corr_lookup, context)
+print("refined flow:", flow.shape)                             # refined flow: torch.Size([1, 2, 32, 32])</code></pre>
+<div class="code-caption">One iteration of the RAFT update operator. It reads the correlation lookup around the current flow, mixes in context features, runs a GRU cell, and predicts a residual $(du, dv)$ that is added to the flow. The same weights are reused across all iterations, so the network learns one convergent update rule rather than a fixed-depth feed-forward predictor.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Iterative Refinement Beats One-Shot Prediction</div>
+<p>The deepest idea in RAFT is architectural humility. Earlier deep-flow networks (FlowNet, PWC-Net) predicted flow in a single forward pass through a fixed pyramid, which forced the network to commit to a coarse estimate and refine it at fixed scales. RAFT instead maintains a single high-resolution flow field and improves it through an unbounded number of weight-shared steps, so at inference you can trade accuracy for speed simply by running more or fewer iterations. This is the same principle that powers diffusion models in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>: a hard prediction is easier to make as a sequence of small, learned, repeated corrections than as one giant leap, and sharing the correction operator across steps keeps the model small.</p>
+</div>
+
+<h2>4. Using Flow, and the Transformer Successors <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+In practice you rarely implement RAFT; you load it. TorchVision ships pretrained RAFT weights, and computing dense flow between two frames is a few lines. The output is a $(2, H, W)$ field of horizontal and vertical displacements that you can feed to the temporal stream of <a href="section-26.2.html">Section 26.2</a>, use to warp one frame onto another, or visualize as a colour-coded motion image.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pretrained RAFT in a Handful of Lines</div>
+<p>The from-scratch components above (encoder, correlation volume, update operator, plus the training that ties them together) are several hundred lines and a training run on the FlyingChairs and Sintel datasets. TorchVision's pretrained RAFT replaces all of it:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+
+weights = Raft_Large_Weights.DEFAULT
+model = raft_large(weights=weights).eval()
+transforms = weights.transforms()
+
+img1, img2 = transforms(frame1, frame2)              # resize + normalize a frame pair
+with torch.no_grad():
+    flow_predictions = model(img1, img2)             # list of flow fields, one per iteration
+flow = flow_predictions[-1]                          # the final, most refined estimate
+print(flow.shape)                                    # torch.Size([1, 2, H, W])  (du, dv)</code></pre>
+<p>The model returns the full sequence of per-iteration flow fields (the dashed loop of Figure 26.4.1); you take the last one. The library handles the correlation pyramid, the shared-weight recurrence, and the trained weights, turning a research codebase into one call. TorchVision also provides <code>flow_to_image</code> to render the field as the standard colour wheel for visualization.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Flow That Stabilized a Drone's Landing</div>
+<p><strong>Who:</strong> an engineer on an agricultural-drone team building a vision-based landing assist for a quadcopter with no downward-facing depth sensor, 2024. <strong>Situation:</strong> the drone needed to estimate its own horizontal drift relative to the ground during the final descent, using only the downward camera. <strong>Problem:</strong> their classical Lucas-Kanade flow, ported from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, was accurate over crop rows with strong texture but collapsed over bare soil and shadow, where the lack of gradient left the flow undefined and the drone drifted. <strong>Decision:</strong> they replaced it with a pretrained RAFT-small running on the onboard accelerator, accepting the higher compute because RAFT's learned features produced a confident flow even over near-textureless soil where the brightness-constancy gradient was nearly zero. <strong>Result:</strong> drift estimation stayed reliable across surface types, and the landing accuracy improved enough to remove a fallback ground-marker requirement. <strong>Lesson:</strong> the textureless-region failure that limited classical flow in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> is exactly what learned features fix; RAFT does not rely on a local intensity gradient because its correlation volume matches learned descriptors that remain distinctive where raw pixels are flat. When classical flow fails on weak texture, the deep method is not just more accurate, it is defined where the classical one is not.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Transformers and Unified Correspondence</div>
+<p>RAFT's all-pairs correlation is itself a form of cross-attention between two frames, so it was natural to rebuild flow with transformers explicitly. GMFlow and FlowFormer (2022) recast the matching as global attention over feature tokens, improving large-displacement accuracy and inference speed; the 2023 to 2025 unified-matching models (the GMFlow and UniMatch line) handle optical flow, stereo, and depth with one architecture by changing only what the two input views are, generalizing RAFT's observation that one engine serves all dense-correspondence tasks. A separate thread targets efficiency: SEA-RAFT (2024) and other distilled variants reach RAFT-level accuracy with far fewer iterations for real-time use on edge devices, the deployment concern of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>. And dense flow is increasingly a supervision signal rather than an end product, used to enforce temporal consistency in the video generators of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>, where a generated video that disagrees with its own estimated flow is penalized for flicker.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.4.1: The Aperture Problem <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The optical flow constraint equation $I_x u + I_y v + I_t = 0$ is one equation in two unknowns per pixel. Explain in two or three sentences why this means a single local measurement can only recover the flow component along the image gradient (the aperture problem), and then explain how RAFT's all-pairs correlation volume sidesteps the issue by not relying on a local linearization at all. Relate the correlation volume's role to the block-matching idea you saw in classical stereo in <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.4.2: Run RAFT and Warp a Frame <span class="exercise-type coding">Coding</span></div>
+<p>Using the pretrained RAFT from the library shortcut, estimate the flow between two consecutive frames of any short video. Then use the flow field with <code>torch.nn.functional.grid_sample</code> to warp the first frame toward the second (build the sampling grid by adding the flow to a base coordinate grid). Display the warped first frame, the true second frame, and their difference. A small difference confirms the flow is accurate; identify and explain the regions where the warp fails (occlusions and disocclusions, where no correspondence exists).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.4.3: Iterations Versus Accuracy <span class="exercise-type analysis">Analysis</span></div>
+<p>RAFT returns one flow field per refinement iteration. Run the pretrained model on a frame pair, extract the intermediate flow at each iteration, and compute the change in flow (mean magnitude of the per-iteration update) as a function of iteration index. Plot the curve and identify roughly how many iterations are needed before the update becomes negligible. Discuss, in one paragraph, how you would set the iteration count for a real-time application versus an offline high-accuracy one, connecting the trade to the iterative-refinement insight in subsection 3 and the efficiency concerns of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.3.html">&#8592; Section 26.3: Video Transformers</a>
+<a href="index.html">Chapter 26</a>
+<a class="next" href="section-26.5.html">Section 26.5: Multi-Object Tracking with Learned Features &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

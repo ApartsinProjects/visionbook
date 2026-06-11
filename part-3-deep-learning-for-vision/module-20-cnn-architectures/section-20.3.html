@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 20.3: ResNet: Residual Learning Changes Everything. The degradation problem in plain deep networks, the residual connection that fixes it, why skip connections keep gradients alive, the bottleneck block, and why this one idea reappears across the rest of the book." name="description"/>
+<title>Section 20.3: ResNet: Residual Learning Changes Everything | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 20: CNN Architectures: From LeNet to ConvNeXt</a></div>
+<h1>ResNet: Residual Learning Changes Everything</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to learn a function. I said: let me learn only the part you got wrong, and pass the rest along untouched. Suddenly I was a hundred layers deep and still standing."</p>
+<cite>A Residual Block With Excellent Posture</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This is the pivot of the chapter: deeper plain networks were getting <em>worse</em>, not merely harder to train, and the residual connection, adding a layer's input to its output, fixed it so completely that it is now in essentially every deep architecture you will ever use.</strong> The fix is almost embarrassingly small, a single addition, but its consequences are enormous: networks jumped from tens of layers to over a hundred while training more easily, and the same skip-connection idea reappears inside the transformer block of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> and the U-Net denoiser of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. If you learn one idea from this chapter, learn this one.</p>
+</div>
+
+<p>
+At the end of <a href="section-20.2.html">Section 20.2</a> we framed depth and width as a tradeoff and warned that plain depth eventually stops helping. ResNet, from Kaiming He and colleagues at Microsoft Research in 2015, identified precisely why and removed the obstacle. The result was so decisive that it won every major recognition track that year and became the default backbone for the better part of a decade. This section explains the bottleneck (degradation), the fix (residual learning), why the fix works (gradient flow), and the engineering form you will actually use (the bottleneck block).
+</p>
+
+<h2>1. The Degradation Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the puzzle that motivated ResNet. Take a working network and add more layers. Intuitively, the deeper network should do at least as well as the shallower one, because the extra layers could in principle learn the identity function and simply pass their input through unchanged, leaving accuracy unharmed. Yet the He team observed the opposite: a 56-layer plain network had <em>higher</em> training error than a 20-layer one. This is not overfitting, where training error is low but test error is high; the training error itself was worse. The deeper network was failing to learn even on data it had seen. They named this the <strong>degradation problem</strong>.
+</p>
+
+<p>
+The diagnosis is subtle. The optimizer struggles to make a stack of nonlinear layers represent the identity. Pushing $\text{ReLU}(W_2 \cdot \text{ReLU}(W_1 x + b_1) + b_2)$ to equal $x$ requires a precise and awkward setting of the weights, and gradient descent does not find it easily. So the very capacity that should have been harmless, the ability to do nothing, is hard to learn, and the extra layers actively hurt. Figure 20.3.1 contrasts the failing plain block with the residual fix.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A plain block must learn the full mapping while a residual block adds the input back, so it only learns the change">
+<style>
+.tt{font:12px sans-serif;fill:#1a1a1a;}
+.ss{font:11px sans-serif;fill:#555;}
+.wb{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;}
+.add{fill:#fdeee3;stroke:#d6802b;stroke-width:1.4;}
+.aaa{stroke:#777;stroke-width:1.6;marker-end:url(#ah4);fill:none;}
+.skip{stroke:#2f9e5c;stroke-width:2;marker-end:url(#ah5);fill:none;stroke-dasharray:5 3;}
+</style>
+<defs>
+<marker id="ah4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="ah5" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+</defs>
+<text class="tt" x="150" y="22" text-anchor="middle">plain block</text>
+<text class="ss" x="150" y="40" text-anchor="middle">must learn full H(x)</text>
+<circle cx="150" cy="62" r="4" fill="#333"/><text class="ss" x="168" y="66">x</text>
+<line class="aaa" x1="150" y1="66" x2="150" y2="92"/>
+<rect class="wb" x="105" y="94" width="90" height="26"/><text class="tt" x="150" y="111" text-anchor="middle">weight + ReLU</text>
+<line class="aaa" x1="150" y1="120" x2="150" y2="146"/>
+<rect class="wb" x="105" y="148" width="90" height="26"/><text class="tt" x="150" y="165" text-anchor="middle">weight + ReLU</text>
+<line class="aaa" x1="150" y1="174" x2="150" y2="210"/>
+<text class="ss" x="150" y="230" text-anchor="middle">output H(x)</text>
+<text class="tt" x="520" y="22" text-anchor="middle">residual block</text>
+<text class="ss" x="520" y="40" text-anchor="middle">learns only F(x) = H(x) - x</text>
+<circle cx="520" cy="62" r="4" fill="#333"/><text class="ss" x="538" y="66">x</text>
+<line class="aaa" x1="520" y1="66" x2="520" y2="92"/>
+<rect class="wb" x="475" y="94" width="90" height="26"/><text class="tt" x="520" y="111" text-anchor="middle">weight + ReLU</text>
+<line class="aaa" x1="520" y1="120" x2="520" y2="146"/>
+<rect class="wb" x="475" y="148" width="90" height="26"/><text class="tt" x="520" y="165" text-anchor="middle">weight</text>
+<line class="aaa" x1="520" y1="174" x2="520" y2="196"/>
+<rect class="add" x="498" y="198" width="44" height="26"/><text class="tt" x="520" y="215" text-anchor="middle">+</text>
+<path class="skip" d="M 520 70 C 615 70, 615 211, 545 211"/>
+<text class="ss" x="628" y="140" text-anchor="middle">identity</text>
+<text class="ss" x="628" y="156" text-anchor="middle">skip</text>
+<line class="aaa" x1="520" y1="224" x2="520" y2="248"/>
+<text class="ss" x="520" y="266" text-anchor="middle">output F(x) + x</text>
+</svg>
+<figcaption><strong>Figure 20.3.1:</strong> Plain versus residual block. The plain block (left) must learn the entire mapping $H(x)$, including the identity if that is what is needed. The residual block (right) computes $F(x)$ and adds the input back through the green identity skip, so the layers only learn the <em>change</em> $F(x) = H(x) - x$. Learning "do nothing" is now trivial: drive $F$ to zero.</figcaption>
+</figure>
+
+<h2>2. The Residual Connection <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The fix reframes what each block is asked to learn. Instead of asking a block to produce the desired output $H(x)$ directly, ask it to produce the <em>residual</em> $F(x) = H(x) - x$, and recover the output by adding the input back:
+</p>
+
+<div class="math-block">
+$$y = F(x, \{W_i\}) + x$$
+</div>
+
+<p>
+The term $+x$ is the <strong>identity shortcut</strong> (or skip connection): the input is carried forward, unchanged, by simple addition. Now learning the identity mapping is trivial, the optimizer just drives the weights of $F$ toward zero, which is easy. More generally, if the optimal function is close to the identity (as it often is once a network is deep enough), the block only has to learn a small perturbation, which is a far gentler optimization problem than learning the full mapping from scratch. The degradation problem evaporates: a residual network with hundreds of layers trains with lower error than its shallower counterpart, exactly the monotone improvement the plain network failed to deliver.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BasicBlock(nn.Module):
+    """The ResNet basic block (used in ResNet-18 and ResNet-34)."""
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        # Projection shortcut only when shape changes (stride > 1 or channels differ):
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),  # 1x1 match shape
+                nn.BatchNorm2d(out_ch))
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + self.shortcut(x)   # the residual addition: F(x) + x
+        return F.relu(out)             # ReLU AFTER the add, per the original design
+
+block = BasicBlock(64, 128, stride=2)
+print(block(torch.randn(1, 64, 56, 56)).shape)  # torch.Size([1, 128, 28, 28])</code></pre>
+<div class="code-caption">The ResNet basic block. The single line <code>out = out + self.shortcut(x)</code> is the residual connection; the $1 \times 1$ projection shortcut appears only when the block changes spatial size or channel count, matching the dimensions so the addition is valid.</div>
+
+<p>
+Two engineering details in the code matter. First, when a block changes the spatial size (stride $> 1$) or the channel count, the identity $x$ no longer matches the shape of $F(x)$, so a $1 \times 1$ convolution (the channel mixer of <a href="section-20.2.html">Section 20.2</a>) projects the shortcut to the right shape. Second, the ReLU is applied <em>after</em> the addition, so the skip path itself is a clean, unactivated identity. Both choices keep the shortcut as close to a pure identity as possible, which is what preserves gradient flow.
+</p>
+
+<h2>3. Why It Works: Gradients Take the Highway <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The deeper reason the residual connection helps is what it does to the backward pass. Recall from <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a> that backpropagation multiplies gradients layer by layer, and that long products of small numbers vanish toward zero. Consider the gradient of the loss $L$ with respect to a block's input $x$ when $y = F(x) + x$. By the chain rule:
+</p>
+
+<div class="math-block">
+$$\frac{\partial L}{\partial x} = \frac{\partial L}{\partial y}\left(\frac{\partial F}{\partial x} + 1\right)$$
+</div>
+
+<p>
+The crucial term is the $+1$. Even if $\partial F / \partial x$ becomes tiny, the gradient flowing back to $x$ is at least $\partial L / \partial y$ itself, carried by the identity path. Stack many residual blocks and the loss gradient reaches the earliest layers essentially undiminished, traveling along the skip connections as if on a highway, while the convolutional branches add their corrections. This is the same mechanism that the residual stream of the transformer relies on, and it is why both architectures can be made extremely deep. The skip connection does not just help; it changes the optimization landscape into one gradient descent can navigate.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Identity Is the Easy Default</div>
+<p>The residual reformulation makes "do nothing" the network's default behavior, achieved by driving $F$ to zero, and asks the layers to learn only the departure from that default. This is why residual networks degrade gracefully when you add layers: an unhelpful block can quietly learn to contribute almost nothing, instead of corrupting the signal. It is also why you can prune or drop residual blocks at inference with surprisingly little accuracy loss, a property the efficient designs of <a href="section-20.4.html">Section 20.4</a> exploit.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>To prove the point that the skip connection, not the depth, was the limiting factor, the ResNet authors trained a 1202-layer network on CIFAR-10. It trained without diverging, which a plain net of that depth never could. It also slightly overfit the tiny dataset and did a touch worse than the 110-layer version, the architectural equivalent of bringing a moving truck to carry one grocery bag. The lesson stuck: the skip removes the depth ceiling, but you still have to pick a sensible depth.</p>
+</div>
+
+<h2>4. The Bottleneck Block and the ResNet Family <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+For the deeper variants (ResNet-50, ResNet-101, ResNet-152), the basic two-convolution block becomes too expensive, so ResNet introduces the <strong>bottleneck block</strong>: a $1 \times 1$ convolution squeezes the channels down, a $3 \times 3$ convolution does the spatial work on the cheaper narrow representation, and a $1 \times 1$ convolution expands the channels back up. The $3 \times 3$ layer, the expensive one, now operates on one quarter of the channels, and the two $1 \times 1$ layers reshape cheaply, another reuse of the $1 \times 1$ bottleneck from Inception. The full ResNet is then a stem (a $7 \times 7$ convolution and a max-pool), four stages of these blocks at increasing channel counts, global average pooling, and a single linear classifier, the parameter-light head GoogLeNet pioneered.
+</p>
+
+<pre><code class="language-python">import torch.nn as nn
+import torch.nn.functional as F
+
+class Bottleneck(nn.Module):
+    """ResNet bottleneck: 1x1 squeeze -> 3x3 spatial -> 1x1 expand (4x)."""
+    expansion = 4
+    def __init__(self, in_ch, mid_ch, stride=1):
+        super().__init__()
+        out_ch = mid_ch * self.expansion
+        self.conv1 = nn.Conv2d(in_ch, mid_ch, 1, bias=False)            # squeeze
+        self.bn1 = nn.BatchNorm2d(mid_ch)
+        self.conv2 = nn.Conv2d(mid_ch, mid_ch, 3, stride=stride,
+                               padding=1, bias=False)                   # spatial
+        self.bn2 = nn.BatchNorm2d(mid_ch)
+        self.conv3 = nn.Conv2d(mid_ch, out_ch, 1, bias=False)           # expand
+        self.bn3 = nn.BatchNorm2d(out_ch)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch))
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        return F.relu(out + self.shortcut(x))
+
+# A ResNet-50 stacks [3, 4, 6, 3] of these blocks across four stages.
+print("expansion factor:", Bottleneck.expansion)  # 4</code></pre>
+<div class="code-caption">The bottleneck block of ResNet-50 and deeper. The $3 \times 3$ convolution works on the squeezed <code>mid_ch</code> channels, making depth affordable; the same residual addition closes the block.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: ResNet in One Line</div>
+<p>You will rarely hand-build a ResNet. torchvision and timm both ship the entire family with pretrained ImageNet weights, replacing the ~50 lines of block and stage assembly with one call:</p>
+<pre><code class="language-python">from torchvision.models import resnet50, ResNet50_Weights
+model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2).eval()  # 80.9% top-1
+# Or via timm, with hundreds of ResNet variants and recipes:
+import timm
+model = timm.create_model("resnet50", pretrained=True, num_classes=10)  # re-headed</code></pre>
+<p>The library handles the stem, the four-stage layout, the projection shortcuts, weight initialization, and the running batch-norm statistics. The <code>IMAGENET1K_V2</code> weights even bake in the modern training recipe of <a href="../module-21-training-recipes/index.html">Chapter 21</a>, the "ResNet strikes back" result, so you get a several-point accuracy boost over the original 2015 weights for free, and <code>timm</code>'s <code>num_classes</code> argument swaps the head for transfer learning in a single argument.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 152-Layer Network That Trained on the First Try</div>
+<p><strong>Who:</strong> a medical-imaging group classifying diabetic retinopathy from fundus photographs, 2024. <strong>Situation:</strong> their existing 22-layer plain CNN had plateaued, and adding layers made validation accuracy <em>drop</em>, the textbook degradation symptom. <strong>Problem:</strong> they suspected overfitting and spent two weeks tuning dropout and weight decay with no improvement. <strong>Decision:</strong> on a reviewer's suggestion they swapped the trunk for a pretrained ResNet-50, fine-tuned end to end, and added no new regularization. <strong>Result:</strong> training error fell monotonically as expected, validation accuracy rose four points over their best plain network, and the model trained without any of the warmup or careful initialization their plain network had needed. <strong>Lesson:</strong> the symptom "deeper makes it worse, and regularization does not help" is degradation, not overfitting, and the cure is architectural, not a hyperparameter. Recognizing which failure you are looking at, exactly the root-cause habit this chapter teaches, saved them weeks of tuning the wrong knob.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Skip Connection Is Everywhere Now</div>
+<p>The residual connection has long since escaped image classification. It is the core of the transformer block you will meet in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, where every attention and feed-forward sub-layer is wrapped in a skip; it forms the encoder-decoder skips of the U-Net that denoises images in diffusion models (<a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>); and ConvNeXt (<a href="section-20.5.html">Section 20.5</a>) keeps it unchanged while modernizing everything around it. Recent analysis (2022 to 2025) frames very deep residual networks as discretized ordinary differential equations, where each block is one Euler step of a continuous flow, a view that connects directly to the continuous-time formulation of diffusion and flow-matching models in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. The single addition you wrote above is one of the most reused ideas in all of deep learning.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.1: Why Identity Is Hard for Plain Layers <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider a single plain block $\text{ReLU}(Wx + b)$ asked to output exactly its input $x$ for arbitrary $x$. (a) Explain why no single choice of $W, b$ can make this hold for all $x$ (consider negative components of $x$). (b) Now consider the residual block $F(x) + x$ with $F(x) = \text{ReLU}(Wx + b)$. Show that setting $W = 0, b = 0$ makes the block output exactly $x$. (c) State in one sentence why this difference explains the degradation problem of subsection 1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.2: Reproduce the Degradation Curve <span class="exercise-type coding">Coding</span></div>
+<p>On CIFAR-10 (the loader from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>), build a 20-layer and a 56-layer <em>plain</em> CNN (no skip connections) using the <code>BasicBlock</code> above with the residual addition removed. Train both with identical settings and plot training error versus epoch on one axis. Confirm that the 56-layer plain network reaches higher training error. Then restore the skip connection in both and repeat, showing the deeper residual network now trains to lower error. Report the four final training-error numbers in a small table.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 20.3.3: Drop a Block, Measure the Damage <span class="exercise-type analysis">Analysis</span></div>
+<p>Load a pretrained <code>resnet50</code> and evaluate its top-1 accuracy on a few hundred ImageNet validation images. Now, using a forward hook or by replacing one bottleneck block's <code>forward</code> with an identity pass-through, disable a single residual block in the third stage and re-evaluate. Report the accuracy drop. Repeat for a block in the first stage. Relate your findings to the "identity is the easy default" insight of subsection 3: why is dropping one residual block far less catastrophic than dropping one layer of a plain VGG would be?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-20.2.html">&#8592; Section 20.2: VGG &amp; Inception</a>
+<a href="index.html">Chapter 20</a>
+<a class="next" href="section-20.4.html">Section 20.4: Efficient Designs &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

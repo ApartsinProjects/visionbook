@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.1: Connecting Text and Pixels with CLIP and text encoders. Contrastive image-text alignment, the shared embedding space, pooled versus per-token conditioning, and why large language-model encoders like T5 improve prompt following." name="description"/>
+<title>Section 34.1: Connecting Text &amp; Pixels: CLIP &amp; Text Encoders | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Text-to-Image Systems</a></div>
+<h1>Connecting Text &amp; Pixels: CLIP &amp; Text Encoders</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I spent four hundred million captions learning that a photo of a corgi and the words 'a photo of a corgi' should land in the same place. Now you ask me to draw one. I only ever learned to point; the drawing is someone else's job."</p>
+<cite>A Contrastive Encoder With Strong Opinions About Corgis</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Before a diffusion model can draw what you describe, something must translate your sentence into a vector the model can attend to, and that translator is a frozen text encoder, not the generator.</strong> The quality of the translation sets a ceiling on prompt following that no amount of denoising can raise. This section studies the two encoder families that do the translation: CLIP, whose contrastive training put images and captions in one shared space, and the large language-model encoders like T5 that newer systems prefer for long, compositional prompts. Get the encoder right and the same generator suddenly obeys instructions it used to ignore.</p>
+</div>
+
+<p>
+The guidance section of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> left us with a conditional denoiser: a network that, given a noisy latent and some conditioning vector $c$, predicts the noise to remove so the result drifts toward images consistent with $c$. We never said where $c$ comes from. For text-to-image generation, $c$ is the output of a text encoder, a separate, usually frozen network that maps a string of words to a sequence of vectors. This section is about that network. It is the least glamorous component of the stack and the one that most often decides whether a system can count, place objects in the right relationship, or render a phrase faithfully.
+</p>
+
+<h2>1. The Problem: Two Modalities, One Space <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Pixels and words live in incompatible representations. An image is a grid of intensities; a caption is a sequence of discrete symbols. To condition a generator on text, we need a function that takes the caption and produces something a vision network can consume continuously. The breakthrough was to learn a <em>shared embedding space</em>: train an image encoder and a text encoder jointly so that an image and its matching caption map to nearby points, and mismatched pairs map far apart. This is the same idea you met as contrastive self-supervision in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, applied across modalities rather than across augmented views of one image.
+</p>
+
+<p>
+CLIP (Contrastive Language-Image Pre-training) trained on roughly 400 million image-caption pairs scraped from the web. Given a batch of $N$ pairs, it computes $N$ image embeddings and $N$ text embeddings, forms the $N \times N$ matrix of cosine similarities, and applies a symmetric cross-entropy loss that rewards high similarity on the $N$ true diagonal pairs and low similarity on the $N^2 - N$ off-diagonal mismatches. The result is an embedding space where the descriptor of an image and the descriptor of its caption coincide, which is exactly the universal text-to-image bridge the field needed. Notice the lineage: the hand-crafted descriptors of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> matched image patches to image patches; CLIP matches images to language.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CLIP contrastive training diagram: image and text encoders project into a shared space where matching pairs align on the diagonal of a similarity matrix">
+<style>
+.bx{fill:#f4f5f7;stroke:#14385c;stroke-width:1.5;}
+.lbl{font-family:Georgia,serif;font-size:13px;fill:#111418;}
+.sm{font-family:Georgia,serif;font-size:11px;fill:#5a626c;}
+.diag{fill:#14385c;}
+.off{fill:#d1d4d8;}
+.ar{stroke:#5a626c;stroke-width:1.5;fill:none;marker-end:url(#ah);}
+</style>
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#5a626c"/></marker></defs>
+<rect class="bx" x="20" y="40" width="120" height="40"/>
+<text class="lbl" x="32" y="65">Image encoder</text>
+<rect class="bx" x="20" y="210" width="120" height="40"/>
+<text class="lbl" x="38" y="235">Text encoder</text>
+<text class="sm" x="20" y="30">images</text>
+<text class="sm" x="20" y="205">captions</text>
+<path class="ar" d="M140,60 L210,120"/>
+<path class="ar" d="M140,230 L210,180"/>
+<text class="lbl" x="220" y="135">I&#8321;..I&#8324;</text>
+<text class="lbl" x="220" y="195">T&#8321;..T&#8324;</text>
+<text class="sm" x="300" y="40">N &#215; N cosine-similarity matrix</text>
+<g transform="translate(310,55)">
+<rect class="diag" x="0" y="0" width="40" height="40"/>
+<rect class="off" x="40" y="0" width="40" height="40"/>
+<rect class="off" x="80" y="0" width="40" height="40"/>
+<rect class="off" x="120" y="0" width="40" height="40"/>
+<rect class="off" x="0" y="40" width="40" height="40"/>
+<rect class="diag" x="40" y="40" width="40" height="40"/>
+<rect class="off" x="80" y="40" width="40" height="40"/>
+<rect class="off" x="120" y="40" width="40" height="40"/>
+<rect class="off" x="0" y="80" width="40" height="40"/>
+<rect class="off" x="40" y="80" width="40" height="40"/>
+<rect class="diag" x="80" y="80" width="40" height="40"/>
+<rect class="off" x="120" y="80" width="40" height="40"/>
+<rect class="off" x="0" y="120" width="40" height="40"/>
+<rect class="off" x="40" y="120" width="40" height="40"/>
+<rect class="off" x="80" y="120" width="40" height="40"/>
+<rect class="diag" x="120" y="120" width="40" height="40"/>
+</g>
+<text class="sm" x="500" y="120">maximize diagonal</text>
+<text class="sm" x="500" y="140">(true pairs)</text>
+<text class="sm" x="500" y="170">minimize off-diagonal</text>
+<text class="sm" x="500" y="190">(mismatches)</text>
+</svg>
+<figcaption><strong>Figure 34.1.1:</strong> CLIP's contrastive objective. Image and text encoders project their inputs into one shared space; the loss pushes the cosine similarity of the $N$ true pairs (the diagonal) up and the $N^2 - N$ mismatches down. The resulting text encoder is what early text-to-image systems used to turn a prompt into conditioning.</figcaption>
+</figure>
+
+<p>
+Figure 34.1.1 shows why the trained encoders are useful far beyond retrieval: because a caption embedding sits where its image embedding sits, a generator trained to produce images consistent with a CLIP text embedding is implicitly producing images consistent with the matching CLIP image embedding. That is the entire conditioning idea in one sentence.
+</p>
+
+<h2>2. Embedding a Prompt in Code <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The mechanics are concrete. CLIP's text encoder is a transformer (<a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> built the architecture). It tokenizes the prompt, prepends a start token and appends an end token, runs the transformer, and produces one vector per token. There are two ways to read its output, and the distinction matters for the rest of this chapter. The <strong>pooled embedding</strong> is a single vector summarizing the whole prompt (CLIP takes the hidden state at the end-of-text token). The <strong>per-token embeddings</strong> are the full sequence of hidden states, one per token. Retrieval and the unCLIP prior use the pooled vector; cross-attention conditioning in Stable Diffusion uses the per-token sequence, because attending to individual word vectors is what lets "red car, blue house" route color to the right object.
+</p>
+
+<pre><code class="language-python">import torch
+from transformers import CLIPTokenizer, CLIPTextModel
+
+# Load the exact text encoder Stable Diffusion 1.5 uses, frozen.
+name = "openai/clip-vit-large-patch14"
+tokenizer = CLIPTokenizer.from_pretrained(name)
+text_encoder = CLIPTextModel.from_pretrained(name).eval()
+
+prompt = "a red car parked next to a blue house, golden hour"
+tokens = tokenizer(prompt, padding="max_length", max_length=77,
+                   truncation=True, return_tensors="pt")
+
+with torch.no_grad():
+    out = text_encoder(**tokens)
+
+seq = out.last_hidden_state          # per-token: (1, 77, 768)
+pooled = out.pooler_output           # whole-prompt: (1, 768)
+print("per-token conditioning:", seq.shape)
+print("pooled embedding:", pooled.shape)
+print("active (non-pad) tokens:", int(tokens.attention_mask.sum()))</code></pre>
+<div class="code-caption">Embedding a prompt with the frozen CLIP text encoder. The 77-token cap is CLIP's fixed context length; <code>last_hidden_state</code> is the per-token sequence that cross-attention consumes, while <code>pooler_output</code> is the single summary vector. Expected output: <code>per-token conditioning: torch.Size([1, 77, 768])</code>, <code>pooled embedding: torch.Size([1, 768])</code>, <code>active (non-pad) tokens: 17</code>.</div>
+
+<p>
+Two facts in that output drive real behavior. First, the 768-dimensional per-token sequence has a fixed length of 77; longer prompts are silently truncated, which is why an over-stuffed prompt loses its tail. Second, the encoder is in <code>eval</code> mode and wrapped in <code>no_grad</code>: in almost every text-to-image system the text encoder is <em>frozen</em>. The generator learns to interpret a fixed language representation rather than the language model learning to serve the generator. This separation is what lets you swap encoders, and it is the lever the next subsection pulls.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Encoder Sets the Ceiling</div>
+<p>
+A diffusion model can only condition on distinctions its text encoder actually represents. If the encoder collapses "a cube on top of a sphere" and "a sphere on top of a cube" to nearly the same embedding, no denoiser can recover the spatial relationship, because the information was destroyed before generation began. Prompt-following failures are frequently encoder failures, not generator failures. This is why the single highest-leverage change between model generations has often been a better text encoder, not a bigger U-Net.
+</p>
+</div>
+
+<h2>3. Why CLIP Is Not Enough: The T5 Argument <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+CLIP was trained for <em>matching</em>, not <em>understanding</em>. Its contrastive objective rewards getting the right caption near the right image, and short web captions ("dog on beach") are enough to win that game. The encoder therefore learns a bag-of-concepts representation that is strong on subjects and weak on syntax: it knows there is a dog and a beach, but it is hazy on counting, negation, and which adjective binds to which noun. For prompts like "three red apples and two green pears, no oranges", CLIP's embedding barely distinguishes the counts.
+</p>
+
+<p>
+The Imagen team made the influential observation that a large, frozen, text-only language-model encoder follows prompts better than a CLIP-scale encoder, even though it never saw an image during training. Their choice was T5-XXL, an encoder-decoder language model with 4.6 billion parameters whose pretraining on text taught it real compositional structure. The intuition is that prompt following is a language-understanding problem, and a model that spent its whole training budget on language understands language better than a model that split its budget between language and a contrastive matching task. Modern systems act on this: SD3 and FLUX feed the generator both CLIP embeddings (for their tight visual grounding) and T5 embeddings (for their compositional reach).
+</p>
+
+<pre><code class="language-python">from transformers import T5Tokenizer, T5EncoderModel
+import torch
+
+# T5 is text-only: an encoder-decoder LM repurposed as a conditioner.
+t5_name = "google/t5-v1_1-base"   # use t5-v1_1-xxl in production systems
+t5_tok = T5Tokenizer.from_pretrained(t5_name)
+t5_enc = T5EncoderModel.from_pretrained(t5_name).eval()
+
+prompt = "three red apples and two green pears, no oranges"
+batch = t5_tok(prompt, padding="longest", return_tensors="pt")
+
+with torch.no_grad():
+    t5_seq = t5_enc(**batch).last_hidden_state   # (1, n_tokens, 768)
+
+print("T5 conditioning sequence:", t5_seq.shape)
+# Unlike CLIP's hard 77-token cap, T5 handles long prompts gracefully.
+print("token count:", t5_seq.shape[1])</code></pre>
+<div class="code-caption">Embedding the same prompt with a T5 encoder. T5 has no 77-token ceiling and its language-model pretraining gives a representation that preserves counts and binding far better than CLIP. Production systems use the much larger <code>t5-v1_1-xxl</code> variant.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>CLIP learning a "bag of concepts" is not a metaphor; it is a measurable failing. Researchers found that CLIP scores "a photo of a horse riding an astronaut" almost identically to "a photo of an astronaut riding a horse", because it counts the words and shrugs at the grammar. The encoder knows there is an astronaut and a horse and a riding; who is on top is, to a contrastive matcher trained on terse alt-text, an unimportant detail. The whole T5 argument is the field collectively deciding that grammar is, in fact, an important detail. The mnemonic: <em>CLIP reads the menu, T5 reads the sentence.</em></p>
+</div>
+
+<p>
+The two encoders are complementary rather than competing, which is the practical conclusion. CLIP anchors the embedding to visual concepts the generator was trained against; T5 supplies the syntactic precision CLIP lacks. The cost is real: T5-XXL is many times larger than CLIP's text tower and dominates the memory footprint of systems that use it, which is why some deployments cache or quantize it. We return to the per-system choices in <a href="section-34.3.html">Section 34.3</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Encoder Is Already Inside the Pipeline</div>
+<p>
+Everything above runs automatically when you call a <code>diffusers</code> pipeline; you never load the encoder yourself unless you want to inspect or modify the embeddings. The pipeline holds the tokenizer and text encoder and calls them in <code>encode_prompt</code> before denoising.
+</p>
+<pre><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
+).to("cuda")
+
+# One call does tokenize -> CLIP encode -> classifier-free duplication.
+image = pipe("a red car next to a blue house, golden hour").images[0]
+image.save("car_house.png")</code></pre>
+<div class="code-caption">The 15 lines of manual tokenizing and encoding above collapse to a single pipeline call. The library handles tokenization, the 77-token padding, the frozen encoder, and the classifier-free guidance duplication (the unconditional empty-prompt embedding) that Section 34.5 explains, then runs the full denoising loop.</div>
+</div>
+
+<h2>4. Inspecting What the Bridge Captures <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Because CLIP places text and images in one space, you can probe its understanding directly with cosine similarity, no generation required. This is the cheapest diagnostic in the whole text-to-image toolkit: if CLIP cannot tell two prompts apart, the downstream generator will struggle too. The following code scores one image against several candidate captions, the zero-shot classification trick that made CLIP famous and that doubles as a conditioning sanity check.
+</p>
+
+<pre><code class="language-python">import torch
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").eval()
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+image = Image.open("car_house.png")
+captions = ["a red car next to a blue house",
+            "a blue car next to a red house",
+            "an empty parking lot"]
+
+inputs = proc(text=captions, images=image, return_tensors="pt", padding=True)
+with torch.no_grad():
+    logits = model(**inputs).logits_per_image      # (1, 3) image-vs-text scores
+probs = logits.softmax(dim=-1)[0]
+for cap, p in zip(captions, probs):
+    print(f"{p:.2f}  {cap}")</code></pre>
+<div class="code-caption">Using CLIP as a zero-shot probe. The image is scored against three candidate captions; the softmax over similarities reveals what CLIP thinks the image depicts. If the color-swapped caption scores nearly as high as the correct one, CLIP did not bind colors to objects, a red flag for any prompt that depends on that binding.</div>
+
+<p>
+Run this on a generation and a color-swapped caption, and you often find the swapped caption uncomfortably close, the measurable footprint of CLIP's weak attribute binding from subsection 3. The probe turns a vague complaint ("the model ignored my colors") into a number you can act on.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Catalog Team and the Vanishing Encoder Upgrade</div>
+<p><strong>Who:</strong> A retail platform generating product lifestyle shots from structured attributes (color, material, setting) compiled into prompts.</p>
+<p><strong>Situation:</strong> They ran a fine-tuned Stable Diffusion 1.5 with CLIP conditioning. Prompts like "a forest-green leather armchair in a sunlit Scandinavian living room" produced beautiful chairs in the wrong color about a third of the time.</p>
+<p><strong>Problem:</strong> The team assumed the generator was at fault and spent two weeks fine-tuning the U-Net on color-labeled data. It barely helped. A CLIP probe like the one above showed the cause: "forest-green leather armchair" and "brown leather armchair" had cosine similarity above 0.9. CLIP was not encoding the color distinction, so no U-Net could honor it.</p>
+<p><strong>Decision:</strong> They migrated to an SD3-class model whose conditioning includes a T5 encoder, and re-ran the same prompt set with no U-Net changes.</p>
+<p><strong>Result:</strong> Color accuracy on the held-out attribute set rose from 64 percent to 91 percent. The two weeks of U-Net fine-tuning were wasted effort aimed at the wrong stage.</p>
+<p><strong>Lesson:</strong> Diagnose the encoder before blaming the generator. Probing CLIP's similarity scores costs minutes and frequently shows that the information you want the model to honor was never in the conditioning to begin with.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Encoders Keep Getting Stronger</div>
+<p>
+The encoder remains an active battleground in 2024 to 2026. SigLIP (Zhai et al., 2023) replaced CLIP's softmax contrastive loss with a sigmoid loss that scales to larger batches and trains better encoders, and its SigLIP 2 successor (2025) is now a common drop-in for CLIP. DALL-E 3 (Betker et al., 2023) showed that the data side matters as much as the architecture: training on long, descriptive synthetic captions, rather than terse web alt-text, dramatically improved prompt following and shifted the bottleneck from the encoder to caption quality. Long-CLIP and related work extended CLIP's 77-token ceiling, the truncation problem from subsection 2, to hundreds of tokens. And the newest systems blur the encoder boundary entirely: rather than a separate frozen text tower, they let a multimodal language model produce the conditioning directly, which is the bridge to the token-based generation of <a href="section-34.4.html">Section 34.4</a>.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.1.1: Pooled Versus Per-Token <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Stable Diffusion conditions cross-attention on CLIP's per-token sequence, not the pooled vector, while DALL-E 2's unCLIP prior targets the pooled image embedding. (a) Explain why cross-attention needs the per-token sequence rather than a single summary vector, in terms of which word should influence which image region. (b) Give a concrete prompt where conditioning on only the pooled vector would lose information that the per-token sequence preserves. (c) SD3 uses the T5 per-token sequence for cross-attention but also injects the CLIP pooled vector as a global modulation signal; propose a reason both are useful at once.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.1.2: Building the Binding Probe <span class="exercise-type coding">Coding</span></div>
+<p>Using the zero-shot probe of subsection 4, build a quantitative attribute-binding test. Generate or collect 20 images, each with a known two-attribute caption (color A object X, color B object Y). For each image, score the correct caption against the attribute-swapped caption with CLIP and with a T5-based retrieval model (embed both and use cosine similarity). Report, for each encoder, the fraction of images where the correct caption wins and by what margin. Which encoder binds attributes more reliably, and does the margin predict the kind of generation failures discussed in this section?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.1.3: The Cost of Truncation <span class="exercise-type analysis">Analysis</span></div>
+<p>CLIP truncates at 77 tokens. Take a 120-token prompt that front-loads its subject and back-loads its style modifiers, then a second version that interleaves them. Tokenize both, count how many tokens survive truncation, and identify exactly which words are dropped in each ordering. Then generate from both with a CLIP-conditioned pipeline and describe how the truncation shows up in the images. What prompt-ordering rule does this suggest for CLIP-only models, and why does the rule become unnecessary for a T5-conditioned model?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 34: Text-to-Image Systems</a>
+<a href="index.html">Chapter 34</a>
+<a class="next" href="section-34.2.html">Section 34.2: Inside Stable Diffusion &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

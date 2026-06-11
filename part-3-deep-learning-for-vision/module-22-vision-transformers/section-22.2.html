@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.2: ViT: Images as Sequences of Patches. The patch embedding as a strided convolution, the learnable class token, positional embeddings, the encoder stack, and the classification head, assembled into a complete runnable Vision Transformer." name="description"/>
+<title>Section 22.2: ViT: Images as Sequences of Patches | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: Vision Transformers</a></div>
+<h1>ViT: Images as Sequences of Patches</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They handed me a sentence with no word order and asked me to translate it. So I stuck a little numbered sticker on every word. The stickers were the whole trick. Lose them and a cat becomes a bag of fur in random places."</p>
+<cite>A Positional Embedding That Refuses to Be Forgotten</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A Vision Transformer is the transformer encoder of <a href="section-22.1.html">Section 22.1</a> with exactly four additions in front of it: cut the image into fixed patches, linearly embed each patch into a token, prepend one learnable class token, and add positional embeddings so the model knows where each patch came from.</strong> Everything else is the stack of blocks you already built. The surprise of the 2020 ViT paper was how little had to change: a model designed for words, fed a sequence of "16x16 visual words", matched the best convolutional networks once it had enough data to compensate for the inductive bias it threw away. This section builds that model end to end and shows that its first layer, the patch embedding, is a convolution in disguise.</p>
+</div>
+
+<p>
+In <a href="section-22.1.html">Section 22.1</a> we built a transformer encoder that operates on any sequence of token vectors, and we deliberately left the tokens abstract. Now we make them concrete. The reader who has spent four chapters thinking in feature maps may find the move jarring: we are about to abandon the spatial grid and treat an image as a flat list. The payoff is that the global, content-dependent attention of the previous section can now relate any region of the image to any other in a single layer. The work of this section is the plumbing that connects pixels to that engine, and the central realization is that almost none of it is new.
+</p>
+
+<h2>1. The Patch Embedding: An Image Becomes a Sequence <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The transformer wants a sequence of vectors. An image is a grid of pixels. ViT bridges the two with the simplest possible idea: partition the image into a grid of non-overlapping square patches, and turn each patch into one token. For a $224 \times 224$ image and a patch size of $16$, the grid is $14 \times 14 = 196$ patches. Each patch holds $16 \times 16 \times 3 = 768$ raw pixel values; flatten that into a vector and pass it through a single learned linear layer to produce a $D$-dimensional token embedding (the base ViT uses $D = 768$). The result is a sequence of $196$ token vectors, exactly the input shape the encoder expects.
+</p>
+
+<p>
+Here is the elegant part. Flattening each non-overlapping patch and applying the same linear map to all of them is mathematically identical to a single convolution whose kernel size and stride both equal the patch size. The kernel is $16 \times 16$, it strides by $16$ so windows never overlap, and it has $D$ output channels. So the "patch embedding" is one strided convolution, the very operation from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>, and every modern implementation writes it that way because it is faster and cleaner than an explicit reshape. Figure 22.2.1 shows the transformation.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Image split into a grid of patches, each flattened and linearly projected into a sequence of token embeddings">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10px sans-serif;fill:#555;}
+.pgrid{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1;}
+.ptok{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.2;}
+.pproj{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.par{stroke:#777;stroke-width:1.5;marker-end:url(#pah);fill:none;}
+</style>
+<defs><marker id="pah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="pl" x="70" y="32" text-anchor="middle">image 224x224</text>
+<g>
+<rect class="pgrid" x="20" y="44" width="100" height="100"/>
+<line x1="45" y1="44" x2="45" y2="144" stroke="#2c6fb5" stroke-width="0.6"/>
+<line x1="70" y1="44" x2="70" y2="144" stroke="#2c6fb5" stroke-width="0.6"/>
+<line x1="95" y1="44" x2="95" y2="144" stroke="#2c6fb5" stroke-width="0.6"/>
+<line x1="20" y1="69" x2="120" y2="69" stroke="#2c6fb5" stroke-width="0.6"/>
+<line x1="20" y1="94" x2="120" y2="94" stroke="#2c6fb5" stroke-width="0.6"/>
+<line x1="20" y1="119" x2="120" y2="119" stroke="#2c6fb5" stroke-width="0.6"/>
+</g>
+<text class="ps" x="70" y="160" text-anchor="middle">14x14 grid of 16x16 patches</text>
+<line class="par" x1="124" y1="94" x2="172" y2="94"/>
+<text class="pl" x="148" y="82" text-anchor="middle">flatten</text>
+<rect class="ptok" x="176" y="60" width="22" height="14"/>
+<rect class="ptok" x="176" y="80" width="22" height="14"/>
+<rect class="ptok" x="176" y="100" width="22" height="14"/>
+<text class="ps" x="187" y="128" text-anchor="middle">768 px each</text>
+<line class="par" x1="202" y1="94" x2="250" y2="94"/>
+<rect class="pproj" x="252" y="64" width="74" height="60"/>
+<text class="pl" x="289" y="90" text-anchor="middle">linear</text>
+<text class="pl" x="289" y="105" text-anchor="middle">proj (=conv</text>
+<text class="ps" x="289" y="119" text-anchor="middle">16x16 stride16)</text>
+<line class="par" x1="328" y1="94" x2="376" y2="94"/>
+<rect class="ptok" x="380" y="64" width="26" height="13"/>
+<rect class="ptok" x="380" y="80" width="26" height="13"/>
+<rect class="ptok" x="380" y="96" width="26" height="13"/>
+<rect class="ptok" x="380" y="112" width="26" height="13"/>
+<text class="ps" x="393" y="142" text-anchor="middle">196 tokens</text>
+<text class="ps" x="393" y="156" text-anchor="middle">dim D=768</text>
+<line class="par" x1="410" y1="94" x2="452" y2="94"/>
+<rect class="pproj" x="456" y="50" width="30" height="13" fill="#f3e8fb" stroke="#8e44ad"/>
+<text class="ps" x="471" y="60" text-anchor="middle">[cls]</text>
+<rect class="ptok" x="456" y="68" width="30" height="13"/>
+<rect class="ptok" x="456" y="84" width="30" height="13"/>
+<rect class="ptok" x="456" y="100" width="30" height="13"/>
+<rect class="ptok" x="456" y="116" width="30" height="13"/>
+<text class="ps" x="471" y="146" text-anchor="middle">prepend</text>
+<text class="ps" x="471" y="158" text-anchor="middle">class token</text>
+<line class="par" x1="490" y1="90" x2="528" y2="90"/>
+<text class="pl" x="560" y="72" text-anchor="middle">+ position</text>
+<text class="pl" x="560" y="88" text-anchor="middle">embeddings</text>
+<line class="par" x1="600" y1="90" x2="640" y2="90"/>
+<text class="pl" x="668" y="94" text-anchor="middle">encoder</text>
+</svg>
+<figcaption><strong>Figure 22.2.1:</strong> From image to token sequence. The image is partitioned into a $14 \times 14$ grid of $16 \times 16$ patches; each is flattened and linearly projected (equivalently, a single $16 \times 16$ stride-16 convolution) into a $D$-dimensional token. A learnable class token is prepended and positional embeddings are added before the sequence enters the encoder.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PatchEmbed(nn.Module):
+    """Split an image into patches and embed each as a token. Implemented as a conv."""
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        self.num_patches = (img_size // patch_size) ** 2     # 14*14 = 196
+        # kernel == stride == patch_size -> non-overlapping patch projection
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):                       # x: (B, 3, 224, 224)
+        x = self.proj(x)                        # (B, 768, 14, 14)
+        x = x.flatten(2).transpose(1, 2)        # (B, 196, 768): tokens last but one
+        return x
+
+pe = PatchEmbed()
+print("token sequence:", pe(torch.randn(1, 3, 224, 224)).shape)
+# token sequence: torch.Size([1, 196, 768])</code></pre>
+<div class="code-caption">The patch embedding as a single strided convolution. The $14 \times 14$ spatial map of $768$-channel features is flattened into $196$ tokens, the exact sequence the encoder of Section 22.1 consumes.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Patch Size Is the One Real Hyperparameter of the Front End</div>
+<p>The patch size sets everything downstream. Smaller patches (say $8 \times 8$) give more tokens, finer spatial detail, and a quadratically larger attention cost; larger patches ($32 \times 32$) give a short, cheap sequence but a coarse view that blurs small objects. The base ViT's $16 \times 16$ is a deliberate middle. Notice that a patch ViT has almost no locality bias <em>within</em> a patch either: the pixels of one patch are mixed by a single linear layer with no notion of which pixel is next to which. This is the inductive bias the convolution had and the ViT gave up, traded for the global attention that follows.</p>
+</div>
+
+<h2>2. The Class Token and Positional Embeddings <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Two pieces of bookkeeping remain before the sequence is ready, and both fix problems created by the move to a token list. The first is the <strong>class token</strong>. After the encoder, we need a single vector to feed the classifier, but the encoder outputs one vector per patch. Rather than pool the patch outputs, ViT prepends an extra learnable token, the class token (often written <code>[cls]</code>), to the front of the sequence. It carries no image content at the start; it is just a learned parameter. As it passes through the encoder it attends to every patch, gathering a global summary, and its final state is the image representation handed to the classification head. It is a learnable placeholder that the network fills in with whatever global information the task needs.
+</p>
+
+<p>
+The second piece is <strong>positional embeddings</strong>, and they are not optional. Self-attention is permutation-invariant: shuffle the order of the tokens and the set of outputs is merely shuffled the same way, because attention treats its input as a set, not a sequence. That is fine for an unordered set, but an image is profoundly ordered; the patch in the top-left is not interchangeable with the one in the center. To restore spatial information, ViT adds a learned position vector to each token, one distinct vector per position. After this addition the token "knows" both what it contains and where it sits. The base ViT learns these position vectors directly as parameters; later designs use relative or 2D-aware schemes, but the principle is identical. Remove the positional embeddings and a ViT's accuracy collapses, because a cat reassembled from patches in random order is no longer a cat.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Because the positional embeddings are just learned vectors indexed by position, you can ask whether the model figured out the 2D layout on its own. The original ViT paper plotted the cosine similarity between learned position embeddings and found a striking result: each position's embedding is most similar to its spatial neighbors, forming a clear 2D grid pattern, even though the model was never told the patches came from a grid. The transformer rediscovered the geometry of the image from the supervised signal alone.</p>
+</div>
+
+<h2>3. Assembling the Full ViT <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+We now have every part: the patch embedding of subsection 1, the class token and positional embeddings of subsection 2, the transformer block of <a href="section-22.1.html">Section 22.1</a>, and a final linear classification head. Assembling them gives the complete ViT. The forward pass reads exactly like the figure: embed patches, prepend the class token, add positions, run the encoder, take the class token's output, normalize, and classify. The code below reuses the <code>TransformerBlock</code> from Section 22.1.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000,
+                 embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        n = self.patch_embed.num_patches
+        # learnable class token and (n+1) position embeddings
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n + 1, embed_dim))
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)                          # (B, 196, 768)
+        cls = self.cls_token.expand(B, -1, -1)           # (B, 1, 768)
+        x = torch.cat((cls, x), dim=1)                   # prepend -> (B, 197, 768)
+        x = x + self.pos_embed                           # add positions
+        for blk in self.blocks:
+            x = blk(x)                                   # L transformer blocks
+        x = self.norm(x)
+        return self.head(x[:, 0])                        # classify the class token
+
+vit = VisionTransformer()
+print("params (M):", round(sum(p.numel() for p in vit.parameters()) / 1e6, 1))
+# params (M): 86.6   (this is ViT-Base/16)
+print("logits:", vit(torch.randn(2, 3, 224, 224)).shape)  # torch.Size([2, 1000])</code></pre>
+<div class="code-caption">The complete ViT-Base/16. Twelve transformer blocks of width $768$ and twelve heads give roughly $86.6$ million parameters; only the class token's output (<code>x[:, 0]</code>) reaches the classification head.</div>
+
+<p>
+That is the entire architecture. The parameter count of about $86.6$ million is dominated by the twelve blocks, each carrying four projection matrices for attention and two large MLP matrices, exactly the per-block budget you can derive from <a href="section-22.1.html">Section 22.1</a>. There is no pyramid, no pooling between stages, and no resolution change anywhere: every block sees the same $197$ tokens at the same width. That uniformity is part of the appeal (it makes scaling clean, as we will see in <a href="section-22.5.html">Section 22.5</a>) and part of the inefficiency that <a href="section-22.4.html">Section 22.4</a> sets out to fix.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained ViT in Three Lines</div>
+<p>The roughly forty lines above (plus the Section 22.1 block) teach the architecture. To actually use a ViT, you load a pretrained one from <code>timm</code>, which gives you the topology, ImageNet weights, and the exact preprocessing transform in three lines:</p>
+<pre><code class="language-python">import timm
+model = timm.create_model("vit_base_patch16_224", pretrained=True).eval()
+# the matching preprocessing (resize, crop, normalize) the weights expect:
+cfg = timm.data.resolve_data_config({}, model=model)
+transform = timm.data.create_transform(**cfg)
+# logits = model(transform(pil_image).unsqueeze(0))</code></pre>
+<div class="code-caption">Loading a pretrained ViT-Base/16 from <code>timm</code>. <code>create_model</code> brings the topology and ImageNet weights; <code>resolve_data_config</code> plus <code>create_transform</code> reconstruct the exact resize, crop, and normalization those weights were trained with.</div>
+<p>The library handles the weight download, the class-token and position-embedding initialization, the patch-embedding convolution, and the preprocessing pipeline tied to those weights. As in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, getting the preprocessing exactly right is the difference between sensible logits and garbage, and <code>resolve_data_config</code> removes that risk. <code>timm</code> exposes hundreds of ViT, DeiT, and Swin variants through the same interface.</p>
+</div>
+
+<h2>4. What the Encoder Actually Learns <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+It is natural to worry that a model with no locality bias would learn nothing sensible, yet trained ViTs develop structure that mirrors what CNNs learn, only reached differently. Analyses of trained ViTs (and the attention-rollout visualizations that aggregate attention across layers) show three consistent findings. First, lower blocks tend to attend locally, the model rediscovers that nearby patches are relevant, even though it could attend anywhere; higher blocks attend globally, relating distant regions. Second, the class token's attention in the final layers concentrates on the patches that actually contain the object, which is why those maps double as a rough, free segmentation. Third, the learned position embeddings encode the 2D grid, as the fun fact above noted.
+</p>
+
+<p>
+The practical lesson is that the inductive biases a CNN has built in, a ViT must learn, and it <em>can</em> learn them given enough data, but the words "enough data" are doing heavy lifting. That phrase is the entire subject of the next section. The decision of when to reach for a ViT therefore comes down to a question this section cannot answer alone: do you have, or can you borrow through pretraining, the data scale that lets the model learn the structure it was not given? Figure 22.2.1 and the code give you the architecture; <a href="section-22.3.html">Section 22.3</a> gives you the recipe that makes it trainable on the data most teams actually have.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Free Segmentation From the Attention Map</div>
+<p><strong>Who:</strong> a solo researcher building a wildlife camera-trap triage tool, 2024. <strong>Situation:</strong> she had a ViT classifier that told her whether a frame contained an animal, but the product team also wanted a rough bounding box to crop thumbnails, and there was no budget to label boxes. <strong>Problem:</strong> training a separate detector needed annotations she did not have. <strong>Decision:</strong> instead of new labels, she extracted the class token's attention weights over the patch tokens from the last encoder block, reshaped the $196$ weights back into the $14 \times 14$ grid, upsampled it to the image size, and thresholded it into a coarse mask. <strong>Result:</strong> the attention heatmap reliably lit up on the animal, giving a usable crop box for free, with zero extra training, because the class token had learned to attend to the object in order to classify it. <strong>Lesson:</strong> the attention map is not just an interpretability toy; the same mechanism that makes ViTs classify produces a spatial saliency signal you can reuse, a preview of the foreground discovery that self-supervised ViTs in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> push much further.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Cleaner Attention With Register Tokens</div>
+<p>Those tidy attention maps have a known flaw. Darcet et al., "Vision Transformers Need Registers" (ICLR 2024, arXiv:2309.16588), showed that trained ViTs sometimes dump high-norm "artifact" values into a few low-information background tokens, using them as scratch memory, which pollutes the attention maps with bright spots that have nothing to do with objects. Their fix is disarmingly simple: add a handful of extra learnable tokens (called <em>registers</em>), much like the class token, that give the model dedicated scratch space. The artifact tokens disappear, the attention maps become clean again, and downstream dense-prediction performance improves. It is a 2024 reminder that even a five-year-old architecture has subtle behaviors still being understood, and that small structural additions, the class token, registers, can change what the model does with its capacity.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.2.1: Why Positional Embeddings Cannot Be Skipped <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Argue precisely why self-attention is permutation-invariant by considering what happens to the formula $\text{softmax}(QK^\top/\sqrt{d_k})V$ if you permute the rows of the input sequence. Then explain, in terms of this invariance, why a ViT without positional embeddings would give the same prediction for an image and for a version of that image whose patches have been shuffled. Finally, contrast this with a CNN: does a convolution have the same blind spot, and why or why not? Refer to the weight-sharing and locality discussion of <a href="section-22.1.html">Section 22.1</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.2.2: Vary the Patch Size <span class="exercise-type coding">Coding</span></div>
+<p>Instantiate three ViTs from the code above with patch sizes $8$, $16$, and $32$ on a $224 \times 224$ input. For each, print the number of tokens, the total parameter count, and a rough estimate of the per-layer attention score-matrix size ($N^2$). Then run a forward pass on a single random image and time it (use <code>time.perf_counter</code>, averaged over several runs). Tabulate tokens, parameters, and latency, and write two sentences relating the patch size to the cost-versus-detail trade-off described in the Key Insight of subsection 1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 22.2.3: Read the Class-Token Attention <span class="exercise-type analysis">Analysis</span></div>
+<p>Load a pretrained <code>vit_base_patch16_224</code> from <code>timm</code> using the library shortcut, run it on a clear single-object photograph, and extract the attention weights from the class token to the $196$ patch tokens in the final block (you may need a forward hook on the attention module). Reshape the weights to $14 \times 14$, upsample to the image size, and overlay the heatmap on the photo. Discuss in a short paragraph whether the bright region falls on the object, how this relates to the camera-trap example of subsection 4, and one way the register-token finding from the Research Frontier callout might change what you see.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-22.1.html">&#8592; Section 22.1: Attention &amp; the Transformer Block</a>
+<a href="index.html">Chapter 22</a>
+<a class="next" href="section-22.3.html">Section 22.3: Data-Efficient Training: DeiT &amp; Augmentation for ViTs &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

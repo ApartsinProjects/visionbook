@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.5: Open-Vocabulary Detection &amp; Segmentation. Carrying CLIP's open vocabulary into dense prediction: region-text alignment for open-vocabulary detectors, language-driven segmentation, the Segment Anything Model as a promptable mask primitive, and grounded detect-then-segment pipelines." name="description"/>
+<title>Section 25.5: Open-Vocabulary Detection &amp; Segmentation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models</a></div>
+<h1>Open-Vocabulary Detection &amp; Segmentation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The old detector knew exactly eighty things and was magnificently helpless about the eighty-first. The new one does not have a list. You name the thing, in whatever words you like, and it goes and finds it. I find this both liberating and faintly terrifying."</p>
+<cite>A Detector That Lost Its Fixed Category List</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Classical detectors and segmenters were locked to a fixed list of categories chosen at training time. Open-vocabulary models break that lock by replacing the fixed classification head with an alignment to CLIP-style text embeddings, so any phrase you can write becomes a category the model can localize.</strong> The same shared image-text space that gave CLIP zero-shot classification gives detectors and segmenters an open vocabulary: a region of an image is matched against the embedding of an arbitrary text query rather than against a fixed set of class weights. Layered on top is the Segment Anything Model, a promptable mask primitive that outputs a mask for any object you point at. Together they let a pipeline detect and segment anything you can name, the dense-prediction payoff of language supervision.</p>
+</div>
+
+<p>
+In <a href="section-25.4.html">Section 25.4</a> CLIP turned a text prompt into an image classifier. This section carries that idea into the dense tasks of <a href="../module-23-object-detection/index.html">Chapter 23</a> and <a href="../module-24-segmentation/index.html">Chapter 24</a>. We will see how a detector aligns each candidate region to text embeddings so its vocabulary becomes open, how segmentation follows the same recipe at the pixel level, and how the Segment Anything Model reframes segmentation as a promptable primitive trained on a billion masks. We will then assemble the grounded detect-then-segment pipeline that has become a default tool. The thread that began with hand-drawn boxes and masks ends with a system you steer by typing a phrase, and it sets up the foundation-model landscape of <a href="section-25.6.html">Section 25.6</a>.
+</p>
+
+<h2>1. From a Fixed Head to Text Embeddings <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Recall how a closed-vocabulary detector classifies a region in <a href="../module-23-object-detection/index.html">Chapter 23</a>: a region feature vector is multiplied by a fixed classification weight matrix, one column per known class, and a softmax picks the class. The matrix has exactly $C$ columns, so the detector can only ever name $C$ things; the eighty-first category does not exist because there is no eighty-first column. The open-vocabulary move is to <strong>replace that fixed weight matrix with text embeddings</strong>. Encode each candidate category name with a CLIP text encoder, and use those text vectors as the classification weights. Now adding a category means adding a sentence, not retraining a head, exactly the zero-shot trick of <a href="section-25.4.html">Section 25.4</a> moved from whole images to regions.
+</p>
+
+<p>
+Concretely, if a region produces a feature $r \in \mathbb{R}^d$ projected into the CLIP space and the candidate categories have text embeddings $t_1, \ldots, t_K$, the region's class scores are the similarities
+</p>
+
+<div class="math-block">
+$$s_k = \frac{r^\top t_k}{\|r\|\,\|t_k\|}, \qquad k = 1, \ldots, K$$
+</div>
+
+<p>
+and the region is assigned the highest-scoring category (or labeled background if no score clears a threshold). The number of categories $K$ is whatever you supply at inference time. Figure 25.5.1 contrasts the closed head with the open one.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Closed-vocabulary detector uses a fixed C-column weight matrix; open-vocabulary detector compares region features to text embeddings of arbitrary category names">
+<style>
+.ol{font:12px sans-serif;fill:#1a1a1a;}
+.os{font:10px sans-serif;fill:#555;}
+.ot{font:13px sans-serif;font-weight:bold;fill:#1a1a1a;}
+.oreg{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.ofix{fill:#f0e0e0;stroke:#c0392b;stroke-width:1.5;}
+.otxt{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.oar{stroke:#777;stroke-width:1.4;marker-end:url(#oah);fill:none;}
+</style>
+<defs><marker id="oah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="ot" x="150" y="24" text-anchor="middle">Closed vocabulary</text>
+<rect class="oreg" x="40" y="60" width="74" height="40"/>
+<text class="ol" x="77" y="84" text-anchor="middle">region feat</text>
+<line class="oar" x1="114" y1="80" x2="158" y2="80"/>
+<rect class="ofix" x="160" y="55" width="94" height="50"/>
+<text class="ol" x="207" y="76" text-anchor="middle">fixed head</text>
+<text class="os" x="207" y="92" text-anchor="middle">C columns</text>
+<text class="os" x="150" y="138" text-anchor="middle">can only name C classes;</text>
+<text class="os" x="150" y="154" text-anchor="middle">class 81 does not exist</text>
+<line x1="300" y1="20" x2="300" y2="240" stroke="#ccc" stroke-width="1"/>
+<text class="ot" x="510" y="24" text-anchor="middle">Open vocabulary</text>
+<rect class="oreg" x="340" y="60" width="74" height="40"/>
+<text class="ol" x="377" y="84" text-anchor="middle">region feat</text>
+<line class="oar" x1="414" y1="80" x2="452" y2="80"/>
+<rect class="otxt" x="454" y="45" width="190" height="22"/>
+<text class="os" x="549" y="60" text-anchor="middle">"a sea otter"  -&gt; text emb</text>
+<rect class="otxt" x="454" y="71" width="190" height="22"/>
+<text class="os" x="549" y="86" text-anchor="middle">"a rusty bicycle" -&gt; text emb</text>
+<rect class="otxt" x="454" y="97" width="190" height="22"/>
+<text class="os" x="549" y="112" text-anchor="middle">any phrase -&gt; text emb</text>
+<text class="os" x="510" y="150" text-anchor="middle">score = region . text;</text>
+<text class="os" x="510" y="166" text-anchor="middle">vocabulary set at inference</text>
+</svg>
+<figcaption><strong>Figure 25.5.1:</strong> Closed versus open vocabulary. A classical detector multiplies each region feature by a fixed classification matrix with one column per known class, so the vocabulary is frozen at training. An open-vocabulary detector projects regions into the CLIP space and scores them against text embeddings of arbitrary category names, so the vocabulary is whatever phrases you provide at inference.</figcaption>
+</figure>
+
+<p>
+Models like ViLD, RegionCLIP, OWL-ViT, and Grounding DINO implement variants of this region-text alignment, differing mainly in how they obtain good region features and how they train the alignment (distilling from CLIP, or training on grounded image-text data that ties phrases to boxes). The detection mechanics, region proposals, the set-prediction transformer decoder, are the ones you built in <a href="../module-23-object-detection/index.html">Chapter 23</a>; only the classification step changed.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Open Vocabulary Is Just the CLIP Trick on Regions</div>
+<p>There is no new principle here beyond <a href="section-25.4.html">Section 25.4</a>. Zero-shot classification compared a whole image to text embeddings; open-vocabulary detection compares a region to text embeddings; open-vocabulary segmentation compares a pixel or mask to text embeddings. The unit of comparison shrinks from image to region to pixel, but the move is identical: throw away the fixed classification head and align visual features to a shared space with language. Once you see this, every open-vocabulary system in the literature reads as the same idea applied at a different spatial granularity.</p>
+</div>
+
+<h2>2. Open-Vocabulary and Promptable Segmentation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Segmentation gets the same treatment, at the pixel level. Language-driven segmenters (LSeg, and the open-vocabulary mask transformers that followed) compute a per-pixel or per-mask embedding in the CLIP space and label each by similarity to text queries, so you can segment "the wooden chair" without that class ever appearing in a training mask. The mask-transformer machinery of <a href="../module-24-segmentation/index.html">Chapter 24</a> supplies the masks; the text alignment supplies the open vocabulary.
+</p>
+
+<p>
+A different and hugely influential idea arrived with the <strong>Segment Anything Model</strong> (SAM, Kirillov et al., 2023). SAM does not classify at all. It is a <em>promptable</em> segmenter: given an image and a prompt (a click point, a box, or a rough mask), it outputs a high-quality mask for the object indicated by the prompt. It was trained on SA-1B, a dataset of 1.1 billion masks built with a data engine in which the model itself proposed masks that annotators refined, bootstrapping to a scale no manual effort could reach. Because the prompt rather than a label specifies the target, SAM segments objects it was never told the names of; it is a segmentation foundation model, a reusable primitive rather than a task-specific network. Figure 25.5.2 shows its three-part architecture.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SAM architecture: a heavy image encoder run once, a light prompt encoder for points or boxes, and a fast mask decoder combining them into a mask">
+<style>
+.sl{font:12px sans-serif;fill:#1a1a1a;}
+.ss{font:10px sans-serif;fill:#555;}
+.simg{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.sprompt{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.sdec{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.smask{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.sar{stroke:#777;stroke-width:1.4;marker-end:url(#sah);fill:none;}
+</style>
+<defs><marker id="sah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="simg" x="30" y="40" width="110" height="46"/>
+<text class="sl" x="85" y="60" text-anchor="middle">image encoder</text>
+<text class="ss" x="85" y="76" text-anchor="middle">heavy, run ONCE</text>
+<rect class="sprompt" x="30" y="140" width="110" height="46"/>
+<text class="sl" x="85" y="160" text-anchor="middle">prompt encoder</text>
+<text class="ss" x="85" y="176" text-anchor="middle">light: point/box</text>
+<line class="sar" x1="140" y1="63" x2="300" y2="100"/>
+<line class="sar" x1="140" y1="163" x2="300" y2="120"/>
+<rect class="sdec" x="302" y="85" width="120" height="50"/>
+<text class="sl" x="362" y="106" text-anchor="middle">mask decoder</text>
+<text class="ss" x="362" y="122" text-anchor="middle">fast, milliseconds</text>
+<line class="sar" x1="422" y1="110" x2="470" y2="110"/>
+<rect class="smask" x="472" y="85" width="90" height="50"/>
+<text class="sl" x="517" y="114" text-anchor="middle">mask</text>
+<text class="ss" x="620" y="100" text-anchor="middle">re-prompt without</text>
+<text class="ss" x="620" y="116" text-anchor="middle">re-encoding image</text>
+<text class="ss" x="362" y="170" text-anchor="middle">interactive: many prompts share one image embedding</text>
+</svg>
+<figcaption><strong>Figure 25.5.2:</strong> The Segment Anything Model. A heavy image encoder runs once per image to produce an embedding; a lightweight prompt encoder turns points or boxes into tokens; a fast mask decoder combines them into a mask in milliseconds. Because the expensive encoding is amortized, you can re-prompt the same image interactively without recomputing the image embedding, the design that makes SAM feel real-time.</figcaption>
+</figure>
+
+<p>
+SAM's design choice that makes it usable interactively is the split: the expensive image encoder runs once, and every subsequent prompt only invokes the cheap decoder, so a user can click around an image and get instant masks. The code below shows the prompt-and-mask loop with the reference implementation.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from segment_anything import sam_model_registry, SamPredictor
+
+sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h.pth")
+predictor = SamPredictor(sam)
+predictor.set_image(image_rgb)               # heavy encoder runs ONCE here
+
+# Now prompt as many times as you like; each call uses only the fast decoder.
+point = np.array([[420, 310]])               # one (x, y) click on the target object
+label = np.array([1])                        # 1 = foreground point, 0 = background
+masks, scores, _ = predictor.predict(
+    point_coords=point, point_labels=label,
+    multimask_output=True,                   # return 3 candidate masks at different scales
+)
+best = masks[scores.argmax()]                # pick the highest-confidence mask
+print("masks returned:", masks.shape[0], "| best mask covers", int(best.sum()), "pixels")
+# masks returned: 3 | best mask covers 18742 pixels</code></pre>
+<div class="code-caption">SAM in use. <code>set_image</code> pays the one-time encoding cost; each <code>predict</code> call with a point or box prompt is fast because only the mask decoder runs. <code>multimask_output</code> returns several masks at different scales to resolve the ambiguity of a single click (the whole person, the shirt, or a button).</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>SAM's training set, SA-1B, contains 1.1 billion masks, more segmentation masks than the entire field had produced in its prior history combined. They were not drawn by hand. A data engine ran in three stages: annotators corrected SAM's masks, then SAM proposed masks and annotators only added missed objects, then SAM ran fully automatically and humans merely audited. The model trained the data that trained the model, a bootstrapping loop that is now a standard recipe for building foundation-scale datasets, and a preview of the generative data engines of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<h2>3. Grounded Pipelines: Detect, Then Segment <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+SAM is powerful but, as the section noted, it does not know category names; it segments what you point at. An open-vocabulary detector knows names but outputs boxes, not pixel-precise masks. The natural and now ubiquitous combination is to chain them: an open-vocabulary detector (commonly Grounding DINO) takes a text query, finds the boxes of every matching object, and feeds those boxes as prompts to SAM, which returns clean masks. The result, often called Grounded SAM, lets you type a phrase and get pixel-accurate masks of everything matching it, with no task-specific training. This composition is the practical face of the whole chapter: foundation models as interoperable primitives.
+</p>
+
+<pre><code class="language-python"># Conceptual pipeline: text query -> open-vocab boxes -> SAM masks.
+# (Using grounded-sam style components; APIs vary by package version.)
+text_query = "every dog . a red frisbee ."        # period-separated phrases, open vocabulary
+
+# 1) Open-vocabulary detection: phrase -> boxes (region-text alignment of Section 1).
+boxes, phrases, confidences = grounding_dino.predict(image_rgb, text_query)
+
+# 2) Promptable segmentation: each detected box becomes a SAM box-prompt.
+predictor.set_image(image_rgb)                      # encode image once
+masks = []
+for box in boxes:
+    m, scores, _ = predictor.predict(box=box, multimask_output=False)
+    masks.append(m[0])
+
+print(f"query matched {len(boxes)} objects: {phrases}")
+# query matched 3 objects: ['a dog', 'a dog', 'a red frisbee']</code></pre>
+<div class="code-caption">The Grounded SAM detect-then-segment pipeline. Grounding DINO turns the open-vocabulary text query into boxes via the region-text alignment of subsection 1; each box prompts SAM for a pixel-accurate mask. No category list and no task-specific training are involved.</div>
+
+<p>
+The practical example below shows a team replacing a brittle, labeled-from-scratch segmentation project with exactly this composition.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Auto-Labeling a Segmentation Dataset Overnight</div>
+<p><strong>Who:</strong> a robotics startup, 2023, building a bin-picking system that needed pixel masks for roughly two hundred warehouse object types. <strong>Situation:</strong> their plan was to hand-annotate masks, but a pilot showed that masking two hundred categories across enough images would take their small annotation team many months. <strong>Problem:</strong> they had the images and a text list of the object types, but no masks and no time to draw them. <strong>Decision:</strong> they ran a Grounded SAM pipeline, feeding each object type as a text query to an open-vocabulary detector and the resulting boxes to SAM, producing candidate masks automatically. Annotators then only <em>reviewed and corrected</em> the machine-generated masks instead of drawing from scratch, the same data-engine loop SAM itself was trained with. <strong>Result:</strong> the first full pass of masks across the dataset finished in a single overnight run; human review and correction took days rather than months, and the corrected masks were used to fine-tune a small, fast in-house segmenter for deployment on the robot. <strong>Lesson:</strong> foundation models are most valuable not as the final deployed model (too large for an edge robot) but as a <em>labeling engine</em> that bootstraps a smaller specialist. Open vocabulary plus promptable segmentation turned a months-long labeling project into an overnight job plus a review pass.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Grounded SAM in a Few Lines</div>
+<p>The detect-then-segment composition is packaged end to end. Through Hugging Face, Grounding DINO and SAM each load with an <code>AutoModel</code>, and the autogenerated mask pipeline collapses the loop above:</p>
+<pre><code class="language-python">from transformers import pipeline
+# Open-vocabulary detection then mask generation, two pretrained models, no training:
+detector = pipeline(model="IDEA-Research/grounding-dino-tiny", task="zero-shot-object-detection")
+detections = detector(image, candidate_labels=["a dog", "a red frisbee"])
+# Each detection's box can be passed to a SAM pipeline for a pixel-accurate mask.</code></pre>
+<p>This replaces the two model downloads, the box-to-prompt plumbing, and the per-object decoder loop with a couple of calls, and the library handles tokenization, box decoding, and preprocessing. SAM's own automatic mask generator (<code>SamAutomaticMaskGenerator</code>) similarly segments every object in an image with one call. The explicit pipeline above exists so you understand which model supplies the names and which supplies the pixels.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: SAM 2, Faster Detectors, and Unified Models</div>
+<p>The open-vocabulary frontier in 2024 to 2026 moves on three fronts. SAM 2 (Ravi et al., 2024) extends promptable segmentation to video with a streaming memory, so a single click tracks an object across frames, the bridge into the video understanding of <a href="../module-26-video-understanding/index.html">Chapter 26</a>. Real-time open-vocabulary detectors such as YOLO-World push region-text alignment to the speeds the deployment chapter cares about, narrowing the gap between foundation-model flexibility and edge-model latency. And a unification trend is folding detection, segmentation, and grounding into single models conditioned on text, often built on the SigLIP encoders of <a href="section-25.4.html">Section 25.4</a> and increasingly invoked as tools by multimodal language models that decide what to detect or segment from a conversation. The open question is whether the future is many specialized foundation primitives composed in pipelines, as in this section, or one model that does everything, which we take up in <a href="section-25.6.html">Section 25.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.1: The One Move Behind Open Vocabulary <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The Key Insight claims open-vocabulary classification, detection, and segmentation are the same move at different spatial scales. For each of the three, state precisely what the unit of comparison is (image, region, pixel or mask) and what it is compared against, and identify the single component that is removed relative to the closed-vocabulary version. Then explain why SAM does <em>not</em> fit this pattern, and what it provides instead.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.2: Build a Grounded SAM Pipeline <span class="exercise-type coding">Coding</span></div>
+<p>Using the library shortcut, build a pipeline that takes an image and a free-text query, detects matching objects with an open-vocabulary detector, and produces a pixel mask for each with SAM. Run it on three images with queries the models were not specifically trained on (for example "the leftmost potted plant"). Report how many objects were found and overlay the masks. Then write one paragraph on a failure case you observe and whether it originates in the detector (wrong or missing box) or in SAM (box correct but mask poor), connecting the diagnosis to the two-stage structure.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.5.3: Foundation Model as Labeling Engine <span class="exercise-type analysis">Analysis</span></div>
+<p>The robotics practical example used a foundation model to label data for a smaller deployed model rather than deploying the foundation model itself. Analyze this decision: list three reasons the foundation model was unsuitable for direct deployment on the robot, and three reasons it was nonetheless valuable as a labeling engine. Then describe the failure mode of trusting auto-generated masks without human review, and explain why the review-and-correct loop (rather than fully automatic labeling) is the safe operating point, connecting it to the SAM data engine described in the Fun Fact.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.4.html">&#8592; Section 25.4: CLIP: Language as Supervision</a>
+<a href="index.html">Chapter 25</a>
+<a class="next" href="section-25.6.html">Section 25.6: The Vision Foundation Model Landscape &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.2: Export &amp; Runtimes. ONNX as the portable model graph, what an inference compiler does (operator fusion, kernel autotuning, precision calibration), and the two dominant hardware runtimes: TensorRT for NVIDIA GPUs and OpenVINO for Intel CPUs and accelerators." name="description"/>
+<title>Section 28.2: Export &amp; Runtimes: ONNX, TensorRT &amp; OpenVINO | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a></div>
+<h1>Export &amp; Runtimes: ONNX, TensorRT &amp; OpenVINO</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"In the lab they called me a model. The compiler called me a graph, fused half my layers into each other, picked different kernels for a GPU I had never met, and handed back something three times faster that I no longer fully recognized. I have made my peace with being optimized."</p>
+<cite>A Trained Network, Recently Compiled</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A trained model and a deployable model are different artifacts: the first is a PyTorch object that runs eagerly under the Python interpreter, the second is a compiled graph fused and tuned for one specific piece of hardware.</strong> The bridge between them is an export format, ONNX, that captures the model as a portable computation graph independent of the framework that built it, plus a runtime that compiles that graph for the target. This section explains what a compiler actually does to make a graph fast (it fuses operators, autotunes kernels, and calibrates precision), then walks the two runtimes that matter most: TensorRT for NVIDIA GPUs and OpenVINO for Intel CPUs and accelerators. The compressed model of <a href="section-28.1.html">Section 28.1</a> only realizes its promised speed once it passes through this stage.</p>
+</div>
+
+<p>
+In <a href="section-28.1.html">Section 28.1</a> we shrank a model but left it as a PyTorch <code>nn.Module</code>. That object is convenient for research and slow for production: every operation dispatches through Python, kernels are chosen generically, and intermediate tensors are written to and read from memory between every layer. Production wants the opposite of all three. This section is about getting there. We first separate the model from its framework with ONNX, then hand the ONNX graph to a runtime that compiles it. By the end you will be able to take any model from this book, a classifier from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, a detector from <a href="../module-23-object-detection/index.html">Chapter 23</a>, or a Vision Transformer from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, and turn it into an engine that runs several times faster than the eager version, on the specific chip you are deploying to.
+</p>
+
+<h2>1. The Problem: Framework Is Not Runtime <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+You train in a framework (PyTorch, in this book) because frameworks are built for iteration: dynamic graphs, automatic differentiation, easy debugging. None of that helps at inference, and some of it actively hurts. At inference there are no gradients, the graph is fixed, and the only thing that matters is pushing inputs through to outputs as fast as possible on the deployment hardware. The deployment hardware, meanwhile, is rarely the workstation you trained on; it might be a different GPU, a server CPU, an embedded module, or a phone, each with its own optimal way to execute the same mathematics.
+</p>
+
+<p>
+The solution is a two-layer separation, shown in Figure 28.2.1. A portable <strong>interchange format</strong> captures the trained model as a hardware-agnostic computation graph: a list of operators (convolution, matmul, add, relu) and the tensors flowing between them. A hardware-specific <strong>runtime</strong> then consumes that graph and compiles it into an executable optimized for one target. The interchange format means you export once and deploy many places; the runtime means each place runs the model the way that place runs best. ONNX is the dominant interchange format, and each major hardware vendor ships a runtime that consumes it.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A trained model exports once to ONNX then compiles to several hardware-specific runtimes">
+<style>
+.x2ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.x2lbl{font:12px sans-serif;fill:#1a1a1a;}
+.x2sm{font:10.5px sans-serif;fill:#555;}
+.x2train{fill:#efe7fb;stroke:#7a4fb5;stroke-width:1.4;}
+.x2onnx{fill:#fff3da;stroke:#d6a52b;stroke-width:1.6;}
+.x2rt{fill:#e7f1fb;stroke:#2c6fb5;stroke-width:1.4;}
+.x2hw{fill:#e9f6ec;stroke:#3a9d52;stroke-width:1.2;}
+.x2ar{stroke:#888;stroke-width:1.6;marker-end:url(#x2a);fill:none;}
+</style>
+<defs><marker id="x2a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#888"/></marker></defs>
+<text class="x2ttl" x="360" y="22" text-anchor="middle">Export once, compile per target</text>
+<rect class="x2train" x="40" y="50" width="150" height="60" rx="6"/>
+<text class="x2lbl" x="115" y="76" text-anchor="middle">PyTorch model</text>
+<text class="x2sm" x="115" y="94" text-anchor="middle">eager, with autograd</text>
+<line class="x2ar" x1="190" y1="80" x2="270" y2="80"/>
+<rect class="x2onnx" x="272" y="50" width="150" height="60" rx="6"/>
+<text class="x2lbl" x="347" y="76" text-anchor="middle">ONNX graph</text>
+<text class="x2sm" x="347" y="94" text-anchor="middle">portable, framework-free</text>
+<!-- fan-out to three runtimes -->
+<line class="x2ar" x1="422" y1="70" x2="510" y2="150"/>
+<line class="x2ar" x1="422" y1="80" x2="510" y2="210"/>
+<line class="x2ar" x1="422" y1="90" x2="510" y2="270"/>
+<rect class="x2rt" x="512" y="128" width="170" height="44" rx="5"/>
+<text class="x2sm" x="597" y="146" text-anchor="middle">TensorRT</text>
+<text class="x2sm" x="597" y="162" text-anchor="middle">NVIDIA GPU</text>
+<rect class="x2rt" x="512" y="188" width="170" height="44" rx="5"/>
+<text class="x2sm" x="597" y="206" text-anchor="middle">OpenVINO</text>
+<text class="x2sm" x="597" y="222" text-anchor="middle">Intel CPU / iGPU / NPU</text>
+<rect class="x2rt" x="512" y="248" width="170" height="44" rx="5"/>
+<text class="x2sm" x="597" y="266" text-anchor="middle">ONNX Runtime / mobile</text>
+<text class="x2sm" x="597" y="282" text-anchor="middle">CPU, Core ML, TFLite</text>
+</svg>
+<figcaption><strong>Figure 28.2.1:</strong> The export-and-runtime pipeline. A trained PyTorch model is exported once to the framework-agnostic ONNX graph, which is then compiled by a hardware-specific runtime: TensorRT for NVIDIA GPUs, OpenVINO for Intel hardware, and ONNX Runtime or the mobile runtimes elsewhere. Export once, compile per target.</figcaption>
+</figure>
+
+<h2>2. ONNX: The Portable Graph <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+ONNX (Open Neural Network Exchange) is a serialization format for a computation graph plus its trained weights. Its operator set is a versioned, standardized vocabulary, so a <code>Conv</code> node means the same thing whether PyTorch, TensorFlow, or scikit-learn produced it. PyTorch exports to ONNX by <em>tracing</em>: it runs a forward pass with an example input, records every operator the tensors flow through, and writes that recorded graph to a file. Because the export is a trace, the example input's shape matters, and any control flow that depends on the data (a Python <code>if</code> branching on a tensor value) is captured only for the path the trace happened to take. This is why exportable inference code avoids data-dependent branching, a discipline that pays off across every runtime. The export call is short.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.models import resnet18, ResNet18_Weights
+
+model = resnet18(weights=ResNet18_Weights.DEFAULT).eval()
+example = torch.randn(1, 3, 224, 224)
+
+# torch.onnx.export traces a forward pass and writes the graph + weights.
+torch.onnx.export(
+    model, example, "resnet18.onnx",
+    input_names=["input"], output_names=["logits"],
+    # Mark axis 0 dynamic so the engine accepts any batch size at runtime.
+    dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+    opset_version=17,                  # the operator-set version to target
+)
+print("wrote resnet18.onnx")
+
+# Validate the graph and check numerical agreement with PyTorch.
+import onnxruntime as ort, numpy as np
+sess = ort.InferenceSession("resnet18.onnx", providers=["CPUExecutionProvider"])
+ort_out = sess.run(None, {"input": example.numpy()})[0]
+torch_out = model(example).detach().numpy()
+print("max abs diff:", np.abs(ort_out - torch_out).max())   # max abs diff: ~1e-5</code></pre>
+<div class="code-caption">Exporting a ResNet-18 to ONNX and validating it. The <code>dynamic_axes</code> entry marks the batch dimension as variable so the compiled engine is not locked to batch size 1. The roughly 1e-5 maximum difference between ONNX Runtime and eager PyTorch confirms the export preserved the computation; a large difference here is the first sign of an export bug, always check it before trusting the engine.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Always Validate the Export Numerically</div>
+<p>The single most common deployment bug is a model that exports without error but computes something subtly different from the original, because of an unsupported operator that got replaced, a tracing branch that took the wrong path, or a preprocessing step that lived in Python and never made it into the graph. The defense is cheap and non-negotiable: run the same input through both the original and the exported model and assert the outputs agree to within a small tolerance, as the code above does. An export that passes this check is trustworthy; one that skips it is a latent production incident. The accuracy you measured in <a href="section-28.1.html">Section 28.1</a> only transfers to deployment if the exported graph is the model you measured.</p>
+</div>
+
+<h2>3. What a Compiler Actually Does <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A runtime does not just execute the ONNX graph node by node; it compiles it, and three optimizations do most of the speedup. Understanding them tells you why a compiled engine is faster and where the gains come from.
+</p>
+
+<p>
+<strong>Operator fusion</strong> merges adjacent operators into a single kernel. A convolution followed by a batch-norm followed by a ReLU is, in the eager graph, three operators that each read their input from memory and write their output back. Fused, they become one kernel that reads the input once, does all three computations in registers, and writes the result once. Because deep networks are usually memory-bandwidth bound (moving tensors costs more than the arithmetic on them), eliminating those intermediate memory trips is often the largest single win. The batch-norm of <a href="../module-21-training-recipes/index.html">Chapter 21</a> can even be folded entirely into the preceding convolution's weights at compile time, since at inference it is just an affine rescaling, removing it from the graph completely. Figure 28.2.2 shows the fusion.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three separate operators with memory round trips between them fuse into one kernel with a single read and write">
+<style>
+.f2ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.f2lbl{font:11.5px sans-serif;fill:#1a1a1a;}
+.f2sm{font:10px sans-serif;fill:#777;}
+.f2op{fill:#e7f1fb;stroke:#2c6fb5;stroke-width:1.3;}
+.f2fused{fill:#e9f6ec;stroke:#3a9d52;stroke-width:1.6;}
+.f2mem{fill:#fbe9d6;stroke:#d6802b;stroke-width:1;}
+.f2ar{stroke:#888;stroke-width:1.4;marker-end:url(#f2a);fill:none;}
+</style>
+<defs><marker id="f2a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+<text class="f2ttl" x="360" y="22" text-anchor="middle">Operator fusion removes intermediate memory traffic</text>
+<text class="f2lbl" x="200" y="52" text-anchor="middle">Before: 3 kernels, 4 memory trips</text>
+<rect class="f2op" x="40" y="64" width="70" height="40" rx="4"/><text class="f2sm" x="75" y="88" text-anchor="middle">Conv</text>
+<rect class="f2mem" x="118" y="72" width="40" height="24" rx="3"/><text class="f2sm" x="138" y="88" text-anchor="middle">mem</text>
+<rect class="f2op" x="166" y="64" width="70" height="40" rx="4"/><text class="f2sm" x="201" y="88" text-anchor="middle">BN</text>
+<rect class="f2mem" x="244" y="72" width="40" height="24" rx="3"/><text class="f2sm" x="264" y="88" text-anchor="middle">mem</text>
+<rect class="f2op" x="292" y="64" width="70" height="40" rx="4"/><text class="f2sm" x="327" y="88" text-anchor="middle">ReLU</text>
+<line class="f2ar" x1="110" y1="84" x2="118" y2="84"/>
+<line class="f2ar" x1="158" y1="84" x2="166" y2="84"/>
+<line class="f2ar" x1="236" y1="84" x2="244" y2="84"/>
+<line class="f2ar" x1="284" y1="84" x2="292" y2="84"/>
+<text class="f2lbl" x="200" y="150" text-anchor="middle">After: 1 fused kernel, 2 memory trips</text>
+<rect class="f2mem" x="60" y="164" width="40" height="24" rx="3"/><text class="f2sm" x="80" y="180" text-anchor="middle">in</text>
+<rect class="f2fused" x="118" y="158" width="180" height="36" rx="4"/><text class="f2sm" x="208" y="180" text-anchor="middle">Conv + BN + ReLU (one kernel)</text>
+<rect class="f2mem" x="316" y="164" width="40" height="24" rx="3"/><text class="f2sm" x="336" y="180" text-anchor="middle">out</text>
+<line class="f2ar" x1="100" y1="176" x2="118" y2="176"/>
+<line class="f2ar" x1="298" y1="176" x2="316" y2="176"/>
+<text class="f2sm" x="540" y="120" text-anchor="middle">Deep nets are usually</text>
+<text class="f2sm" x="540" y="136" text-anchor="middle">memory-bandwidth bound,</text>
+<text class="f2sm" x="540" y="152" text-anchor="middle">so removing memory trips</text>
+<text class="f2sm" x="540" y="168" text-anchor="middle">is the biggest single win.</text>
+</svg>
+<figcaption><strong>Figure 28.2.2:</strong> Operator fusion. The eager graph runs Conv, BatchNorm, and ReLU as three kernels, each reading from and writing to memory. The compiler fuses them into one kernel with a single input read and output write, eliminating the intermediate memory traffic that dominates the cost of memory-bandwidth-bound networks.</figcaption>
+</figure>
+
+<p>
+<strong>Kernel autotuning</strong> picks the fastest implementation of each operator for the specific hardware. There are many ways to compute a convolution (direct, im2col-plus-matmul, Winograd, FFT-based, and several tiled GPU variants), and which is fastest depends on the layer's shape and the chip's cache sizes and core layout. TensorRT, during its build step, actually benchmarks several candidate kernels for each layer on the real device and keeps the winner. This is why building a TensorRT engine takes minutes and why the engine is tied to the exact GPU it was built on; the autotuning baked in choices specific to that silicon.
+</p>
+
+<p>
+<strong>Precision calibration</strong> is the runtime-side half of the quantization from <a href="section-28.1.html">Section 28.1</a>. Given a calibration dataset, the runtime measures activation ranges and chooses per-tensor scales so it can run layers in int8 (or FP16, or FP8 on newer hardware) while keeping accuracy. The runtime decides per layer whether the speed gain of lower precision is worth the accuracy cost, sometimes keeping a few sensitive layers in higher precision, a mixed-precision plan you could not easily hand-tune.
+</p>
+
+<h2>4. TensorRT: The NVIDIA GPU Runtime <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+TensorRT is NVIDIA's inference compiler and runtime. It takes an ONNX graph (or a framework model through a plugin) and builds an <em>engine</em>: a serialized, hardware-tuned plan that the TensorRT runtime executes. The build does all three optimizations above for the target GPU. Engines are not portable across GPU architectures, so you build on (or for) the deployment device. The easiest path from ONNX to an engine is the <code>trtexec</code> command-line tool, and the same engine then runs from Python or C++. The snippet below shows the build and a Python timing harness; the comments give representative numbers from a mid-range GPU so you can see the shape of the win.
+</p>
+
+<pre><code class="language-python"># --- Build an int8 engine from ONNX (shell command, run once on the target GPU) ---
+# trtexec --onnx=resnet18.onnx --saveEngine=resnet18.engine \
+#         --int8 --shapes=input:8x3x224x224
+# The build autotunes kernels for THIS GPU and calibrates int8 ranges.
+
+# --- Load and time the engine from Python ---
+import tensorrt as trt
+import numpy as np
+
+logger = trt.Logger(trt.Logger.WARNING)
+with open("resnet18.engine", "rb") as f:
+    engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+context = engine.create_execution_context()
+
+# (Allocate device buffers, copy input, run context.execute_async_v3, copy output.)
+# The mechanics are runtime-version specific; the point is the measured latency:
+#
+#   eager PyTorch fp32 (batch 8) : 9.8 ms / batch
+#   TensorRT fp16    (batch 8)   : 2.7 ms / batch   -> 3.6x faster
+#   TensorRT int8    (batch 8)   : 1.9 ms / batch   -> 5.2x faster
+#
+# Always re-measure on YOUR GPU; these ratios shift with architecture and shape.
+print("engine loaded; benchmark on the target device")</code></pre>
+<div class="code-caption">Building and loading a TensorRT engine. The <code>trtexec</code> build step autotunes kernels and calibrates int8 ranges for the specific GPU, which is why the engine is device-locked. The representative latencies show the typical FP16 and int8 speedups over eager PyTorch; the exact ratios depend on the GPU and the batch shape, so the build step is also your measurement step.</div>
+
+<p>
+The most common practical wrinkle with TensorRT is the <strong>optimization profile</strong>: because the engine is tuned for specific input shapes, dynamic dimensions (variable batch size or image resolution) must be declared with a minimum, optimum, and maximum at build time, and the engine is fastest at the optimum. Forgetting this is why a dynamically shaped engine sometimes runs slower than expected, it is being executed away from the shape it was tuned for. This same engine, built for a Jetson rather than a data-center GPU, is the deployment path of <a href="section-28.3.html">Section 28.3</a>.
+</p>
+
+<h2>5. OpenVINO: The CPU and Accelerator Runtime <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Not everything runs on an NVIDIA GPU. A great deal of vision inference runs on CPUs (servers without GPUs, industrial PCs, retail edge boxes) and on Intel's integrated GPUs and neural accelerators. OpenVINO is Intel's counterpart to TensorRT for that hardware. Its model optimizer compiles an ONNX or framework graph into an intermediate representation, applies the same family of fusions and precision optimizations, and runs it through a unified inference API that targets CPU, integrated GPU, or NPU with a single device string. The conversion and inference are a few lines.
+</p>
+
+<pre><code class="language-python">import openvino as ov
+import numpy as np
+
+core = ov.Core()
+# Read ONNX directly; OpenVINO converts and optimizes it internally.
+model = core.read_model("resnet18.onnx")
+
+# Compile for the target device: "CPU", "GPU" (Intel iGPU), or "NPU".
+compiled = core.compile_model(model, device_name="CPU")
+
+# Run inference. OpenVINO has already fused ops and chosen CPU-optimal kernels.
+infer = compiled.create_infer_request()
+x = np.random.randn(1, 3, 224, 224).astype(np.float32)
+result = infer.infer({0: x})
+logits = list(result.values())[0]
+print("output shape:", logits.shape)         # output shape: (1, 1000)
+
+# For int8, run OpenVINO's post-training quantization (NNCF) first; the compiled
+# CPU engine then uses the VNNI integer instructions for a further 2-3x speedup.</code></pre>
+<div class="code-caption">Compiling and running a model with OpenVINO on a CPU. <code>read_model</code> ingests the same ONNX graph that TensorRT consumed; <code>compile_model</code> applies CPU-specific fusions and kernel selection. Switching <code>device_name</code> to "GPU" or "NPU" retargets the same code to Intel's integrated accelerators, the portability that the export-once pipeline buys you.</div>
+
+<p>
+The strategic point is portability through ONNX. The exact same <code>resnet18.onnx</code> file fed TensorRT in subsection 4 and OpenVINO here; the export work was done once. Table 28.2.1 summarizes when to reach for each runtime, including the cross-platform fallback, ONNX Runtime, which itself dispatches to TensorRT or OpenVINO under the hood through its execution-provider system when those are available.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 28.2.1:</strong> <em>Choosing an inference runtime for a vision model.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Runtime</th>
+<th scope="col">Target hardware</th>
+<th scope="col">Reach for it when</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>TensorRT</td><td>NVIDIA GPUs (data center to Jetson)</td><td>You deploy on NVIDIA and want maximum GPU throughput; you accept device-locked engines.</td></tr>
+<tr><td>OpenVINO</td><td>Intel CPUs, iGPUs, NPUs</td><td>You deploy on CPU or Intel accelerators, common for on-prem and industrial vision.</td></tr>
+<tr><td>ONNX Runtime</td><td>CPU, CUDA, and via providers nearly anything</td><td>You want one runtime that works everywhere and dispatches to the best backend available.</td></tr>
+<tr><td>Core ML / TFLite / ExecuTorch</td><td>Phones and embedded</td><td>You deploy on mobile or microcontrollers (the subject of Section 28.3).</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Export Call for Every Runtime</div>
+<p>The export-and-validate dance above is worth doing by hand once to understand it. In a model-zoo workflow, the per-runtime export is a single argument. Ultralytics wraps ONNX export, TensorRT engine building, OpenVINO conversion, and the mobile formats behind one <code>format</code> string:</p>
+<pre><code class="language-python">from ultralytics import YOLO
+model = YOLO("yolo11n.pt")
+
+model.export(format="onnx")        # portable ONNX graph
+model.export(format="engine")      # builds a TensorRT engine on this GPU
+model.export(format="openvino")    # OpenVINO IR for Intel CPU/iGPU/NPU
+# Then run inference on the exported artifact with the same predict API:
+YOLO("yolo11n.engine").predict("street.jpg")   # uses the TensorRT runtime</code></pre>
+<p>Each call internally runs the trace, opset selection, shape declaration, runtime-specific build, and numerical validation, the roughly hundred lines this section unpacked, and writes a ready-to-serve artifact. The library does not relieve you of measuring latency on the real device; it relieves you of the export boilerplate.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Engine That Was Slower in Production</div>
+<p>A retail-analytics team built a person-detection pipeline for in-store cameras, running on a single data-center GPU that served dozens of camera streams. Their TensorRT engine benchmarked at 1.8 ms per frame on the build machine, so they sized the fleet for that number. In production, throughput was less than half of what the benchmark predicted, and latency was erratic. The cause was the optimization profile: the engine had been built with an optimum batch size of 32, but the real serving layer dispatched frames one at a time as each camera produced them, so the engine ran almost entirely at batch size 1, far from the shape it was tuned for, and the per-frame fixed cost dominated. The fix was twofold: rebuild the engine with an optimum profile matching the real batch distribution, and add the dynamic batching of <a href="section-28.4.html">Section 28.4</a> so the serving layer actually collected the batches the engine wanted. After both changes the production number matched the benchmark. The lesson: a benchmark on a shape you will not serve is a benchmark of a model you will not run. Profile the engine for the traffic you will actually see, and measure under that traffic.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compiler Stacks and the FP8 Era (2024-2026)</div>
+<p>The boundary between framework and runtime is dissolving. PyTorch 2's <code>torch.compile</code> brought graph capture and kernel fusion into the framework itself through the TorchInductor backend, and the 2024 onward <code>torch.export</code> plus AOTInductor path produces ahead-of-time-compiled, Python-free artifacts that blur the line with ONNX export. Triton, the GPU-kernel language, lets compilers autotune custom fused kernels rather than picking from a fixed library, and is now the codegen backend behind several stacks. On the hardware side, TensorRT 10 and the Blackwell generation made FP8 and FP4 first-class compiled precisions, so the calibration step of subsection 3 now targets sub-8-bit formats directly. For large vision-language and diffusion models in particular, the 2025-2026 deployment story is increasingly a single compile-and-quantize pipeline, <code>torch.export</code> to a quantized FP8 engine, rather than the multi-tool dance this section describes, though ONNX remains the lingua franca whenever you must cross a vendor boundary.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The reason a TensorRT engine refuses to load on a different GPU is not licensing or stubbornness; it is that the build step physically benchmarked candidate kernels on the exact silicon in front of it and baked the winners into the plan. The engine is less a portable program than a frozen race result: "on this chip, with these cache sizes, Winograd beat im2col for layer 14." Move it to a chip where the race would have gone differently and the result is meaningless, which is why an engine built on a teammate's RTX 4090 will not run on your A100. The signature phrase to remember: <em>export once, compile per target</em>, because the compile is the part that knows the hardware by name.</p>
+</div>
+
+<h2>6. Summary and the Road to the Edge</h2>
+
+<p>
+Deployment requires separating the model from its framework. ONNX captures a trained model as a portable computation graph by tracing a forward pass; always validate the export numerically against the original. A runtime then compiles that graph for specific hardware, applying operator fusion (eliminating memory traffic), kernel autotuning (picking the fastest implementation per layer per chip), and precision calibration (running int8 or FP8 where accuracy allows). TensorRT serves NVIDIA GPUs and builds device-locked engines tuned with optimization profiles; OpenVINO serves Intel CPUs and accelerators; ONNX Runtime is the portable fallback. With a compiled engine in hand, the next question is the hardware it runs on. <a href="section-28.3.html">Section 28.3</a> takes these same runtimes to the edge: the Jetson modules, the mobile runtimes, and the architectures designed for a power budget measured in single-digit watts.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.2.1: Why Tracing Drops Control Flow <span class="exercise-type conceptual">Conceptual</span></div>
+<p>PyTorch's ONNX export traces a single forward pass with an example input. Suppose a model's <code>forward</code> contains <code>if x.mean() &gt; 0: return branch_a(x) else: return branch_b(x)</code>, where the branch depends on the input tensor's values. Explain in two or three sentences what the exported ONNX graph will contain, why running it on an input that would have taken the other branch gives the wrong answer, and how this connects to the numerical-validation check in the Key Insight callout. Suggest one way to make such a model exportable.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.2.2: Export, Validate, and Time <span class="exercise-type coding">Coding</span></div>
+<p>Export a pretrained ResNet-18 to ONNX as in subsection 2, with a dynamic batch axis. Validate it numerically against eager PyTorch and report the maximum absolute difference. Then time three configurations on whatever hardware you have: eager PyTorch, ONNX Runtime on CPU, and (if you have an NVIDIA GPU) a TensorRT FP16 engine, each at batch sizes 1, 8, and 32. Tabulate latency per batch and per image. Write one paragraph on how the per-image cost changes with batch size and why, connecting it to the fixed-versus-amortized-overhead idea that <a href="section-28.4.html">Section 28.4</a> builds on.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.2.3: Diagnose the Optimization Profile <span class="exercise-type analysis">Analysis</span></div>
+<p>Reread the production incident in the Practical Example. You are handed a TensorRT engine that benchmarks at 1.8 ms per frame on the build machine but delivers 4.1 ms per frame in production. List the diagnostic questions you would ask, in order, to localize the cause (consider the optimization-profile shape, the actual serving batch distribution, GPU contention from other models, precision mode, and input-preprocessing cost). For each question, state what measurement would confirm or rule out that cause, and explain why measuring under production traffic is the only conclusive test.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-28.1.html">&#8592; Section 28.1: The Efficiency Toolbox</a>
+<a href="index.html">Chapter 28</a>
+<a class="next" href="section-28.3.html">Section 28.3: Edge &amp; Mobile Vision: From Jetson to Phones &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

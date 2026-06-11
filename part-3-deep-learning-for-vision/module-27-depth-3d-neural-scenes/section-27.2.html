@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.2: 3D Representations: Point Clouds, Voxels &amp; Meshes. The three explicit ways to store 3D structure, their memory profiles and natural operations, and how to lift a depth map into a colored point cloud using camera intrinsics." name="description"/>
+<title>Section 27.2: 3D Representations: Point Clouds, Voxels &amp; Meshes | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>3D Representations: Point Clouds, Voxels &amp; Meshes</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A point cloud is a swarm of fireflies that agree on nothing. A voxel grid is a city of identical apartment blocks, most of them empty. A mesh is origami that took a graphics PhD to fold. Pick your poison; the geometry is the same."</p>
+<cite>A Data Structure That Has Stored the Same Bunny a Thousand Ways</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>There are three explicit ways to write down 3D geometry, and the choice among them is a choice about which operations are cheap and which are catastrophic.</strong> A <em>point cloud</em> is an unordered list of 3D coordinates: trivially produced by any depth sensor, but with no surface and no neighbor structure. A <em>voxel grid</em> is a 3D pixel array: regular and convolution-friendly, but its memory grows as the cube of resolution. A <em>mesh</em> is a set of vertices joined by triangles: compact, the native language of rendering, but awkward to produce and to learn. This section explains the trade-offs precisely, shows how each stores the same scene, and walks through the single most useful conversion in applied 3D vision: lifting the depth map of <a href="section-27.1.html">Section 27.1</a> into a colored point cloud using the camera intrinsics of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>.</p>
+</div>
+
+<p>
+<a href="section-27.1.html">Section 27.1</a> ended with a depth map, a 2D array of distances. That is fine for visualization, but it is still tied to the image plane: you cannot rotate it, measure a volume, or register it against another capture. To do real 3D work you must lift the geometry into a representation that lives in actual three-dimensional space. This section surveys the three explicit choices, the structures that store geometry as concrete numbers rather than as a neural network (which we reach in <a href="section-27.4.html">Section 27.4</a>). Each makes a different bet, and understanding the bets is essential before we ask a network to learn on them in <a href="section-27.3.html">Section 27.3</a>.
+</p>
+
+<h2>1. Point Clouds: Geometry as an Unordered Set <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>point cloud</strong> is the simplest 3D representation: a set of points, each an $(x, y, z)$ coordinate, optionally carrying attributes such as color $(r, g, b)$ or a surface normal. It is what every depth sensor, LiDAR scanner, RGB-D camera, or stereo rig produces natively, so it is the raw material of applied 3D vision. Its virtues are directness and density control: you can have a thousand points or a billion, sampled wherever you have measurements, with no wasted storage on empty space.
+</p>
+
+<p>
+Its defining property, and the source of every difficulty in <a href="section-27.3.html">Section 27.3</a>, is that it is an <em>unordered set with no connectivity</em>. There is no canonical first point, no grid of neighbors, no notion of which points form a surface. Two point clouds that list the same points in different orders are the same cloud. This permutation invariance is geometrically honest but architecturally hostile: the convolution of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> relies on a fixed grid of neighbors, which a point cloud simply does not have. We will spend the next section solving exactly this problem.
+</p>
+
+<h2>2. Voxels: Geometry on a 3D Grid <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>voxel grid</strong> is the 3D generalization of a pixel image: space is diced into a regular array of cubic cells, and each cell stores an occupancy bit, a density, or a feature vector. Its great appeal is regularity. Because it is a grid, the 2D convolution generalizes immediately to a 3D convolution (exactly the spatiotemporal kernel of <a href="../module-26-video-understanding/index.html">Chapter 26</a>, now over space rather than space-time), so the entire CNN toolkit transfers without modification. Early deep 3D learning (VoxNet, 3D ShapeNets) lived here for precisely this reason.
+</p>
+
+<p>
+The fatal weakness is memory. A voxel grid at resolution $N$ has $N^3$ cells, so doubling the resolution multiplies storage and compute by eight. A $512^3$ grid is 134 million cells, most of them empty, because real surfaces are two-dimensional sheets floating in a three-dimensional volume. This <strong>cubic curse</strong> is why dense voxels rarely exceed $128^3$ in practice and why the field largely moved to sparse representations (octrees, hash grids, the sparse convolutions of MinkowskiEngine) that store only the occupied cells. Figure 27.2.1 contrasts the three representations and makes the memory trade-off visible.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three 3D representations side by side: point cloud as scattered dots, voxel grid as cubes, mesh as triangles, all approximating a sphere">
+<style>
+.rl{font:13px sans-serif;fill:#1a1a1a;}
+.rs{font:10px sans-serif;fill:#555;}
+.rpt{fill:#2c6fb5;}
+.rvox{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1;}
+.rtri{fill:#fdeee3;stroke:#d6802b;stroke-width:1;}
+.rpanel{fill:#fafafa;stroke:#ccc;stroke-width:1;}
+</style>
+<rect class="rpanel" x="10" y="14" width="220" height="180"/>
+<text class="rl" x="120" y="214" text-anchor="middle">Point Cloud</text>
+<text class="rs" x="120" y="232" text-anchor="middle">unordered (x,y,z) set</text>
+<circle class="rpt" cx="80" cy="60" r="3"/><circle class="rpt" cx="110" cy="50" r="3"/>
+<circle class="rpt" cx="150" cy="58" r="3"/><circle class="rpt" cx="170" cy="80" r="3"/>
+<circle class="rpt" cx="60" cy="90" r="3"/><circle class="rpt" cx="95" cy="100" r="3"/>
+<circle class="rpt" cx="135" cy="95" r="3"/><circle class="rpt" cx="175" cy="115" r="3"/>
+<circle class="rpt" cx="70" cy="130" r="3"/><circle class="rpt" cx="110" cy="140" r="3"/>
+<circle class="rpt" cx="150" cy="135" r="3"/><circle class="rpt" cx="120" cy="115" r="3"/>
+<circle class="rpt" cx="90" cy="75" r="3"/><circle class="rpt" cx="160" cy="98" r="3"/>
+<rect class="rpanel" x="250" y="14" width="220" height="180"/>
+<text class="rl" x="360" y="214" text-anchor="middle">Voxel Grid</text>
+<text class="rs" x="360" y="232" text-anchor="middle">regular, O(N^3) memory</text>
+<rect class="rvox" x="320" y="55" width="22" height="22"/><rect class="rvox" x="342" y="55" width="22" height="22"/>
+<rect class="rvox" x="364" y="55" width="22" height="22"/>
+<rect class="rvox" x="298" y="77" width="22" height="22"/><rect class="rvox" x="320" y="77" width="22" height="22"/>
+<rect class="rvox" x="342" y="77" width="22" height="22"/><rect class="rvox" x="364" y="77" width="22" height="22"/>
+<rect class="rvox" x="386" y="77" width="22" height="22"/>
+<rect class="rvox" x="298" y="99" width="22" height="22"/><rect class="rvox" x="386" y="99" width="22" height="22"/>
+<rect class="rvox" x="298" y="121" width="22" height="22"/><rect class="rvox" x="320" y="121" width="22" height="22"/>
+<rect class="rvox" x="342" y="121" width="22" height="22"/><rect class="rvox" x="364" y="121" width="22" height="22"/>
+<rect class="rvox" x="386" y="121" width="22" height="22"/>
+<rect class="rpanel" x="490" y="14" width="220" height="180"/>
+<text class="rl" x="600" y="214" text-anchor="middle">Mesh</text>
+<text class="rs" x="600" y="232" text-anchor="middle">vertices + triangle faces</text>
+<polygon class="rtri" points="600,50 555,90 600,100"/>
+<polygon class="rtri" points="600,50 645,90 600,100"/>
+<polygon class="rtri" points="555,90 600,100 565,135"/>
+<polygon class="rtri" points="645,90 600,100 635,135"/>
+<polygon class="rtri" points="565,135 600,100 635,135"/>
+<polygon class="rtri" points="565,135 635,135 600,150"/>
+</svg>
+<figcaption><strong>Figure 27.2.1:</strong> The same spherical surface in three representations. The point cloud samples the surface as scattered coordinates; the voxel grid fills space with cubes (storing many empty interior and exterior cells); the mesh stitches vertices into triangle faces. The point cloud is sensor-native, the voxel grid is convolution-friendly but memory-hungry, and the mesh is compact and render-ready.</figcaption>
+</figure>
+
+<h2>3. Meshes: Geometry as Connected Surface <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A <strong>triangle mesh</strong> stores geometry as a list of vertices (3D points) plus a list of faces (triples of vertex indices that form triangles). This is the native representation of computer graphics: every game, film, and CAD model is a mesh, and GPUs rasterize triangles in hardware. A mesh is compact (a smooth surface needs few triangles where it is flat and many where it is detailed) and, crucially, it represents the <em>surface</em> explicitly, so you can compute areas, volumes, and watertight boundaries that a point cloud cannot express.
+</p>
+
+<p>
+The cost is structural complexity. A mesh has irregular connectivity (each vertex belongs to a variable number of triangles), and generating a good mesh from raw points (surface reconstruction) is a hard problem with its own literature: Poisson reconstruction, marching cubes, ball pivoting, and the modern neural variants. Editing a mesh while keeping it valid (no holes, no self-intersections, consistent winding) is delicate, which is why most learning systems predict points or voxels and convert to a mesh only at the very end. The conversions among the three form a small ecosystem, summarized in Table 27.2.1.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 27.2.1:</strong> <em>The three explicit 3D representations compared.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Property</th>
+<th scope="col">Point Cloud</th>
+<th scope="col">Voxel Grid</th>
+<th scope="col">Mesh</th>
+</tr>
+</thead>
+<tr><td>Structure</td><td>Unordered set</td><td>Regular 3D grid</td><td>Vertices + faces</td></tr>
+<tr><td>Memory at resolution N</td><td>O(points)</td><td>O(N³)</td><td>O(surface area)</td></tr>
+<tr><td>Convolution applies?</td><td>No (needs PointNet)</td><td>Yes (3D conv)</td><td>No (needs graph nets)</td></tr>
+<tr><td>Represents surface?</td><td>No</td><td>Implicitly</td><td>Yes, explicitly</td></tr>
+<tr><td>Sensor-native?</td><td>Yes (LiDAR, RGB-D)</td><td>No</td><td>No</td></tr>
+<tr><td>Render-ready?</td><td>Splat only</td><td>Volume render</td><td>Yes (GPU raster)</td></tr>
+</table>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: There Is No Universal Best Representation</div>
+<p>The representation is dictated by the operation you need most. Registering two LiDAR scans? Stay in point clouds, where ICP works directly. Running a 3D CNN for occupancy prediction? Use voxels (or sparse voxels) so convolution applies. Shipping an asset to a game engine or measuring a volume? You need a mesh. Real pipelines convert freely: sensor produces points, a network voxelizes them to reason, and the final output is reconstructed as a mesh. Fluency means knowing which conversion costs what, not pledging loyalty to one structure.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Surface Is Lonely in a Cube</div>
+<p>The cubic curse has an oddly philosophical flavor: a $512^3$ voxel grid holds 134 million cells, yet a real object is a two-dimensional skin draped over emptiness, so the overwhelming majority of those cells store the answer to a question nobody asked, namely "is there anything here?" No. Voxels spend almost all their effort certifying the absence of geometry. Sparse representations are simply the field agreeing to stop paying rent on empty space.</p>
+</div>
+
+<h2>4. Lifting a Depth Map to a Point Cloud <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The single most useful conversion in this chapter is the inverse of the projection from <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. A depth map gives, for each pixel $(u, v)$, the distance $z$ to the surface. The pinhole equations forward-projected 3D to 2D; with $z$ known we run them backward to recover the 3D point:
+</p>
+
+<div class="math-block">
+$$X = \frac{(u - c_x)\, z}{f_x}, \qquad Y = \frac{(v - c_y)\, z}{f_y}, \qquad Z = z$$
+</div>
+
+<p>
+This is called <strong>back-projection</strong> or <strong>unprojection</strong>. Run it over every pixel and you turn an $H \times W$ depth map into a point cloud of up to $H \times W$ points, one per pixel, each colored by the corresponding RGB value. The code below does exactly this with vectorized NumPy, the bridge from the depth output of <a href="section-27.1.html">Section 27.1</a> to a genuine 3D structure.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def depth_to_pointcloud(depth, rgb, fx, fy, cx, cy):
+    """depth: (H,W) metric depth. rgb: (H,W,3). Returns (N,3) points, (N,3) colors."""
+    H, W = depth.shape
+    u, v = np.meshgrid(np.arange(W), np.arange(H))      # pixel coordinate grids
+    z = depth.reshape(-1)
+    valid = z > 0                                        # drop pixels with no depth
+    u, v = u.reshape(-1)[valid], v.reshape(-1)[valid]
+    z = z[valid]
+    x = (u - cx) * z / fx                                # back-project: invert the pinhole
+    y = (v - cy) * z / fy
+    points = np.stack([x, y, z], axis=1)                 # (N, 3)
+    colors = rgb.reshape(-1, 3)[valid] / 255.0           # match colors to surviving points
+    return points, colors
+
+# Example with a synthetic intrinsics matrix (fx=fy=525 is a common RGB-D default).
+depth = np.full((480, 640), 2.0, np.float32)             # a flat wall 2 m away
+rgb = np.zeros((480, 640, 3), np.uint8)
+pts, cols = depth_to_pointcloud(depth, rgb, fx=525, fy=525, cx=320, cy=240)
+print("points:", pts.shape, " z range:", pts[:, 2].min(), pts[:, 2].max())
+# points: (307200, 3)  z range: 2.0 2.0</code></pre>
+<div class="code-caption">Back-projecting a depth map into a colored point cloud. The <code>(u - cx) * z / fx</code> lines are the inverted pinhole projection; every valid pixel becomes one 3D point carrying its original color. A flat 2-meter wall correctly yields points all at z = 2.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Warehouse Robot Picks the Wrong Representation</div>
+<p><strong>Who:</strong> a robotics team building a bin-picking arm for a fulfillment warehouse, 2022. <strong>Situation:</strong> a wrist-mounted RGB-D camera produced point clouds of cluttered bins, and the team needed to detect graspable surfaces. <strong>Problem:</strong> their first system voxelized every cloud into a $256^3$ grid to run a 3D CNN, and inference took 400 milliseconds and 11 gigabytes of GPU memory per frame, far too slow and too large for the per-pick budget, because the grid was 99 percent empty air. <strong>Decision:</strong> they dropped dense voxels and kept the data as a point cloud, running a PointNet-style network (the subject of <a href="section-27.3.html">Section 27.3</a>) directly on the raw points, with sparse voxel features only where points existed. <strong>Result:</strong> inference fell to 30 milliseconds and well under a gigabyte, and the cubic memory wall of subsection 2 vanished because empty space cost nothing. <strong>Lesson:</strong> dense voxels are seductive because convolution just works, but for the sparse 2D surfaces that real sensors capture, the cubic curse makes them the wrong default; match the representation to the data's sparsity.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Open3D Does Lifting, Viewing, and Meshing</div>
+<p>The hand-written back-projection above is good for understanding, but Open3D bundles unprojection, visualization, normal estimation, and surface reconstruction into a few well-tested calls. Creating a point cloud from RGB-D and meshing it drops from roughly 60 lines of NumPy and marching-cubes code to this:</p>
+<pre><code class="language-python">import open3d as o3d
+# Build an RGB-D image, unproject with the camera intrinsics, then mesh it.
+rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color, depth_o3d)
+intr = o3d.camera.PinholeCameraIntrinsic(640, 480, 525, 525, 320, 240)
+pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intr)  # the lift
+pcd.estimate_normals()                                            # needed for meshing
+mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+o3d.visualization.draw_geometries([pcd])                          # interactive 3D viewer</code></pre>
+<p>Open3D handles the intrinsics bookkeeping, the normal estimation that Poisson reconstruction requires, and the full point-to-mesh conversion of subsection 3, plus an interactive viewer. It is the library shortcut behind nearly all explicit-geometry work in this chapter, and it interoperates with the PyTorch3D tensors used in <a href="section-27.3.html">Section 27.3</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Implicit Surfaces Blur the Three Categories (2024-2026)</div>
+<p>The clean three-way split of this section is being eroded by a fourth option: <strong>implicit representations</strong> that store a surface as the zero level-set of a learned function, the signed distance field (SDF) or occupancy field. DeepSDF (2019) and the neural-implicit family represent a shape as a network $f(x, y, z) \to$ distance-to-surface, combining the compactness of a mesh with the smoothness and learnability of a continuous function, and you extract a mesh on demand with marching cubes. This is the direct conceptual cousin of the NeRF density field in <a href="section-27.4.html">Section 27.4</a>. The 2024-2026 frontier fuses these: methods like <strong>2D Gaussian Splatting</strong> and <strong>SuGaR</strong> recover clean meshes from the splat representation of <a href="section-27.5.html">Section 27.5</a>, and feed-forward models such as <strong>VGGT</strong> (2025) and the large reconstruction models predict point maps or implicit fields directly from images, collapsing the capture-and-convert pipeline into a single forward pass. The boundary between "explicit" and "neural" geometry, sharp in this section, is exactly what the rest of the chapter dissolves.</p>
+</div>
+
+<p>
+We now have geometry in an explicit 3D structure. The point cloud, in particular, is sensor-native and ubiquitous, but its unordered, grid-free nature means we cannot run a convolution on it. Building a network that <em>can</em> consume a raw point cloud is the problem we solve next, in <a href="section-27.3.html">Section 27.3</a>.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.2.1: The Cubic Curse in Numbers <span class="exercise-type analysis">Analysis</span></div>
+<p>A voxel grid stores one 4-byte float per cell. Compute the memory required for a dense grid at resolutions $32^3$, $128^3$, $256^3$, and $512^3$. Then suppose the surface you are representing occupies only the cells within one voxel of a sphere of radius $0.4N$; estimate the fraction of cells that are actually on the surface at each resolution. Write a short paragraph explaining, with these numbers, why the field moved to sparse voxel representations and how that connects to the warehouse-robot story in subsection 4.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.2.2: Lift Your Own Depth Map <span class="exercise-type coding">Coding</span></div>
+<p>Take the depth map you produced from a foundation model in Exercise 27.1.2 (or any RGB-D capture). Using the <code>depth_to_pointcloud</code> function of subsection 4 with reasonable intrinsics ($f_x = f_y = 0.9 \times \text{width}$, $c_x, c_y$ at the image center), back-project it into a colored point cloud and save it as a <code>.ply</code> file with Open3D. Open it in a viewer and rotate it. Then deliberately use intrinsics that are too large by 50 percent and re-lift; describe how the cloud's shape distorts, and connect the distortion to the role of $f_x$ in the back-projection equations.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.2.3: Choosing a Representation <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following tasks, state which of the three representations (point cloud, voxel grid, mesh) you would use as the primary working structure and justify the choice in one sentence using Table 27.2.1: (a) computing the watertight volume of a scanned mechanical part; (b) aligning two overlapping LiDAR scans of a building; (c) running a 3D convolutional occupancy predictor on a small object; (d) shipping a captured statue into a video game. Then identify one task where you would need to convert between two representations and name the conversion direction.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.1.html">&#8592; Section 27.1: Monocular Depth Estimation</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="section-27.3.html">Section 27.3: Learning on Point Clouds: PointNet &amp; Successors &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

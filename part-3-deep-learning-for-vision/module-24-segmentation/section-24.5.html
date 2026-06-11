@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.5: Segment Anything: Promptable Segmentation. Segmentation's foundation model: SAM's image encoder, prompt encoder, and lightweight mask decoder, the billion-mask data engine that trained it, ambiguity handling with multiple mask outputs, the shift from training a segmenter to prompting one, and SAM 2's extension to video." name="description"/>
+<title>Section 24.5: Segment Anything: Promptable Segmentation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a></div>
+<h1>Segment Anything: Promptable Segmentation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They used to train a whole new me for every list of classes. Now they just point. A click here, a box there, and I cut out whatever they meant, even if no one ever taught me the word for it. Turns out you do not need a name to find an edge."</p>
+<cite>A Promptable Segmenter Who Never Asks What It Is</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The Segment Anything Model (SAM) is segmentation's foundation model: a single network that, given a prompt, a click, a box, or a rough mask, returns a segmentation of that object in any image, with no fixed class list and no fine-tuning.</strong> It works because of three deliberate choices. First, a promptable task: the model learns "given this image and this hint, produce a valid mask," which is general enough to transfer to unseen domains. Second, an architecture split into a heavy image encoder run once per image and a tiny prompt-conditioned mask decoder run in milliseconds per click, so interaction is real time. Third, a data engine that bootstrapped the model and human annotators together to label over a billion masks. The result shifts the workflow from "train a segmenter for your classes" to "prompt a segmenter for your object."</p>
+</div>
+
+<p>
+Every segmenter so far in this chapter is tied to a label set decided at training time: FCN and DeepLab know their 19 or 21 classes, Mask R-CNN its 80 COCO categories, Mask2Former whatever it was trained on. Point any of them at a new domain, an unfamiliar object, a medical modality, an industrial part, and you must collect annotations and retrain. The Segment Anything Model, released by Meta AI in 2023, breaks that dependence. It does not classify; it segments whatever you indicate, and it generalizes to images and objects far outside its training distribution. This is the same foundation-model leap that <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> will explain in general, arriving early in segmentation.
+</p>
+
+<h2>1. The Promptable Segmentation Task <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+SAM's designers asked what task, if learned at scale, would transfer the way a language model's next-token prediction transfers. Their answer is the <strong>promptable segmentation task</strong>: given an image and a prompt indicating an object, return a valid mask for that object. A prompt can be a foreground point (click), a background point, a bounding box, a coarse mask, or, in principle, text. The training objective is simply to produce a good mask for whatever the prompt points at, even when the prompt is ambiguous. This task is more general than any fixed-class segmentation because it never commits to a vocabulary; "the thing here" is defined by the prompt, not by a label index. Because the task is promptable, SAM can be composed into larger systems: a detector emits boxes, SAM turns each into a precise mask, no retraining required.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Decouple the Expensive Encoder from the Cheap Decoder</div>
+<p>SAM's architecture is deliberately lopsided. The image encoder is a heavy ViT (<a href="../module-22-vision-transformers/index.html">Chapter 22</a>) that produces a single image embedding and runs once, in hundreds of milliseconds. The prompt encoder and mask decoder are tiny and run in a few milliseconds per prompt. So in an interactive session you encode the image once, then every click, box, or correction reuses that cached embedding and returns a new mask almost instantly. This split is what makes SAM feel real time in a labeling tool, and it is a reusable design lesson: when one input changes slowly (the image) and another fast (the prompt), put the cost on the slow side and cache it.</p>
+</div>
+
+<h2>2. SAM's Three Components <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SAM is three modules in series, shown in Figure 24.5.1. The <strong>image encoder</strong> is a ViT, pretrained with the masked-autoencoder self-supervision you will meet in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, that maps the input image to a dense embedding grid. The <strong>prompt encoder</strong> turns prompts into tokens: points and boxes become positional encodings added to learned type embeddings, and a coarse input mask is embedded by a small convolution and added to the image embedding. The <strong>mask decoder</strong> is a lightweight two-layer transformer decoder, structurally the cousin of the Mask2Former decoder from <a href="section-24.4.html">Section 24.4</a>: prompt tokens and a few learned output tokens attend to the image embedding (and it attends back), then a dynamic dot-product, the same einsum as in Section 24.4, between an output token and the upsampled image embedding produces the mask.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SAM architecture: heavy image encoder run once, lightweight prompt encoder and mask decoder run per prompt, producing multiple masks with scores">
+<style>
+.al{font:12px sans-serif;fill:#1a1a1a;}
+.as{font:10px sans-serif;fill:#555;}
+.aimg{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.aprompt{fill:#fff3cd;stroke:#c79100;stroke-width:1.5;}
+.adec{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.amask{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.aar{stroke:#777;stroke-width:1.5;marker-end:url(#aah2);fill:none;}
+</style>
+<defs><marker id="aah2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="aimg" x="20" y="40" width="110" height="60"/>
+<text class="al" x="75" y="64" text-anchor="middle">image encoder</text>
+<text class="as" x="75" y="82" text-anchor="middle">heavy ViT, run ONCE</text>
+<line class="aar" x1="130" y1="80" x2="300" y2="120"/>
+<rect class="aprompt" x="20" y="160" width="110" height="70"/>
+<text class="al" x="75" y="186" text-anchor="middle">prompt encoder</text>
+<text class="as" x="75" y="204" text-anchor="middle">point / box / mask</text>
+<text class="as" x="75" y="220" text-anchor="middle">-&gt; tokens</text>
+<line class="aar" x1="130" y1="190" x2="300" y2="150"/>
+<rect class="adec" x="302" y="110" width="120" height="60"/>
+<text class="al" x="362" y="136" text-anchor="middle">mask decoder</text>
+<text class="as" x="362" y="154" text-anchor="middle">tiny, run PER prompt</text>
+<line class="aar" x1="422" y1="125" x2="490" y2="80"/>
+<line class="aar" x1="422" y1="140" x2="490" y2="140"/>
+<line class="aar" x1="422" y1="155" x2="490" y2="200"/>
+<rect class="amask" x="492" y="55" width="100" height="36"/><text class="as" x="542" y="78" text-anchor="middle">mask: whole</text>
+<rect class="amask" x="492" y="122" width="100" height="36"/><text class="as" x="542" y="145" text-anchor="middle">mask: part</text>
+<rect class="amask" x="492" y="182" width="100" height="36"/><text class="as" x="542" y="205" text-anchor="middle">mask: subpart</text>
+<text class="as" x="650" y="140" text-anchor="middle">+ IoU score</text>
+<text class="as" x="650" y="156" text-anchor="middle">each</text>
+</svg>
+<figcaption><strong>Figure 24.5.1:</strong> SAM's lopsided architecture. The heavy image encoder (blue) runs once per image. The prompt encoder (yellow) and mask decoder (green) are tiny and run per prompt. To resolve ambiguity, the decoder emits three masks (whole object, part, subpart), each with a predicted IoU score so the caller can pick the best one.</figcaption>
+</figure>
+
+<p>
+The code below runs SAM through its official predictor: encode the image once, then query with a single foreground click. Note that the embedding is computed in <code>set_image</code> and reused by every subsequent <code>predict</code> call, the caching that subsection 1 highlighted.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from segment_anything import sam_model_registry, SamPredictor
+
+# Load a SAM checkpoint (vit_h is the largest; vit_b is the lightest).
+sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+predictor = SamPredictor(sam)
+
+image = np.zeros((720, 1280, 3), dtype=np.uint8)   # stand-in for an RGB image (H, W, 3)
+predictor.set_image(image)                          # HEAVY: encodes the image once
+
+# Prompt with a single foreground click at pixel (640, 360).
+point_coords = np.array([[640, 360]])
+point_labels = np.array([1])                        # 1 = foreground, 0 = background
+masks, scores, _ = predictor.predict(              # CHEAP: reuses the cached embedding
+    point_coords=point_coords, point_labels=point_labels,
+    multimask_output=True)                          # return 3 masks for ambiguity
+print(masks.shape, scores)        # (3, 720, 1280)  e.g. [0.94 0.88 0.72]
+best = masks[scores.argmax()]                       # pick the highest-confidence mask
+print(best.sum(), "foreground pixels")</code></pre>
+<div class="code-caption">SAM's interactive predictor. <code>set_image</code> runs the heavy encoder once; each <code>predict</code> call with a new prompt is fast. With <code>multimask_output=True</code> the decoder returns three candidate masks at different scales, each with a predicted IoU score for selection.</div>
+
+<h2>3. Ambiguity and the Three-Mask Output <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A single click is genuinely ambiguous. Click on a person's shirt: do you mean the shirt, the torso, or the whole person? Rather than guess, SAM's decoder emits <strong>three</strong> masks per prompt, corresponding roughly to the whole object, a part, and a subpart, and predicts an IoU quality score for each so the caller (or the model itself) can select. This is the same ambiguity that, in <a href="section-24.4.html">Section 24.4</a>, the mask-set view handled with many queries; here it is handled by emitting a small fixed nesting of plausible masks. When the prompt is unambiguous (a box, or several points), the model is trained to use only the single highest-quality output. The score head is itself a small regression that learns to predict each mask's overlap with the true object, so confidence is calibrated rather than guessed.
+</p>
+
+<p>
+The fourth component, not a network but a process, is the <strong>data engine</strong>. SAM was trained on SA-1B, over 1.1 billion masks on 11 million images, and no team annotates that by hand. The engine ran in three stages. In the assisted-manual stage, annotators corrected masks proposed by an early SAM, which retrained on the corrections. In the semi-automatic stage, SAM auto-generated confident masks and annotators only labeled what it missed, increasing diversity. In the fully automatic stage, SAM was prompted with a regular grid of points across each image and kept the confident, stable masks, producing the bulk of SA-1B with no human in the loop. Model and data improved together, the same bootstrapping loop that the negative-result triage and iterative-improvement disciplines of research practice formalize, applied to annotation. Figure 24.5.2 sketches the loop.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SAM data engine loop: model proposes masks, humans correct, model retrains, increasing automation across three stages">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.dstage{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.dmodel{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.dar{stroke:#777;stroke-width:1.5;marker-end:url(#dah);fill:none;}
+.dloop{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#dahp);fill:none;stroke-dasharray:5 3;}
+</style>
+<defs>
+<marker id="dah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="dahp" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker>
+</defs>
+<rect class="dstage" x="30" y="60" width="120" height="50"/>
+<text class="dl" x="90" y="82" text-anchor="middle">1. assisted</text>
+<text class="ds" x="90" y="98" text-anchor="middle">human corrects all</text>
+<rect class="dstage" x="300" y="60" width="120" height="50"/>
+<text class="dl" x="360" y="82" text-anchor="middle">2. semi-auto</text>
+<text class="ds" x="360" y="98" text-anchor="middle">human adds missed</text>
+<rect class="dstage" x="570" y="60" width="120" height="50"/>
+<text class="dl" x="630" y="82" text-anchor="middle">3. fully auto</text>
+<text class="ds" x="630" y="98" text-anchor="middle">grid prompt, no human</text>
+<line class="dar" x1="150" y1="85" x2="300" y2="85"/>
+<line class="dar" x1="420" y1="85" x2="570" y2="85"/>
+<rect class="dmodel" x="300" y="155" width="120" height="44"/>
+<text class="dl" x="360" y="181" text-anchor="middle">SAM retrains</text>
+<line class="dloop" x1="90" y1="110" x2="305" y2="160"/>
+<line class="dloop" x1="420" y1="178" x2="360" y2="112"/>
+<text class="ds" x="200" y="150" text-anchor="middle" fill="#8e44ad">masks improve model;</text>
+<text class="ds" x="200" y="164" text-anchor="middle" fill="#8e44ad">model improves masks</text>
+<text class="ds" x="360" y="222" text-anchor="middle">1.1 billion masks, 11 million images (SA-1B)</text>
+</svg>
+<figcaption><strong>Figure 24.5.2:</strong> The SAM data engine. Across three stages the annotation becomes progressively more automatic: humans first correct every mask, then only add what the model misses, then step out entirely as SAM auto-generates masks from a grid of point prompts. The model and the dataset improve in a loop (purple), producing the billion-mask SA-1B.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>SA-1B's 1.1 billion masks are roughly 400 times more masks than the entire COCO dataset, the benchmark that occupied the field for the previous decade. If a human annotator could trace one perfect mask per minute without ever sleeping, hand-labeling SA-1B would take over two thousand years. The data engine compressed that into a few months precisely because the model annotated most of itself, the bootstrap that the section's "prompt, do not train" thesis quietly depends on. The takeaway phrase: <em>SAM was its own most productive annotator</em>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Annotating a Niche Dataset in a Week, Not a Quarter</div>
+<p><strong>Who:</strong> a two-person research group building a segmentation dataset of coral structures from underwater imagery, 2024. <strong>Situation:</strong> coral is utterly absent from COCO and ADE20K, so no pretrained segmenter was useful, and hand-tracing the intricate coral boundaries was projected to take a full quarter of annotator time. <strong>Problem:</strong> the budget covered roughly a week of annotation, not a quarter. <strong>Decision:</strong> instead of training a segmenter first, they used SAM zero-shot as an annotation accelerator: an annotator clicked once or twice on each coral structure and SAM produced the precise boundary, which the annotator accepted or nudged with a correcting click, exactly the assisted-manual stage of subsection 3's data engine. They then trained a small specialized SegFormer (<a href="section-24.4.html">Section 24.4</a>) on the resulting masks. <strong>Result:</strong> the annotation finished in eight days, an order of magnitude faster than tracing by hand, and the boundaries were more consistent because they came from one model rather than several annotators' hands. <strong>Lesson:</strong> SAM's biggest near-term impact is often not as the final model but as a label-generation tool that makes specialized segmentation datasets affordable. The foundation model does not replace your task model; it makes training one cheap.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Automatic Mask Generation and SAM 2 for Video</div>
+<p>To segment everything in an image with no prompts, SAM's automatic generator prompts the model on a grid for you, the same trick that built SA-1B:</p>
+<pre><code class="language-python">from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+import numpy as np
+
+sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
+generator = SamAutomaticMaskGenerator(sam)            # grid-prompts the model internally
+masks = generator.generate(np.zeros((512, 512, 3), dtype=np.uint8))
+print(len(masks), "masks; each is a dict with 'segmentation', 'area', 'stability_score'")
+
+# SAM 2 extends prompting to video: prompt one frame, the mask propagates with memory.
+# from sam2.build_sam import build_sam2_video_predictor
+# predictor = build_sam2_video_predictor(cfg, ckpt)
+# state = predictor.init_state(video_path)            # streaming memory across frames
+# predictor.add_new_points(state, frame_idx=0, obj_id=1, points=pts, labels=lbls)
+# for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
+#     ...  # mask tracked through the whole clip from one prompt</code></pre>
+<div class="code-caption">Prompt-free segmentation: <code>SamAutomaticMaskGenerator</code> grid-prompts the model and returns every stable mask in an image, while the commented SAM 2 block shows the video predictor propagating a single first-frame prompt across an entire clip via its streaming memory.</div>
+<p>The automatic generator replaces a custom grid-prompting-and-filtering loop with one call. SAM 2 (2024) adds a streaming memory module so a single prompt on one frame propagates a tracked mask through an entire video in real time, the segmentation analog of the tracking you met in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> and will see learned in <a href="../module-26-video-understanding/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: SAM 2, Open-Vocabulary, and Specialized SAMs</div>
+<p>Promptable segmentation is one of the most active areas of 2024-2025 vision. SAM 2 (2024) unifies image and video segmentation with a memory bank that makes mask tracking real time, the subject of the library shortcut above. Text-promptable systems such as Grounded-SAM chain an open-vocabulary detector (Grounding DINO) to SAM so you can segment "the third bottle from the left" by description, leaning on the vision-language grounding of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. Domain-specialized variants, MedSAM for medical imaging and a growing family of remote-sensing and microscopy SAMs, fine-tune the decoder on niche data while keeping the general encoder. And efficiency-focused successors (MobileSAM, EfficientSAM, FastSAM) shrink the image encoder so promptable segmentation runs on a phone, connecting directly to the edge-deployment concerns of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>. The open question for 2026 is whether a single promptable model, prompted by clicks, boxes, or text, becomes the default front end for all segmentation, retiring the task-specific training the earlier sections describe.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.1: Why Three Masks, Not One <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in three or four sentences why SAM emits three masks for a single-point prompt but is trained to use only the single best output when given a box or multiple points. Frame your answer around the ambiguity of the prompt: what information does a box carry that a single click does not, and how does that change whether the whole-part-subpart nesting is needed? Relate the multi-mask idea to the multi-query approach of <a href="section-24.4.html">Section 24.4</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.2: Click Refinement <span class="exercise-type coding">Coding</span></div>
+<p>Using SAM's predictor on a photo with two overlapping objects, segment one object with a single foreground click, then add a <em>background</em> click (label 0) on the part of the mask that wrongly includes the second object, and re-run <code>predict</code> with both points. Display the mask before and after the correcting click and write a short paragraph on how the prompt encoder's foreground-versus-background distinction lets a user iteratively refine a mask, and why the cached image embedding makes this interaction feel instant.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.5.3: Foundation Model versus Specialist <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a small domain-specific segmentation set (for example, the coral or a leaf-disease dataset). Compare three approaches on ten test images: (a) SAM zero-shot prompted with the ground-truth box of each object, (b) a SegFormer trained from scratch on your few hundred training images, and (c) the same SegFormer but trained on masks that SAM auto-generated and a human lightly corrected. Report mean IoU for each and write an analysis: when does the zero-shot foundation model win, when does the trained specialist win, and does the SAM-assisted labeling of approach (c) close the gap, echoing the data-engine argument of subsection 3 and the practical example?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.4.html">&#8592; Section 24.4: Transformer Segmenters: SegFormer &amp; Mask2Former</a>
+<a href="index.html">Chapter 24</a>
+<a class="next" href="section-24.6.html">Section 24.6: Losses, Metrics &amp; Evaluation for Dense Prediction &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

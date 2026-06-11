@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 33: Diffusion Models. Destroy an image with noise, learn to rebuild it, and you get the engine behind modern image generation: the forward and reverse processes, DDPM, the score-based SDE view, the probability-flow ODE, fast samplers like DDIM and DPM-Solver, flow matching and consistency models, classifier-free guidance, and latent diffusion." name="description"/>
+<title>Chapter 33: Diffusion Models | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Chapter 33: Diffusion Models</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They poured static on me until I forgot what I was, then taught a network to un-forget me one grain at a time. I came back as a photograph of a cat I had never seen. Frankly, the procedure was undignified, but the results speak for themselves."</p>
+<cite>A Diffusion Model, Halfway Through Denoising</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A diffusion model learns to generate by mastering the opposite of destruction: take a clean image, add Gaussian noise in many small steps until nothing is left but static, then train a network to undo one step of that corruption, and you can start from pure static and walk all the way back to a brand-new image.</strong> This single idea, learned iterative denoising, is the engine behind Stable Diffusion, DALL-E, Midjourney, and the video and 3D generators of the chapters that follow. It is also a direct descendant of the denoising you met classically in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> and learned in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>; the difference is that diffusion denoises not once but dozens of times, each step nudging samples toward the data distribution. This chapter builds the idea from the forward corruption process up, shows the three equivalent views that explain why it works (the variational view, the score-based view, and the flow view), then turns to the engineering that made it fast and controllable: efficient samplers, guidance, and the latent-space trick that let the whole thing run on a single consumer GPU.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+For two chapters you have studied generators that produce an image in a single forward pass. The <a href="../module-31-autoencoders-vaes/index.html">variational autoencoder</a> of Chapter 31 decodes a latent vector into a picture and trains against a reconstruction-plus-regularization objective; the <a href="../module-32-gans/index.html">generative adversarial network</a> of Chapter 32 plays a generator against a discriminator until the fakes fool the critic. Both are powerful and both are fragile. VAEs tend to produce blurry samples because the reconstruction loss averages over plausible outputs; GANs produce sharp samples but train through a delicate, often unstable minimax game and can collapse to a handful of modes. Diffusion models sidestep both problems by giving up the single forward pass. Instead of asking a network to invent an entire image at once, they ask it to perform a much easier task many times: remove a little noise.
+</p>
+<p>
+The recipe is almost suspiciously simple. The <strong>forward process</strong> takes a real image and adds a controlled amount of Gaussian noise, repeatedly, over hundreds of steps, until the image is statistically indistinguishable from random static. This process has no learnable parameters at all; it is just a fixed corruption schedule. The <strong>reverse process</strong> is where the learning happens: a neural network, almost always a <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">convolutional</a> U-Net with <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">attention</a>, is trained to predict the noise that was added at a given step, so that it can be subtracted off. Run the reverse process from pure noise and you generate a sample. <a href="section-33.1.html">Section 33.1</a> builds both processes from scratch and shows the one beautiful algebraic shortcut, the closed-form jump to any noise level, that makes training tractable.
+</p>
+<p>
+With the machinery in place, the chapter turns to understanding. <a href="section-33.2.html">Section 33.2</a> formalizes the denoising diffusion probabilistic model (DDPM): the noise schedule, the three equivalent parameterizations of what the network predicts, and the variational bound that justifies the simple noise-prediction loss everyone actually uses. <a href="section-33.3.html">Section 33.3</a> reveals that the same model is, in the limit of infinitely many steps, a stochastic differential equation whose drift is the <a href="../module-30-generative-foundations/index.html">score</a> of the data distribution, the gradient of log-density you first met in the energy-based models of Chapter 30. That continuous view unlocks the probability-flow ODE, a deterministic path between noise and data that the fast samplers of <a href="section-33.4.html">Section 33.4</a> exploit to cut a thousand sampling steps down to twenty.
+</p>
+<p>
+The final three sections are about making diffusion practical and steerable. <a href="section-33.5.html">Section 33.5</a> presents the 2022 to 2024 reframing, flow matching, rectified flow, and consistency models, that straightens the generative path and pushes high-quality sampling toward a single step. <a href="section-33.6.html">Section 33.6</a> covers guidance, the technique that lets you trade diversity for fidelity and, in its classifier-free form, is the mechanism behind every "prompt strength" slider in every image tool you have used. <a href="section-33.7.html">Section 33.7</a> closes with latent diffusion: instead of denoising pixels, compress the image into a small latent with an autoencoder and denoise there, a change that dropped the compute cost by an order of magnitude and put Stable Diffusion on laptops. By the end you will understand not just how to call a pipeline but why each piece exists.
+</p>
+<p>
+The thread running through the chapter is the one promised in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>: denoising, introduced as a humble image-cleanup operation, returns here as the entire generative engine. The U-Net is the convolution of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> made learnable and stacked; the cross-attention that injects text is the attention of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>; the latent space is the one from <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>. Diffusion is less a new idea than a new way of composing ideas you already hold.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-30-generative-foundations/index.html">Chapter 30: Foundations of Generative Modeling</a>, especially its treatment of energy-based models, score functions, and Langevin dynamics, because the score-based view in <a href="section-33.3.html">Section 33.3</a> builds directly on it. <a href="../module-31-autoencoders-vaes/index.html">Chapter 31: Autoencoders &amp; VAEs</a> supplies the variational lower bound that <a href="section-33.2.html">Section 33.2</a> reuses, the denoising-autoencoder intuition, and the autoencoder that <a href="section-33.7.html">Section 33.7</a> repurposes for latent diffusion. From the deep-learning part you need the <a href="../../part-3-deep-learning-for-vision/module-18-neural-networks-pytorch/index.html">PyTorch training loop</a> of Chapter 18, the <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">convolution</a> and U-Net structure that the denoiser is built from, and the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">self- and cross-attention</a> of Chapter 22 that conditions the network. Comfort with Gaussian distributions, the reparameterization trick, and basic stochastic calculus notation (you will see $dx = f\,dt + g\,dW$, but we explain every symbol) makes the derivations concrete. The classical <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">denoising</a> of Chapter 7 is the conceptual seed of the whole chapter.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">33.1</span>
+<a href="section-33.1.html"><span class="section-title">Destroying &amp; Rebuilding: The Forward &amp; Reverse Processes</span></a>
+<span class="section-desc">The forward noising process with no learnable parameters, the closed-form jump to any noise level, and the learned reverse process that walks static back to an image. Both built from scratch in PyTorch, with a tiny trainable denoiser on a toy dataset.</span>
+</li>
+<li>
+<span class="section-num">33.2</span>
+<a href="section-33.2.html"><span class="section-title">DDPM: Noise Schedules, Parameterizations &amp; the Variational View</span></a>
+<span class="section-desc">The denoising diffusion probabilistic model in full: linear and cosine noise schedules, the three equivalent prediction targets (noise, clean image, and velocity), and the variational bound that collapses to the simple noise-prediction loss used in practice.</span>
+</li>
+<li>
+<span class="section-num">33.3</span>
+<a href="section-33.3.html"><span class="section-title">The Score-Based View: VE/VP SDEs &amp; the Probability-Flow ODE</span></a>
+<span class="section-desc">Diffusion as a stochastic differential equation, the variance-exploding and variance-preserving formulations, why the reverse drift is the score of the data, and the deterministic probability-flow ODE that shares the same marginals as the noisy SDE.</span>
+</li>
+<li>
+<span class="section-num">33.4</span>
+<a href="section-33.4.html"><span class="section-title">Fast Sampling: DDIM, Solvers &amp; Step Distillation</span></a>
+<span class="section-desc">How to cut sampling from a thousand steps to twenty: the deterministic DDIM sampler, high-order ODE solvers like DPM-Solver, and progressive distillation that trains a student to take the steps a teacher needs many for.</span>
+</li>
+<li>
+<span class="section-num">33.5</span>
+<a href="section-33.5.html"><span class="section-title">Flow Matching, Rectified Flow &amp; Consistency Models</span></a>
+<span class="section-desc">The modern reframing that straightens the generative path: conditional flow matching as a simpler training objective, rectified flow's straight-line transport, and consistency models that learn to map any point on a trajectory to its endpoint in one step.</span>
+</li>
+<li>
+<span class="section-num">33.6</span>
+<a href="section-33.6.html"><span class="section-title">Guidance: Classifier &amp; Classifier-Free</span></a>
+<span class="section-desc">How to steer generation toward a class or a prompt: classifier guidance using the gradient of a noise-robust classifier, and the now-dominant classifier-free guidance that trains one network on both conditional and unconditional objectives and extrapolates between them at sampling time.</span>
+</li>
+<li>
+<span class="section-num">33.7</span>
+<a href="section-33.7.html"><span class="section-title">Latent Diffusion: Compress First, Then Diffuse</span></a>
+<span class="section-desc">The trick that put diffusion on consumer hardware: train an autoencoder to compress images into a small perceptual latent, run the entire diffusion process there, and decode once at the end. The architecture of Stable Diffusion, plus the modern diffusion transformer (DiT) backbone.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+This chapter gives you the generative engine; the next chapter gives it a voice. <a href="../module-34-text-to-image/index.html">Chapter 34: Text-to-Image Systems</a> takes the conditional diffusion model of <a href="section-33.6.html">Section 33.6</a> and the latent backbone of <a href="section-33.7.html">Section 33.7</a> and asks how a sentence becomes a picture: how a text encoder like CLIP or T5 turns a prompt into the conditioning vectors that cross-attention consumes, how the major systems (Stable Diffusion, DALL-E, Imagen, and the SD3 and FLUX generation that adopted flow matching from <a href="section-33.5.html">Section 33.5</a>) differ, and how to prompt and evaluate them. From there, <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a> shows how to edit and control diffusion outputs with masks, edges, and inversion, and <a href="../module-36-video-3d-world-generation/index.html">Chapter 36</a> extends the same denoising idea into time and three dimensions. Everything generative that follows is built on the seven sections you are about to read.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Sohl-Dickstein, J. et al. "Deep Unsupervised Learning using Nonequilibrium Thermodynamics." ICML (2015). <a href="https://arxiv.org/abs/1503.03585" target="_blank" rel="noopener">arXiv:1503.03585</a></div>
+<div class="bib-annotation">The origin of diffusion generative models. It framed generation as reversing a gradual noising process borrowed from statistical physics, the forward-and-reverse idea of Section 33.1, years before the technique became practical.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ho, J., Jain, A., Abbeel, P. "Denoising Diffusion Probabilistic Models." NeurIPS (2020). <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener">arXiv:2006.11239</a></div>
+<div class="bib-annotation">DDPM, the paper that made diffusion competitive with GANs and the backbone of Section 33.2. It introduced the simplified noise-prediction loss and the linear schedule that the whole field built on.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, Y. et al. "Score-Based Generative Modeling through Stochastic Differential Equations." ICLR (2021). <a href="https://arxiv.org/abs/2011.13456" target="_blank" rel="noopener">arXiv:2011.13456</a></div>
+<div class="bib-annotation">The unifying SDE framework of Section 33.3. It showed DDPM and score matching are the same model in continuous time, introduced the VE and VP SDEs, and derived the probability-flow ODE.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, J., Meng, C., Ermon, S. "Denoising Diffusion Implicit Models." ICLR (2021). <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">arXiv:2010.02502</a></div>
+<div class="bib-annotation">DDIM, the deterministic fast sampler of Section 33.4. It defined a non-Markovian forward process that shares DDPM's training objective but allows large, deterministic sampling steps.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Rombach, R. et al. "High-Resolution Image Synthesis with Latent Diffusion Models." CVPR (2022). <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener">arXiv:2112.10752</a></div>
+<div class="bib-annotation">Latent diffusion (Stable Diffusion), the architecture of Section 33.7. By diffusing in a compressed autoencoder latent rather than pixels, it cut compute by an order of magnitude and made open-weight text-to-image possible.</div>
+</div>
+
+<h3>Recent Research (2022-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Ho, J., Salimans, T. "Classifier-Free Diffusion Guidance." NeurIPS Workshop (2021). <a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noopener">arXiv:2207.12598</a></div>
+<div class="bib-annotation">Classifier-free guidance, the core of Section 33.6 and the mechanism behind every prompt-strength control. One network is trained with and without conditioning, and the two predictions are extrapolated at sampling time.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Karras, T. et al. "Elucidating the Design Space of Diffusion-Based Generative Models (EDM)." NeurIPS (2022). <a href="https://arxiv.org/abs/2206.00364" target="_blank" rel="noopener">arXiv:2206.00364</a></div>
+<div class="bib-annotation">The EDM paper that cleaned up diffusion's notation and design choices, the preconditioning, schedule, and second-order sampler referenced in Sections 33.2 and 33.4. The modern practitioner's reference for what knobs matter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lipman, Y. et al. "Flow Matching for Generative Modeling." ICLR (2023). <a href="https://arxiv.org/abs/2210.02747" target="_blank" rel="noopener">arXiv:2210.02747</a></div>
+<div class="bib-annotation">Flow matching, the simpler simulation-free training objective of Section 33.5. It generalizes and clarifies diffusion as learning a velocity field that transports noise to data along chosen probability paths.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, Y. et al. "Consistency Models." ICML (2023). <a href="https://arxiv.org/abs/2303.01469" target="_blank" rel="noopener">arXiv:2303.01469</a></div>
+<div class="bib-annotation">Consistency models of Section 33.5, which learn to map any point on a probability-flow trajectory directly to its endpoint, enabling one- or few-step generation without the quality cliff of naive step reduction.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Peebles, W., Xie, S. "Scalable Diffusion Models with Transformers (DiT)." ICCV (2023). <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noopener">arXiv:2212.09748</a></div>
+<div class="bib-annotation">The diffusion transformer of Section 33.7. Replacing the U-Net with a ViT-style backbone that scales cleanly, DiT is the architecture behind Sora, SD3, and most 2024-onward frontier image and video models.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Esser, P. et al. "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (SD3)." ICML (2024). <a href="https://arxiv.org/abs/2403.03206" target="_blank" rel="noopener">arXiv:2403.03206</a></div>
+<div class="bib-annotation">Stable Diffusion 3, which combines the rectified flow of Section 33.5 with the DiT backbone of Section 33.7, the clearest 2024 example of the chapter's ideas assembled into a frontier system.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Prince, S. J. D. <em>Understanding Deep Learning.</em> MIT Press (2023). <a href="https://udlbook.github.io/udlbook/" target="_blank" rel="noopener">udlbook.github.io/udlbook</a></div>
+<div class="bib-annotation">Chapter 18 gives the clearest textbook derivation of DDPM and the variational bound of Section 33.2, with figures that make the forward and reverse processes intuitive. Free online.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Murphy, K. P. <em>Probabilistic Machine Learning: Advanced Topics.</em> MIT Press (2023). <a href="https://probml.github.io/pml-book/book2.html" target="_blank" rel="noopener">probml.github.io/pml-book</a></div>
+<div class="bib-annotation">Covers diffusion, score matching, and SDEs (Section 33.3) within the broader probabilistic-modeling landscape, with the rigor to connect them to energy-based models and normalizing flows. Free online.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Hugging Face <code>diffusers</code>. <a href="https://github.com/huggingface/diffusers" target="_blank" rel="noopener">github.com/huggingface/diffusers</a></div>
+<div class="bib-annotation">The reference library for diffusion: schedulers (DDPM, DDIM, DPM-Solver), pipelines (Stable Diffusion, SDXL, SD3, FLUX), and the U-Net and DiT building blocks. The library shortcut behind nearly every code example in this chapter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Karras, T. et al. EDM reference code (NVlabs). <a href="https://github.com/NVlabs/edm" target="_blank" rel="noopener">github.com/NVlabs/edm</a></div>
+<div class="bib-annotation">The clean, well-documented implementation of the EDM formulation, schedules, and second-order sampler discussed in Sections 33.2 and 33.4. The best codebase to read for diffusion done carefully.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Karras, T. et al. "Analyzing and Improving the Training Dynamics of Diffusion Models (EDM2)." CVPR (2024). <a href="https://arxiv.org/abs/2312.02696" target="_blank" rel="noopener">arXiv:2312.02696</a></div>
+<div class="bib-annotation">The 2024 follow-up that sets the current ImageNet generation record by fixing magnitude growth in the network, the state of the art baseline referenced across the chapter's research-frontier callouts.</div>
+</div>
+
+<h3>Tutorials &amp; Explainers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Weng, L. "What are Diffusion Models?" Lil'Log (2021, updated). <a href="https://lilianweng.github.io/posts/2021-07-11-diffusion-models/" target="_blank" rel="noopener">lilianweng.github.io</a></div>
+<div class="bib-annotation">The most thorough single-page derivation of DDPM, the SDE view, guidance, and fast samplers, covering essentially every section of this chapter with consistent notation. Read it alongside the math.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hugging Face Diffusion Models Course. <a href="https://github.com/huggingface/diffusion-models-class" target="_blank" rel="noopener">github.com/huggingface/diffusion-models-class</a></div>
+<div class="bib-annotation">A hands-on notebook course that trains a diffusion model from scratch and then with <code>diffusers</code>, mirroring the build-then-shortcut structure of Sections 33.1 and 33.7.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-32-gans/index.html">&#8592; Chapter 32: Generative Adversarial Networks</a>
+<a href="../index.html">Part IV</a>
+<a class="next" href="section-33.1.html">Section 33.1: Destroying &amp; Rebuilding &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

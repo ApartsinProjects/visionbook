@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.5: Monitoring, Drift &amp; Continual Improvement. Why deployed vision accuracy decays silently without labels, detecting data and concept drift from inputs and confidence alone, the human-in-the-loop labeling and retraining loop, and the guardrails (shadow deployment, canary rollout) that make continual improvement safe." name="description"/>
+<title>Section 28.5: Monitoring, Drift &amp; Continual Improvement | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a></div>
+<h1>Monitoring, Drift &amp; Continual Improvement</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Nobody told me the cameras would be replaced with a sharper model, that the store would repaint its walls beige, or that winter would arrive. I kept answering with the same confidence I had in summer. Confidence, I have learned, is the last thing to notice it is wrong."</p>
+<cite>A Deployed Classifier the World Quietly Moved On From</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A deployed vision model decays, not because its weights change but because the world does, and the cruelty of the failure is that it is silent: production has no labels, so accuracy can fall for weeks while every metric you log looks fine.</strong> The model that was excellent on launch day meets new cameras, new lighting, new seasons, and new behaviors, and its predictions drift from correct without a single error being raised. This section builds the loop that catches that decay: monitoring the inputs and the model's own confidence to detect distribution shift without labels, triggering human review and retraining when drift crosses a threshold, and rolling new models out safely with shadow deployment and canary releases. Deployment is not the finish line; it is the start of the part of the system's life that lasts longest.</p>
+</div>
+
+<p>
+Every previous section in this chapter assumed a fixed model meeting a fixed world. The world is not fixed. The training distribution you so carefully assembled in <a href="../module-21-training-recipes/index.html">Chapter 21</a> was a snapshot, and the production distribution slides away from it continuously: hardware gets upgraded, environments change, user behavior evolves, and rare conditions you never trained on eventually arrive. The model does not know any of this. It keeps mapping inputs to outputs with the same machinery, and because no ground truth arrives in production to score against, accuracy can collapse with no alarm. This section is about replacing that silence with signal, and then closing the loop so the model improves rather than merely degrades.
+</p>
+
+<h2>1. Why Accuracy Decays Silently <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The core difficulty is the absence of labels. In training you knew the right answer for every image, so accuracy was a number you could compute. In production the right answer almost never arrives, or arrives much later (a fraud is confirmed weeks on, a diagnosis is verified at follow-up), so the one metric you actually care about is the one you cannot measure in real time. Meanwhile the input distribution shifts. We distinguish two kinds of shift, because they call for different responses.
+</p>
+
+<p>
+<strong>Data drift</strong> (covariate shift) is a change in the distribution of inputs $p(x)$: new camera sensors, a redesigned store, a different season, a population the model rarely saw. The relationship between input and label is unchanged, but the model now sees inputs unlike its training data and extrapolates poorly. <strong>Concept drift</strong> is a change in the relationship $p(y \mid x)$ itself: the same input should now get a different label, perhaps because a product category was redefined or fashions changed what counts as the target class. Data drift you can detect from the inputs alone; concept drift is harder because the inputs may look unchanged while their correct labels have moved. Figure 28.5.1 contrasts them.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Data drift shifts the input distribution while concept drift moves the decision boundary between classes">
+<style>
+.d5ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.d5lbl{font:11.5px sans-serif;fill:#1a1a1a;}
+.d5sm{font:10px sans-serif;fill:#666;}
+.d5train{fill:#2c6fb5;}
+.d5prod{fill:#d6802b;}
+.d5bound{stroke:#3a9d52;stroke-width:2;stroke-dasharray:5 4;fill:none;}
+.d5ax{stroke:#bbb;stroke-width:1;}
+</style>
+<text class="d5ttl" x="360" y="22" text-anchor="middle">Two kinds of drift</text>
+<!-- data drift panel -->
+<text class="d5lbl" x="185" y="50" text-anchor="middle">Data drift: inputs move, boundary fixed</text>
+<rect x="60" y="60" width="250" height="170" fill="#fafafa" stroke="#ddd"/>
+<line class="d5bound" x1="185" y1="64" x2="185" y2="226"/>
+<!-- training cluster (blue) on left -->
+<circle class="d5train" cx="110" cy="110" r="4"/><circle class="d5train" cx="125" cy="135" r="4"/><circle class="d5train" cx="100" cy="160" r="4"/><circle class="d5train" cx="135" cy="100" r="4"/><circle class="d5train" cx="118" cy="180" r="4"/>
+<!-- production cluster (orange) shifted right -->
+<circle class="d5prod" cx="230" cy="115" r="4"/><circle class="d5prod" cx="250" cy="140" r="4"/><circle class="d5prod" cx="265" cy="105" r="4"/><circle class="d5prod" cx="240" cy="170" r="4"/><circle class="d5prod" cx="258" cy="185" r="4"/>
+<text class="d5sm" x="185" y="248" text-anchor="middle">inputs drifted into new region</text>
+<!-- concept drift panel -->
+<text class="d5lbl" x="535" y="50" text-anchor="middle">Concept drift: boundary moves, inputs fixed</text>
+<rect x="410" y="60" width="250" height="170" fill="#fafafa" stroke="#ddd"/>
+<!-- same points both panels -->
+<circle class="d5train" cx="470" cy="110" r="4"/><circle class="d5train" cx="490" cy="150" r="4"/><circle class="d5train" cx="460" cy="180" r="4"/>
+<circle class="d5prod" cx="600" cy="120" r="4"/><circle class="d5prod" cx="580" cy="160" r="4"/><circle class="d5prod" cx="610" cy="185" r="4"/>
+<circle class="d5train" cx="540" cy="100" r="4"/><circle class="d5prod" cx="545" cy="195" r="4"/>
+<!-- old boundary -->
+<line class="d5bound" x1="535" y1="64" x2="535" y2="226"/>
+<!-- new boundary (different color hint via dashes shifted) -->
+<line x1="500" y1="64" x2="570" y2="226" stroke="#a33" stroke-width="2" stroke-dasharray="2 3"/>
+<text class="d5sm" x="535" y="248" text-anchor="middle">same inputs, label rule changed</text>
+</svg>
+<figcaption><strong>Figure 28.5.1:</strong> Data drift versus concept drift. In data drift (left), the input distribution moves (orange) away from training (blue) while the decision boundary stays correct; the model errs because it extrapolates into unfamiliar input regions. In concept drift (right), the inputs look the same but the correct decision boundary has moved (red), so predictions that were right become wrong even though nothing about the inputs signals it.</figcaption>
+</figure>
+
+<h2>2. Detecting Drift Without Labels <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Since labels are unavailable, drift detection works from two label-free signals. The first is the <strong>input distribution</strong>: compare the statistics of recent production inputs against a reference window from training or launch. Comparing raw pixels is hopeless (too high-dimensional), so the effective recipe, established by the "Failing Loudly" study, is to reduce dimensionality first, usually by running inputs through the model's own feature extractor (the penultimate-layer embeddings, the learned representations of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>), then run a statistical two-sample test on those low-dimensional features. The second signal is the model's <strong>output confidence</strong>: a model meeting unfamiliar inputs tends to become either over-confident in wrong predictions or diffusely uncertain, so the distribution of maximum softmax probabilities or prediction entropy shifts measurably even when accuracy itself cannot be measured. The histograms-and-statistics tools of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> return here as drift detectors.
+</p>
+
+<p>
+A standard univariate test is the two-sample Kolmogorov-Smirnov test, which compares two empirical distributions and reports the probability they came from the same source. Applied to a confidence score or to each feature dimension (with a multiple-comparison correction), it gives a principled drift alarm. The code below builds a minimal drift monitor on the model's confidence scores.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy import stats
+
+class ConfidenceDriftMonitor:
+    """Alarm when production confidence drifts from a reference window (label-free)."""
+    def __init__(self, reference_confidences, alpha=0.01):
+        self.reference = np.asarray(reference_confidences)   # e.g. launch-day max-softmax
+        self.alpha = alpha                                    # significance threshold
+
+    def check(self, recent_confidences):
+        recent = np.asarray(recent_confidences)
+        # Two-sample KS test: is the recent confidence distribution the same as reference?
+        ks_stat, p_value = stats.ks_2samp(self.reference, recent)
+        drifted = p_value &lt; self.alpha
+        return {
+            "ks_statistic": float(ks_stat),
+            "p_value": float(p_value),
+            "drifted": bool(drifted),
+            "mean_shift": float(recent.mean() - self.reference.mean()),
+        }
+
+# Reference: confidences observed at launch (model is healthy and well-calibrated).
+ref = np.random.beta(8, 2, size=5000)            # skewed high: confident, mostly correct
+monitor = ConfidenceDriftMonitor(ref)
+
+# Production batch after the environment shifted: confidence sags toward uncertainty.
+drifted_batch = np.random.beta(4, 3, size=1000)  # flatter, less confident
+print(monitor.check(drifted_batch))
+# {'ks_statistic': 0.34, 'p_value': 1.2e-58, 'drifted': True, 'mean_shift': -0.21}</code></pre>
+<div class="code-caption">A label-free confidence drift monitor using the two-sample Kolmogorov-Smirnov test. It compares the distribution of the model's maximum-softmax confidence on a recent production batch against a reference window from launch; a small p-value flags that the confidence distribution has shifted, an early warning of data drift that needs no ground-truth labels. The same test applied to feature embeddings detects input drift the confidence alone might miss.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Drift Is a Warning, Not a Verdict</div>
+<p>A drift alarm tells you the input or confidence distribution has changed; it does not tell you accuracy has dropped. Sometimes drift is benign (a new but well-handled camera) and sometimes catastrophic (a population the model fails on). The alarm's job is to trigger a cheap human check on a sample of the drifted inputs, which is the only way to confirm whether accuracy actually fell. Treating every drift alarm as a guaranteed accuracy regression leads to alarm fatigue and needless retraining; treating it as a prompt to look leads to catching the real failures early. Drift detection buys you attention, not certainty, and the value is in directing scarce labeling effort to the inputs most likely to be failing.</p>
+</div>
+
+<h2>3. The Continual-Improvement Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A drift alarm is the entry point to a loop, not an end in itself. The mature production loop, sometimes called the data flywheel, turns the model's own uncertainty into the next training set. It runs continuously: the deployed model serves predictions; a monitor watches inputs and confidence for drift; when drift or low confidence flags interesting inputs, those inputs are <strong>sampled for human labeling</strong> (prioritizing the uncertain and drifted, which is exactly the active-learning principle of spending labels where they teach most); the new labels are added to the training set; the model is <strong>retrained or fine-tuned</strong>; and the candidate is validated and rolled out, after which the loop repeats. Figure 28.5.2 lays out the cycle.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A cycle from deployed model to monitoring to human labeling to retraining to safe rollout and back">
+<style>
+.l5ttl{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.l5lbl{font:11px sans-serif;fill:#1a1a1a;}
+.l5sm{font:9.5px sans-serif;fill:#666;}
+.l5a{fill:#e7f1fb;stroke:#2c6fb5;stroke-width:1.4;}
+.l5b{fill:#fff3da;stroke:#d6a52b;stroke-width:1.4;}
+.l5c{fill:#fdeede;stroke:#d6802b;stroke-width:1.4;}
+.l5d{fill:#e9f6ec;stroke:#3a9d52;stroke-width:1.4;}
+.l5ar{stroke:#888;stroke-width:1.6;marker-end:url(#l5m);fill:none;}
+</style>
+<defs><marker id="l5m" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#888"/></marker></defs>
+<text class="l5ttl" x="360" y="22" text-anchor="middle">The continual-improvement loop (data flywheel)</text>
+<rect class="l5a" x="290" y="48" width="140" height="48" rx="6"/><text class="l5lbl" x="360" y="68" text-anchor="middle">Deployed model</text><text class="l5sm" x="360" y="84" text-anchor="middle">serves predictions</text>
+<rect class="l5b" x="540" y="120" width="140" height="48" rx="6"/><text class="l5lbl" x="610" y="140" text-anchor="middle">Monitor drift</text><text class="l5sm" x="610" y="156" text-anchor="middle">inputs + confidence</text>
+<rect class="l5c" x="540" y="210" width="140" height="48" rx="6"/><text class="l5lbl" x="610" y="230" text-anchor="middle">Human labeling</text><text class="l5sm" x="610" y="246" text-anchor="middle">sample uncertain inputs</text>
+<rect class="l5d" x="290" y="232" width="140" height="48" rx="6"/><text class="l5lbl" x="360" y="252" text-anchor="middle">Retrain / fine-tune</text><text class="l5sm" x="360" y="268" text-anchor="middle">add new labels</text>
+<rect class="l5a" x="40" y="120" width="140" height="48" rx="6"/><text class="l5lbl" x="110" y="140" text-anchor="middle">Safe rollout</text><text class="l5sm" x="110" y="156" text-anchor="middle">shadow + canary</text>
+<line class="l5ar" x1="430" y1="78" x2="545" y2="125"/>
+<line class="l5ar" x1="610" y1="168" x2="610" y2="208"/>
+<line class="l5ar" x1="540" y1="240" x2="432" y2="252"/>
+<line class="l5ar" x1="290" y1="252" x2="150" y2="170"/>
+<line class="l5ar" x1="110" y1="120" x2="295" y2="78"/>
+<text class="l5sm" x="360" y="160" text-anchor="middle" font-style="italic">labels flow to the inputs the model is least sure about</text>
+</svg>
+<figcaption><strong>Figure 28.5.2:</strong> The continual-improvement loop. The deployed model serves predictions while a monitor watches for drift; flagged uncertain inputs are sampled for human labeling, added to the training set, and used to retrain; the candidate is then rolled out safely with shadow and canary stages before becoming the new deployed model. Labeling effort flows to exactly the inputs the model is least confident on.</figcaption>
+</figure>
+
+<p>
+Two pieces of this loop have appeared elsewhere in the book. The "sample the uncertain inputs for labeling" step is active learning, and the human-labeling pipeline (codebooks, multiple raters, agreement) is its own discipline. The retraining step is the training recipe of <a href="../module-21-training-recipes/index.html">Chapter 21</a> run again on an enlarged dataset, often as a fine-tune from the current weights rather than from scratch. The new piece is doing the rollout safely.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Defect Detector That Aged Out of Its Factory</div>
+<p>A manufacturer ran a surface-defect detector on a production line, inspecting metal parts for scratches and dents from <a href="../module-23-object-detection/index.html">Chapter 23</a>-style detection. It launched at 0.96 recall and was trusted to pass or reject parts automatically. Eight months later a customer complaint surfaced a batch of defective parts the system had passed. There had been no alarm, no error, no metric out of range, because the line had no labels to score against. The investigation found the cause: the supplier had switched to a slightly different alloy with a duller surface finish, and the new finish reflected the inspection lighting differently, shifting the input distribution into a region the model handled poorly. A confidence drift monitor like the one in subsection 2 would have flagged the sagging confidence within days of the alloy change; instead it ran blind for months. The fix was the full loop: they added the monitor, sampled the drifted (low-confidence) images for human labeling, fine-tuned on the new finish, and rolled the update out behind a shadow deployment before trusting it. The lesson: a model with no monitoring is not a deployed product, it is a liability with a launch date, and the cost of the missing monitor was paid by the customer who received the parts it silently passed.</p>
+</div>
+
+<h2>4. Rolling Out Safely <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A retrained model is a hypothesis, not an improvement, until proven on real traffic. Deploying it straight to all users risks a regression worse than the drift you were fixing, so production rollout uses two guardrails. In a <strong>shadow deployment</strong> the new model runs alongside the current one on the same live requests, but its predictions are logged and not served; this measures the new model on real production traffic without exposing users to it, and lets you compare the two before committing. In a <strong>canary rollout</strong> the new model serves a small fraction of traffic (say 1 to 5 percent) while monitored closely; if its metrics hold, the fraction is ramped up gradually, and if anything regresses it is rolled back instantly with most users never affected. The two compose: shadow first to validate offline-style on live data, then canary to validate while serving. The sketch below shows the routing logic.
+</p>
+
+<pre><code class="language-python">import random
+
+class CanaryRouter:
+    """Route a fraction of traffic to a candidate model; shadow-run it on the rest."""
+    def __init__(self, stable_model, candidate_model, canary_fraction=0.05):
+        self.stable = stable_model
+        self.candidate = candidate_model
+        self.canary_fraction = canary_fraction
+        self.log = []                       # for comparing the two models offline
+
+    def predict(self, x):
+        stable_out = self.stable(x)         # always run the trusted model
+
+        if random.random() &lt; self.canary_fraction:
+            served = self.candidate(x)      # canary: candidate actually serves this request
+            source = "candidate"
+        else:
+            served = stable_out             # stable serves; candidate runs in shadow
+            shadow_out = self.candidate(x)  # logged, NOT served, for comparison
+            self.log.append((stable_out, shadow_out))
+            source = "stable"
+
+        return served, source
+
+# Operating discipline: ramp canary_fraction 1% -> 5% -> 25% -> 100% only while
+# the candidate's monitored metrics (confidence, agreement, downstream signals)
+# hold; roll back instantly to 0% on any regression.</code></pre>
+<div class="code-caption">A canary router with shadow logging. The trusted stable model always runs; a small <code>canary_fraction</code> of requests are actually served by the candidate, while the rest run the candidate in shadow (logged, not served) for offline comparison. Ramping the fraction up only while monitored metrics hold, and rolling back instantly on regression, is what makes deploying a retrained model safe rather than a gamble.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Drift Monitoring Off the Shelf</div>
+<p>The KS-test monitor in subsection 2 teaches the mechanism, but you should not hand-roll a production drift system. Open-source monitoring libraries package multivariate drift tests, confidence tracking, and dashboards. Evidently, for example, computes a full drift report over a reference and current dataset in a few lines:</p>
+<pre><code class="language-python">from evidently import Report
+from evidently.presets import DataDriftPreset
+
+# reference_df and current_df hold model features / confidences as columns.
+report = Report(metrics=[DataDriftPreset()])
+result = report.run(reference_data=reference_df, current_data=current_df)
+result.save_html("drift_report.html")     # per-feature drift, tests, and visuals
+# Flags which feature columns drifted, with the test and p-value for each.</code></pre>
+<p>The library runs the appropriate statistical test per feature type, applies multiple-comparison handling, and renders an interpretable report, replacing a few hundred lines of monitoring code and the statistics expertise to get the tests right. You still choose the reference window and decide what a drift flag should trigger; the library handles the detection, not the policy.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Label-Free Accuracy Estimation and Autonomous Loops (2024-2026)</div>
+<p>The hardest problem in this section, estimating accuracy without labels, is an active research front. The 2023-onward work on automatic model evaluation and confidence-based accuracy prediction (average thresholded confidence, agreement among augmented views, the "disagreement equals error" line of work) aims to estimate the test error of a deployed model from unlabeled production data alone, turning the silent decay of subsection 1 into a measured curve. Foundation-model embeddings from <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> have made input-drift detection sharper, since a strong general-purpose feature space catches semantic shift that pixel statistics miss, and 2024-2025 systems increasingly use a large vision-language model as an automatic auditor that flags and even pre-labels the drifted inputs for human review. The further frontier is the autonomous flywheel: loops that detect drift, mine and pseudo-label hard examples, fine-tune, and canary-deploy with progressively less human involvement, raising governance questions (when is automatic retraining safe?) that the safety and evaluation material of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> takes up for generative systems.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most famous drift in computer vision history may be the one nobody monitored: image classifiers trained before a certain year had never seen a face wearing a surgical mask as a routine input, and when masks became ubiquitous overnight, face-detection and recognition systems worldwide degraded in the same week, a global, synchronized concept-and-data drift. Teams that had a monitoring loop saw their confidence distributions sag and their labeling queues fill with masked faces, and retrained within days. Teams that did not learned about the drift from their users. The world does not file a change request before it shifts under your model.</p>
+</div>
+
+<h2>5. Summary: Deployment Is a Loop, Not a Line</h2>
+
+<p>
+A deployed vision model decays because the world drifts away from its training distribution, and the decay is silent because production has no labels to score against. Data drift changes the inputs $p(x)$; concept drift changes the input-to-label relationship $p(y \mid x)$. Both are detectable without labels by monitoring the input feature distribution and the model's confidence with two-sample tests, but a drift alarm is a prompt to look, not a verdict on accuracy. The continual-improvement loop turns that signal into action: sample the uncertain and drifted inputs for human labeling, retrain on the enlarged set, and roll the candidate out safely behind shadow deployment and canary releases. This closes Chapter 28 and Part III's journey from a trained network to a living production system. The same compression, export, and serving discipline becomes essential again for the far larger generative models of Part IV, and the monitoring-and-governance loop built here is the operational foundation that <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> extends to the harder evaluation problems of generated content.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.5.1: Tell the Two Drifts Apart <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state whether it is primarily data drift, concept drift, or both, and explain in one sentence how (or whether) a label-free monitor watching input features and confidence could detect it: (a) a retail camera is upgraded to a higher-resolution sensor; (b) a fashion-classification model's "formal wear" category is redefined by the business to include a style it used to call "casual"; (c) a new factory opens in a country with different product packaging; (d) a content-policy change makes a previously-allowed image category now require flagging. Connect your answers to why concept drift is the harder case to catch from inputs alone.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.5.2: Build a Two-Signal Drift Monitor <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>ConfidenceDriftMonitor</code> from subsection 2 into a two-signal monitor: in addition to the confidence KS test, extract penultimate-layer embeddings from a pretrained classifier for a reference set and a "production" set, reduce them with PCA to a handful of dimensions, and run a KS test per reduced dimension with a Bonferroni correction. Simulate a controlled data drift (for example, apply a brightness or blur shift to the production images, using the operations of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>) and verify that the embedding monitor flags it before the confidence monitor does. Report which signal fired first and at what shift magnitude.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 28.5.3: Design a Rollout for a High-Stakes Model <span class="exercise-type analysis">Analysis</span></div>
+<p>You have retrained the surface-defect detector from the Practical Example after a confidence drift alarm, and you must roll it out on a line where a missed defect is expensive and a false reject wastes a part. Design the rollout: specify the shadow-deployment duration and what you would compare between the stable and candidate models with no production labels, the canary fractions and ramp schedule, the metrics that would trigger an instant rollback, and how you would obtain enough ground truth to make the go or no-go decision. Justify each choice against the asymmetric cost of the two error types, and explain why deploying the candidate to 100 percent of the line immediately, even after a good shadow result, is the wrong move.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-28.4.html">&#8592; Section 28.4: Serving Vision Models</a>
+<a href="index.html">Chapter 28</a>
+<a class="next" href="../module-29-tools-of-the-trade/index.html">Chapter 29: Tools of the Trade: The Deep Vision Stack &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

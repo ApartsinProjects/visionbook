@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.2: Training Pathologies: Mode Collapse and Instability. Why GANs are hard to train, mode collapse and vanishing gradients, the Wasserstein GAN and its meaningful loss, gradient penalty and spectral normalization, and the diagnostics that distinguish a healthy run from a failing one." name="description"/>
+<title>Section 32.2: Training Pathologies | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Generative Adversarial Networks</a></div>
+<h1>Section 32.2: Training Pathologies: Mode Collapse &amp; Instability</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I found one digit the bank could not tell from real, so I printed only that digit forever. They called it mode collapse. I called it efficiency. We were both, in our way, completely correct."</p>
+<cite>A Generator With Exactly One Good Idea</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A GAN has no single loss to drive to zero; the healthy state is a balance between two networks, and most of the field's progress has been inventing ways to keep that balance from tipping over.</strong> This section names the three classic failure modes, mode collapse, vanishing gradients, and oscillation, and traces each to the geometry of the Jensen-Shannon divergence the original GAN minimizes. It then builds the two repairs that defined the late 2010s: the Wasserstein distance, which gives the loss a meaningful magnitude even when real and fake distributions barely overlap, and the Lipschitz constraints (gradient penalty, spectral normalization) that make the Wasserstein critic trainable. We close with the diagnostic habits that tell you, mid-run, whether your GAN is converging or quietly dying.</p>
+</div>
+
+<p>
+In <a href="section-32.1.html">Section 32.1</a> we derived a clean theory: at the global optimum the generator matches the data distribution and the discriminator is reduced to a coin flip. That theory assumes you can actually reach the optimum. In practice the two-player game is one of the hardest optimization problems in deep learning, because the thing you are descending keeps moving, and the surface it lives on has cliffs the moment the two distributions stop overlapping. This section is the honest middle of the chapter, the part the glossy sample grids never show.
+</p>
+
+<h2>1. The Three Classic Failures <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+<strong>Mode collapse</strong> is the signature GAN failure. The data has many modes (ten digits in MNIST, thousands of object types in a photo dataset), but the generator discovers that producing just one or a few of them reliably fools the discriminator, so it abandons the rest. You see a sheet of nearly identical outputs. The cause is structural: the generator's objective rewards fooling the discriminator on the current batch, not covering the whole distribution, and nothing in the basic loss penalizes a generator for ignoring entire regions of $p_{\text{data}}$. If the discriminator catches up and learns to reject the over-produced mode, the generator simply hops to a different single mode, a behavior called <strong>mode hopping</strong>, and the two can chase each other around the data forever without the generator ever covering everything at once.
+</p>
+
+<p>
+<strong>Vanishing gradients</strong> is the failure we previewed in Section 32.1. When the discriminator gets too good, it rejects fakes with near-certainty, and the gradient passed back to the generator shrinks toward zero. The non-saturating loss helps, but only partly: if the supports of $p_{\text{data}}$ and $p_g$ are disjoint, which is the generic situation early in training because both live on thin manifolds inside a huge pixel space, then an optimal discriminator can separate them perfectly and the Jensen-Shannon divergence is pinned at its maximum $\log 2$ regardless of how far apart they are. A constant divergence has zero gradient. The generator is told "you are wrong" but never "wrong in which direction".
+</p>
+
+<p>
+<strong>Oscillation and non-convergence</strong> is the third. Because the two networks chase opposed objectives, the parameters can cycle indefinitely instead of settling, the discrete-time analogue of two players circling a saddle point. A famous toy example is a simple bilinear game whose continuous dynamics orbit the equilibrium forever; gradient descent on a GAN can do the same, with sample quality rising and falling in waves rather than improving monotonically. Figure 32.2.1 contrasts the three diseased loss patterns with the healthy one.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four small loss-curve panels: a healthy run where discriminator and generator losses stay in a stable band, mode collapse where the generator loss drops then sample diversity dies, vanishing gradients where the discriminator loss falls to near zero, and oscillation where both losses swing in growing waves">
+  <g font-family="sans-serif" font-size="12">
+    <!-- panel 1 healthy -->
+    <rect x="20" y="30" width="160" height="120" fill="#f7faf7" stroke="#bbb"/>
+    <text x="100" y="22" text-anchor="middle" font-weight="bold" fill="#2e8b57">Healthy</text>
+    <path d="M28,90 q20,-12 40,4 t40,-2 t40,2 t12,-3" fill="none" stroke="#a0356f" stroke-width="1.8"/>
+    <path d="M28,100 q20,10 40,-4 t40,3 t40,-2 t12,4" fill="none" stroke="#2e8b57" stroke-width="1.8"/>
+    <text x="100" y="142" text-anchor="middle" font-size="10" fill="#555">both stay in a band</text>
+    <!-- panel 2 mode collapse -->
+    <rect x="200" y="30" width="160" height="120" fill="#fdf6f0" stroke="#bbb"/>
+    <text x="280" y="22" text-anchor="middle" font-weight="bold" fill="#c8862a">Mode collapse</text>
+    <path d="M208,70 q40,-10 80,0 t72,2" fill="none" stroke="#a0356f" stroke-width="1.8"/>
+    <path d="M208,110 q40,8 80,-30 t72,-6" fill="none" stroke="#2e8b57" stroke-width="1.8"/>
+    <text x="280" y="142" text-anchor="middle" font-size="10" fill="#555">G loss low, diversity dies</text>
+    <!-- panel 3 vanishing -->
+    <rect x="380" y="30" width="160" height="120" fill="#fdf6f0" stroke="#bbb"/>
+    <text x="460" y="22" text-anchor="middle" font-weight="bold" fill="#c8862a">Vanishing grad</text>
+    <path d="M388,120 q40,-5 80,-20 t72,-10" fill="none" stroke="#a0356f" stroke-width="1.8"/>
+    <path d="M388,70 q40,25 80,30 t72,8" fill="none" stroke="#2e8b57" stroke-width="1.8"/>
+    <text x="460" y="142" text-anchor="middle" font-size="10" fill="#555">D wins, G stalls</text>
+    <!-- panel 4 oscillation -->
+    <rect x="560" y="30" width="160" height="120" fill="#fdf6f0" stroke="#bbb"/>
+    <text x="640" y="22" text-anchor="middle" font-weight="bold" fill="#c8862a">Oscillation</text>
+    <path d="M568,90 q12,-30 24,0 t24,30 t24,-40 t24,40 t24,-48 t24,46" fill="none" stroke="#a0356f" stroke-width="1.8"/>
+    <text x="640" y="142" text-anchor="middle" font-size="10" fill="#555">growing swings</text>
+    <!-- legend -->
+    <line x1="250" y1="175" x2="280" y2="175" stroke="#a0356f" stroke-width="2"/>
+    <text x="286" y="179" font-size="11">discriminator loss</text>
+    <line x1="430" y1="175" x2="460" y2="175" stroke="#2e8b57" stroke-width="2"/>
+    <text x="466" y="179" font-size="11">generator loss</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.2.1:</strong> Loss signatures of a healthy GAN and the three classic pathologies. Only the leftmost panel, with both losses oscillating gently inside a stable band, indicates a converging run. The other three are the patterns to recognize and intervene on, and they motivate the repairs in the rest of this section.</figcaption>
+</figure>
+
+<h2>2. The Root Cause: Jensen-Shannon Has No Gradient When Supports Are Disjoint</h2>
+
+<p>
+The vanishing-gradient and the disjoint-support problems share one root, and seeing it clearly motivates everything that follows. Consider the simplest possible mismatch: $p_{\text{data}}$ is a point mass at $x = 0$ and $p_g$ is a point mass at $x = \theta$, and we slide $\theta$ from far away toward $0$. The Jensen-Shannon divergence between two non-overlapping point masses is the constant $\log 2$ for every $\theta \ne 0$, then drops discontinuously to $0$ at $\theta = 0$. (The Jensen-Shannon and KL divergences themselves were developed in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>.) As a function of the generator parameter $\theta$, the JSD is flat everywhere except at a single point, so its gradient is zero almost everywhere. No matter how the generator moves, the loss does not change, and gradient descent gets no signal about which direction reduces the gap.
+</p>
+
+<p>
+This is not a quirk of point masses. Two distributions supported on low-dimensional manifolds inside high-dimensional pixel space almost never overlap, so the JSD between a real image distribution and a freshly initialized generator is generically pinned at its maximum. The discriminator can separate them perfectly, and a perfect discriminator gives no useful gradient. The clean theory of Section 32.1 assumed the optimum was reachable by gradient descent; this is the precise sense in which, with the original loss, it often is not.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Right Distance Should Move Smoothly</div>
+<p>The fix is to replace a distance that is constant when distributions do not overlap with one that decreases smoothly as they approach. For the point-mass example, you want a distance equal to $|\theta|$: it tells the generator exactly how far it has to go and in which direction. That distance is the Wasserstein, or earth-mover, distance, and adopting it is the single most important stabilization in GAN history.</p>
+</div>
+
+<h2>3. The Wasserstein GAN <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The <strong>Wasserstein-1 distance</strong> $W(p_{\text{data}}, p_g)$ measures the minimum cost of transporting the mass of one distribution to match the other, where cost is mass times distance moved, hence the name "earth mover". For our two point masses it equals exactly $|\theta|$, which is the smooth, informative signal we wanted. The trouble is that the transport definition is an intractable optimization over all couplings. The Kantorovich-Rubinstein duality rescues it by rewriting the distance as a maximization over functions:
+</p>
+
+<p>
+$$ W(p_{\text{data}}, p_g) \;=\; \sup_{\lVert f \rVert_L \le 1} \; \mathbb{E}_{\mathbf{x} \sim p_{\text{data}}} \big[ f(\mathbf{x}) \big] \;-\; \mathbb{E}_{\mathbf{x} \sim p_g} \big[ f(\mathbf{x}) \big], $$
+</p>
+
+<p>
+where the supremum is over all <strong>1-Lipschitz</strong> functions $f$ (functions whose output changes by at most the input distance). We approximate $f$ with a network, now called a <strong>critic</strong> rather than a discriminator because it outputs an unbounded real score instead of a probability. The critic maximizes the difference of its mean scores on real and fake images; the generator minimizes the negative of the critic's score on fakes. The whole objective becomes
+</p>
+
+<p>
+$$ \min_{G} \max_{\lVert D \rVert_L \le 1} \; \mathbb{E}_{\mathbf{x} \sim p_{\text{data}}} \big[ D(\mathbf{x}) \big] \;-\; \mathbb{E}_{\mathbf{z} \sim p_z} \big[ D(G(\mathbf{z})) \big]. $$
+</p>
+
+<p>
+There is no <code>log</code> and no sigmoid. Two consequences matter enormously in practice. First, the loss now <em>means something</em>: the critic's score difference is an estimate of the Wasserstein distance, so it correlates with sample quality and actually goes down as the generator improves, unlike the original loss whose magnitude told you almost nothing. Second, you can and should train the critic to near-optimality each step, because a better critic gives a better distance estimate rather than a vanishing gradient. The only catch is enforcing the $1$-Lipschitz constraint, which is what the next subsection is about.
+</p>
+
+<h2>4. Enforcing Lipschitz: Gradient Penalty and Spectral Normalization</h2>
+
+<p>
+The original WGAN paper enforced the Lipschitz constraint by <strong>weight clipping</strong>, clamping every critic weight into $[-c, c]$ after each step. It worked but was brittle: too small a clip and the critic underfits, too large and the constraint is violated, and the clipped weights tend to pile up at the boundaries. Two cleaner mechanisms replaced it and remain standard.
+</p>
+
+<p>
+<strong>Gradient penalty (WGAN-GP)</strong> notes that a function is $1$-Lipschitz exactly when its gradient has norm at most $1$ everywhere. Rather than clip weights, it adds a soft penalty that pushes the critic's gradient norm toward $1$, evaluated at random points $\hat{\mathbf{x}}$ interpolated between real and fake samples:
+</p>
+
+<p>
+$$ \mathcal{L}_{\text{GP}} \;=\; \lambda \, \mathbb{E}_{\hat{\mathbf{x}}} \Big[ \big( \lVert \nabla_{\hat{\mathbf{x}}} D(\hat{\mathbf{x}}) \rVert_2 - 1 \big)^2 \Big], \qquad \hat{\mathbf{x}} = \epsilon \mathbf{x} + (1 - \epsilon) G(\mathbf{z}), \;\; \epsilon \sim U[0,1]. $$
+</p>
+
+<p>
+The penalty weight $\lambda = 10$ is a robust default. The implementation is short and is the reason WGAN-GP became the workhorse of the era.
+</p>
+
+<pre><code class="language-python">import torch
+
+def gradient_penalty(critic, real, fake, device, lam=10.0):
+    """WGAN-GP: penalize the critic's gradient norm away from 1
+       at random interpolations between real and fake images."""
+    bs = real.size(0)
+    eps = torch.rand(bs, 1, 1, 1, device=device)          # one mix weight per image
+    interp = (eps * real + (1 - eps) * fake).requires_grad_(True)
+    scores = critic(interp)
+    grads = torch.autograd.grad(
+        outputs=scores, inputs=interp,
+        grad_outputs=torch.ones_like(scores),
+        create_graph=True, retain_graph=True)[0]            # create_graph: penalty is differentiable
+    grads = grads.view(bs, -1)
+    gp = ((grads.norm(2, dim=1) - 1.0) ** 2).mean()         # target gradient norm is exactly 1
+    return lam * gp</code></pre>
+<div class="code-caption">The WGAN-GP gradient penalty. The key subtlety is <code>create_graph=True</code>, which makes the gradient-norm term itself differentiable so that backpropagation can flow through it into the critic's weights.</div>
+
+<p>
+<strong>Spectral normalization</strong> (Miyato et al., 2018) takes a different route. The Lipschitz constant of a linear layer is its largest singular value (spectral norm), and the Lipschitz constant of a composition is bounded by the product of the per-layer constants. So if you divide each layer's weight matrix by its own spectral norm, estimated cheaply with one step of power iteration per forward pass, every layer becomes $1$-Lipschitz and the whole critic is constrained for free. It adds almost no cost and is a single wrapper in PyTorch.
+</p>
+
+<pre><code class="language-python">import torch.nn as nn
+from torch.nn.utils.parametrizations import spectral_norm
+
+# Wrap each conv/linear in the discriminator; power iteration runs on the fly.
+disc = nn.Sequential(
+    spectral_norm(nn.Conv2d(3, 64, 4, 2, 1)), nn.LeakyReLU(0.2),
+    spectral_norm(nn.Conv2d(64, 128, 4, 2, 1)), nn.LeakyReLU(0.2),
+    spectral_norm(nn.Conv2d(128, 1, 4, 1, 0)),
+)</code></pre>
+<div class="code-caption">Spectral normalization applied to a convolutional discriminator. Each <code>spectral_norm</code> wrapper enforces a per-layer Lipschitz bound during every forward pass, with no extra loss term and negligible overhead.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>The two stabilizers above are exactly where libraries earn their keep. Spectral normalization from scratch means implementing power iteration, caching the estimated singular vectors across steps, and re-normalizing the weight on every forward pass, roughly thirty lines that are easy to get subtly wrong. PyTorch's <code>torch.nn.utils.parametrizations.spectral_norm</code> reduces all of that to a one-line wrapper per layer and handles the buffer management internally. Likewise the modern <code>betas</code>, two-time-scale learning rates, and exponential-moving-average of generator weights that production GANs rely on are built into training frameworks rather than re-derived each project.</p>
+</div>
+
+<h2>5. Reading the Signs: GAN Diagnostics <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Because no loss curve tells the full story, diagnosing a GAN is a craft. A short checklist that catches most problems:
+</p>
+
+<ul>
+<li><strong>Watch sample diversity, not just sample quality.</strong> The fastest mode-collapse detector is a fixed grid of latent vectors decoded every few epochs: if distinct $\mathbf{z}$ values start producing near-identical images, the generator is collapsing. Quantitatively, the <strong>Fréchet Inception Distance</strong> (FID) of <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> penalizes low diversity because it compares the full feature-distribution statistics, not individual images.</li>
+<li><strong>Track the critic score gap.</strong> In a WGAN, the difference $\mathbb{E}[D(\text{real})] - \mathbb{E}[D(\text{fake})]$ is your distance estimate; it should shrink as training proceeds. A gap that grows without bound means the critic is overpowering the generator.</li>
+<li><strong>Track $D(\text{real})$ and $D(\text{fake})$ in a standard GAN.</strong> Both near $0.5$ is healthy; $D(\text{real}) \to 1$ and $D(\text{fake}) \to 0$ means the discriminator is winning and the generator's gradient is vanishing.</li>
+<li><strong>Save checkpoints often and keep the best by FID, not the last.</strong> Because runs oscillate, the final checkpoint is frequently worse than one from the middle of the run.</li>
+</ul>
+
+<p>
+Several light interventions rebalance a tipping game. <strong>Two time-scale update rules (TTUR)</strong> give the discriminator a higher learning rate than the generator, which the FID paper showed helps convergence to a local equilibrium. <strong>One-sided label smoothing</strong> replaces the real label $1$ with $0.9$ so the discriminator never becomes overconfident. <strong>Minibatch standard deviation</strong>, which we will meet in <a href="section-32.3.html">Section 32.3</a>, feeds the discriminator a statistic of batch diversity so it can directly punish mode collapse. And simply training the critic multiple steps per generator step (five is the WGAN default) keeps the distance estimate accurate.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The instability of early GANs spawned an entire folklore of "GAN hacks", a widely circulated GitHub list of superstitions and tricks (normalize inputs to $[-1,1]$, use a spherical latent, avoid sparse gradients, flip labels occasionally) that practitioners traded like recipes. Many were never rigorously justified and some were later shown to be unnecessary once spectral normalization and good optimizers arrived, but for a few years the list was, only half-jokingly, the most-cited "paper" in the GAN community.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Medical GAN That Memorized One Tumor</div>
+<p>A research hospital team in 2019 wanted to augment a small, imbalanced dataset of dermoscopy images: melanomas were rare, and a classifier trained on the raw data missed them. The plan was to train a GAN to synthesize additional melanoma images and balance the classes. Their first model trained "successfully" by every loss they watched, both curves looked stable, but the augmented classifier got worse. The cause was severe mode collapse: the GAN had learned to reproduce a handful of training melanomas almost pixel for pixel, so the augmentation added thousands of near-duplicates of a few cases rather than genuine variety, and the classifier overfit to them. The team had been watching the wrong signal. Switching to a WGAN-GP critic, adding the minibatch-standard-deviation diversity statistic, and selecting checkpoints by FID rather than by loss produced a generator whose samples spanned the melanoma variety, and the augmented classifier's recall on held-out melanomas rose meaningfully. The lesson, repeated across the medical-imaging GAN literature, is that for any safety-critical use a GAN must be audited for memorization and diversity, never trusted on its loss curves alone.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier</div>
+<p>Stabilization remains active research into the mid-2020s. NVIDIA's <strong>R3GAN</strong> (Huang et al., NeurIPS 2024) revisited the question of whether GANs are inherently unstable and argued no: with a well-posed regularized relativistic loss and a modern backbone, a plain GAN trains stably and competitively without the bag of tricks, challenging the folklore directly. On the conditional side, the discriminator-stabilization ideas here power the <strong>adversarial distillation</strong> of fast <a href="../module-33-diffusion-models/index.html">diffusion</a> samplers (SDXL-Turbo and Stable Diffusion 3.5 Turbo, 2024), covered in Chapter 33, where the gradient-penalty and spectral-normalization lineage keeps the auxiliary discriminator well-behaved. The throughline is that the Lipschitz-control insight of Wasserstein GANs outlived the architecture that introduced it and is now infrastructure for the diffusion era.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.1 <span class="exercise-type">Conceptual</span></div>
+<p>Using the two-point-mass example of Section 2, compute the Jensen-Shannon divergence and the Wasserstein-1 distance between a mass at $0$ and a mass at $\theta$, as functions of $\theta$. Sketch both. Explain in one paragraph why the Wasserstein curve gives a usable gradient for moving $\theta$ toward $0$ while the JSD curve does not, and connect this to the vanishing-gradient pathology.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.2 <span class="exercise-type">Coding</span></div>
+<p>Convert the MNIST GAN from <a href="section-32.1.html">Section 32.1</a> into a WGAN-GP: remove the sigmoid and <code>BCEWithLogitsLoss</code>, make the discriminator output a raw score (the critic), train the critic five steps per generator step, add the <code>gradient_penalty</code> function from this section, and use the Wasserstein losses (<code>-critic(real).mean() + critic(fake).mean() + gp</code> for the critic, <code>-critic(fake).mean()</code> for the generator). Log the critic's real-minus-fake score gap each epoch and confirm it decreases as samples improve, unlike the original BCE loss.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.2.3 <span class="exercise-type">Analysis</span></div>
+<p>Deliberately induce mode collapse: take a working MNIST GAN and shrink the latent dimension to $2$, or train the generator far more often than the discriminator. Decode a fixed grid of $64$ latent vectors every five epochs and visually track diversity. Then estimate a crude diversity score (for example, the mean pairwise pixel distance among the $64$ samples) and plot it over training. Identify the epoch at which collapse begins, and describe which diagnostic from Section 5 would have flagged it earliest.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-32.1.html">&#8592; Section 32.1: The Adversarial Game</a>
+<a href="index.html">Chapter 32</a>
+<a class="next" href="section-32.3.html">Section 32.3: DCGAN to StyleGAN &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

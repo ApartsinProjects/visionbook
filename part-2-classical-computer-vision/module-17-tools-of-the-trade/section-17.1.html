@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.1: OpenCV Beyond the Basics: features2d, calib3d &amp; video. The OpenCV modules behind Part II: detector and matcher inventories in features2d, the calibration and pose verbs of calib3d, USAC robust estimation, stereo matching, and the optical-flow and tracker APIs, with the pip packaging traps that decide what you can import." name="description"/>
+<title>Section 17.1: OpenCV Beyond the Basics: features2d, calib3d &amp; video | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Tools of the Trade: The Classical CV Stack</a></div>
+<h1>OpenCV Beyond the Basics: features2d, calib3d &amp; video</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"People think I am one library. I am forty modules in a trench coat, and the one with the patent-free descriptors moved out years ago. Check the door label before you knock."</p>
+<cite>An OpenCV Build, Counting Its Modules</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost every geometric algorithm in Part II already lives inside OpenCV, spread across three modules, and the hardest part of using them is not the math but knowing they exist, which pip wheel ships them, and which silent convention they expect.</strong> The <code>features2d</code> module is the detector-descriptor-matcher zoo of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>; <code>calib3d</code> is the calibration, pose, and stereo machinery of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> and <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>; <code>video</code> is the optical-flow, tracking, and Kalman toolbox of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>. This section is the map.</p>
+</div>
+<p>
+Throughout Part II we reached for OpenCV one function at a time: <code>cv2.SIFT_create</code> in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, <code>cv2.calibrateCamera</code> in <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>, <code>cv2.findEssentialMat</code> in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, <code>cv2.calcOpticalFlowPyrLK</code> in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>. This section steps back and surveys the three modules those calls came from as coherent toolkits, so that the next time a geometric task appears you can guess, correctly, that OpenCV already solved it. We begin with the packaging decision that gates everything else.
+</p>
+<h2>1. The Packaging Trap: Four Wheels, One Import Name <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Before any function matters, the right OpenCV must be installed, and this is where most newcomers lose an hour. The project ships <em>four mutually exclusive</em> PyPI wheels, all imported as <code>cv2</code>, and installing the wrong one makes perfectly correct code raise an <code>AttributeError</code>. The split exists because some classic algorithms (notably SIFT's relatives and the extra trackers) live in a separate "contrib" repository, and because headless servers want a build without GUI dependencies.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 17.1.1:</strong> <em>The four OpenCV PyPI wheels. Install exactly one; never mix them in one environment.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Package</th><th scope="col">Contains</th><th scope="col">Use when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>opencv-python</code></td><td>Main modules + GUI (<code>imshow</code>)</td><td>Desktop development, you want windows</td></tr>
+<tr><td><code>opencv-contrib-python</code></td><td>Main + contrib (<code>xfeatures2d</code>, extra trackers) + GUI</td><td>You need SURF, the legacy trackers, or SFM helpers</td></tr>
+<tr><td><code>opencv-python-headless</code></td><td>Main modules, no GUI</td><td>Servers, Docker, CI; <code>imshow</code> would crash anyway</td></tr>
+<tr><td><code>opencv-contrib-python-headless</code></td><td>Main + contrib, no GUI</td><td>Servers that also need contrib functions</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+Since the relevant patents expired, SIFT moved from contrib back into the main module, so <code>cv2.SIFT_create()</code> works in every wheel; SURF (<code>cv2.xfeatures2d.SURF_create</code>) and the newer <code>legacy</code> trackers still require a contrib build. Code 17.1.1 is the first thing to run in any new environment: it prints the build, the version, and a quick capability probe.
+</p>
+<pre><code class="language-python">import cv2
+
+print("OpenCV version:", cv2.__version__)
+# Is this a contrib build? Probe a contrib-only symbol.
+has_contrib = hasattr(cv2, "xfeatures2d")
+print("contrib modules present:", has_contrib)
+
+# These are in the MAIN module since the SIFT patent expired in 2020:
+sift = cv2.SIFT_create()
+orb = cv2.ORB_create()
+print("SIFT and ORB available:", sift is not None and orb is not None)
+
+# Optimized backend status (IPP / OpenCL); affects Section 17.1 timings.
+print("optimized build:", cv2.useOptimized())</code></pre>
+<div class="code-caption"><strong>Code 17.1.1:</strong> The environment probe to run before anything else. <code>hasattr(cv2, "xfeatures2d")</code> is the reliable test for a contrib build, and <code>cv2.useOptimized()</code> reports whether the SIMD and OpenCL fast paths discussed in <a href="../../part-1-image-processing/module-08-tools-of-the-trade/index.html">Chapter 8</a> are active.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: AttributeError Is Almost Always a Packaging Error</div>
+<p>When an OpenCV call raises <code>AttributeError: module 'cv2' has no attribute 'X'</code>, the code is rarely wrong. The environment has the wrong wheel, or two wheels were installed on top of each other so the import resolves to a partial build. The fix is mechanical: <code>pip uninstall opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless</code> until none remain, then install exactly one. Mixing wheels is the single most common OpenCV setup bug, and it never shows up until you call the one function the installed wheel happens to lack.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>For two decades, the most-asked OpenCV question was a one-line apology: <code>cv2.SIFT_create()</code> raised an error because the algorithm was patented, exiled to the contrib package, and renamed <code>xfeatures2d.SIFT_create</code> for good measure. The patent finally expired in March 2020, SIFT walked back into the main module, and a generation of Stack Overflow answers became obsolete overnight. Lowe's descriptor is one of the rare algorithms whose import path has a legal history, and remembering this is the keyword for memorizing the whole module: <strong>the patent-free verbs live in the main wheel; the encumbered and exotic ones moved to contrib.</strong></p>
+</div>
+<h2>2. features2d: The Detector, Descriptor &amp; Matcher Zoo <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The <code>features2d</code> module formalizes the pipeline of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> into three plug-compatible stages: a <strong>detector</strong> finds keypoints, a <strong>descriptor</strong> turns each keypoint's neighborhood into a vector, and a <strong>matcher</strong> pairs descriptors across images. The elegance is that every detector exposes the same <code>detectAndCompute</code> interface, so swapping SIFT for ORB is a one-line change. Table 17.1.2 inventories the production-relevant choices and the matcher each one demands.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 17.1.2:</strong> <em>The features2d detectors and descriptors worth knowing, with their descriptor type and the distance the matcher must use.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Constructor</th><th scope="col">Descriptor</th><th scope="col">Matcher norm</th><th scope="col">Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cv2.SIFT_create()</code></td><td>128-D float</td><td><code>NORM_L2</code></td><td>Accurate, scale/rotation invariant; now patent-free and in the main wheel</td></tr>
+<tr><td><code>cv2.ORB_create()</code></td><td>256-bit binary</td><td><code>NORM_HAMMING</code></td><td>Fast, free, the SLAM default; fewer, coarser keypoints than SIFT</td></tr>
+<tr><td><code>cv2.AKAZE_create()</code></td><td>binary (MLDB)</td><td><code>NORM_HAMMING</code></td><td>Nonlinear scale space; strong on textured surfaces, in the main wheel</td></tr>
+<tr><td><code>cv2.BRISK_create()</code></td><td>512-bit binary</td><td><code>NORM_HAMMING</code></td><td>Scale-aware binary; a free middle ground</td></tr>
+<tr><td><code>cv2.xfeatures2d.SURF_create()</code></td><td>64/128-D float</td><td><code>NORM_L2</code></td><td>Contrib only, still patent-encumbered for commercial use</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+The matcher pairs with the descriptor type: float descriptors use the L2 norm, binary descriptors use the Hamming distance (a bit count, computed in hardware on modern CPUs). Getting this wrong is a frequent bug, an L2 matcher on binary descriptors compiles, runs, and produces nonsense matches. Code 17.1.2 shows the canonical robust matching recipe: detect, describe, match with a k-nearest-neighbor query, then apply Lowe's ratio test to keep only confident matches, exactly the procedure derived in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>.
+</p>
+<pre><code class="language-python">import cv2
+
+img1 = cv2.imread("view1.jpg", cv2.IMREAD_GRAYSCALE)
+img2 = cv2.imread("view2.jpg", cv2.IMREAD_GRAYSCALE)
+
+# Detector + descriptor in one object; one line to swap algorithms.
+detector = cv2.SIFT_create(nfeatures=4000)
+kp1, des1 = detector.detectAndCompute(img1, None)
+kp2, des2 = detector.detectAndCompute(img2, None)
+
+# SIFT is float -> L2 norm. For ORB/AKAZE/BRISK use cv2.NORM_HAMMING.
+bf = cv2.BFMatcher(cv2.NORM_L2)
+knn = bf.knnMatch(des1, des2, k=2)            # two nearest neighbours each
+
+# Lowe's ratio test: keep a match only if the best is clearly better than 2nd.
+good = [m for m, n in knn if m.distance < 0.75 * n.distance]
+print(f"{len(kp1)} + {len(kp2)} keypoints -> {len(good)} confident matches")</code></pre>
+<div class="code-caption"><strong>Code 17.1.2:</strong> The detect-describe-match-ratio-test pipeline. Switching to ORB requires changing only the constructor and the matcher norm to <code>cv2.NORM_HAMMING</code>; the rest is identical, which is the whole point of the unified <code>features2d</code> interface.</div>
+<p>
+For large image collections the brute-force matcher becomes the bottleneck. OpenCV ships <code>cv2.FlannBasedMatcher</code>, an approximate nearest-neighbor index that trades a little recall for a large speedup, the same engine that scales the matching stage inside the reconstruction tools of <a href="section-17.2.html">Section 17.2</a>.
+</p>
+<h2>3. calib3d: The Geometry Verbs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+If <code>features2d</code> produces correspondences, <code>calib3d</code> turns them into geometry. This is the densest module in Part II's story: it implements camera calibration (<a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>), the fundamental and essential matrices and pose recovery (<a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>), the Perspective-n-Point problem, triangulation, and dense stereo. Figure 17.1.1 organizes the module by the geometric question each function answers, which is the mental index worth memorizing.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The calib3d module organized by geometric question: calibration, two-view relations, pose, triangulation, and stereo, each box listing its key OpenCV functions">
+<style>
+.qbox { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; }
+.qbox2 { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+.qbox3 { fill: #fef3c7; stroke: #d97706; stroke-width: 2; }
+.qbox4 { fill: #fae8ff; stroke: #a21caf; stroke-width: 2; }
+.qbox5 { fill: #ffe4e6; stroke: #e11d48; stroke-width: 2; }
+.qt { font-family: Verdana, Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #111827; text-anchor: middle; }
+.qf { font-family: Consolas, monospace; font-size: 11px; fill: #1f2937; text-anchor: middle; }
+.qs { font-family: Verdana, Arial, sans-serif; font-size: 10.5px; fill: #4b5563; text-anchor: middle; }
+.flow { stroke: #6b7280; stroke-width: 2; fill: none; marker-end: url(#ar17); }
+</style>
+<defs>
+<marker id="ar17" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+<path d="M0,0 L7,3 L0,6 z" fill="#6b7280"/>
+</marker>
+</defs>
+<rect class="qbox" x="20" y="30" width="200" height="95" rx="8"/>
+<text class="qt" x="120" y="55">"What lens is this?"</text>
+<text class="qs" x="120" y="74">Calibration</text>
+<text class="qf" x="120" y="94">calibrateCamera</text>
+<text class="qf" x="120" y="111">findChessboardCorners</text>
+<rect class="qbox2" x="350" y="30" width="200" height="95" rx="8"/>
+<text class="qt" x="450" y="55">"How do two</text>
+<text class="qt" x="450" y="72">views relate?"</text>
+<text class="qf" x="450" y="94">findEssentialMat</text>
+<text class="qf" x="450" y="111">findFundamentalMat</text>
+<rect class="qbox3" x="680" y="30" width="200" height="95" rx="8"/>
+<text class="qt" x="780" y="55">"Where is the</text>
+<text class="qt" x="780" y="72">camera now?"</text>
+<text class="qf" x="780" y="94">solvePnPRansac</text>
+<text class="qf" x="780" y="111">recoverPose</text>
+<rect class="qbox4" x="200" y="240" width="220" height="95" rx="8"/>
+<text class="qt" x="310" y="265">"Where is the</text>
+<text class="qt" x="310" y="282">3D point?"</text>
+<text class="qf" x="310" y="304">triangulatePoints</text>
+<text class="qf" x="310" y="321">projectPoints</text>
+<rect class="qbox5" x="480" y="240" width="220" height="95" rx="8"/>
+<text class="qt" x="590" y="265">"How far is</text>
+<text class="qt" x="590" y="282">every pixel?"</text>
+<text class="qf" x="590" y="304">StereoSGBM</text>
+<text class="qf" x="590" y="321">stereoRectify</text>
+<path class="flow" d="M220,90 L348,90"/>
+<path class="flow" d="M550,95 L700,200 L780,127"/>
+<path class="flow" d="M450,125 L370,238"/>
+<path class="flow" d="M220,110 L300,238"/>
+<path class="flow" d="M780,127 L600,238"/>
+<text class="qs" x="285" y="80">K, distortion</text>
+<text class="qs" x="640" y="180">R, t</text>
+</svg>
+<figcaption><strong>Figure 17.1.1:</strong> The <code>calib3d</code> module organized by geometric question. Calibration yields the intrinsics that two-view estimation needs; two-view relations and PnP yield the camera poses that triangulation and stereo consume. The arrows are the data dependencies that also order a reconstruction pipeline.</figcaption>
+</figure>
+<p>
+A recurring detail trips up everyone once: most <code>calib3d</code> functions return a rotation as a 3-element <strong>Rodrigues vector</strong> (an axis-angle encoding), not a $3 \times 3$ matrix. The conversion is $R = $ <code>cv2.Rodrigues(rvec)[0]</code>, and a rotation $R$ with translation $\mathbf{t}$ composes the projection $\mathbf{x} \sim K [R \mid \mathbf{t}] \mathbf{X}$ from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>. Code 17.1.3 chains the verbs into a minimal two-view pose recovery, the computational core of the structure-from-motion of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# pts1, pts2: matched, undistorted image points (Nx2 float32); K: intrinsics.
+E, mask = cv2.findEssentialMat(pts1, pts2, K,
+                               method=cv2.USAC_MAGSAC,   # modern robust estimator
+                               prob=0.999, threshold=1.0)
+
+# Decompose E into relative pose, keeping only the cheirality-valid solution.
+n_inliers, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, K, mask=mask)
+print(f"recovered pose from {n_inliers} inliers")
+
+# Triangulate the inliers into 3D (homogeneous), given the two camera matrices.
+P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])     # first camera at origin
+P2 = K @ np.hstack([R, t])                            # second camera pose
+inl = mask_pose.ravel().astype(bool)
+X_h = cv2.triangulatePoints(P1, P2, pts1[inl].T, pts2[inl].T)
+X = (X_h[:3] / X_h[3]).T                              # de-homogenize -> Nx3
+print("triangulated points:", X.shape)</code></pre>
+<div class="code-caption"><strong>Code 17.1.3:</strong> Two-view geometry end to end: essential matrix, pose recovery with cheirality check, and triangulation. The translation $\mathbf{t}$ is recovered only up to scale, the monocular scale ambiguity from <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, which is why a single camera pair cannot recover metric size.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: USAC Replaces a RANSAC Loop</div>
+<p>A faithful from-scratch RANSAC for essential-matrix estimation, with minimal-sample drawing, model scoring, inlier counting, and local optimization, runs to roughly 80 to 120 lines (we wrote one in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>). Passing <code>method=cv2.USAC_MAGSAC</code> to <code>cv2.findEssentialMat</code> replaces all of it with one keyword. USAC is OpenCV's unified robust-estimation framework: it handles the sampling, the marginalizing MAGSAC++ scoring that removes the brittle inlier threshold, local refinement, and a final least-squares fit on the inlier set, internally and in optimized C++. The same <code>USAC_*</code> flags work for <code>findHomography</code> and <code>findFundamentalMat</code>, so one keyword upgrades every robust fit in your codebase.</p>
+</div>
+<h3>3.1 Dense Stereo in One Object</h3>
+<p>
+For rectified stereo pairs, <code>cv2.StereoSGBM_create</code> implements the semi-global matching of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>: it computes a per-pixel disparity by aggregating matching costs along multiple 1D paths, an efficient approximation to a full 2D smoothness optimization. The disparity $d$ converts to depth $Z$ by $Z = f B / d$, where $f$ is the focal length and $B$ the baseline. The block size and the two smoothness penalties $P_1, P_2$ are the parameters worth tuning; the defaults rarely suit a new camera.
+</p>
+<h2>4. video: Flow, Trackers &amp; the Kalman Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The <code>video</code> module is the temporal half of OpenCV and the home of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>. It splits into three families: sparse and dense optical flow, object trackers, and the <code>cv2.KalmanFilter</code> state estimator. Sparse flow (<code>cv2.calcOpticalFlowPyrLK</code>) follows a handful of corners across frames using the pyramidal Lucas-Kanade method; dense flow (<code>cv2.calcOpticalFlowFarneback</code>, or the contrib <code>cv2.optflow</code> algorithms) estimates a motion vector at every pixel. Code 17.1.4 is the standard sparse-flow loop: find good corners to track, then propagate them with a forward-backward consistency check that discards points the tracker lost.
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+cap = cv2.VideoCapture("walk.mp4")
+ok, prev = cap.read()
+prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+# Shi-Tomasi corners are the classic features to track (Chapter 15).
+p0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=200, qualityLevel=0.3,
+                             minDistance=7)
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Pyramidal Lucas-Kanade: track p0 forward; st==1 marks successful tracks.
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None)
+    good_new = p1[st.ravel() == 1]
+    # ... draw or store the tracks here ...
+    prev_gray, p0 = gray, good_new.reshape(-1, 1, 2)
+cap.release()</code></pre>
+<div class="code-caption"><strong>Code 17.1.4:</strong> The sparse optical-flow loop with <code>goodFeaturesToTrack</code> and pyramidal Lucas-Kanade. The <code>st</code> status array is the cheap quality filter; in production a forward-backward re-projection check (track forward, then back, and reject points that do not return near their origin) further prunes drifting tracks.</div>
+<p>
+The tracker family wraps higher-level single-object trackers behind a uniform <code>init</code>/<code>update</code> interface. The correlation-filter tracker <code>cv2.TrackerKCF_create</code> and the more accurate <code>cv2.TrackerCSRT_create</code> live in the main wheel; several others moved to <code>cv2.legacy</code> in OpenCV 4.5. The <code>cv2.KalmanFilter</code> class implements the constant-velocity and constant-acceleration state estimators of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>, the predict-correct recursion that smooths a noisy detector into a stable track and bridges short occlusions.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Tracker That Vanished in Production</div>
+<p><strong>Who:</strong> A two-person team building a sports-analytics tool that tracks players from broadcast footage.</p>
+<p><strong>Situation:</strong> Their prototype, developed on a laptop with <code>opencv-contrib-python</code>, used <code>cv2.legacy.TrackerMOSSE_create</code> for fast per-player tracking and ran beautifully.</p>
+<p><strong>Problem:</strong> The Dockerized service, built on <code>opencv-python-headless</code> to keep the image small, crashed on startup with <code>AttributeError: module 'cv2' has no attribute 'legacy'</code>. The legacy trackers are contrib-only, and the headless main wheel does not ship them. The error never appeared in development because the laptop had a different wheel.</p>
+<p><strong>Decision:</strong> Rather than fatten the container with the full contrib build, they switched to <code>cv2.TrackerCSRT_create</code> (main wheel, slightly slower but more accurate) and pinned a single explicit wheel in <code>requirements.txt</code> with a comment explaining why.</p>
+<p><strong>Result:</strong> The container shrank, the crash disappeared, and tracking quality improved. The incident cost an afternoon of confusion that Code 17.1.1's capability probe would have caught in the first CI run.</p>
+<p><strong>Lesson:</strong> Pin the exact OpenCV wheel, and probe for the symbols you depend on at startup. The development and deployment environments must agree on the wheel, not just the version number.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: OpenCV Grows a Deep-Learning Neighborhood</div>
+<p>The classical <code>features2d</code> detectors are increasingly paired with, or replaced by, learned components, and OpenCV is absorbing them. Its <code>cv2.dnn</code> module already runs ONNX models, and the 2024 to 2025 trend is to drop learned features into the same matching pipeline: <strong>SuperPoint</strong> (DeTone et al., CVPRW 2018) as a learned detector-descriptor and <strong>LightGlue</strong> (Lindenberger et al., ICCV 2023) as an adaptive learned matcher now routinely outperform SIFT plus FLANN on hard wide-baseline pairs, and the <code>kornia.feature</code> library exposes both behind an interface that mirrors <code>features2d</code>. On the dense side, learned optical flow such as <strong>RAFT</strong> (Teed and Deng, ECCV 2020) and the 2024 <strong>SEA-RAFT</strong> have overtaken Farneback on every benchmark in <a href="section-17.3.html">Section 17.3</a>, and you will meet them as first-class citizens in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>. The practical pattern for 2026: keep OpenCV for the geometry verbs in <code>calib3d</code>, which remain state of the art, and swap learned modules into the feature and flow stages where data-driven methods have pulled ahead.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.1.1: Match the Norm to the Descriptor <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each pairing, state whether it is correct and what symptom a wrong pairing produces: (a) ORB descriptors with <code>cv2.BFMatcher(cv2.NORM_L2)</code>; (b) SIFT descriptors with <code>cv2.NORM_HAMMING</code>; (c) AKAZE descriptors with <code>cv2.NORM_HAMMING</code>; (d) SIFT descriptors fed to <code>cv2.FlannBasedMatcher</code> with default KD-tree parameters. For the wrong pairings, explain why the code still runs without raising an exception, which is what makes the bug dangerous.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.1.2: Detector Bake-Off <span class="exercise-type coding">Coding</span></div>
+<p>Take any image pair with overlap. For SIFT, ORB, AKAZE, and BRISK, run the Code 17.1.2 pipeline (adjusting the matcher norm per Table 17.1.2) and record three numbers per detector: keypoint count, confident matches after the ratio test, and wall-clock time for <code>detectAndCompute</code>. Then estimate an essential matrix from each detector's matches with <code>cv2.findEssentialMat(..., cv2.USAC_MAGSAC)</code> and compare inlier counts. Which detector gives the best speed-versus-inliers trade-off on your pair, and does the ranking match Table 17.1.2's notes?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.1.3: Rodrigues Round-Trip <span class="exercise-type analysis">Analysis</span></div>
+<p>Build a random rotation matrix $R$ (orthonormal, determinant $+1$). Convert it to a Rodrigues vector with <code>cv2.Rodrigues</code>, then back to a matrix, and measure the maximum element-wise difference from the original. Now repeat for a rotation very close to 180 degrees about an axis. Explain why the round-trip error grows near 180 degrees, relating your finding to the axis-angle singularity, and state one practical consequence for pose estimation in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter 17 Overview</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span></a>
+<a class="next" href="section-17.2.html"><span class="nav-label">Section 17.2: Reconstruction Tooling: COLMAP, OpenMVG &amp; Friends</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.3: Learning on Point Clouds: PointNet &amp; Successors. Why a convolution cannot consume a point cloud, how PointNet's symmetric max-pool gives permutation invariance, and the hierarchical, graph, and transformer successors that brought back local structure." name="description"/>
+<title>Section 27.3: Learning on Point Clouds: PointNet &amp; Successors | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>Learning on Point Clouds: PointNet &amp; Successors</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They handed me a bag of three-dimensional confetti and asked what it was. No grid, no order, no edges. So I looked at every piece at once, kept only the loudest opinion about each feature, and declared it a chair. I was right, which still surprises me."</p>
+<cite>A Network That Learned to Think in Sets</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>To learn directly on a point cloud you need a network that is invariant to the order of its inputs, and the deceptively simple answer is to apply the same small network to every point independently and then aggregate with a symmetric function.</strong> A point cloud is an unordered set, so any architecture that consumes it must produce the same answer no matter how the points are listed. PointNet achieves this with two ideas: a shared per-point MLP that lifts each point into a feature vector, and a symmetric pooling operation (a max over all points) that collapses those features into one global descriptor immune to ordering. This section derives why that works, builds PointNet from scratch in PyTorch, and then follows the line of successors (PointNet++, DGCNN, point transformers) that restored the local neighborhood structure the original flat design threw away.</p>
+</div>
+
+<p>
+<a href="section-27.2.html">Section 27.2</a> left us with a point cloud and a problem: the convolution that powers every network in Part III needs a regular grid of neighbors, and a point cloud has none. Voxelizing the cloud (subsection 2 of the previous section) restores the grid but pays the cubic memory curse and quantizes away fine detail. The question PointNet answered, in 2017, was whether a network could consume the raw, unordered points directly. The answer reshaped 3D deep learning, and the core trick is a beautiful piece of architectural reasoning about symmetry.
+</p>
+
+<h2>1. The Permutation Problem <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Let a point cloud be a set $\{x_1, x_2, \ldots, x_N\}$ of $N$ points in 3D. A network that classifies the cloud computes some function $f(\{x_1, \ldots, x_N\})$. Because the set is unordered, $f$ must satisfy <strong>permutation invariance</strong>: shuffling the points must not change the output. A standard MLP fed the points as a flattened vector $[x_1; x_2; \ldots; x_N]$ violates this immediately, the first weight column only ever sees $x_1$, so reordering the points changes the answer. A 1D convolution along the point index fails for the same reason: it assumes the index carries meaning, and it does not.
+</p>
+
+<p>
+The theorem behind PointNet is that any continuous permutation-invariant function can be approximated arbitrarily well in the form
+</p>
+
+<div class="math-block">
+$$f(\{x_1, \ldots, x_N\}) \approx \gamma\Big(\underset{i=1\ldots N}{\text{MAX}}\; h(x_i)\Big)$$
+</div>
+
+<p>
+where $h$ is a per-point transformation (applied identically to each point), MAX is an element-wise maximum over all the point features (a symmetric function, immune to order), and $\gamma$ is a final transformation of the pooled result. The MAX is doing all the work: because the maximum of a set is the same regardless of how the set is listed, the whole expression is permutation-invariant by construction. PointNet simply makes $h$ and $\gamma$ learnable MLPs.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Symmetric Pool Buys Permutation Invariance for Free</div>
+<p>The single most important design decision in point-cloud learning is the choice of aggregation. Sum, mean, and max are all symmetric (order-independent), so any of them grants permutation invariance. PointNet uses max because it acts as a feature-wise selector: for each of the learned feature channels, the network keeps only the point that most strongly activates it, so the global descriptor is built from a sparse set of "critical points" that outline the shape. This is why PointNet is robust to missing or extra points: as long as the critical points survive, the descriptor barely changes. Choose your aggregation and you have chosen your invariance.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: A Committee That Only Listens to the Loudest Voice</div>
+<p>Max-pooling runs the world's most ruthless meeting. Thousands of points each shout their opinion on every feature, and for each feature the network keeps exactly one voice, the loudest, and discards the rest. The shape ends up summarized by a tiny clique of "critical points" that happened to win their channels. Delete eighty percent of the silent majority and the chair is still a chair. Democracy this is not, but it is gloriously order-independent.</p>
+</div>
+
+<h2>2. Building PointNet From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The architecture follows the formula directly, as Figure 27.3.1 shows. Each point (an $x, y, z$ triple, plus optional features) passes through a shared MLP, implemented as a stack of $1 \times 1$ convolutions so the <em>same</em> weights apply to every point. After lifting each point to a high-dimensional feature, a single max-pool over the point axis produces one global feature vector for the whole cloud. For classification, that vector feeds a small MLP to class scores; for segmentation, the global feature is concatenated back onto every per-point feature so each point can be labeled using both its own identity and the global context.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PointNet architecture: N points through a shared MLP to per-point features, max-pooled to a global feature, then to classification or per-point segmentation">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10px sans-serif;fill:#555;}
+.ppts{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.pmlp{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.ppool{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.pglob{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.par{stroke:#777;stroke-width:1.5;marker-end:url(#pah);fill:none;}
+</style>
+<defs><marker id="pah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="ppts" x="12" y="100" width="70" height="70"/>
+<text class="pl" x="47" y="92" text-anchor="middle">N x 3</text>
+<text class="ps" x="47" y="186" text-anchor="middle">points</text>
+<line class="par" x1="84" y1="135" x2="120" y2="135"/>
+<rect class="pmlp" x="122" y="95" width="86" height="80"/>
+<text class="pl" x="165" y="128" text-anchor="middle">shared MLP</text>
+<text class="ps" x="165" y="146" text-anchor="middle">(1x1 conv)</text>
+<text class="ps" x="165" y="162" text-anchor="middle">per point</text>
+<line class="par" x1="208" y1="135" x2="244" y2="135"/>
+<rect class="pmlp" x="246" y="105" width="66" height="60" fill="#d7efe0"/>
+<text class="pl" x="279" y="132" text-anchor="middle">N x 1024</text>
+<text class="ps" x="279" y="150" text-anchor="middle">features</text>
+<line class="par" x1="312" y1="135" x2="348" y2="135"/>
+<rect class="ppool" x="350" y="110" width="76" height="50"/>
+<text class="pl" x="388" y="132" text-anchor="middle">MAX pool</text>
+<text class="ps" x="388" y="150" text-anchor="middle">over points</text>
+<line class="par" x1="426" y1="135" x2="462" y2="135"/>
+<rect class="pglob" x="464" y="112" width="76" height="46"/>
+<text class="pl" x="502" y="132" text-anchor="middle">1 x 1024</text>
+<text class="ps" x="502" y="150" text-anchor="middle">global</text>
+<line class="par" x1="540" y1="125" x2="600" y2="80"/>
+<line class="par" x1="540" y1="145" x2="600" y2="190"/>
+<rect class="pglob" x="602" y="58" width="106" height="40" fill="#efe0fa"/>
+<text class="pl" x="655" y="82" text-anchor="middle">class scores</text>
+<rect class="pglob" x="602" y="172" width="106" height="40" fill="#efe0fa"/>
+<text class="pl" x="655" y="190" text-anchor="middle">per-point</text>
+<text class="ps" x="655" y="204" text-anchor="middle">labels (seg)</text>
+</svg>
+<figcaption><strong>Figure 27.3.1:</strong> The PointNet architecture. A shared MLP (implemented as $1 \times 1$ convolutions, so identical weights touch every point) lifts each point to a 1024-dimensional feature; a single max-pool over the point axis yields a permutation-invariant global descriptor. Classification reads off the global vector; segmentation concatenates it back onto every per-point feature.</figcaption>
+</figure>
+
+<p>
+The implementation below is the classification branch, complete enough to run. The crucial line is the <code>torch.max</code> over the point dimension, which is the symmetric aggregation of subsection 1. Read the per-point MLP as the function $h$ and the post-pool layers as $\gamma$.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class PointNetCls(nn.Module):
+    """PointNet classification head. Input: (B, 3, N) point clouds. Output: class logits."""
+    def __init__(self, num_classes=10):
+        super().__init__()
+        # Shared per-point MLP as 1x1 convs: same weights applied to every point.
+        self.feat = nn.Sequential(
+            nn.Conv1d(3, 64, 1),   nn.BatchNorm1d(64),   nn.ReLU(),
+            nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128),  nn.ReLU(),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU())
+        self.head = nn.Sequential(
+            nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512, num_classes))
+
+    def forward(self, x):                  # x: (B, 3, N)
+        f = self.feat(x)                   # (B, 1024, N) per-point features
+        g = torch.max(f, dim=2)[0]         # (B, 1024) symmetric max-pool over points
+        return self.head(g)                # (B, num_classes)
+
+model = PointNetCls(num_classes=10)
+cloud = torch.randn(4, 3, 2048)            # batch of 4 clouds, 2048 points each
+print("logits:", model(cloud).shape)       # logits: torch.Size([4, 10])
+
+# Permutation invariance check: shuffle the points, the output is unchanged.
+perm = torch.randperm(2048)
+same = torch.allclose(model(cloud), model(cloud[:, :, perm]), atol=1e-5)
+print("invariant to point order:", same)   # invariant to point order: True</code></pre>
+<div class="code-caption">PointNet classification from scratch. The shared MLP is three $1 \times 1$ convolutions; <code>torch.max(f, dim=2)</code> is the order-independent pool. The final assertion confirms the network's output is identical after the points are randomly shuffled, the permutation invariance proved in subsection 1.</div>
+
+<p>
+The full PointNet adds small <strong>T-Net</strong> sub-networks that predict an affine transform to align the input cloud and its features into a canonical pose, improving robustness to rotation. We omit them here for clarity; they are a refinement, not the central idea, and modern successors often drop them in favor of better local modeling.
+</p>
+
+<h2>3. Bringing Back Locality: PointNet++, DGCNN, and Point Transformers <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+PointNet's elegance is also its weakness. Because it pools <em>globally</em> in one shot, it sees each point and the whole cloud, but nothing in between: it has no notion of local neighborhoods, the very thing that made CNNs powerful through their hierarchy of receptive fields (<a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>). Fine geometric detail, a sharp edge, a small protrusion, is lost in the global max. The successors all answer the same question: how do you give a point-cloud network a sense of locality without a grid?
+</p>
+
+<p>
+<strong>PointNet++</strong> applies PointNet recursively. It samples a set of centroid points, gathers each one's local neighborhood (the points within a radius), runs a small PointNet on each neighborhood to summarize it, and repeats on the summarized points. This builds exactly the coarse-to-fine hierarchy of a CNN, but on sets: local features at the bottom, global structure at the top. <strong>DGCNN</strong> takes a graph view: at each layer it builds a k-nearest-neighbor graph (recomputed in feature space, hence "dynamic") and applies an <em>edge convolution</em> that processes each point together with its neighbors' differences, capturing relationships rather than isolated points. <strong>Point transformers</strong> (2021 onward) replace the pooling with self-attention restricted to local neighborhoods, importing the attention mechanism of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> into 3D and currently topping most point-cloud benchmarks.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Autonomous-Driving LiDAR Segmentation Picks Its Battles</div>
+<p><strong>Who:</strong> a perception team at an autonomous-driving company, 2023, segmenting LiDAR point clouds into road, vehicle, pedestrian, and background. <strong>Situation:</strong> a single spinning LiDAR sweep is roughly 120,000 points, arriving ten times a second, and the segmentation had to run in real time on an in-car GPU. <strong>Problem:</strong> a plain PointNet ran fast but was too coarse, it missed thin objects like poles and distant pedestrians because the global max-pool washed out local detail; a full point transformer was accurate but too slow at 120k points to hit the 100-millisecond budget. <strong>Decision:</strong> they adopted a PointNet++-style hierarchical backbone with sparse voxel features in the early layers (so neighborhoods were cheap to query) and reserved attention for a small final stage. <strong>Result:</strong> they hit the latency budget while recovering the thin-object accuracy the flat network lost, because the hierarchy reintroduced locality where it mattered. <strong>Lesson:</strong> the PointNet-to-transformer spectrum is a speed-accuracy dial; on real-time, large-cloud problems you place locality and attention surgically rather than everywhere.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PyTorch3D and Torch-Points3D Ship the Operators</div>
+<p>The neighborhood queries, farthest-point sampling, and k-NN graph construction that PointNet++ and DGCNN need are easy to get wrong and slow in pure Python. PyTorch3D provides them as fused, differentiable, GPU operators:</p>
+<pre><code class="language-python">from pytorch3d.ops import sample_farthest_points, knn_points, knn_gather
+# points: (B, N, 3). Sample 512 well-spread centroids, then grab each one's 32 neighbors.
+centroids, idx = sample_farthest_points(points, K=512)        # coverage-maximizing sample
+knn = knn_points(centroids, points, K=32)                     # 32 nearest neighbors each
+neighbors = knn_gather(points, knn.idx)                       # (B, 512, 32, 3) local groups
+# These three calls are the "set abstraction" core of PointNet++.</code></pre>
+<p>What would be dozens of lines of index juggling and a hand-written CUDA kernel for the k-NN becomes three tested calls. PyTorch3D (and the Torch-Points3D framework built on it) also bundles chamfer distance, batched point-cloud and mesh containers, and reference implementations of PointNet++, DGCNN, and KPConv, the standard starting point for any point-cloud project today.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Point Cloud Foundation Models and 3D-Language (2024-2026)</div>
+<p>Point-cloud learning is following the same foundation-model trajectory as 2D vision (<a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>). <strong>Point-MAE</strong> and <strong>Point-BERT</strong> brought masked-autoencoder pretraining to point clouds, learning self-supervised representations by reconstructing masked point patches. The 2024-2026 frontier connects 3D to language and images: <strong>ULIP</strong> and <strong>OpenShape</strong> align point-cloud encoders with the CLIP embedding space (the same multimodal space you will meet in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>), enabling zero-shot 3D classification from text prompts, and <strong>PointLLM</strong> attaches a point encoder to a large language model so you can ask questions about a 3D object in natural language. The Point Transformer V3 (2024) scaled point attention to outdoor driving scenes with serialization tricks that make attention linear, closing much of the gap between research accuracy and the real-time constraint of the driving example above.</p>
+</div>
+
+<p>
+We have now learned to classify and segment explicit geometry. But every method so far stores the scene as concrete points, voxels, or triangles. The most influential idea of the last five years takes a radically different route: store the entire scene <em>inside the weights of a small neural network</em> and recover any view by querying it. That is neural radiance fields, the subject of <a href="section-27.4.html">Section 27.4</a>.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.3.1: Prove the Pool Is Invariant <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Show formally that the function $g(\{x_1, \ldots, x_N\}) = \text{MAX}_i\, h(x_i)$ is invariant under any permutation $\pi$ of the points, that is, $g(\{x_{\pi(1)}, \ldots, x_{\pi(N)}\}) = g(\{x_1, \ldots, x_N\})$. Then explain in two or three sentences why replacing MAX with a plain concatenation of the $h(x_i)$ vectors would break the invariance, and why replacing it with a SUM or MEAN would preserve it. What practical property does MAX give (think about robustness to outliers and to changing the number of points) that SUM does not?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.3.2: Find the Critical Points <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>PointNetCls</code> of subsection 2 to also return, for each of the 1024 feature channels, the index of the point that won the max-pool. Run it on a point cloud of a simple shape (a sampled cube or sphere) and collect the unique set of winning points across all channels; these are PointNet's "critical points". Visualize them against the full cloud. Then randomly delete 80 percent of the <em>non-critical</em> points and confirm the predicted class is unchanged, demonstrating the robustness claimed in the Key Insight of subsection 1. Write one sentence on why this set is typically a sparse skeleton of the shape.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.3.3: The Locality Gap <span class="exercise-type analysis">Analysis</span></div>
+<p>PointNet has no intermediate receptive field between a single point and the entire cloud. Construct (on paper or in code) two point clouds that PointNet cannot distinguish but that have clearly different local structure, for example, the same set of points where one cloud has them clustered into two dense lumps and the other spreads them evenly, with both sharing the same per-channel maxima. Explain how PointNet++ would tell them apart, referencing its neighborhood sampling, and relate the locality gap to the receptive-field hierarchy of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.2.html">&#8592; Section 27.2: 3D Representations: Point Clouds, Voxels &amp; Meshes</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="section-27.4.html">Section 27.4: NeRF: Neural Radiance Fields &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

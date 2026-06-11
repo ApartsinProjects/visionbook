@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.3: One-Stage Detectors: YOLO, SSD and RetinaNet. Detection as dense grid prediction with no proposal step: YOLO's single pass, SSD's multi-scale default boxes, the foreground-background imbalance problem, and RetinaNet's focal loss that finally let one-stage detectors match two-stage accuracy at real-time speed." name="description"/>
+<title>Section 23.3: One-Stage Detectors: YOLO, SSD &amp; RetinaNet | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>One-Stage Detectors: YOLO, SSD &amp; RetinaNet</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Why propose regions and then judge them, like some indecisive committee? I look once. The whole grid speaks at the same instant, every cell shouting what it sees and where. It is chaos, but it is fast chaos, and I have learned to ignore the ten thousand cells yelling 'background' at me."</p>
+<cite>A YOLO Grid Cell That Made Up Its Mind</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>One-stage detectors delete the proposal step entirely: a single network looks at the image once and predicts a class and a box directly at every location of a dense grid, trading a little accuracy for the real-time speed that two-stage detectors cannot reach.</strong> This is the family that put detection on phones, drones, and live video. The price of skipping proposals is a brutal data imbalance, since the vast majority of grid locations are background, and for years that imbalance kept one-stage models a step behind in accuracy. RetinaNet's focal loss diagnosed and fixed the imbalance, letting a one-stage detector match the best two-stage models for the first time. This section builds the dense-prediction idea through YOLO and SSD, derives the focal loss carefully, and connects it to the feature pyramid that makes multi-scale detection work.</p>
+</div>
+
+<p>
+The Faster R-CNN of <a href="section-23.2.html">Section 23.2</a> is accurate but spends a per-region head on hundreds of proposals, capping it at a handful of frames per second. For a self-driving perception stack or a phone camera that wants to draw boxes on a live preview, that is far too slow. The one-stage family asks: what if we skip the proposal stage and predict everything in a single forward pass, treating detection as a dense regression problem over a fixed grid? The answer is a class of detectors an order of magnitude faster, and the engineering question that dominates them is how to train such a dense predictor when almost every location is background.
+</p>
+
+<h2>1. YOLO: You Only Look Once <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The original YOLO (Redmon et al., 2016) reframed detection as a single regression. Divide the image into an $S \times S$ grid; each cell predicts a small fixed number of boxes (center, size, and an objectness confidence) plus one class distribution for the cell. A whole image's worth of detections, all boxes and all classes, emerges from one forward pass of one network, hence "you only look once." The training target assigns each ground-truth object to the single grid cell containing its center, and the loss is a weighted sum of localization error on the responsible box, objectness error everywhere, and classification error on the responsible cell.
+</p>
+
+<p>
+That single-pass design made YOLO dramatically faster than anything before it, running at real-time frame rates while staying respectably accurate. Its weaknesses were equally instructive: the original coarse grid struggled with small objects and with multiple objects whose centers fell in the same cell, and its single-scale prediction missed the multi-scale structure that detection needs. Every YOLO version since (and there have been many, through YOLO11 in 2024 and the YOLO12 line in 2025) has been a steady accumulation of the fixes the rest of this chapter describes: anchors, then anchor-free heads, multi-scale feature pyramids, better losses, and stronger augmentation. The YOLO name now denotes a family of fast, well-engineered one-stage detectors rather than a single architecture, and it is the family you will fine-tune in <a href="section-23.6.html">Section 23.6</a>.
+</p>
+
+<h2>2. SSD: Multi-Scale Default Boxes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SSD (Single Shot MultiBox Detector, Liu et al., 2016) addressed YOLO's single-scale weakness head-on. Instead of predicting from one final feature map, SSD attaches detection heads to several feature maps of decreasing resolution within the backbone. Early, high-resolution maps have small receptive fields and detect small objects; later, low-resolution maps have large receptive fields and detect large objects. At each location of each map, SSD places a set of <strong>default boxes</strong> (its name for anchors) of a few aspect ratios, and predicts a class score and a box offset per default box, exactly the anchor parameterization of <a href="section-23.2.html">Section 23.2</a>. The result is a dense, multi-scale, single-pass detector that handled the range of object sizes far better than the original YOLO.
+</p>
+
+<p>
+SSD's multi-scale insight, that different feature-map resolutions should detect different object sizes, is the direct ancestor of the <strong>feature pyramid network</strong> (FPN) that nearly every modern detector uses. FPN improves on SSD's naive use of backbone maps by adding a top-down pathway: it takes the semantically rich but spatially coarse deep feature map, upsamples it, and adds it to the spatially fine but semantically weak shallow maps, so that every level of the pyramid is both high-resolution and semantically strong. This is the learned, end-to-end descendant of the Gaussian and Laplacian image pyramids you built in <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and the feature-hierarchy fusion of <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. Figure 23.3.1 contrasts the single-scale, plain multi-scale, and top-down-fused designs.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three feature extraction designs: single scale, plain multi-scale prediction, and a feature pyramid network with a top-down pathway">
+<style>
+.gl{font:11px sans-serif;fill:#1a1a1a;}
+.gs{font:10px sans-serif;fill:#555;}
+.gfm{stroke-width:1.5;}
+.gc{fill:#e7f5ec;stroke:#2f9e5c;}
+.gp{fill:#fdeee3;stroke:#d6802b;}
+.gar{stroke:#777;stroke-width:1.5;marker-end:url(#gah);fill:none;}
+.gtd{stroke:#8e44ad;stroke-width:2;marker-end:url(#gah2);fill:none;}
+</style>
+<defs>
+<marker id="gah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="gah2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker>
+</defs>
+<text class="gl" x="80" y="28" text-anchor="middle">single scale</text>
+<rect class="gfm gc" x="40" y="40" width="80" height="40"/>
+<rect class="gfm gc" x="52" y="92" width="56" height="30"/>
+<rect class="gfm gc" x="62" y="134" width="36" height="22"/>
+<line class="gar" x1="98" y1="145" x2="150" y2="145"/>
+<rect class="gfm gp" x="152" y="132" width="34" height="26"/>
+<text class="gs" x="169" y="178" text-anchor="middle">predict</text>
+<text class="gl" x="320" y="28" text-anchor="middle">plain multi-scale (SSD)</text>
+<rect class="gfm gc" x="280" y="40" width="80" height="40"/>
+<rect class="gfm gc" x="292" y="92" width="56" height="30"/>
+<rect class="gfm gc" x="302" y="134" width="36" height="22"/>
+<line class="gar" x1="362" y1="60" x2="392" y2="60"/>
+<line class="gar" x1="350" y1="107" x2="392" y2="107"/>
+<line class="gar" x1="340" y1="145" x2="392" y2="145"/>
+<rect class="gfm gp" x="394" y="48" width="26" height="24"/>
+<rect class="gfm gp" x="394" y="95" width="26" height="24"/>
+<rect class="gfm gp" x="394" y="133" width="26" height="24"/>
+<text class="gl" x="580" y="28" text-anchor="middle">FPN (top-down fused)</text>
+<rect class="gfm gc" x="520" y="40" width="80" height="40"/>
+<rect class="gfm gc" x="532" y="92" width="56" height="30"/>
+<rect class="gfm gc" x="542" y="134" width="36" height="22"/>
+<line class="gtd" x1="560" y1="156" x2="560" y2="124"/>
+<line class="gtd" x1="560" y1="92" x2="560" y2="82"/>
+<line class="gar" x1="602" y1="60" x2="632" y2="60"/>
+<line class="gar" x1="590" y1="107" x2="632" y2="107"/>
+<line class="gar" x1="580" y1="145" x2="632" y2="145"/>
+<rect class="gfm gp" x="634" y="48" width="26" height="24"/>
+<rect class="gfm gp" x="634" y="95" width="26" height="24"/>
+<rect class="gfm gp" x="634" y="133" width="26" height="24"/>
+<text class="gs" x="580" y="200" text-anchor="middle">purple: top-down adds</text>
+<text class="gs" x="580" y="216" text-anchor="middle">deep semantics to shallow maps</text>
+</svg>
+<figcaption><strong>Figure 23.3.1:</strong> From single-scale to feature pyramid. SSD predicts on plain backbone maps of different resolutions; FPN adds a top-down pathway (purple) that injects deep semantic features into the high-resolution shallow maps, so every pyramid level is both fine and semantically rich. Modern detectors predict on the FPN levels.</figcaption>
+</figure>
+
+<h2>3. The Foreground-Background Imbalance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the structural problem that kept one-stage detectors behind. A dense detector evaluates a class score at every anchor on every pyramid level, perhaps a hundred thousand anchors per image. Of those, only a few dozen overlap a real object; the rest, more than 99.9 percent, are background. When you sum a standard cross-entropy loss over all of them, the gradient is dominated by the enormous mass of easy background examples, each contributing a tiny but relentless signal that collectively drowns out the few foreground examples that actually teach the model what objects look like. Two-stage detectors dodged this because the RPN and a sampling step rebalanced the data before the second-stage loss; a one-stage detector has no such filter.
+</p>
+
+<p>
+The standard cross-entropy for a single example with predicted probability $p_t$ of the correct class is $\text{CE}(p_t) = -\log(p_t)$. The trouble is that even a well-classified background example with, say, $p_t = 0.9$ still contributes a loss of $-\log(0.9) \approx 0.105$, and multiplied by a hundred thousand such examples this is a large, persistent gradient that swamps the foreground. The detector learns to predict "background" confidently and stops improving on the rare objects.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Imbalance Is a Loss Problem, Not a Data Problem</div>
+<p>The natural first instinct is to fix imbalance by resampling: throw away most background examples (hard negative mining), as SSD did, keeping only the hardest negatives at a fixed 3:1 ratio. RetinaNet's deeper insight was that you do not need to discard any examples if you instead reshape the loss so that easy examples contribute almost nothing. This keeps the full signal from the hard examples of every class while automatically silencing the easy background, and it requires no sampling heuristics or ratio tuning. Reshaping the loss rather than the dataset is a recurring move in deep learning; you will see its cousin in the class-balanced losses of long-tailed recognition.</p>
+</div>
+
+<h2>4. Focal Loss: Down-Weighting the Easy <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The <strong>focal loss</strong> (Lin et al., 2017) is cross-entropy multiplied by a modulating factor that shrinks toward zero as an example becomes easy:
+</p>
+
+<div class="math-block">
+$$\text{FL}(p_t) = -\alpha_t\,(1 - p_t)^{\gamma}\,\log(p_t)$$
+</div>
+
+<p>
+The factor $(1 - p_t)^{\gamma}$ is the whole idea. For a well-classified example $p_t$ is near $1$, so $(1 - p_t)^{\gamma}$ is near $0$ and the example's loss is suppressed; for a misclassified example $p_t$ is small, $(1 - p_t)^{\gamma}$ is near $1$, and the loss is essentially unchanged. The focusing parameter $\gamma$ (the paper uses $\gamma = 2$) controls how aggressively easy examples are down-weighted: at $\gamma = 0$ focal loss is plain cross-entropy, and larger $\gamma$ silences the easy examples harder. The $\alpha_t$ is an ordinary class-weighting term that additionally balances foreground against background. Figure 23.3.2 plots how the modulating factor collapses the loss of easy examples.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Plot of cross-entropy loss versus focal loss as a function of the predicted probability of the correct class, showing focal loss collapsing for easy examples">
+<style>
+.xl{font:12px sans-serif;fill:#1a1a1a;}
+.xs{font:10px sans-serif;fill:#555;}
+.xaxis{stroke:#333;stroke-width:1.5;}
+.xce{fill:none;stroke:#d6802b;stroke-width:2.5;}
+.xfl{fill:none;stroke:#2c6fb5;stroke-width:2.5;}
+</style>
+<line class="xaxis" x1="80" y1="40" x2="80" y2="250"/>
+<line class="xaxis" x1="80" y1="250" x2="460" y2="250"/>
+<text class="xl" x="50" y="46">loss</text>
+<text class="xl" x="70" y="270">0</text>
+<text class="xl" x="450" y="270">1</text>
+<text class="xl" x="270" y="290" text-anchor="middle">p_t (prob. of correct class)</text>
+<path class="xce" d="M85,55 C140,110 210,170 300,205 C360,228 420,242 455,247"/>
+<path class="xfl" d="M85,70 C140,150 200,215 280,242 C350,249 420,250 455,250"/>
+<text class="xl" x="160" y="100" fill="#d6802b">cross-entropy</text>
+<text class="xl" x="300" y="170" fill="#2c6fb5">focal (&#947;=2)</text>
+<text class="xs" x="380" y="232">easy examples:</text>
+<text class="xs" x="380" y="248">focal &#8776; 0</text>
+</svg>
+<figcaption><strong>Figure 23.3.2:</strong> Cross-entropy versus focal loss. For easy examples (high $p_t$, right side) the modulating factor $(1 - p_t)^{\gamma}$ drives the focal loss toward zero, so the hundred thousand easy background anchors barely move the gradient, while hard examples (left side) are nearly unchanged. This rebalancing is what let RetinaNet train a dense detector to two-stage accuracy.</figcaption>
+</figure>
+
+<p>
+The implementation is a few lines on top of the binary-cross-entropy logits loss, and reading it makes the modulating factor concrete.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+    """logits, targets: same shape (e.g. (N, num_classes)) with 0/1 targets.
+       Returns the summed focal loss over all entries."""
+    p = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)        # prob. of the true label
+    modulating = (1 - p_t) ** gamma                    # collapses for easy examples
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    return (alpha_t * modulating * ce).sum()
+
+logits = torch.tensor([[3.0], [0.1]])     # one easy positive, one hard positive
+targets = torch.tensor([[1.0], [1.0]])
+print(focal_loss(logits, targets).item())  # the easy example contributes far less
+</code></pre>
+<div class="code-caption">Focal loss in five lines. The easy positive (logit 3.0, so $p_t \approx 0.95$) is multiplied by a tiny $(1 - 0.95)^2$ and nearly vanishes, while the hard positive (logit 0.1) keeps almost its full cross-entropy, exactly the rebalancing Figure 23.3.2 shows.</div>
+
+<p>
+RetinaNet is the architecture that paired this loss with a ResNet-plus-FPN backbone and a simple dense head. With the imbalance solved by the loss rather than by sampling, RetinaNet became the first one-stage detector to match the accuracy of the best two-stage models, while keeping the one-stage speed advantage. Focal loss has since spread far beyond RetinaNet; it appears in FCOS (<a href="section-23.4.html">Section 23.4</a>), in many YOLO heads, and in the classification branch of several DETR variants.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: RetinaNet and Focal Loss, Prebuilt</div>
+<p>torchvision ships RetinaNet with COCO-pretrained weights, and its focal-loss helper is a single import, so you never need the from-scratch version above in production:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.detection import (
+    retinanet_resnet50_fpn_v2, RetinaNet_ResNet50_FPN_V2_Weights)
+from torchvision.ops import sigmoid_focal_loss     # the same loss, fused
+
+weights = RetinaNet_ResNet50_FPN_V2_Weights.DEFAULT
+model = retinanet_resnet50_fpn_v2(weights=weights).eval()
+with torch.no_grad():
+    out = model([torch.rand(3, 800, 800)])[0]       # boxes, labels, scores
+print({k: v.shape for k, v in out.items()})
+</code></pre>
+<p>The whole RetinaNet, ResNet-50 backbone, FPN neck, classification and box subnets, anchor generation, focal-loss training objective, and the batched NMS at inference, is one constructor; the standalone <code>sigmoid_focal_loss</code> replaces the function above with a tested, fused kernel. Roughly 800 lines of detector plus the focal-loss math reduce to two imports, and the library guarantees the anchor configuration matches the pretrained weights.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Real-Time Detection on a Drone's Tiny Chip</div>
+<p><strong>Who:</strong> an agritech company counting and locating crop rows and weeds from a low-flying drone, 2024. <strong>Situation:</strong> the drone carried a small embedded accelerator with a few watts of power budget, and detection had to keep up with the video feed so the sprayer could act in flight. <strong>Problem:</strong> a Faster R-CNN gave the best weed-versus-crop accuracy in the lab but ran at 4 frames per second on the embedded chip, far too slow for the 30-frame feed, and dropped frames meant missed weeds. <strong>Decision:</strong> they moved to a compact one-stage YOLO model, quantized it to int8 (a preview of the efficiency techniques of <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>), and accepted a small mAP drop in exchange for a tenfold speedup. They recovered most of the lost accuracy with aggressive augmentation and by training at the drone's actual altitude and resolution. <strong>Result:</strong> the detector ran at video rate on-device, the sprayer acted in real time, and the small-object weed recall stayed within their tolerance. <strong>Lesson:</strong> the one-stage family exists for exactly this regime; when the deployment target is a low-power chip on a moving platform, the speed of a single forward pass is the constraint that picks the architecture, and the lab-best accurate model is the wrong choice.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>"You Only Look Once" was a deliberate jab at the two-stage detectors that look thousands of times, and the acronym YOLO landed in 2016 just as the same four letters were peaking as internet slang for "you only live once." Joseph Redmon leaned all the way into the joke: the early YOLO papers are sprinkled with deadpan asides, and his resume was once formatted as a My Little Pony fan page. The field's most-deployed detector family is named after a meme, which is a useful reminder that the catchiest name, not always the highest mAP, is what makes an architecture famous.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The YOLO Arms Race, 2024 to 2026</div>
+<p>The one-stage line is the most actively developed corner of detection. YOLOv8 and YOLO11 (Ultralytics, 2023 to 2024) are anchor-free, use a decoupled detection head, and pair task-aligned label assignment with distribution-focal-loss box regression, blurring the line between this section and the anchor-free <a href="section-23.4.html">Section 23.4</a>. YOLOv9 introduced programmable gradient information, YOLOv10 (2024) removed NMS at inference with a dual-assignment training trick, getting one-stage detectors most of the way to DETR's NMS-free promise without a transformer, and the YOLO12 line (2025) brings attention modules into the backbone. RT-DETR, a real-time DETR (<a href="section-23.5.html">Section 23.5</a>), now competes directly on the speed-accuracy frontier these YOLOs defined. The headline trend is convergence: anchor-free, NMS-free, attention-augmented one-stage detectors that are fast enough for the edge and accurate enough to rival anything two-stage.</p>
+</div>
+
+<h2>5. Choosing Among the One-Stage Family <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The one-stage detectors share a profile: a single forward pass, dense prediction on FPN levels, a focal or task-aligned classification loss to handle imbalance, and an NMS post-step (which the newest YOLOs are learning to drop). They differ mainly in the backbone size, the head design, and the training recipe, and the practical choice is a speed-accuracy trade-off rather than a deep architectural decision. A modern compact YOLO is the default for edge and real-time work; RetinaNet remains a clean, well-understood research baseline; SSD is largely of historical interest now, superseded by its descendants. Table 23.3.1 summarizes the trade-offs against the two-stage family of the previous section.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 23.3.1:</strong> <em>Two-stage versus one-stage detectors, the trade-offs that pick one.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Property</th>
+<th scope="col">Two-stage (Faster R-CNN)</th>
+<th scope="col">One-stage (YOLO, RetinaNet)</th>
+</tr>
+</thead>
+<tr>
+<td>Proposal step</td>
+<td>Yes (RPN)</td>
+<td>No (dense grid)</td>
+</tr>
+<tr>
+<td>Imbalance handling</td>
+<td>Proposal sampling</td>
+<td>Focal / task-aligned loss</td>
+</tr>
+<tr>
+<td>Speed</td>
+<td>Lower (per-region head)</td>
+<td>Higher (single pass)</td>
+</tr>
+<tr>
+<td>Small-object recall</td>
+<td>Often higher</td>
+<td>Improving, historically lower</td>
+</tr>
+<tr>
+<td>Typical use</td>
+<td>Offline, accuracy-critical</td>
+<td>Real-time, edge, video</td>
+</tr>
+</table>
+</div>
+
+<p>
+Both families still rely on the anchor box, the hand-designed reference shapes whose scales and aspect ratios you must tune to your data, as Exercise 23.2.2 showed. That tuning is a real burden, and it is the next thing the field shed. <a href="section-23.4.html">Section 23.4</a> shows how detectors learned to predict boxes directly from feature-map locations with no anchors at all.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.1: When Does Focal Loss Help? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Focal loss helped one-stage detection enormously but is rarely used for ordinary image classification. In two or three sentences, explain the difference in class balance between the two settings that makes focal loss valuable in one and unnecessary in the other. Then predict what would happen to a balanced classification task (1,000 examples per class) if you trained it with $\gamma = 2$ focal loss: would it help, hurt, or roughly match plain cross-entropy, and why?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.2: Visualizing the Modulating Factor <span class="exercise-type coding">Coding</span></div>
+<p>Plot the per-example focal loss as a function of $p_t$ for $\gamma \in \{0, 0.5, 1, 2, 5\}$ on one figure (set $\alpha = 1$ so you isolate the focusing effect). Mark the loss value at $p_t = 0.9$ (a typical easy background) for each $\gamma$ and compute, for $\gamma = 2$, the ratio of the loss at $p_t = 0.5$ (hard) to the loss at $p_t = 0.9$ (easy). This ratio is the relative emphasis focal loss places on hard examples; explain in one sentence how it changes as $\gamma$ grows.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.3.3: Speed-Accuracy on Your Hardware <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the torchvision library shortcuts, run the pretrained Faster R-CNN (Section 23.2) and the pretrained RetinaNet on the same batch of images and time both end-to-end (warm up first, then average over 20 runs). Report frames per second for each on your machine, and on a busy multi-object image compare the number of detections above a 0.5 confidence threshold. Write a short paragraph deciding which you would deploy for a 30-frame-per-second video application and which for an offline archival-tagging job, justifying each choice from your measured numbers and Table 23.3.1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.2.html">&#8592; Section 23.2: Two-Stage Detectors: The R-CNN Family</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="section-23.4.html">Section 23.4: Anchor-Free &amp; Keypoint-Based Detection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

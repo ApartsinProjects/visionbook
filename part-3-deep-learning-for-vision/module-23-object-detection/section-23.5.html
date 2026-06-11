@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.5: DETR: Detection as Set Prediction. Detection reframed as predicting a fixed-size set with a transformer decoder and learned object queries, the Hungarian bipartite matching loss that removes non-maximum suppression, why the original DETR trained slowly, and how Deformable DETR and the DINO family fixed it." name="description"/>
+<title>Section 23.5: DETR: Detection as Set Prediction | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>DETR: Detection as Set Prediction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me a hundred little assistants and told each one: go find me an object, any object, but no two of you may return the same one. At first we argued constantly about who saw what. Eventually we worked out a polite division of labor, and now I never need anyone to clean up after me. No suppression. No duplicates. Just a tidy list."</p>
+<cite>A Transformer Decoder With a Hundred Object Queries</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>DETR reframes detection as direct set prediction: a transformer decoder turns a fixed set of learned object queries into a fixed-size list of (box, class) predictions, and a bipartite matching loss forces exactly one query to claim each object, so the model produces a clean set with no anchors and no non-maximum suppression.</strong> Every detector before it emitted a redundant pile of overlapping boxes and leaned on hand-designed post-processing (anchors, NMS) to recover a clean answer. DETR makes the clean answer the training objective itself. The price was slow convergence in the original, which Deformable DETR and the DINO family fixed, producing the first transformer detectors to beat the best convolutional models on COCO. This section builds the object-query idea, the Hungarian matching loss, and the line of fixes that made the design practical, and it connects directly back to the attention you built in Chapter 22.</p>
+</div>
+
+<p>
+Every detector from <a href="section-23.2.html">Section 23.2</a> through <a href="section-23.4.html">Section 23.4</a> shares an awkward two-step character: the network emits many overlapping candidate boxes, and a separate, non-learned procedure (NMS, sometimes preceded by anchor matching) prunes them into a final set. That post-processing is hand-tuned, non-differentiable, and a frequent failure point in crowded scenes. DETR (Detection Transformer, Carion et al., 2020) asked a more ambitious question: can the network simply output the final set directly, with duplicate-suppression folded into the loss rather than bolted on afterward? Doing so requires the attention mechanism of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> and a loss that compares two sets, and it changed how the field thinks about the detection output.
+</p>
+
+<h2>1. Object Queries and the Decoder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+DETR's architecture is a CNN or transformer backbone, a transformer encoder that processes the backbone's flattened feature map, and a transformer decoder that is the new idea. The decoder takes a small, fixed number of learned input vectors called <strong>object queries</strong> (the original uses $N = 100$), and through cross-attention to the encoded image features, transforms each query into a prediction: a class (including a "no object" class, written $\varnothing$) and a box. Because there are always exactly $N$ queries, the output is always exactly $N$ predictions; most of them on any given image will be $\varnothing$, and the rest are the detected objects. The queries are learned, not hand-placed like anchors; over training each query specializes, with some learning to attend to the left of the image, some to large central objects, and so on, a soft, learned version of the spatial priors anchors hard-coded.
+</p>
+
+<p>
+The decoder is exactly the transformer decoder block from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>: each query attends to the other queries (self-attention, which is how queries coordinate to avoid claiming the same object) and to the image features (cross-attention, which is how a query gathers the evidence for its object). Figure 23.5.1 shows the full pipeline and the crucial bipartite match that defines the loss.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DETR pipeline: backbone and encoder produce image features, a decoder turns N object queries into N predictions, and a bipartite matching assigns each prediction to a ground-truth box or to no-object">
+<style>
+.el{font:11px sans-serif;fill:#1a1a1a;}
+.es{font:10px sans-serif;fill:#555;}
+.ebox{stroke-width:1.5;}
+.eback{fill:#e7f5ec;stroke:#2f9e5c;}
+.eenc{fill:#eaf2fb;stroke:#2c6fb5;}
+.edec{fill:#fdeee3;stroke:#d6802b;}
+.epred{fill:#f3e8fb;stroke:#8e44ad;}
+.egt{fill:#fff4e6;stroke:#b8860b;}
+.ear{stroke:#777;stroke-width:1.5;marker-end:url(#eah);fill:none;}
+.ematch{stroke:#8e44ad;stroke-width:1.5;stroke-dasharray:4 3;}
+</style>
+<defs><marker id="eah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="ebox eback" x="20" y="120" width="70" height="50"/>
+<text class="el" x="55" y="149" text-anchor="middle">backbone</text>
+<line class="ear" x1="92" y1="145" x2="122" y2="145"/>
+<rect class="ebox eenc" x="124" y="116" width="76" height="58"/>
+<text class="el" x="162" y="140" text-anchor="middle">encoder</text>
+<text class="es" x="162" y="158" text-anchor="middle">img features</text>
+<line class="ear" x1="202" y1="145" x2="232" y2="145"/>
+<rect class="ebox edec" x="234" y="100" width="86" height="90"/>
+<text class="el" x="277" y="128" text-anchor="middle">decoder</text>
+<text class="es" x="277" y="146" text-anchor="middle">cross-attn</text>
+<text class="es" x="277" y="162" text-anchor="middle">to features</text>
+<text class="es" x="277" y="216" text-anchor="middle">N object queries in</text>
+<line class="ear" x1="277" y1="240" x2="277" y2="192"/>
+<line class="ear" x1="322" y1="145" x2="352" y2="145"/>
+<rect class="ebox epred" x="354" y="96" width="96" height="100"/>
+<text class="el" x="402" y="118" text-anchor="middle">N predictions</text>
+<text class="es" x="402" y="140" text-anchor="middle">(class, box)</text>
+<text class="es" x="402" y="158" text-anchor="middle">incl. &#8709;</text>
+<line class="ematch" x1="452" y1="130" x2="560" y2="110"/>
+<line class="ematch" x1="452" y1="150" x2="560" y2="160"/>
+<rect class="ebox egt" x="562" y="92" width="120" height="44"/>
+<text class="el" x="622" y="118" text-anchor="middle">GT object 1</text>
+<rect class="ebox egt" x="562" y="146" width="120" height="44"/>
+<text class="el" x="622" y="172" text-anchor="middle">GT object 2</text>
+<text class="es" x="560" y="220" text-anchor="middle">purple: Hungarian match (one query per GT; rest -&gt; &#8709;)</text>
+</svg>
+<figcaption><strong>Figure 23.5.1:</strong> DETR as set prediction. The backbone and encoder produce image features; the decoder turns $N$ learned object queries into $N$ (class, box) predictions; a Hungarian bipartite matching (purple) assigns exactly one prediction to each ground-truth object and labels every other prediction "no object". The matching is what trains the queries to divide the work without duplicates.</figcaption>
+</figure>
+
+<h2>2. The Set-Prediction Loss and Hungarian Matching <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The decoder emits $N$ predictions but the image has some smaller number of ground-truth objects, and crucially the predictions come in no particular order. To compute a loss we must first decide which prediction is responsible for which ground-truth object. DETR pads the ground-truth set to size $N$ with $\varnothing$ entries and finds the one-to-one assignment between the $N$ predictions and the $N$ (padded) ground truths that minimizes a total matching cost. This optimal one-to-one assignment is the classical <strong>assignment problem</strong>, solved exactly in polynomial time by the <strong>Hungarian algorithm</strong>. The matching cost for pairing prediction $i$ with ground truth $\sigma(i)$ combines a class term and a box term:
+</p>
+
+<div class="math-block">
+$$\hat{\sigma} = \arg\min_{\sigma} \sum_{i=1}^{N} \Big[ -\mathbb{1}_{\{c_i \ne \varnothing\}}\, \hat{p}_{\sigma(i)}(c_i) + \mathbb{1}_{\{c_i \ne \varnothing\}}\, L_{\text{box}}(b_i, \hat{b}_{\sigma(i)}) \Big]$$
+</div>
+
+<p>
+where $c_i$ and $b_i$ are the ground-truth class and box, $\hat{p}$ and $\hat{b}$ are the predicted class probability and box, and $L_{\text{box}}$ is a weighted sum of an L1 distance and a GIoU loss (the IoU-based loss flagged back in <a href="section-23.1.html">Section 23.1</a>). Once the optimal matching $\hat{\sigma}$ is fixed, the actual training loss is computed against it: a cross-entropy classification loss on every prediction (matched ones toward their object's class, unmatched ones toward $\varnothing$) plus the box loss on the matched pairs only.
+</p>
+
+<p>
+This one-to-one matching is the entire trick that removes NMS. Because exactly one prediction is rewarded for each object and all others are pushed toward $\varnothing$, the network is directly penalized for emitting two boxes on one object; duplicate suppression is in the loss, not in a post-process. The snippet below shows the matching step using SciPy's exact solver, which is precisely what the reference implementation calls.
+</p>
+
+<pre><code class="language-python">import torch
+from scipy.optimize import linear_sum_assignment
+
+def hungarian_match(pred_logits, pred_boxes, gt_labels, gt_boxes, cost_giou_fn):
+    """pred_logits: (N, num_classes+1). pred_boxes: (N, 4).
+       gt_labels: (M,). gt_boxes: (M, 4). Returns matched (pred_idx, gt_idx)."""
+    probs = pred_logits.softmax(-1)                     # (N, C+1)
+    cost_class = -probs[:, gt_labels]                   # (N, M): want high prob -> low cost
+    cost_l1 = torch.cdist(pred_boxes, gt_boxes, p=1)    # (N, M) L1 box distance
+    cost_giou = cost_giou_fn(pred_boxes, gt_boxes)      # (N, M) negative GIoU
+    cost = cost_class + 5.0 * cost_l1 + 2.0 * cost_giou # weighted total matching cost
+    pred_idx, gt_idx = linear_sum_assignment(cost.cpu().numpy())  # exact assignment
+    return torch.as_tensor(pred_idx), torch.as_tensor(gt_idx)
+</code></pre>
+<div class="code-caption">The Hungarian matching step that defines DETR's loss. <code>linear_sum_assignment</code> finds the one-to-one prediction-to-ground-truth pairing of minimum total cost; every unmatched prediction is then trained toward the "no object" class, which is what makes NMS unnecessary.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One-to-One Assignment Is the Whole Difference</div>
+<p>The dividing line between DETR and every prior detector is the assignment cardinality. Anchor-based and anchor-free detectors use <strong>one-to-many</strong> assignment: each ground-truth object is matched to many anchors or locations, all trained to predict it, which is why they emit duplicates and need NMS. DETR uses <strong>one-to-one</strong> assignment: each object gets exactly one prediction, so there are no duplicates to suppress. This also explains DETR's original weakness, slow training: one-to-one assignment gives each object only a single positive example per image, a sparse and unstable learning signal, where one-to-many floods the model with positives. The 2022 to 2023 fixes (notably DINO's query denoising and the hybrid one-to-many auxiliary losses of H-DETR and Group-DETR) all work by restoring a dense training signal while keeping the one-to-one inference that avoids NMS. The assignment rule, foreshadowed as the deep lesson of <a href="section-23.4.html">Section 23.4</a>, is once again the crux.</p>
+</div>
+
+<h2>3. Why the Original DETR Was Slow, and How It Was Fixed <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The 2020 DETR matched Faster R-CNN's accuracy but needed roughly 500 training epochs to do it, around ten times the schedule of a convolutional detector, and it was weak on small objects. Two causes, two fixes. The first cause was the sparse one-to-one signal just described. The second was the encoder's global attention over the full feature map: with the quadratic cost you met in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, DETR could only afford a coarse, low-resolution feature map, which hurt small objects, and the dense attention took many epochs to learn where to look.
+</p>
+
+<p>
+<strong>Deformable DETR</strong> (Zhu et al., 2021) fixed the attention cost by replacing dense global attention with <em>deformable attention</em>: each query attends to only a small set of learned sampling points around a reference location, rather than to every feature-map position. This made multi-scale, high-resolution features affordable (helping small objects) and cut training to around 50 epochs. <strong>DINO</strong> (Zhang et al., 2023) added contrastive query denoising (feeding noised ground-truth boxes as auxiliary queries to give a dense, stable training signal), mixed query selection (initializing queries from encoder features rather than from scratch), and a look-forward-twice box-refinement scheme. The combination made DINO the first DETR-family detector to surpass the best convolutional detectors on COCO, around 63 AP, and it remains a 2024-era state-of-the-art template. Table 23.5.1 summarizes the line of fixes.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 23.5.1:</strong> <em>The DETR family and the problem each variant solved.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Model</th>
+<th scope="col">Year</th>
+<th scope="col">Key idea</th>
+<th scope="col">Problem solved</th>
+</tr>
+</thead>
+<tr>
+<td>DETR</td>
+<td>2020</td>
+<td>Object queries + Hungarian match</td>
+<td>Removed anchors and NMS</td>
+</tr>
+<tr>
+<td>Deformable DETR</td>
+<td>2021</td>
+<td>Sparse deformable attention</td>
+<td>Slow training, weak small objects</td>
+</tr>
+<tr>
+<td>DINO</td>
+<td>2023</td>
+<td>Query denoising, mixed selection</td>
+<td>Beat convolutional detectors on COCO</td>
+</tr>
+<tr>
+<td>RT-DETR</td>
+<td>2023</td>
+<td>Efficient hybrid encoder, NMS-free</td>
+<td>Real-time DETR, rivals YOLO speed</td>
+</tr>
+</table>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Run DETR in a Handful of Lines</div>
+<p>Hugging Face Transformers ships the DETR family with the image processor and a post-processor that turns the raw $N$ predictions into a clean list, no NMS needed. The whole set-prediction detector is a few lines:</p>
+<pre><code class="language-python">import torch
+from transformers import DetrImageProcessor, DetrForObjectDetection
+from PIL import Image
+
+processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
+model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50").eval()
+
+image = Image.open("street.jpg")
+inputs = processor(images=image, return_tensors="pt")
+with torch.no_grad():
+    outputs = model(**inputs)
+# post_process turns the 100 queries into final boxes above a score threshold.
+results = processor.post_process_object_detection(
+    outputs, target_sizes=torch.tensor([image.size[::-1]]), threshold=0.7)[0]
+for box, label, score in zip(results["boxes"], results["labels"], results["scores"]):
+    print(model.config.id2label[label.item()], round(score.item(), 2), box.tolist())
+</code></pre>
+<p>The encoder, decoder, object queries, and the entire Hungarian-matched training objective are inside the pretrained model; the <code>post_process_object_detection</code> call simply drops the $\varnothing$ predictions and thresholds the rest. There is no NMS anywhere in this code, which is the practical payoff of the set-prediction design. Swap the model name for <code>SenseTime/deformable-detr</code> or an RT-DETR checkpoint to trade accuracy for speed.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting in a Crowd Where NMS Failed</div>
+<p><strong>Who:</strong> a stadium-analytics team estimating crowd density and locating individuals in packed sections for safety monitoring, 2023. <strong>Situation:</strong> they used a strong one-stage detector, but in the densest sections people overlapped heavily and the boxes of adjacent people had high mutual IoU. <strong>Problem:</strong> NMS, which suppresses any box overlapping a kept box above the IoU threshold, was merging two genuinely separate people into one detection, undercounting exactly where accurate counts mattered most; lowering the NMS threshold to keep both then re-admitted duplicates elsewhere. There was no single NMS threshold that worked across the density range. <strong>Decision:</strong> they moved to a DINO-style DETR detector, whose one-to-one set prediction needs no NMS at all, so adjacent overlapping people are kept as distinct predictions without any IoU-based suppression. <strong>Result:</strong> counts in the densest sections became reliable, and the team deleted the NMS-threshold tuning that had consumed weeks. <strong>Lesson:</strong> NMS is a structural liability in crowded scenes because a single IoU threshold cannot separate "duplicate of one object" from "two genuinely close objects"; the set-prediction design removes the dilemma by never producing duplicates in the first place.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Open-Vocabulary and Real-Time DETRs</div>
+<p>The DETR design has become the backbone of two of detection's most active 2024 to 2026 frontiers. <strong>Open-vocabulary detection</strong> drops the fixed class list: Grounding DINO (2024) fuses a DETR detector with a text encoder so you can detect whatever a free-form prompt names ("the red backpack on the left"), and YOLO-World brings similar promptability to the real-time YOLO line. <strong>Real-time DETRs</strong> close the speed gap that long kept transformers out of live applications: RT-DETR (2023) and its successors use an efficient hybrid encoder and an NMS-free design to rival YOLO frame rates while keeping the set-prediction cleanliness. The same object-query decoder also generalizes beyond boxes: it is the engine of the mask transformers (Mask2Former) you will meet in <a href="../module-24-segmentation/index.html">Chapter 24</a>, where each query predicts a segmentation mask instead of a box. The query-and-match idea has outgrown detection.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The Hungarian algorithm at the heart of DETR's loss was published in 1955 by Harold Kuhn, who named it in tribute to two earlier Hungarian mathematicians, Konig and Egervary, whose work it built on. It sat in the operations-research toolbox for assigning workers to jobs and taxis to passengers for over six decades before a detection paper made it the training objective of a neural network. DETR is a small monument to the habit of solving a new problem by recognizing it as a very old one in disguise.</p>
+</div>
+
+<h2>4. Where DETR Sits Today <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The set-prediction view reshaped detection's conceptual map. The convolutional families (two-stage, one-stage, anchor-free) and the transformer family (DETR and descendants) now coexist, and the practical choice is no longer "CNN or transformer" but "what assignment and what backbone fit my speed, data, and accuracy needs." A DINO-style DETR is the accuracy leader on COCO; a compact anchor-free YOLO or an RT-DETR is the choice for the edge; a Faster R-CNN remains a robust, well-understood baseline with strong small-object recall. The next section steps out of the architecture comparisons entirely and into practice: you will take one modern detector, fine-tune it on your own labeled data, read its mAP without fooling yourself, and export it for deployment, the workflow that turns every idea in this chapter into a working product.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.1: Why No NMS <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in three or four sentences the causal chain from "one-to-one Hungarian matching" to "no NMS needed at inference". Specifically: what does the loss do to a prediction that duplicates another prediction's object, and how does that differ from what an anchor-based detector's one-to-many assignment does to the same situation? Why does this make the duplicate-suppression problem disappear rather than merely move it elsewhere?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.2: Inspect the Object Queries <span class="exercise-type coding">Coding</span></div>
+<p>Load the pretrained <code>facebook/detr-resnet-50</code> from the library shortcut and run it on 20 to 50 images. For each of the 100 object queries, record the center coordinates of any box it predicts with score above 0.5, and scatter-plot the centers per query (a few queries at a time). You should see that different queries specialize to different regions and object sizes, the learned analogue of anchors. Write one sentence relating what you observe to the role anchors played in earlier detectors.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.5.3: The Cost of the Sparse Signal <span class="exercise-type analysis">Analysis</span></div>
+<p>The original DETR needed about 500 epochs while Deformable DETR needed about 50. Using the key-insight box and subsection 3, write an analysis identifying the two distinct causes of the slow convergence (the sparse one-to-one signal and the dense global attention) and matching each to the specific fix that addressed it (query denoising or auxiliary one-to-many losses; deformable sampling). Then argue which of the two fixes you would expect to matter more for a dataset of many small objects, and why, connecting to the quadratic-attention discussion of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-23.4.html">&#8592; Section 23.4: Anchor-Free &amp; Keypoint-Based Detection</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="section-23.6.html">Section 23.6: Training &amp; Deploying a Detector on Custom Data &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

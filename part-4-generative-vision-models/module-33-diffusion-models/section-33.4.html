@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.4: Fast Sampling. How to cut diffusion sampling from a thousand steps to twenty: the deterministic DDIM sampler, high-order ODE solvers like DPM-Solver, and progressive distillation that trains a student to take the steps a teacher needs many for." name="description"/>
+<title>Section 33.4: Fast Sampling | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Fast Sampling: DDIM, Solvers &amp; Step Distillation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A thousand tiny steps will get you home, but so will twenty long strides if you know which way to lean. I learned to lean."</p>
+<cite>A Sampler That Used to Take All Day</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The thousand-step sampling that makes diffusion slow is not fundamental; it is the cost of solving the generative ODE with the crudest possible integrator, and three families of methods cut it dramatically: DDIM rewrites the sampler as a deterministic ODE solver that takes large accurate steps, higher-order solvers like DPM-Solver use curvature information to take even fewer, and distillation trains a student network to reproduce many teacher steps in one.</strong> The first two need no extra training and turn a thousand steps into roughly twenty; the third needs training but pushes toward one to four steps and near-real-time generation. This section derives DDIM, surveys the solver landscape, and explains distillation.</p>
+</div>
+
+<p>
+In <a href="section-33.3.html">Section 33.3</a> you learned that every diffusion model has a deterministic probability-flow ODE whose trajectories carry noise to data. The stochastic ancestral sampler of <a href="section-33.1.html">Section 33.1</a> is, in effect, a noisy Euler solver of the reverse SDE, and Euler with a thousand steps is reliable but wasteful. Recognizing sampling as numerical ODE solving immediately suggests the fix: use a better solver. This section makes that concrete. We derive the DDIM sampler as the Euler discretization of the probability-flow ODE, see why it can take twenty steps where the stochastic sampler needs a thousand, then move to the higher-order solvers and the distillation methods that go further still.
+</p>
+
+<h2>1. DDIM: Sampling as Deterministic ODE Solving <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The denoising diffusion implicit model (DDIM) starts from a clever observation: the DDPM training objective from <a href="section-33.2.html">Section 33.2</a> only constrains the marginals $q(x_t \mid x_0)$, not the joint Markov chain. So you are free to define a <em>different</em> reverse process, even a non-Markovian one, as long as it has the same marginals, and reuse the exact same trained network. DDIM chooses a reverse process that is deterministic. Its update predicts the clean image from the current noisy image and the network's noise estimate, then re-noises it to the next, lower noise level along a straight line:
+</p>
+
+<div class="math-block">
+$$x_{t-1} = \sqrt{\bar\alpha_{t-1}}\ \underbrace{\left(\frac{x_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\theta(x_t, t)}{\sqrt{\bar\alpha_t}}\right)}_{\text{predicted } x_0} \ +\ \sqrt{1 - \bar\alpha_{t-1}}\ \epsilon_\theta(x_t, t).$$
+</div>
+
+<p>
+There is no random term. The two pieces are the predicted clean image, scaled to the next noise level, plus the predicted noise direction, also scaled to the next level. Because the trajectory is deterministic and smooth, you do not have to visit every integer timestep; you can pick any decreasing subsequence of steps, say 50 of the 1000, and apply the update between consecutive chosen steps. This is exactly the probability-flow ODE integrator you wrote in <a href="section-33.3.html">Section 33.3</a>, now named and motivated. Figure 33.4.1 contrasts the wandering stochastic path with the smooth deterministic one.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 680 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two paths from a noise point to a data point: a jagged many-step stochastic path and a smooth few-step deterministic DDIM path">
+<style>
+.fl{font:12px sans-serif;fill:#1a1a1a;}
+.fs{font:10.5px sans-serif;fill:#555;}
+.endpt{fill:#2c6fb5;}
+.startpt{fill:#8a7a6a;}
+.stoch{stroke:#d6802b;stroke-width:1.6;fill:none;}
+.det{stroke:#2f9e5c;stroke-width:2.4;fill:none;}
+.dot{fill:#2f9e5c;}
+</style>
+<circle class="startpt" cx="70" cy="140" r="9"/>
+<text class="fl" x="70" y="170" text-anchor="middle">noise x_T</text>
+<circle class="endpt" cx="610" cy="140" r="9"/>
+<text class="fl" x="610" y="170" text-anchor="middle">data x_0</text>
+<path class="stoch" d="M78,140 L120,100 L150,165 L195,95 L235,170 L285,105 L330,165 L385,100 L435,160 L490,110 L540,150 L600,140"/>
+<text class="fs" x="300" y="70" text-anchor="middle" fill="#d6802b">stochastic SDE: ~1000 small noisy steps</text>
+<path class="det" d="M78,145 C200,215 430,215 600,148"/>
+<circle class="dot" cx="78" cy="145" r="4"/>
+<circle class="dot" cx="200" cy="200" r="4"/>
+<circle class="dot" cx="340" cy="210" r="4"/>
+<circle class="dot" cx="480" cy="198" r="4"/>
+<circle class="dot" cx="600" cy="148" r="4"/>
+<text class="fs" x="340" y="245" text-anchor="middle" fill="#2f9e5c">deterministic DDIM ODE: ~20 large steps</text>
+</svg>
+<figcaption><strong>Figure 33.4.1:</strong> Two routes from the same noise sample to data. The stochastic ancestral sampler (orange) injects fresh noise at every step, so its path jitters and must take many small steps to stay accurate. The deterministic DDIM path (green) follows the smooth probability-flow ODE, so a handful of large steps (the dots) lands close to the same data point. Smoothness is what buys the step reduction.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+
+@torch.no_grad()
+def ddim_sample(unet, alpha_bars, shape, steps=50, T=1000, device="cpu"):
+    """Deterministic DDIM sampling on a chosen subset of timesteps."""
+    x = torch.randn(shape, device=device)
+    ts = torch.linspace(T - 1, 0, steps).long().to(device)   # 50 of 1000 steps
+    for i in range(len(ts)):
+        t = ts[i]
+        ab = alpha_bars[t]
+        eps = unet(x, t.repeat(shape[0])).sample             # one network call
+        x0_pred = (x - (1 - ab).sqrt() * eps) / ab.sqrt()    # predicted clean image
+        if i < len(ts) - 1:
+            ab_next = alpha_bars[ts[i + 1]]
+            x = ab_next.sqrt() * x0_pred + (1 - ab_next).sqrt() * eps  # to next level
+        else:
+            x = x0_pred                                       # final step: return x0
+    return x.clamp(-1, 1)
+
+# 50 network calls instead of 1000: a 20x speedup with the same weights.
+print("DDIM uses the same trained unet, just a smarter update rule")</code></pre>
+<div class="code-caption">A complete DDIM sampler. It reuses a network trained with the ordinary DDPM loss of Section 33.2 and makes only <code>steps</code> calls to it. Setting <code>steps=50</code> gives roughly a twentyfold speedup over the 1000-step ancestral sampler with little visible quality loss.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Same Weights, Different Walk</div>
+<p>
+The most important practical fact about DDIM is that it requires <em>no retraining</em>. A model trained with the plain DDPM objective can be sampled with the stochastic ancestral sampler, with DDIM at 50 steps, or with a high-order solver at 20 steps, all from the identical weights. The number of sampling steps is a deployment-time dial, not a training-time commitment. This is why a single Stable Diffusion checkpoint ships with a dozen interchangeable schedulers: they are all different ODE/SDE solvers walking the same learned vector field. The determinism of the DDIM walk also makes it invertible, which is the property the <a href="../module-35-controllable-generation-editing/index.html">inversion-based editing of Chapter 35</a> relies on to map a real image back to the noise that would regenerate it.
+</p>
+</div>
+
+<h2>2. Higher-Order Solvers: DPM-Solver and Friends <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+DDIM is a first-order (Euler) solver of the probability-flow ODE. Numerical analysis offers a long menu of more accurate solvers that use information about the curvature of the trajectory to take larger steps for the same error. The diffusion ODE has a special structure: its drift is linear in $x$ plus a nonlinear score term, a so-called semi-linear ODE, and exploiting that structure with an exponential integrator yields <strong>DPM-Solver</strong> (and its improved variants DPM-Solver++ and the multistep UniPC). These solvers reach DDPM-quality samples in roughly 10 to 20 network calls, about half of what DDIM needs at the same quality. A second-order solver evaluates the network twice per step (or reuses the previous step's evaluation) to estimate curvature, then takes a corrected step. The EDM sampler of <a href="section-33.2.html">Section 33.2</a> uses Heun's method, a classic second-order scheme, for the same reason. The practical guidance is simple: for a given step budget, a higher-order solver almost always beats Euler/DDIM, and the cost is only a little extra bookkeeping.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: Swapping Schedulers in diffusers</div>
+<p>Implementing DPM-Solver++ or UniPC correctly, with the exponential-integrator coefficients and the multistep history, is a hundred-plus lines of subtle numerics that are easy to get wrong at the schedule endpoints. In <code>diffusers</code> it is a one-line swap: <code>pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)</code> replaces whatever sampler a pipeline shipped with. The same checkpoint then generates in 20 steps instead of 50. The library exposes <code>DDIMScheduler</code>, <code>DPMSolverMultistepScheduler</code>, <code>UniPCMultistepScheduler</code>, <code>EulerDiscreteScheduler</code>, and <code>HeunDiscreteScheduler</code>, all interchangeable, and handles the VP/VE and $\epsilon$/$v$ conversions of Sections 33.2 and 33.3 internally so you do not have to reconcile them by hand. Read one solver from scratch to understand the idea; choose among the library's schedulers in practice.</p>
+</div>
+
+<h2>3. Distillation: Training Away the Steps <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Better solvers reduce steps without retraining, but they hit a floor around 10 to 20 steps because below that the ODE trajectory is too curved for any fixed-order solver to track in a few jumps. To go lower you change the model, not the solver. <strong>Progressive distillation</strong> (Salimans and Ho, 2022) trains a student network to take one step that matches two teacher steps, then distills the student into a new student that takes one step for its two, and so on, halving the step count each round: 1024 to 512 to 256 down to 4 or even 1. Each round is a short fine-tune with a regression loss against the teacher's two-step output. The $v$-prediction parameterization of <a href="section-33.2.html">Section 33.2</a> was invented precisely to keep this distillation numerically stable. A newer and now-dominant family, the consistency models of <a href="section-33.5.html">Section 33.5</a>, trains directly for the property that any point on a trajectory maps to its endpoint, achieving one to four step generation in a single training run rather than many distillation rounds. Distillation is itself a form of the <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">knowledge-transfer training of Chapter 21</a>: a small or few-step student is supervised by a slow, high-quality teacher, the same teacher-student pattern, here aimed at sampling speed rather than label efficiency.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Bringing a Generator Into an Interactive Editor</div>
+<p><strong>Who:</strong> a product team adding AI image generation to a web-based design tool, 2024. <strong>Situation:</strong> their backend used a latent diffusion model at 50 DDIM steps, taking about four seconds per image on their GPU, fine for a "generate and wait" flow. <strong>Problem:</strong> designers wanted a live preview that updated as they typed the prompt and dragged sliders, which demands sub-second generation; four seconds felt broken in an interactive loop. <strong>Decision:</strong> they kept the 50-step model for the final high-quality render but added a distilled few-step model, a Latent Consistency Model adapter, for the live preview, generating a draft in four steps (roughly 0.3 seconds) and only running the full sampler when the user committed. <strong>Result:</strong> the preview felt instantaneous, exploration time per design dropped sharply, and the final-render quality was unchanged because the slow model still produced the deliverable. <strong>Lesson:</strong> step count is a product lever. A two-tier setup, a fast distilled model for interaction and a slow accurate one for the final artifact, often beats forcing one model to be both fast and best, and the fast tier is a drop-in distilled sibling of the same checkpoint.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The reason naive step-skipping (just running the ancestral sampler on every 50th step) produces garbage, while DDIM on the same 50 steps produces clean images, confused many practitioners early on. The difference is that the stochastic sampler's update assumes the small-step Gaussian approximation, which breaks across large gaps, whereas DDIM's update is exact for the deterministic ODE regardless of step size. The lesson the field learned the hard way: you cannot skip steps of a method designed for small steps; you must switch to a method designed for large ones.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: One-Step Generation Catches Up</div>
+<p>The race to few-step generation defined diffusion engineering from 2023 to 2025. Latent Consistency Models (Luo et al., 2023) brought consistency distillation to Stable Diffusion latents for four-step generation. Adversarial distillation, SDXL-Turbo and SD3-Turbo (Sauer et al., 2023 to 2024), added a GAN-style discriminator from <a href="../module-32-gans/index.html">Chapter 32</a> to the distillation loss, reaching convincing single-step samples. Distribution-matching distillation (DMD and DMD2, 2024) matched the student's output distribution to the teacher's score and closed much of the remaining quality gap to multi-step sampling. By 2025 the practical state of the art was that a well-distilled model gives 90-plus percent of multi-step quality in one to four steps, which is why real-time, type-and-see image and video tools became feasible, and why few-step diffusion is increasingly a candidate for the <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">on-device and edge deployment of Chapter 28</a> rather than a server-only workload. The open question is whether one-step models can fully match the best multi-step quality or whether a small residual gap is inherent.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.4.1: Why DDIM Can Skip Steps <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain in a short paragraph why the deterministic DDIM update can take a large jump from step $t$ to a much smaller step $t'$ with little error, while the stochastic ancestral update of <a href="section-33.1.html">Section 33.1</a> cannot. Reference the smoothness of the probability-flow ODE from <a href="section-33.3.html">Section 33.3</a> and the role of the injected noise term. Then state what quantity a higher-order solver estimates that Euler/DDIM ignores.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.4.2: Steps vs Quality Curve <span class="exercise-type coding">Coding</span></div>
+<p>Take a pretrained Stable Diffusion or DDPM checkpoint from <code>diffusers</code>. Generate the same prompt and seed at 5, 10, 20, 50, and 100 steps with both <code>DDIMScheduler</code> and <code>DPMSolverMultistepScheduler</code>, keeping everything else fixed. Arrange the images in a grid and, for each scheduler, note the smallest step count at which you stop seeing improvement. Confirm the claim in subsection 2 that the higher-order solver reaches good quality at fewer steps.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.4.3: The Cost of Distillation <span class="exercise-type analysis">Analysis</span></div>
+<p>Compare the three speedup strategies of this section along several axes: extra training cost, achievable minimum steps, and whether the original checkpoint is reusable. Summarize in a small table (DDIM, DPM-Solver, progressive/consistency distillation) and write one paragraph advising a team that needs sub-second generation but cannot afford a long distillation run. Connect your recommendation to the two-tier deployment in the practical example, and to the consistency models you will study in <a href="section-33.5.html">Section 33.5</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.3.html">&#8592; Section 33.3: The Score-Based View</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="section-33.5.html">Section 33.5: Flow Matching &amp; Consistency Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

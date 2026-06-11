@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.1: The Adversarial Game. The generator-discriminator setup, the minimax value function, the optimal discriminator and the Jensen-Shannon divergence, the non-saturating generator loss, and a complete GAN trained from scratch on MNIST in PyTorch." name="description"/>
+<title>Section 32.1: The Adversarial Game | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Generative Adversarial Networks</a></div>
+<h1>Section 32.1: The Adversarial Game</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My counterfeiter and I have an arrangement. I get better, then he gets better, then I get better. We have never agreed on anything except that the bank should never tell us apart. Last Tuesday it could not. We called it a draw and went home."</p>
+<cite>A Forger Who Reports Directly to the Mint</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A GAN never receives a loss that describes a good image; it learns from a second network whose only job is to catch fakes, and training is the chase between a counterfeiter and the bank.</strong> This section derives that chase precisely. We write the two-player minimax value function, solve for the discriminator that any fixed generator should face, and discover that the generator is then secretly minimizing the Jensen-Shannon divergence between its samples and the data. We fix the one place where the textbook objective fails in practice, the generator's vanishing gradient early in training, with the non-saturating loss everyone actually uses, and we close by training a complete GAN on MNIST in about forty lines of PyTorch.</p>
+</div>
+
+<p>
+In the previous chapter the <a href="../module-31-autoencoders-vaes/index.html">variational autoencoder</a> learned to generate by maximizing a likelihood: it wrote down an explicit, if approximate, probability for every image and pushed that probability up. The cost of that honesty was softness. Averaging over many plausible reconstructions, the maximum-likelihood objective hedges its bets, and the hedge shows up as blur. The generative adversarial network of Goodfellow and colleagues (2014) makes the opposite bet. It refuses to write down a likelihood at all. It only learns to <em>sample</em>, and it judges those samples not against a formula but against an adversary. This is the defining move of an <strong>implicit generative model</strong>, a theme introduced in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>: a model you can draw from but cannot ask "how probable is this image".
+</p>
+
+<h2>1. Two Networks, One Game <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A GAN has two networks with opposing incentives. The <strong>generator</strong> $G$ takes a random vector $\mathbf{z}$ drawn from a simple prior $p_z$ (a standard Gaussian or uniform, exactly the kind of latent code you met in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>) and maps it to an image $G(\mathbf{z})$. Its goal is to make $G(\mathbf{z})$ look like a real sample. The <strong>discriminator</strong> $D$ takes an image, real or generated, and outputs a single number $D(\mathbf{x}) \in (0, 1)$, its estimated probability that the image is real. Its goal is to be right. The generator wants $D$ to be wrong on its fakes.
+</p>
+
+<p>
+The standard analogy, from the original paper, is a team of counterfeiters ($G$) racing a police force ($D$). The counterfeiters print bills; the police inspect them and flag the fakes. Each side improves in response to the other. The counterfeiters never see a rulebook for "what a real bill looks like"; they only ever see whether the police caught them. Figure 32.1.1 lays out the wiring.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GAN data flow: a latent vector z feeds the generator G to produce a fake image; real images come from the dataset; the discriminator D scores both and produces real-or-fake; the discriminator loss trains D, and the same signal trains G in the opposite direction">
+  <g font-family="sans-serif" font-size="13">
+    <!-- latent -->
+    <rect x="20" y="120" width="110" height="46" rx="6" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="75" y="142" text-anchor="middle">latent z</text>
+    <text x="75" y="158" text-anchor="middle" font-size="11" fill="#555">~ p_z (Gaussian)</text>
+    <!-- generator -->
+    <rect x="180" y="115" width="120" height="56" rx="6" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="240" y="140" text-anchor="middle" font-weight="bold">Generator G</text>
+    <text x="240" y="158" text-anchor="middle" font-size="11" fill="#555">z &#8594; image</text>
+    <!-- fake image -->
+    <rect x="350" y="120" width="100" height="46" rx="6" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="400" y="142" text-anchor="middle">fake G(z)</text>
+    <!-- real image -->
+    <rect x="350" y="30" width="100" height="46" rx="6" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="400" y="52" text-anchor="middle">real x</text>
+    <text x="400" y="92" text-anchor="middle" font-size="11" fill="#555">~ p_data</text>
+    <!-- discriminator -->
+    <rect x="510" y="80" width="130" height="86" rx="6" fill="#f6e7ef" stroke="#a0356f"/>
+    <text x="575" y="118" text-anchor="middle" font-weight="bold">Discriminator D</text>
+    <text x="575" y="138" text-anchor="middle" font-size="11" fill="#555">image &#8594; (0,1)</text>
+    <!-- output -->
+    <rect x="700" y="95" width="130" height="56" rx="6" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="765" y="120" text-anchor="middle">real / fake</text>
+    <text x="765" y="138" text-anchor="middle" font-size="11" fill="#555">D(x) probability</text>
+    <!-- arrows -->
+    <defs>
+      <marker id="ah321" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker>
+    </defs>
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah321)">
+      <path d="M130,143 L178,143"/>
+      <path d="M300,143 L348,143"/>
+      <path d="M450,53 L575,53 L575,78"/>
+      <path d="M450,143 L508,123"/>
+      <path d="M640,123 L698,123"/>
+    </g>
+    <!-- training signals -->
+    <path d="M765,151 L765,250 L575,250 L575,168" stroke="#a0356f" stroke-width="1.5" fill="none" stroke-dasharray="5,4" marker-end="url(#ah321)"/>
+    <text x="690" y="268" text-anchor="middle" font-size="11" fill="#a0356f">train D: maximize log D(x) + log(1 - D(G(z)))</text>
+    <path d="M575,250 L240,250 L240,173" stroke="#2e8b57" stroke-width="1.5" fill="none" stroke-dasharray="5,4" marker-end="url(#ah321)"/>
+    <text x="380" y="240" text-anchor="middle" font-size="11" fill="#2e8b57">train G: make D(G(z)) &#8594; 1</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.1.1:</strong> The adversarial setup. The generator turns a random latent code into a fake image; the discriminator scores real and fake images alike. The same discriminator output drives two opposed updates: the discriminator (magenta) climbs the value function, and the generator (green) descends it.</figcaption>
+</figure>
+
+<p>
+Crucially, $G$ and $D$ are both differentiable networks, and $G$ is trained <em>through</em> $D$. The generator never touches a real image. Its only learning signal is the gradient that flows back from the discriminator's verdict on its fakes. That is the whole trick: the discriminator is a learned, adaptive loss function for the generator, and it gets harder to fool exactly as the generator gets better at fooling it.
+</p>
+
+<h2>2. The Minimax Value Function <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The two opposing goals are captured in a single value function $V(D, G)$ that the discriminator maximizes and the generator minimizes:
+</p>
+
+<p>
+$$ \min_{G} \max_{D} \; V(D, G) \;=\; \mathbb{E}_{\mathbf{x} \sim p_{\text{data}}} \big[ \log D(\mathbf{x}) \big] \;+\; \mathbb{E}_{\mathbf{z} \sim p_z} \big[ \log\big(1 - D(G(\mathbf{z}))\big) \big]. $$
+</p>
+
+<p>
+Read it term by term. The first term rewards the discriminator for assigning high probability $D(\mathbf{x}) \to 1$ to real images. The second rewards it for assigning low probability $D(G(\mathbf{z})) \to 0$ to fakes, since $\log(1 - D)$ is largest when $D$ is small. The discriminator wants both terms large. The generator appears only in the second term, and it wants that term <em>small</em>: it wants $D(G(\mathbf{z})) \to 1$, fooling the discriminator into calling its fakes real. This is the same binary cross-entropy loss you would use for any real-versus-fake classifier, with the labels real $= 1$ and fake $= 0$; the only novelty is that one of the two classes is produced by a network you are simultaneously training to defeat the classifier.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Discriminator Is a Learned Loss Function</div>
+<p>In every model before this chapter, the loss was a fixed formula chosen by a human: squared error, cross-entropy, an ELBO. A GAN replaces that fixed formula with a second network. The discriminator <em>is</em> the loss the generator minimizes, and because it is learned, it can capture aspects of "realism" that no hand-written loss does, sharp edges, plausible texture, global coherence. The catch, which the next section is entirely about, is that a moving loss is much harder to optimize against than a fixed one.</p>
+</div>
+
+<h2>3. The Optimal Discriminator and the Hidden Divergence <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+What is the generator actually minimizing? To answer that, fix the generator and ask which discriminator maximizes $V$. Let $p_g$ denote the distribution of generated images $G(\mathbf{z})$. Writing the expectations as integrals over image space, the value function is
+</p>
+
+<p>
+$$ V(D, G) \;=\; \int_{\mathbf{x}} \Big[ p_{\text{data}}(\mathbf{x}) \log D(\mathbf{x}) \;+\; p_g(\mathbf{x}) \log\big(1 - D(\mathbf{x})\big) \Big] \, d\mathbf{x}. $$
+</p>
+
+<p>
+The integrand has the form $a \log y + b \log(1 - y)$ in the scalar $y = D(\mathbf{x})$, which is maximized at $y = a / (a + b)$. So for any fixed generator the best possible discriminator is
+</p>
+
+<p>
+$$ D^{*}(\mathbf{x}) \;=\; \frac{p_{\text{data}}(\mathbf{x})}{p_{\text{data}}(\mathbf{x}) + p_g(\mathbf{x})}. $$
+</p>
+
+<p>
+This is intuitive: where real images are far more common than fakes, $D^{*} \to 1$; where the generator over-produces, $D^{*} \to 0$; and where the two distributions are equal, $D^{*} = \tfrac{1}{2}$, the discriminator's coin-flip state of perfect confusion. Substituting $D^{*}$ back into $V$ and simplifying (the algebra is in the original paper) yields, up to a constant,
+</p>
+
+<p>
+$$ V(D^{*}, G) \;=\; -\log 4 \;+\; 2 \cdot \mathrm{JSD}\big(p_{\text{data}} \,\|\, p_g\big), $$
+</p>
+
+<p>
+where $\mathrm{JSD}$ is the <strong>Jensen-Shannon divergence</strong>, a symmetric, bounded relative of the KL divergence you met in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>. The generator minimizes $V$, so against an optimal discriminator the generator is minimizing the Jensen-Shannon divergence between its samples and the data. The global minimum is reached exactly when $p_g = p_{\text{data}}$, at which point $\mathrm{JSD} = 0$, $D^{*} = \tfrac{1}{2}$ everywhere, and $V = -\log 4 \approx -1.386$.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Discriminator Estimates a Density Ratio</div>
+<p>The optimal discriminator $D^{*}(\mathbf{x}) = p_{\text{data}} / (p_{\text{data}} + p_g)$ is a one-to-one function of the density ratio $p_{\text{data}}(\mathbf{x}) / p_g(\mathbf{x})$. The discriminator never estimates either density on its own, but it learns their ratio, and that ratio is exactly the signal a generator needs to know which way to move its samples. This density-ratio view is the bridge to the Wasserstein reformulation in <a href="section-32.2.html">Section 32.2</a>, where a different distance replaces the JSD that this analysis exposes.</p>
+</div>
+
+<h2>4. Why the Textbook Generator Loss Fails, and the Fix</h2>
+
+<p>
+The clean theory above hides a practical disaster. Early in training the generator is terrible, so the discriminator easily rejects every fake: $D(G(\mathbf{z})) \approx 0$. The generator's loss term is $\log(1 - D(G(\mathbf{z})))$, and the gradient of $\log(1 - D)$ with respect to the generator is tiny when $D \approx 0$. The function is flat there. So precisely when the generator most needs a strong learning signal, when it is producing garbage, it receives almost none. The loss <strong>saturates</strong>.
+</p>
+
+<p>
+Goodfellow's fix, used in essentially every GAN since, is to change the generator's objective without changing its intent. Instead of minimizing $\log(1 - D(G(\mathbf{z})))$, the generator <em>maximizes</em> $\log D(G(\mathbf{z}))$, equivalently minimizing $-\log D(G(\mathbf{z}))$. Both objectives push $D(G(\mathbf{z}))$ toward 1, but the second has a large gradient exactly where the first is flat. This is the <strong>non-saturating loss</strong>, and the difference between the two curves, plotted in Figure 32.1.2, is the difference between a GAN that trains and one that stalls.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two generator-loss curves plotted against the discriminator output on the fake; the saturating log(1 minus D) curve is flat near D equals zero, while the non-saturating minus-log-D curve has a steep gradient there">
+  <g font-family="sans-serif" font-size="13">
+    <!-- axes -->
+    <line x1="80" y1="270" x2="640" y2="270" stroke="#333" stroke-width="1.5"/>
+    <line x1="80" y1="40" x2="80" y2="270" stroke="#333" stroke-width="1.5"/>
+    <text x="360" y="305" text-anchor="middle">D(G(z))  (discriminator's score on the fake)</text>
+    <text x="30" y="155" text-anchor="middle" transform="rotate(-90 30 155)">generator loss</text>
+    <text x="80" y="288" text-anchor="middle" font-size="11">0</text>
+    <text x="640" y="288" text-anchor="middle" font-size="11">1</text>
+    <!-- saturating curve: log(1-D), flat near 0 then drops -->
+    <path d="M80,250 C 250,248 420,238 560,160 C 600,120 620,80 638,48" fill="none" stroke="#c8862a" stroke-width="2.5"/>
+    <text x="560" y="100" fill="#c8862a" font-size="12">minimize log(1 - D): flat near 0</text>
+    <!-- non-saturating curve: -log D, steep near 0 -->
+    <path d="M96,48 C 120,140 180,210 320,245 C 440,262 540,266 638,268" fill="none" stroke="#2e8b57" stroke-width="2.5"/>
+    <text x="150" y="80" fill="#2e8b57" font-size="12">minimize -log D: steep near 0</text>
+    <!-- region marker -->
+    <line x1="120" y1="40" x2="120" y2="270" stroke="#888" stroke-dasharray="4,4"/>
+    <text x="120" y="36" text-anchor="middle" font-size="11" fill="#888">early training</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.1.2:</strong> Two generator objectives versus the discriminator's score on a fake. The saturating objective $\log(1-D)$ (orange) is nearly flat when fakes are easily rejected ($D \to 0$), so the generator learns slowly when it most needs to. The non-saturating objective $-\log D$ (green) is steep there, supplying a strong gradient. Both share the same minimum at $D \to 1$.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The legend that the GAN idea was sketched in a Montreal pub in 2014 is essentially true: Goodfellow has recounted arguing the design over drinks, then going home and coding the first working version that same night. The first GAN faces were tiny, grainy 64-pixel CIFAR and MNIST samples that impressed almost no one outside the lab. Less than a decade later the same core objective was generating megapixel faces no human could flag as synthetic.</p>
+</div>
+
+<h2>5. A GAN From Scratch on MNIST</h2>
+
+<p>
+The fastest way to internalize the game is to write it. Here is a complete, runnable GAN for $28 \times 28$ MNIST digits using fully-connected networks, deliberately small so it trains on a laptop CPU in a few minutes and on a GPU in seconds. We start with the two networks.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+LATENT_DIM = 64
+IMG_DIM = 28 * 28
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(LATENT_DIM, 256), nn.LeakyReLU(0.2),
+            nn.Linear(256, 512), nn.LeakyReLU(0.2),
+            nn.Linear(512, IMG_DIM),
+            nn.Tanh(),                      # outputs in [-1, 1] to match normalized images
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(IMG_DIM, 512), nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),                # dropout regularizes D so it does not win too fast
+            nn.Linear(512, 256), nn.LeakyReLU(0.2),
+            nn.Linear(256, 1),              # a single logit; we apply BCEWithLogitsLoss
+        )
+
+    def forward(self, x):
+        return self.net(x)</code></pre>
+<div class="code-caption">The two adversaries as small MLPs. The generator ends in <code>Tanh</code> so its output range matches images normalized to $[-1, 1]$; the discriminator emits a single raw logit, and dropout deliberately weakens it so it does not outrun the generator early on.</div>
+
+<p>
+The training loop alternates two updates per batch: first the discriminator on a mix of real and fake images, then the generator through the (frozen-gradient) discriminator. We use <code>BCEWithLogitsLoss</code>, which combines a sigmoid and binary cross-entropy in a numerically stable way, and we implement the non-saturating generator objective by training $G$ against the "real" label, which is precisely minimizing $-\log D(G(\mathbf{z}))$.
+</p>
+
+<pre><code class="language-python">from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tf = transforms.Compose([transforms.ToTensor(),
+                         transforms.Normalize((0.5,), (0.5,))])   # to [-1, 1]
+loader = DataLoader(datasets.MNIST(".", train=True, download=True, transform=tf),
+                    batch_size=128, shuffle=True, drop_last=True)
+
+G, D = Generator().to(device), Discriminator().to(device)
+opt_G = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_D = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+bce = nn.BCEWithLogitsLoss()
+
+for epoch in range(30):
+    for real, _ in loader:
+        real = real.view(real.size(0), -1).to(device)
+        bs = real.size(0)
+        ones, zeros = torch.ones(bs, 1, device=device), torch.zeros(bs, 1, device=device)
+
+        # --- train discriminator: real -> 1, fake -> 0 ---
+        z = torch.randn(bs, LATENT_DIM, device=device)
+        fake = G(z)
+        loss_D = bce(D(real), ones) + bce(D(fake.detach()), zeros)  # detach: no G gradient here
+        opt_D.zero_grad(); loss_D.backward(); opt_D.step()
+
+        # --- train generator: push fakes toward the "real" label (non-saturating) ---
+        z = torch.randn(bs, LATENT_DIM, device=device)
+        loss_G = bce(D(G(z)), ones)        # minimize -log D(G(z))
+        opt_G.zero_grad(); loss_G.backward(); opt_G.step()
+
+    print(f"epoch {epoch:2d}  loss_D {loss_D.item():.3f}  loss_G {loss_G.item():.3f}")</code></pre>
+<div class="code-caption">The full adversarial training loop. Note the two distinct fake samples per step (one for D, one for G) and the critical <code>fake.detach()</code> in the discriminator update, which blocks gradients from reaching the generator during D's turn.</div>
+
+<p>
+Run this and the printed losses will <em>not</em> march steadily downward the way a normal training curve does. A healthy GAN run hovers: <code>loss_D</code> drifts toward roughly $2\log 2 \approx 1.386$ (the value when $D$ is at its confused equilibrium $D = \tfrac{1}{2}$) while <code>loss_G</code> bounces around a similar scale. Expected output for the first few epochs looks like this:
+</p>
+
+<pre><code class="language-python">epoch  0  loss_D 0.847  loss_G 1.923
+epoch  1  loss_D 1.046  loss_G 1.402
+epoch  2  loss_D 1.198  loss_G 1.121
+# ... losses stay in a band; sample quality rises even as numbers plateau</code></pre>
+<div class="code-caption">Representative training output. Unlike supervised training, neither loss converges to zero; the two values trading places in a stable band is the sign of a working game, a point we make precise in Section 32.2.</div>
+
+<p>
+The two <code>betas=(0.5, 0.999)</code> on Adam are not arbitrary: the lowered first momentum term ($\beta_1 = 0.5$ instead of the usual $0.9$) is the DCGAN recommendation of <a href="section-32.3.html">Section 32.3</a>, and it noticeably stabilizes the oscillation. This tiny MLP GAN will produce recognizable but rough digits; swapping the MLPs for the convolutional generator and discriminator of <a href="section-32.3.html">Section 32.3</a> is what makes the samples crisp.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>The from-scratch loop above is the right way to learn the mechanics, but you rarely write it in practice. PyTorch's <code>torchgan</code> and the broader ecosystem (and, for production face and image GANs, NVIDIA's <a href="https://github.com/NVlabs/stylegan3" target="_blank" rel="noopener">stylegan3</a> repository) package the generator, discriminator, loss, and training schedule behind a few lines. The single most reused shortcut is <code>nn.BCEWithLogitsLoss</code> itself: it replaces a manual <code>sigmoid</code> followed by hand-written cross-entropy (and the log-sum-exp stabilization you would otherwise have to get right) with one numerically safe call, cutting the loss code from roughly eight lines to one and removing the most common source of <code>NaN</code> in early GAN code.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Sketch That Sold a House</div>
+<p>A small architecture-visualization studio in 2018 had a recurring bottleneck. Clients arrived with rough pencil elevations of a planned facade and wanted photoreal renders to show buyers, but a full 3D render took a junior artist most of a day per concept. The lead engineer prototyped a from-scratch conditional GAN, structurally the loop you just read, trained on a few thousand sketch-and-photo pairs of building exteriors scraped from the firm's archive. The first model collapsed: every output was the same beige stucco box regardless of the input sketch, the textbook mode collapse of <a href="section-32.2.html">Section 32.2</a>. The fix was not a bigger network but the non-saturating loss and a discriminator weakened with dropout, exactly the two choices in the code above, which kept the generator learning long enough to discover variety. The shipped tool turned a day of rendering into a thirty-second draft the artist then refined, and the studio closed three contracts that quarter it credited to faster concept turnaround. The lesson: a GAN's headline failure is usually an optimization-balance problem, not a capacity problem, and the smallest correct objective often beats the largest network.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier</div>
+<p>The adversarial objective derived here, once thought to be superseded by diffusion, returned to the spotlight in 2024 and 2025 as the engine of fast sampling. <strong>Adversarial diffusion distillation</strong> (the ADD loss behind SDXL-Turbo, Sauer et al., 2024) and the <strong>latent adversarial diffusion distillation</strong> in Stable Diffusion 3.5 Turbo add a discriminator on top of a pretrained <a href="../module-33-diffusion-models/index.html">diffusion model</a> (Chapter 33) so that a one-to-four-step student can match a fifty-step teacher. The discriminator is doing exactly what it does in this section, estimating a density ratio between real and generated images, but now in the service of speed rather than from-scratch generation. The 2024 line of <strong>consistency-model</strong> and <strong>distribution-matching distillation</strong> work uses the same adversarial signal. The minimax game you just coded is, ten years on, the fastest known way to turn a slow generator into a real-time one.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.1.1 <span class="exercise-type">Conceptual</span></div>
+<p>Starting from the optimal discriminator $D^{*}(\mathbf{x}) = p_{\text{data}} / (p_{\text{data}} + p_g)$, explain in words why $D^{*} = \tfrac{1}{2}$ everywhere is both the generator's goal and the discriminator's worst outcome. Then argue why a discriminator that is <em>too</em> good, driving $D \to 1$ on reals and $D \to 0$ on fakes, is bad for training even though it is "correct". Connect your answer to the saturating-loss problem of Section 4.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.1.2 <span class="exercise-type">Coding</span></div>
+<p>Take the MNIST GAN above and replace the non-saturating generator loss <code>bce(D(G(z)), ones)</code> with the original saturating objective: compute <code>fake = G(z)</code>, then maximize <code>log(1 - sigmoid(D(fake)))</code> by minimizing its negation. Train both versions for ten epochs, logging the generator's gradient norm each epoch (use <code>torch.nn.utils.clip_grad_norm_</code> with a huge threshold to read the norm without clipping). Plot the two gradient-norm curves and confirm that the saturating loss produces a much smaller early-training gradient.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.1.3 <span class="exercise-type">Analysis</span></div>
+<p>During a run, log <code>D(real)</code> and <code>D(G(z))</code> (after a sigmoid) averaged over each epoch. A healthy run keeps both near $0.5$; a discriminator that is winning pushes <code>D(real)</code> toward $1$ and <code>D(G(z))</code> toward $0$. Run for thirty epochs, plot both curves, and identify any epoch where the discriminator started to dominate. Propose, without coding it yet, one change from Section 32.2 that would rebalance the game, and explain which quantity in your plot it would move.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 32 Index</a>
+<a href="index.html">Chapter 32</a>
+<a class="next" href="section-32.2.html">Section 32.2: Training Pathologies &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

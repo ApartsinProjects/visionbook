@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 21: Training Recipes: Data, Augmentation & Transfer. The practitioner's chapter on what turns a good architecture into an accurate model: vision datasets and the ImageNet legacy, augmentation from flips to MixUp and CutMix, transfer learning and fine-tuning, the modern training recipe of schedules and regularization, class imbalance and label noise, and how to debug a training run." name="description"/>
+<title>Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They spent six months arguing about my layer count. Then someone fixed the learning-rate schedule, flipped half my images left to right, and froze my first four blocks. I gained eight points of accuracy overnight, and nobody changed a single layer."</p>
+<cite>A Backbone That Finally Read Its Own Training Log</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>In real projects the recipe matters as much as the architecture: the same backbone from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> can score either near-random or near-state-of-the-art depending entirely on the data, the augmentation, the schedule, and how you transfer from pretrained weights.</strong> This chapter is the recipe. It covers where vision data comes from and the long shadow ImageNet still casts; the augmentation ladder from a horizontal flip up to MixUp and CutMix; transfer learning and the decision of what to freeze and what to fine-tune; the modern bundle of learning-rate schedules, weight decay, and regularizers that every strong result quietly relies on; the messy realities of class imbalance and label noise that no benchmark warns you about; and finally how to read a training curve and diagnose what went wrong. By the end you will be able to take any architecture in this book and train it well, which is a separate and equally important skill from designing it.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Through <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a>, <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>, and <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> you learned to build networks and arrange them into the great architectures. Those chapters answer "what should the model be?" This chapter answers the question that actually decides whether your project ships: "how do I train it well on the data I really have?" The uncomfortable truth that experienced practitioners internalize is that two teams handed the identical ResNet-50 will get wildly different results, and the difference is almost never the layers. It is the recipe: the data they fed it, the transforms they applied, the weights they started from, the schedule they ran, and the regularization they tuned. Section 20.5's ConvNeXt result made this explicit, much of the transformer's apparent edge turned out to be its training recipe, and this chapter is where that recipe gets written down.
+</p>
+<p>
+The chapter opens with data, because nothing downstream can fix a problem in the data. <a href="section-21.1.html">Section 21.1</a> surveys the canonical vision datasets and explains why ImageNet, a 2009 benchmark, still shapes nearly every pretrained backbone you will ever download, including the normalization statistics baked into your preprocessing. <a href="section-21.2.html">Section 21.2</a> climbs the augmentation ladder. It starts with the geometric transforms of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> repurposed as regularizers (flips, crops, color jitter), then reaches the modern label-mixing methods, MixUp and CutMix, that blend not just pixels but the targets themselves, plus the automated policies (RandAugment, TrivialAugment) that removed the guesswork.
+</p>
+<p>
+<a href="section-21.3.html">Section 21.3</a> is the highest-leverage section for a working engineer: transfer learning. Almost no real project trains from scratch. You take a backbone pretrained on a large dataset and adapt it to your task with a fraction of the data and compute, and the central decisions are what to freeze, what to fine-tune, and how to set discriminative learning rates so you do not destroy the features you are trying to reuse. <a href="section-21.4.html">Section 21.4</a> assembles the modern training recipe itself: warmup and cosine learning-rate schedules, weight decay done correctly, label smoothing, stochastic depth, exponential moving averages, and mixed-precision training, the bundle that every competitive 2024-2026 result uses together.
+</p>
+<p>
+<a href="section-21.5.html">Section 21.5</a> leaves the clean benchmark world for the data you actually get: classes that are wildly imbalanced (one rare defect among thousands of good parts), and labels that are simply wrong (the long tail of annotation noise that even ImageNet contains). It gives you class-balanced losses, resampling, focal loss, and noise-robust techniques. <a href="section-21.6.html">Section 21.6</a> closes the chapter as a debugging manual: how to read loss and accuracy curves, distinguish overfitting from underfitting from a broken pipeline, run the sanity checks that catch most bugs in minutes (overfit a single batch, check the data loader, verify the loss at initialization), and build the habits that turn a stalled run into a diagnosable one.
+</p>
+<p>
+This chapter is deliberately practical, but its ideas are also threads that run through the whole book. The augmentation of <a href="section-21.2.html">Section 21.2</a> grows out of the geometric transforms of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> and grows into the generative data engines of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>. The transfer learning of <a href="section-21.3.html">Section 21.3</a> becomes foundation-model fine-tuning in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> and LoRA adapters for generators in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. The label-noise discussion in <a href="section-21.5.html">Section 21.5</a> connects back to the noise models of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> and forward to the noise schedules of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. Learn the recipe here and you will recognize it, slightly disguised, in nearly every chapter that follows.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a> for the training loop, optimizers, loss functions, and tensor mechanics that this chapter tunes rather than re-derives. <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a> supplies batch normalization, dropout, and the data-loading pipeline that the augmentation discussion extends. <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures</a> provides the backbones (ResNet, EfficientNet, ConvNeXt) that the transfer-learning and recipe sections fine-tune. The geometric transforms of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5: Geometric Transformations</a> and the histogram and statistics ideas of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2: Point Operations &amp; Histograms</a> are the classical roots of the augmentation and normalization material. Comfort with basic probability (expectations, distributions) makes the loss-function and label-smoothing arguments concrete.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">21.1</span>
+<a href="section-21.1.html"><span class="section-title">Vision Datasets &amp; the ImageNet Legacy</span></a>
+<span class="section-desc">The canonical datasets (MNIST, CIFAR, ImageNet, COCO, and beyond), why ImageNet still governs your pretrained weights and normalization statistics, dataset splits done right, and the leakage and bias traps that silently inflate or wreck results.</span>
+</li>
+<li>
+<span class="section-num">21.2</span>
+<a href="section-21.2.html"><span class="section-title">Data Augmentation: From Flips to MixUp &amp; CutMix</span></a>
+<span class="section-desc">The augmentation ladder: geometric and photometric transforms as regularizers, why augmentation must respect label semantics, the label-mixing revolution of MixUp and CutMix, and the automated policies (RandAugment, TrivialAugment) that replaced hand-tuning.</span>
+</li>
+<li>
+<span class="section-num">21.3</span>
+<a href="section-21.3.html"><span class="section-title">Transfer Learning &amp; Fine-Tuning Strategies</span></a>
+<span class="section-desc">Why almost nobody trains from scratch: feature extraction versus fine-tuning, what to freeze and what to unfreeze, discriminative (layer-wise) learning rates, gradual unfreezing, and the small-data decision tree that picks a strategy for you.</span>
+</li>
+<li>
+<span class="section-num">21.4</span>
+<a href="section-21.4.html"><span class="section-title">Regularization, Schedules &amp; the Modern Training Recipe</span></a>
+<span class="section-desc">The bundle behind every strong result: warmup plus cosine learning-rate schedules, weight decay done correctly (AdamW), label smoothing, stochastic depth, model EMA, and mixed-precision training, assembled into one reproducible recipe.</span>
+</li>
+<li>
+<span class="section-num">21.5</span>
+<a href="section-21.5.html"><span class="section-title">Class Imbalance, Label Noise &amp; Real-World Data</span></a>
+<span class="section-desc">The data you actually get: long-tailed class distributions, class-balanced and focal losses, resampling strategies, the reality of label noise (even in ImageNet), and noise-robust training techniques that stop the model memorizing mistakes.</span>
+</li>
+<li>
+<span class="section-num">21.6</span>
+<a href="section-21.6.html"><span class="section-title">Debugging Training: Curves, Overfitting &amp; Sanity Checks</span></a>
+<span class="section-desc">Reading the loss and accuracy curves, telling overfitting from underfitting from a broken pipeline, the high-value sanity checks (overfit one batch, verify loss at init, inspect a loaded batch), and a systematic playbook for a run that will not learn.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+With the recipe in hand you can train any architecture in this book to its potential, which is exactly what you will need for the chapters ahead. <a href="../module-22-vision-transformers/index.html">Chapter 22: Vision Transformers</a> introduces the attention-based architecture that, notably, depends on this recipe even more than CNNs do: vision transformers are data-hungry and were initially considered hard to train precisely because they lack the convolutional inductive bias, so the augmentation, regularization, and schedule choices of this chapter are what made them practical. The transfer-learning workflow of <a href="section-21.3.html">Section 21.3</a> scales up directly into the foundation-model fine-tuning of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25: Self-Supervised Learning &amp; Foundation Models</a>, and the augmentation thread reaches its destination in <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>, where generative models themselves become the data engine. Architecture told you what to build; this chapter told you how to train it; the rest of Part III puts both to work on detection, segmentation, and beyond.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Deng, J. et al. "ImageNet: A Large-Scale Hierarchical Image Database." CVPR (2009). <a href="https://www.image-net.org/static_files/papers/imagenet_cvpr09.pdf" target="_blank" rel="noopener">image-net.org</a></div>
+<div class="bib-annotation">The dataset of Section 21.1 that defined modern visual recognition. Its 1000-class subset, normalization statistics, and pretrained backbones still propagate into nearly every transfer-learning workflow in this chapter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, H. et al. "mixup: Beyond Empirical Risk Minimization." ICLR (2018). <a href="https://arxiv.org/abs/1710.09412" target="_blank" rel="noopener">arXiv:1710.09412</a></div>
+<div class="bib-annotation">MixUp of Section 21.2. Training on convex combinations of pairs of images and their one-hot labels, a deceptively simple regularizer that improves accuracy and calibration across architectures.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Yun, S. et al. "CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Features." ICCV (2019). <a href="https://arxiv.org/abs/1905.04899" target="_blank" rel="noopener">arXiv:1905.04899</a></div>
+<div class="bib-annotation">CutMix of Section 21.2. Pastes a rectangular patch from one image into another and mixes labels by area, combining the locality of Cutout with the label-mixing of MixUp.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Cubuk, E. et al. "RandAugment: Practical Automated Data Augmentation with a Reduced Search Space." CVPR Workshop (2020). <a href="https://arxiv.org/abs/1909.13719" target="_blank" rel="noopener">arXiv:1909.13719</a></div>
+<div class="bib-annotation">RandAugment of Section 21.2. Reduces automated augmentation to two interpretable hyperparameters (number of ops and global magnitude), removing the expensive policy search of its AutoAugment predecessor.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Loshchilov, I. and Hutter, F. "Decoupled Weight Decay Regularization." ICLR (2019). <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></div>
+<div class="bib-annotation">AdamW of Section 21.4. Shows that L2 regularization and weight decay are not equivalent for adaptive optimizers, and that decoupling decay from the gradient step is the correct and now-standard fix.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Loshchilov, I. and Hutter, F. "SGDR: Stochastic Gradient Descent with Warm Restarts." ICLR (2017). <a href="https://arxiv.org/abs/1608.03983" target="_blank" rel="noopener">arXiv:1608.03983</a></div>
+<div class="bib-annotation">The cosine learning-rate schedule of Section 21.4. The smooth cosine decay (with or without restarts) is the default schedule in essentially every modern vision training recipe.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lin, T. et al. "Focal Loss for Dense Object Detection." ICCV (2017). <a href="https://arxiv.org/abs/1708.02002" target="_blank" rel="noopener">arXiv:1708.02002</a></div>
+<div class="bib-annotation">Focal loss of Section 21.5. Down-weights easy examples so the gradient is dominated by hard, often rare cases, the canonical fix for extreme class imbalance.</div>
+</div>
+
+<h3>Recent Research (2021-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Wightman, R., Touvron, H., and Jegou, H. "ResNet strikes back: An improved training procedure in timm." NeurIPS Workshop (2021). <a href="https://arxiv.org/abs/2110.00476" target="_blank" rel="noopener">arXiv:2110.00476</a></div>
+<div class="bib-annotation">The cleanest demonstration of this chapter's thesis: a 2015 ResNet-50, trained with the modern recipe of Section 21.4, gains several accuracy points, proving the recipe is as decisive as the architecture.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Muller, S. and Hutter, F. "TrivialAugment: Tuning-free Yet State-of-the-Art Data Augmentation." ICCV (2021). <a href="https://arxiv.org/abs/2103.10158" target="_blank" rel="noopener">arXiv:2103.10158</a></div>
+<div class="bib-annotation">The augmentation method of Section 21.2 that needs zero tuning: apply one random op at a random magnitude per image, and match or beat heavily-searched policies. A reminder that simpler is often better.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Northcutt, C., Athalye, A., and Mueller, J. "Pervasive Label Errors in Test Sets Destabilize Machine Learning Benchmarks." NeurIPS (2021). <a href="https://arxiv.org/abs/2103.14749" target="_blank" rel="noopener">arXiv:2103.14749</a></div>
+<div class="bib-annotation">The label-noise reality of Section 21.5. Documents systematic label errors in ImageNet, CIFAR, and other benchmark test sets, and shows how they distort model rankings.</div>
+</div>
+
+<h3>Books &amp; Courses</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Howard, J. and Gugger, S. <em>Deep Learning for Coders with fastai and PyTorch</em> (2020). <a href="https://github.com/fastai/fastbook" target="_blank" rel="noopener">github.com/fastai/fastbook</a></div>
+<div class="bib-annotation">The practitioner's source for transfer learning, discriminative learning rates, the learning-rate finder, and gradual unfreezing of Section 21.3, all with runnable code.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, A. et al. <em>Dive into Deep Learning</em> (2023). <a href="https://d2l.ai/" target="_blank" rel="noopener">d2l.ai</a></div>
+<div class="bib-annotation">Interactive chapters on data augmentation, fine-tuning, weight decay, and learning-rate scheduling with executable PyTorch, an ideal hands-on companion to this chapter's recipe.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">torchvision.transforms.v2. Official augmentation and preprocessing API. <a href="https://pytorch.org/vision/stable/transforms.html" target="_blank" rel="noopener">pytorch.org/vision/transforms</a></div>
+<div class="bib-annotation">The v2 transforms used throughout Sections 21.1 and 21.2, including RandAugment, MixUp, and CutMix as built-in transforms, the library shortcuts that replace dozens of hand-written lines.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wightman, R. <code>timm</code> (PyTorch Image Models). <a href="https://github.com/huggingface/pytorch-image-models" target="_blank" rel="noopener">github.com/huggingface/pytorch-image-models</a></div>
+<div class="bib-annotation">Ships the full modern recipe of Section 21.4 (schedulers, EMA, MixUp/CutMix, RandAugment, label smoothing) plus hundreds of pretrained backbones for the transfer learning of Section 21.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Albumentations. Fast image augmentation library. <a href="https://albumentations.ai/docs/" target="_blank" rel="noopener">albumentations.ai</a></div>
+<div class="bib-annotation">A high-performance augmentation library that also transforms bounding boxes, masks, and keypoints in lockstep with the image, the production choice for detection and segmentation pipelines built later in Part III.</div>
+</div>
+
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Lin, T. et al. "Microsoft COCO: Common Objects in Context." ECCV (2014). <a href="https://arxiv.org/abs/1405.0312" target="_blank" rel="noopener">arXiv:1405.0312</a></div>
+<div class="bib-annotation">The detection and segmentation benchmark of Section 21.1, with object boxes, masks, and a naturally long-tailed class distribution that motivates the imbalance discussion of Section 21.5.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Krizhevsky, A. "Learning Multiple Layers of Features from Tiny Images." Technical Report (2009). <a href="https://www.cs.toronto.edu/~kriz/cifar.html" target="_blank" rel="noopener">cs.toronto.edu/~kriz/cifar</a></div>
+<div class="bib-annotation">CIFAR-10 and CIFAR-100, the small-image benchmarks used for the quick augmentation and recipe experiments throughout this chapter because they train in minutes rather than days.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-20-cnn-architectures/index.html">&#8592; Chapter 20: CNN Architectures</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-21.1.html">Section 21.1: Vision Datasets &amp; the ImageNet Legacy &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

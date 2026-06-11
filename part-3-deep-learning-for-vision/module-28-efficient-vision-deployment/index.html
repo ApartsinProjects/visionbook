@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 28: Efficient Vision &amp; Edge Deployment. Ship a trained vision model to real hardware: quantization, pruning and distillation; export to ONNX, TensorRT and OpenVINO; edge and mobile deployment from Jetson to phones; serving for throughput and latency; and monitoring, drift detection and continual improvement in production." name="description"/>
+<title>Chapter 28: Efficient Vision &amp; Edge Deployment | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a></div>
+<h1>Chapter 28: Efficient Vision &amp; Edge Deployment</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They trained me for six weeks on a cluster the size of a tennis court, then asked me to run on a doorbell. I lost three quarters of my weights and most of my dignity, and I have never been faster."</p>
+<cite>A Formerly Float32 Network, Now Quantized and Content</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A model that cannot run on the target hardware within the target latency and power budget is not a model; it is a research artifact.</strong> Everything in Part III so far has optimized for accuracy on a benchmark, measured in milliseconds on a data-center GPU you did not have to pay for by the watt. Production inverts the constraint. The question is no longer "what is the best mean average precision" but "what is the best accuracy I can buy under sixteen milliseconds, two watts, and four megabytes of weights, on a chip that costs eight dollars." This chapter is about closing that gap. We shrink the model with quantization, pruning, and distillation; we compile it to a hardware-specific runtime with ONNX, TensorRT, and OpenVINO; we deploy it to edge devices from a Jetson to a phone; we serve it under real traffic with batching and concurrency; and we watch it after launch, because the world the model meets in production is never the world it was trained on.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+There is a moment in every applied vision project where the research ends and the engineering begins. The validation curve has plateaued, the model is as accurate as it is going to get, and someone asks the question that no benchmark answers: can we actually ship this? The honest answer is usually no, not yet. The model that scores well on the leaderboard is a few hundred megabytes of float32 weights, it assumes a recent GPU, and it returns a prediction in forty milliseconds only when nothing else is competing for the device. The product needs it to run in real time on a battery-powered camera, or to serve ten thousand requests a second without melting the budget. The distance between those two states is the subject of this chapter.
+</p>
+<p>
+We cross that distance in five steps, and the order matters. <a href="section-28.1.html">Section 28.1</a> opens the efficiency toolbox: the three model-level techniques that make a network smaller and faster without retraining it from scratch. Quantization stores and computes weights in eight bits instead of thirty-two, cutting memory by four and unlocking integer math that modern chips run far faster than floating point. Pruning removes the weights and channels that contribute least, trading a small accuracy drop for a smaller, sparser network. Distillation trains a small student model to imitate a large teacher, transferring accuracy that the student could never reach by training on labels alone. These techniques compose, and used together they routinely deliver a four-to-tenfold speedup for a single-digit accuracy cost.
+</p>
+<p>
+A smaller model still needs to actually run, and a PyTorch <code>nn.Module</code> running under the Python interpreter is not how you deploy. <a href="section-28.2.html">Section 28.2</a> is about export and runtimes: ONNX as the portable interchange format that decouples the framework you train in from the engine you serve on, and the two dominant hardware-specific compilers, NVIDIA's TensorRT for their GPUs and Intel's OpenVINO for their CPUs and accelerators. We trace what a compiler actually does (operator fusion, kernel autotuning, precision calibration) and why a compiled engine is often several times faster than the same graph run eagerly. <a href="section-28.3.html">Section 28.3</a> takes the compiled model to the edge: the Jetson family for embedded GPU compute, the mobile runtimes (Core ML, TensorFlow Lite, ExecuTorch) that put vision on a phone, and the architectural choices, the MobileNet and EfficientNet families, designed for these constraints from the start. The camera and sensor pipeline first met in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> reappears here as the front end of an edge system.
+</p>
+<p>
+Not every model lives at the edge; many live behind an API, and serving them well is its own discipline. <a href="section-28.4.html">Section 28.4</a> covers vision-model serving: the throughput-versus-latency trade that governs every serving decision, dynamic batching that amortizes GPU overhead across requests, and the inference servers (Triton, TorchServe, Ray Serve) that productionize all of it. Finally, <a href="section-28.5.html">Section 28.5</a> confronts the truth that deployment is not the finish line. Data drifts, the distribution shifts under your model's feet, and accuracy decays silently because production has no labels to tell you it is failing. The section builds the monitoring, drift-detection, and continual-improvement loop that keeps a deployed model honest, closing the chapter where every real system actually lives.
+</p>
+<p>
+The recurring theme is that efficiency is a system property, not a model property. A quantized network exported to a tuned runtime on the right accelerator behind a well-batched server with a working drift monitor is a deployment; any one of those pieces missing is a liability. By the end of this chapter you will be able to take a model from <a href="../module-23-object-detection/index.html">Chapter 23</a> or <a href="../module-24-segmentation/index.html">Chapter 24</a> and walk it all the way to a chip, and to know which knob to turn when the latency budget is blown.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter assumes the deep-learning foundation of Part III. You should have built and trained a model in PyTorch, so <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a> is essential, and you should understand the convolutional and transformer backbones we will be compressing, from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a>, <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures</a>, and <a href="../module-22-vision-transformers/index.html">Chapter 22: Vision Transformers</a>. The training-recipe material of <a href="../module-21-training-recipes/index.html">Chapter 21: Training Recipes</a> matters because quantization-aware training and distillation are fine-tuning recipes. The detectors of <a href="../module-23-object-detection/index.html">Chapter 23: Object Detection</a> and segmentation models of <a href="../module-24-segmentation/index.html">Chapter 24: Segmentation</a> are the running examples we deploy. From Part I, the image and sensor pipeline of <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1: Digital Image Fundamentals</a> is the front end of every edge system here. Comfort reading basic latency and throughput numbers, and a willingness to measure rather than guess, will serve you throughout.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">28.1</span>
+<a href="section-28.1.html"><span class="section-title">The Efficiency Toolbox: Quantization, Pruning &amp; Distillation</span></a>
+<span class="section-desc">The three model-level compression techniques: integer quantization (post-training and quantization-aware), magnitude and structured pruning, and knowledge distillation. How each works, what it costs in accuracy, and how they compose into a single shrunk model.</span>
+</li>
+<li>
+<span class="section-num">28.2</span>
+<a href="section-28.2.html"><span class="section-title">Export &amp; Runtimes: ONNX, TensorRT &amp; OpenVINO</span></a>
+<span class="section-desc">Moving from a training framework to a serving engine: ONNX as the portable graph format, what a compiler does (operator fusion, autotuning, precision calibration), and the two dominant hardware runtimes, TensorRT for NVIDIA GPUs and OpenVINO for Intel CPUs and accelerators.</span>
+</li>
+<li>
+<span class="section-num">28.3</span>
+<a href="section-28.3.html"><span class="section-title">Edge &amp; Mobile Vision: From Jetson to Phones</span></a>
+<span class="section-desc">Deploying to constrained devices: the Jetson embedded-GPU family, the mobile runtimes (Core ML, TensorFlow Lite, ExecuTorch), and the efficient architectures (MobileNet, EfficientNet) designed for the edge. Power, memory, and thermal budgets as first-class constraints.</span>
+</li>
+<li>
+<span class="section-num">28.4</span>
+<a href="section-28.4.html"><span class="section-title">Serving Vision Models: Batching, Throughput &amp; Latency</span></a>
+<span class="section-desc">Productionizing a model behind an API: the throughput-versus-latency trade, dynamic batching that amortizes GPU overhead, concurrency and model instances, and the inference servers (Triton, TorchServe, Ray Serve) that orchestrate it all under real traffic.</span>
+</li>
+<li>
+<span class="section-num">28.5</span>
+<a href="section-28.5.html"><span class="section-title">Monitoring, Drift &amp; Continual Improvement</span></a>
+<span class="section-desc">Life after launch: why accuracy decays silently without labels, detecting data and concept drift from inputs and confidence alone, the human-in-the-loop labeling and retraining loop, and the guardrails (shadow deployment, canary rollout) that make continual improvement safe.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+This chapter is the last of Part III's content chapters, and it ends the journey from a trained network to a running product. <a href="../module-29-tools-of-the-trade/index.html">Chapter 29: Tools of the Trade: The Deep Vision Stack</a> follows immediately and zooms out: it surveys the full ecosystem of frameworks, libraries, model zoos, experiment trackers, and deployment platforms that the previous eleven chapters have drawn on piecemeal, so you can assemble your own stack with intent rather than habit. Many of the deployment tools introduced here, ONNX, TensorRT, OpenVINO, Triton, and the edge runtimes, reappear there in the context of the wider toolchain. Beyond Part III, the efficiency techniques of this chapter become essential again in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33: Diffusion Models</a> and <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34: Text-to-Image Systems</a>, where the sheer size of generative models makes quantization, distillation, and step-reduction not a luxury but the only path to interactive generation.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Jacob, B. et al. "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference." CVPR (2018). <a href="https://arxiv.org/abs/1712.05877" target="_blank" rel="noopener">arXiv:1712.05877</a></div>
+<div class="bib-annotation">The integer-only quantization scheme of Section 28.1 and the foundation of TensorFlow Lite's quantized inference. Defines the affine mapping between float and int8 and the simulated-quantization trick that makes quantization-aware training possible.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Hinton, G., Vinyals, O. &amp; Dean, J. "Distilling the Knowledge in a Neural Network." NeurIPS Deep Learning Workshop (2015). <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">arXiv:1503.02531</a></div>
+<div class="bib-annotation">The knowledge-distillation paper of Section 28.1. Soft targets from a teacher's temperature-scaled logits carry "dark knowledge" about class similarity that hard labels do not, letting a small student learn what it could not learn alone.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Han, S., Mao, H. &amp; Dally, W. "Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding." ICLR (2016), Best Paper. <a href="https://arxiv.org/abs/1510.00149" target="_blank" rel="noopener">arXiv:1510.00149</a></div>
+<div class="bib-annotation">The deep-compression pipeline of Section 28.1 that combined pruning, quantization, and coding to shrink networks by an order of magnitude. The paper that made model compression a research field in its own right.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Frankle, J. &amp; Carbin, M. "The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural Networks." ICLR (2019), Best Paper. <a href="https://arxiv.org/abs/1803.03635" target="_blank" rel="noopener">arXiv:1803.03635</a></div>
+<div class="bib-annotation">The lottery-ticket hypothesis referenced in Section 28.1: dense networks contain sparse subnetworks that, trained in isolation from the original initialization, match the full network's accuracy. The theoretical backbone of why pruning works.</div>
+</div>
+
+<h3>Efficient Architectures</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Howard, A. et al. "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications." (2017). <a href="https://arxiv.org/abs/1704.04861" target="_blank" rel="noopener">arXiv:1704.04861</a></div>
+<div class="bib-annotation">The depthwise-separable convolution of Section 28.3 that splits a standard convolution into a per-channel spatial filter and a pointwise mixing step, cutting compute by an order of magnitude. The architecture that defined on-device vision.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tan, M. &amp; Le, Q. "EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks." ICML (2019). <a href="https://arxiv.org/abs/1905.11946" target="_blank" rel="noopener">arXiv:1905.11946</a></div>
+<div class="bib-annotation">The compound-scaling rule of Section 28.3 that scales depth, width, and resolution together by a single coefficient, producing a family of models on the accuracy-efficiency frontier. The reference for choosing a model size to a hardware budget.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Sandler, M. et al. "MobileNetV2: Inverted Residuals and Linear Bottlenecks." CVPR (2018). <a href="https://arxiv.org/abs/1801.04381" target="_blank" rel="noopener">arXiv:1801.04381</a></div>
+<div class="bib-annotation">The inverted-residual block of Section 28.3 that expands, filters depthwise, then projects back down, the building block of nearly every modern mobile vision backbone and the default student in many distillation setups.</div>
+</div>
+
+<h3>Tools, Runtimes &amp; Servers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">ONNX: Open Neural Network Exchange, the portable model format. <a href="https://onnx.ai/" target="_blank" rel="noopener">onnx.ai</a> · <a href="https://onnxruntime.ai/" target="_blank" rel="noopener">onnxruntime.ai</a></div>
+<div class="bib-annotation">The interchange format and cross-platform runtime of Section 28.2 that decouples the training framework from the serving engine. ONNX Runtime ships execution providers for CPU, CUDA, TensorRT, OpenVINO, Core ML, and more.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">NVIDIA TensorRT, the high-performance GPU inference compiler. <a href="https://docs.nvidia.com/deeplearning/tensorrt/" target="_blank" rel="noopener">docs.nvidia.com/deeplearning/tensorrt</a></div>
+<div class="bib-annotation">The GPU runtime of Sections 28.2 and 28.3. Operator fusion, kernel autotuning, and int8 calibration that turn a static graph into an optimized engine for a specific GPU, the default for NVIDIA deployment from data center to Jetson.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Intel OpenVINO, the toolkit for CPU and accelerator inference. <a href="https://docs.openvino.ai/" target="_blank" rel="noopener">docs.openvino.ai</a></div>
+<div class="bib-annotation">The CPU and integrated-accelerator runtime of Section 28.2, with a model optimizer that compiles ONNX or framework graphs to an intermediate representation tuned for Intel hardware. The TensorRT counterpart for the CPU world.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">NVIDIA Triton Inference Server, the multi-framework model server. <a href="https://github.com/triton-inference-server/server" target="_blank" rel="noopener">github.com/triton-inference-server/server</a></div>
+<div class="bib-annotation">The production inference server of Section 28.4 with dynamic batching, concurrent model instances, and multi-framework backends (TensorRT, ONNX, PyTorch). The reference implementation of the serving patterns in that section.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch quantization, pruning, and ExecuTorch on-device runtime. <a href="https://pytorch.org/docs/stable/quantization.html" target="_blank" rel="noopener">pytorch.org/docs/stable/quantization</a> · <a href="https://pytorch.org/executorch/" target="_blank" rel="noopener">pytorch.org/executorch</a></div>
+<div class="bib-annotation">The library shortcuts behind Sections 28.1 and 28.3: the <code>torch.ao</code> quantization and <code>torch.nn.utils.prune</code> APIs, and ExecuTorch, the 2024-onward on-device PyTorch runtime for phones and embedded targets.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ultralytics YOLO export to ONNX, TensorRT, OpenVINO, Core ML, and TFLite. <a href="https://docs.ultralytics.com/modes/export/" target="_blank" rel="noopener">docs.ultralytics.com/modes/export</a></div>
+<div class="bib-annotation">The one-command export pipeline used as a running library shortcut across the chapter, wrapping the per-runtime export and quantization steps that Sections 28.2 and 28.3 perform by hand.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Rabanser, S., Günnemann, S. &amp; Lipton, Z. "Failing Loudly: An Empirical Study of Methods for Detecting Dataset Shift." NeurIPS (2019). <a href="https://arxiv.org/abs/1810.11953" target="_blank" rel="noopener">arXiv:1810.11953</a></div>
+<div class="bib-annotation">The dataset-shift detection study behind Section 28.5: a systematic comparison of statistical tests for detecting distribution shift from unlabeled data, including the dimensionality-reduction-then-test recipe that the section's drift monitor uses.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-27-depth-3d-neural-scenes/index.html">&#8592; Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-28.1.html">Section 28.1: The Efficiency Toolbox &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

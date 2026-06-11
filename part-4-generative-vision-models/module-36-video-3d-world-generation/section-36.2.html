@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.2: Text-to-Video Systems: Sora-Class Models &amp; the Open Ecosystem. The latent video transformer at scale, spacetime patches for any resolution and length, the open models you can run, and a hands-on diffusers pipeline." name="description"/>
+<title>Section 36.2: Text-to-Video Systems | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Video, 3D Generation &amp; World Models</a></div>
+<h1>Text-to-Video Systems: Sora-Class Models &amp; the Open Ecosystem</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me a sentence and I will give you a world that moves. Just do not ask me how many fingers the person has, or whether the candle is getting shorter. I am still negotiating with thermodynamics."</p>
+<cite>A Latent Video Transformer With Big Ambitions</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Scaling video diffusion to the Sora class required one key idea beyond Section 36.1: stop thinking in fixed-size clips and start thinking in spacetime patches, the variable-length tokens that let a single transformer ingest images and videos of any resolution and duration.</strong> Once video is a sequence of spacetime tokens, the same transformer scaling laws that built large language models apply, and a text-to-video system becomes a latent diffusion transformer conditioned on a prompt. This section covers that architecture, the open models that implement it, and how to run one with a few lines of diffusers.</p>
+</div>
+
+<p>
+<a href="section-36.1.html">Section 36.1</a> built a video denoiser by adding temporal layers to an image U-Net and showed how a video VAE compresses the clock. That recipe works, but it bakes in a fixed frame count and a fixed resolution. The leap to systems like OpenAI's Sora, and to the open models that chase it, came from a representation change borrowed from the vision transformers of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>: cut the compressed spacetime latent into a sequence of patch tokens, and let a transformer denoise the sequence. Because a sequence has no fixed length, one model can train on a still photo (a sequence of one frame's worth of patches) and a long clip (many frames' worth) in the same batch.
+</p>
+
+<h2>1. Spacetime Patches: One Representation for Everything <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Recall from <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> that a Vision Transformer turns an image into a grid of patch tokens. The spacetime-patch idea extends this to the time axis: after the video VAE compresses a clip into a latent of shape $(F', C, H', W')$, you cut it into small cubes of size $(t_p, h_p, w_p)$, flatten each cube into a token, and you have a one-dimensional sequence of <strong>spacetime patches</strong>. A 5-second clip and a single image differ only in how many tokens they produce; the transformer treats both as sequences.
+</p>
+
+<p>
+This is the unification that powers Sora-class training. The number of tokens $N$ for a latent of $F'$ frames at $H' \times W'$ with patch size $(t_p, h_p, w_p)$ is
+</p>
+
+<p>
+$$ N \;=\; \frac{F'}{t_p} \cdot \frac{H'}{h_p} \cdot \frac{W'}{w_p}, $$
+</p>
+
+<p>
+and the transformer's cost scales as $O(N^2)$ in its attention, the familiar quadratic from <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>. Variable $N$ means variable resolution and variable duration are handled by the same weights; you simply pad sequences to a common length within a batch. The diffusion transformer (DiT) you met in <a href="../module-33-diffusion-models/index.html">Chapter 33</a> is the denoiser, now operating on these spacetime tokens and conditioned on a text embedding through cross-attention exactly as in <a href="../module-34-text-to-image/index.html">Chapter 34</a>.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline from raw video to spacetime patch tokens: a video is encoded by a 3D VAE into a compact spacetime latent, the latent is cut into small cubes called spacetime patches, each patch is flattened into a token, and the token sequence feeds a diffusion transformer conditioned on text">
+  <g font-family="sans-serif" font-size="13">
+    <text x="70" y="30" text-anchor="middle" font-weight="bold" fill="#1b4f72">raw video</text>
+    <rect x="30" y="45" width="80" height="55" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.4" rx="3"/>
+    <text x="70" y="78" text-anchor="middle" font-size="11" fill="#1b4f72">F x H x W</text>
+    <line x1="115" y1="72" x2="160" y2="72" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <rect x="165" y="40" width="110" height="65" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5" rx="6"/>
+    <text x="220" y="68" text-anchor="middle" font-weight="bold" fill="#9c4a00">3D VAE</text>
+    <text x="220" y="86" text-anchor="middle" font-size="11" fill="#9c4a00">encode</text>
+    <line x1="275" y1="72" x2="320" y2="72" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="370" y="30" text-anchor="middle" font-weight="bold" fill="#145a32">spacetime latent</text>
+    <g>
+      <rect x="330" y="45" width="80" height="55" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.2"/>
+      <line x1="357" y1="45" x2="357" y2="100" stroke="#1e8449" stroke-width="0.6"/>
+      <line x1="384" y1="45" x2="384" y2="100" stroke="#1e8449" stroke-width="0.6"/>
+      <line x1="330" y1="63" x2="410" y2="63" stroke="#1e8449" stroke-width="0.6"/>
+      <line x1="330" y1="81" x2="410" y2="81" stroke="#1e8449" stroke-width="0.6"/>
+    </g>
+    <text x="370" y="118" text-anchor="middle" font-size="11" fill="#145a32">cut into cubes</text>
+    <line x1="415" y1="72" x2="460" y2="72" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="540" y="30" text-anchor="middle" font-weight="bold" fill="#512e5f">spacetime patch tokens</text>
+    <g fill="#e8daef" stroke="#7d3c98" stroke-width="1.2">
+      <rect x="465" y="55" width="18" height="18"/>
+      <rect x="487" y="55" width="18" height="18"/>
+      <rect x="509" y="55" width="18" height="18"/>
+      <rect x="531" y="55" width="18" height="18"/>
+      <rect x="553" y="55" width="18" height="18"/>
+      <rect x="575" y="55" width="18" height="18"/>
+      <rect x="597" y="55" width="18" height="18"/>
+    </g>
+    <text x="540" y="92" text-anchor="middle" font-size="11" fill="#512e5f">variable-length sequence</text>
+    <line x1="540" y1="100" x2="540" y2="135" stroke="#5a626c" stroke-width="1.5" marker-end="url(#ah)"/>
+    <rect x="430" y="140" width="220" height="55" fill="#fadbd8" stroke="#c0392b" stroke-width="1.5" rx="6"/>
+    <text x="540" y="165" text-anchor="middle" font-weight="bold" fill="#922b21">Diffusion Transformer (DiT)</text>
+    <text x="540" y="183" text-anchor="middle" font-size="11" fill="#922b21">denoise tokens, cross-attend to text</text>
+    <rect x="690" y="140" width="120" height="55" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.5" rx="6"/>
+    <text x="750" y="165" text-anchor="middle" font-weight="bold" fill="#1a5276">text encoder</text>
+    <text x="750" y="183" text-anchor="middle" font-size="11" fill="#1a5276">prompt</text>
+    <line x1="690" y1="167" x2="650" y2="167" stroke="#2471a3" stroke-width="1.5" marker-end="url(#ah3)"/>
+    <text x="540" y="230" text-anchor="middle" font-size="11" fill="#5a626c">denoised tokens unpatchify and VAE-decode back to pixels</text>
+  </g>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5a626c"/></marker>
+    <marker id="ah3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2471a3"/></marker>
+  </defs>
+</svg>
+<figcaption><strong>Figure 36.2.1</strong>: The Sora-class pipeline. A 3D VAE compresses raw video into a spacetime latent; the latent is cut into cubes and flattened into a variable-length sequence of spacetime patch tokens; a diffusion transformer denoises the sequence while cross-attending to the text prompt. Because the sequence length is free, one model handles any resolution and any duration, including single images.</figcaption>
+</figure>
+
+<p>
+Figure 36.2.1 traces the full path from pixels to tokens and back. The crucial property is in the caption: variable sequence length is what lets a single set of weights train jointly on the entire spectrum from one image to a long clip, which is why these models inherit the broad visual knowledge of image datasets while learning motion from video.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Video Generation Inherits Transformer Scaling</div>
+<p>
+The reason the patch representation matters so much is that it makes video generation a sequence-modeling problem, and sequence modeling is the one domain where the field has decisively learned how to scale. The same compute-and-data scaling laws, the same transformer engineering, the same mixed-resolution training tricks that built large language models now apply to video. Sora's technical report frames this directly: scaling a spacetime-patch diffusion transformer produces emergent capabilities (object permanence, rough 3D consistency, simple cause and effect) that were never explicitly engineered. This is the empirical claim that motivates the entire back half of this chapter: scale a good-enough video generator and it starts to behave like a world simulator.
+</p>
+</div>
+
+<h2>2. The Open Ecosystem: What You Can Actually Run <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Sora itself is closed, but the architecture is public and the open ecosystem has reproduced most of it. As of 2025 the practical landscape has three tiers. <strong>Image-to-video</strong> open models, led by Stable Video Diffusion (Blattmann et al., 2023), are the most reliable: give them a starting frame and they animate it. <strong>Text-to-video</strong> open models, including CogVideoX, Mochi-1, LTX-Video, and HunyuanVideo (all 2024), generate clips directly from a prompt using the spacetime-DiT design of Section 1. <strong>Closed APIs</strong> (Sora, Runway Gen-3, Kling, Veo) lead on quality and length but expose only a generation endpoint.
+</p>
+
+<p>
+For learning and for most products, the open image-to-video models are the right starting point because they are runnable on a single modern GPU and because image conditioning, as <a href="section-36.1.html">Section 36.1</a> argued, is the most stable mode. The diffusers library wraps them behind a uniform pipeline interface.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import StableVideoDiffusionPipeline
+from diffusers.utils import load_image, export_to_video
+
+# Load the open image-to-video model in half precision to fit a single GPU.
+pipe = StableVideoDiffusionPipeline.from_pretrained(
+    "stabilityai/stable-video-diffusion-img2vid-xt",
+    torch_dtype=torch.float16, variant="fp16")
+pipe.enable_model_cpu_offload()         # stream weights so it fits in modest VRAM
+
+image = load_image("product.png").resize((1024, 576))
+generator = torch.manual_seed(42)
+frames = pipe(
+    image,
+    decode_chunk_size=8,                # decode 8 frames at a time to bound memory
+    motion_bucket_id=127,               # higher = more motion, lower = more stable
+    noise_aug_strength=0.02,            # small noise on the conditioning image
+    num_frames=25,
+    generator=generator,
+).frames[0]
+
+export_to_video(frames, "out.mp4", fps=7)
+print(f"generated {len(frames)} frames")   # generated 25 frames</code></pre>
+<div class="code-caption">A complete image-to-video generation in fifteen lines with diffusers and Stable Video Diffusion. The <code>motion_bucket_id</code> is the motion-versus-stability knob from Section 36.1; CPU offload and chunked decoding keep the model inside a single consumer GPU.</div>
+
+<p>
+The <code>motion_bucket_id</code> parameter is the production knob: 127 is a balanced default, lower values produce nearly still video (safe for product shots), higher values produce dramatic motion (risky for coherence). The <code>noise_aug_strength</code> adds a touch of noise to the conditioning image, which paradoxically improves motion by preventing the model from clamping too tightly to the static input. These two dials, plus the seed, are most of what a practitioner tunes.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Text-to-Video Is the Same Three Lines</div>
+<p>
+Switching from image-to-video to a text-to-video open model is a one-line change of pipeline class; the spacetime-DiT internals are identical, only the conditioning differs:
+</p>
+<pre><code class="language-python">from diffusers import CogVideoXPipeline
+pipe = CogVideoXPipeline.from_pretrained(
+    "THUDM/CogVideoX-5b", torch_dtype=torch.bfloat16)
+frames = pipe("a red kite drifting over a wheat field at sunset",
+              num_frames=49, guidance_scale=6.0).frames[0]</code></pre>
+<div class="code-caption">Switching to a text-to-video open model (CogVideoX) is a one-line pipeline-class change; the spacetime-DiT internals are shared with image-to-video.</div>
+<p>
+This single call hides the text encoder, the 3D VAE, the spacetime patchification, the DiT denoising loop, classifier-free guidance, and the VAE decode, easily a thousand-line system reimplemented from scratch, behind one pipeline object. The library handles the scheduler, the guidance, and the memory-saving offload internally.
+</p>
+</div>
+
+<h2>3. Length, Resolution, and the Cost Wall <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The spacetime-patch representation is elegant but it runs straight into the quadratic-attention wall. Doubling the clip length roughly quadruples the attention cost, because $N$ doubles and attention is $O(N^2)$. This is why open text-to-video models top out at a few seconds: a 1-minute clip at reasonable resolution is hundreds of thousands of tokens, beyond the memory of any single GPU. Three strategies push the frontier, all of which you have seen in earlier guises.
+</p>
+
+<p>
+First, <strong>heavier latent compression</strong>: a more aggressive video VAE (say $8 \times 16 \times 16$ instead of $4 \times 8 \times 8$) reduces $N$ at the cost of reconstruction fidelity, the same latent-space tradeoff from <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>. Second, <strong>windowed and sparse attention</strong>, where tokens attend only within local spacetime neighborhoods plus a few global tokens, the efficient-attention idea from <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a>. Third, and most important for the rest of this chapter, <strong>autoregressive rollout</strong>: generate the clip in overlapping windows, each window conditioned on the tail of the previous one, so arbitrarily long video is produced at constant per-window cost. That last strategy is exactly the world-model interface of <a href="section-36.6.html">Section 36.6</a>, where each new window is conditioned not just on the past but on an action.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+Quadratic attention means every second of video you ask for makes the model roughly four times grumpier. Want twice the runtime? Pay four times the bill. This is why a model that can dream a flawless four-second clip melts down at twenty seconds: it is not getting dumber, it is getting <em>squared</em>. The field's answer, generate the long clip as a chain of short ones, is the same trick a TV writer uses for a long season: never write the whole thing at once, just keep the previous episode in mind.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Marketing Team That Hit the Length Wall</div>
+<p>
+A mid-size advertising agency adopted an open text-to-video model to prototype 30-second spots before committing to expensive live shoots. Their first sprint went well: 4-second clips of products, scenery, and simple actions looked broadcast-ready. Then a client asked for a continuous 20-second shot following a runner through a city. Every attempt either ran out of GPU memory or, when they reduced resolution to fit, dissolved into incoherence past the 6-second mark; the runner's jacket changed color, the buildings rearranged themselves. The team's lead diagnosed the problem correctly as the quadratic-attention wall, not a quality bug, and switched tactics: they generated the spot as five overlapping 5-second windows, each conditioned on the last frame of the previous window (image-to-video chaining), then cross-faded the seams. The runner stayed coherent because every window re-anchored on a clean frame. The lesson: <em>long video today is not one generation, it is a chain of conditioned short ones, and knowing the difference is the difference between a working pipeline and an out-of-memory error.</em> This chaining is the seed of autoregressive world models.
+</p>
+</div>
+
+<h2>4. Where Text-to-Video Still Fails <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Honest practice requires knowing the boundary of validity, and text-to-video has a sharp one. These models excel at texture, lighting, atmosphere, and camera motion, the things a 2D image prior already knows, smeared coherently across time. They struggle precisely where physics and counting matter: object permanence over long occlusions (a person walks behind a pillar and emerges as someone else), conservation laws (a poured liquid that gains volume, a candle that does not shorten), and discrete counting (the right number of fingers, legs, wheels). These are not random bugs; they are the symptom that the model has learned the <em>appearance</em> of dynamics without an underlying state that the appearance must respect.
+</p>
+
+<p>
+That diagnosis is the entire motivation for the world-model half of this chapter. A text-to-video model is a powerful renderer of plausible motion with no explicit world state; a world model (Sections 36.5 through 36.7) makes the latent state explicit and trains it to predict consequences, which is what coherent physics requires. The evaluation tools of <a href="section-36.8.html">Section 36.8</a> exist precisely to measure this gap quantitatively rather than by eyeballing finger counts.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Generators to Simulators (2024-2026)</div>
+<p>
+The defining research question of the moment is whether scaling text-to-video crosses the line into genuine world simulation. The Sora report (Brooks et al., 2024) argued yes, citing emergent 3D consistency and object permanence. Skeptical follow-ups push back with controlled experiments: Kang et al. (2024), the physical-law study that anchors <a href="section-36.8.html">Section 36.8</a>, find that scaling improves in-distribution motion but does not reliably induce out-of-distribution physical laws, the model interpolates among seen motions rather than discovering the rule. Meanwhile the open frontier is converging the two: action-conditioned video models (Genie, Bruce et al. 2024; the GameNGen DOOM engine, Valevski et al. 2024) turn a text-to-video backbone into an interactive simulator by conditioning each frame on a control input. The current consensus is nuanced: large video generators are excellent appearance simulators and weak physics simulators, and closing that gap, through explicit state, longer context, action conditioning, or hybrid objectives, is where the field is investing. The next sections follow that investment.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercises</div>
+<p><span class="exercise-type">Conceptual.</span> Explain in your own words why the spacetime-patch representation lets a single model train on both still images and videos in the same batch, and why that joint training is valuable. What goes wrong with the fixed-clip-length design of Section 36.1 if you try to feed it a single image?</p>
+<p><span class="exercise-type">Coding.</span> Using the diffusers Stable Video Diffusion snippet, generate the same starting image at three <code>motion_bucket_id</code> values (50, 127, 200) with a fixed seed. Compute the flow-based warping error from Section 36.1 for each clip. Plot motion-bucket value against warping error and against a subjective motion-magnitude judgment, and describe the tradeoff curve you observe.</p>
+<p><span class="exercise-type">Analysis.</span> A 5-second clip at a given resolution produces $N$ spacetime tokens. Estimate the attention FLOPs and peak memory for a 20-second clip generated (a) as one sequence of $4N$ tokens versus (b) as four chained 5-second windows of $N$ tokens each. Quantify the saving, then list the qualitative cost: which consistency property does the chained scheme risk losing at the window seams, and how does the field's autoregressive-rollout approach try to mitigate it?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-36.1.html">&#8592; Section 36.1: Video Diffusion: Architectures &amp; Temporal Consistency</a>
+<a href="index.html">Chapter 36</a>
+<a class="next" href="section-36.3.html">Section 36.3: Text-to-3D &amp; Image-to-3D Generation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

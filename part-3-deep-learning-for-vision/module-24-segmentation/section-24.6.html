@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.6: Losses, Metrics &amp; Evaluation for Dense Prediction. The measurement toolkit: pixel cross-entropy, Dice, Tversky, and focal losses and when each helps, IoU, mean IoU, pixel accuracy, boundary-F1, and panoptic quality, and the practical traps of class imbalance and boundary error that decide whether a segmenter is actually good." name="description"/>
+<title>Section 24.6: Losses, Metrics &amp; Evaluation for Dense Prediction | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a></div>
+<h1>Losses, Metrics &amp; Evaluation for Dense Prediction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They trained me to maximize pixel accuracy, so I labeled everything 'background' and scored 98 percent. Then someone introduced me to Intersection-over-Union, and for the first time my grade actually depended on finding the small, rare, important things. Humbling, but fair."</p>
+<cite>A Segmenter That Learned the Difference Between a Number and a Score</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Dense prediction lives or dies by two choices, the loss you train on and the metric you report, and the central difficulty is class imbalance: in most images the interesting classes occupy a small fraction of the pixels, so a naive loss and a naive metric both reward ignoring them.</strong> Pixel cross-entropy is the workhorse loss but is dominated by the majority class; Dice and Tversky losses optimize overlap directly and are robust to imbalance; focal loss down-weights easy pixels so the model attends to hard ones. On the metric side, pixel accuracy is misleading for the same imbalance reason, so the field reports Intersection-over-Union, averaged across classes as mean IoU, and adds boundary-F1 when edge precision matters and panoptic quality when instances do. Pick the loss for your imbalance and the metric for your application, or you will optimize the wrong thing.</p>
+</div>
+
+<p>
+The architectures of this chapter are only half the story; the other half is how you train and judge them. Every section so far has deferred its loss and its metric to here, and the reason they share one section is that they share one enemy, imbalance. This is the dense, learned descendant of the <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">PSNR and SSIM image-quality metrics of Chapter 1</a> and the <a href="../module-23-object-detection/index.html">IoU and mAP of detection in Chapter 23</a>, and it extends naturally into the <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">distribution metrics like FID in Chapter 37</a>.
+</p>
+
+<h2>1. Losses for Dense Prediction <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The default segmentation loss is <strong>pixel-wise cross-entropy</strong>: treat every pixel as an independent classification example and average the cross-entropy over all of them, exactly as introduced in <a href="section-24.1.html">Section 24.1</a>. It works well when the classes are roughly balanced. When they are not, and they rarely are, a problem appears. If 95 percent of pixels are background, the loss is dominated by background pixels, and the model can drive the loss low while barely learning the rare foreground class. Three families of loss address this.
+</p>
+
+<p>
+The <strong>Dice loss</strong> optimizes overlap directly. The Dice coefficient between a predicted soft mask $p$ and a ground-truth mask $g$ is twice their intersection over the sum of their areas, and the loss is one minus it:
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{Dice}} = 1 - \frac{2 \sum_i p_i g_i + \epsilon}{\sum_i p_i + \sum_i g_i + \epsilon}$$
+</div>
+
+<p>
+Because Dice is a ratio of foreground quantities, it is insensitive to the number of background pixels; a tiny lesion contributes as much to the loss as a large organ. The <strong>Tversky loss</strong> generalizes Dice with two weights $\alpha$ and $\beta$ that trade off false positives against false negatives, useful when missing the object (a false negative) is costlier than over-segmenting (a false positive), as in medical screening. The <strong>focal loss</strong>, borrowed from detection, multiplies the cross-entropy of each pixel by $(1 - p_t)^\gamma$, where $p_t$ is the predicted probability of the true class, so confidently-correct easy pixels are down-weighted and the gradient concentrates on hard, often boundary or rare-class, pixels. In practice a <em>combination</em>, typically cross-entropy plus Dice, is the robust default, getting the stable gradients of cross-entropy and the imbalance-robustness of Dice. The code below implements Dice and focal so the mechanics are concrete.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def dice_loss(logits, targets, num_classes, eps=1.0):
+    """Soft multi-class Dice loss. logits: (B, C, H, W); targets: (B, H, W) ints."""
+    probs = logits.softmax(dim=1)                              # per-pixel class probs
+    onehot = F.one_hot(targets, num_classes).permute(0, 3, 1, 2).float()  # (B, C, H, W)
+    inter = (probs * onehot).sum(dim=(0, 2, 3))                # per-class intersection
+    card  = probs.sum(dim=(0, 2, 3)) + onehot.sum(dim=(0, 2, 3))  # per-class areas
+    dice = (2 * inter + eps) / (card + eps)                    # per-class Dice score
+    return 1 - dice.mean()                                     # average over classes
+
+def focal_loss(logits, targets, gamma=2.0):
+    """Multi-class focal loss: down-weights easy, confidently-correct pixels."""
+    ce = F.cross_entropy(logits, targets, reduction="none")    # (B, H, W) per-pixel CE
+    pt = torch.exp(-ce)                                        # prob of the true class
+    return ((1 - pt) ** gamma * ce).mean()                     # focal modulation
+
+logits  = torch.randn(2, 4, 32, 32, requires_grad=True)        # 4-class logits
+targets = torch.randint(0, 4, (2, 32, 32))
+combo = F.cross_entropy(logits, targets) + dice_loss(logits, targets, num_classes=4)
+print(f"CE+Dice: {combo.item():.3f}   focal: {focal_loss(logits, targets).item():.3f}")</code></pre>
+<div class="code-caption">Dice and focal losses for dense prediction. Dice optimizes class-wise overlap and ignores background volume; focal reweights toward hard pixels. The combined cross-entropy-plus-Dice objective on the last line is the robust default for imbalanced segmentation.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Loss Encodes What You Care About</div>
+<p>Cross-entropy says "get each pixel's label right, all pixels equal." Dice says "maximize overlap with the foreground, background volume be damned." Tversky says "and I care more about misses than false alarms." Focal says "spend your gradient on the pixels you keep getting wrong." None is universally best; each is a precise statement about which errors you are willing to tolerate. Choosing a loss is choosing an error budget, and for imbalanced segmentation the cross-entropy default quietly chooses to tolerate exactly the errors, on the small rare classes, that you probably care about most.</p>
+</div>
+
+<h2>2. Metrics: IoU, Mean IoU, and the Pixel-Accuracy Trap <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The epigraph is not a joke: <strong>pixel accuracy</strong>, the fraction of correctly-labeled pixels, is the single most misleading segmentation metric. On a dataset where background is 95 percent of pixels, a model that predicts "background" everywhere scores 95 percent accuracy while segmenting nothing. The metric that resists this is <strong>Intersection-over-Union</strong> (IoU), also called the Jaccard index: for a class, the number of pixels where prediction and truth agree it is that class, divided by the number of pixels where either says so.
+</p>
+
+<div class="math-block">
+$$\text{IoU}_c = \frac{|P_c \cap G_c|}{|P_c \cup G_c|} = \frac{TP_c}{TP_c + FP_c + FN_c}$$
+</div>
+
+<p>
+The all-background predictor scores IoU near zero on every foreground class, because its intersection with each foreground class is empty. Averaging IoU over the classes gives <strong>mean IoU</strong> (mIoU), the standard semantic-segmentation headline number, which weights every class equally regardless of how many pixels it occupies, so the rare classes finally count. Figure 24.6.1 shows the geometry and why accuracy and IoU diverge.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Intersection over union geometry showing overlap of predicted and ground truth regions and the pixel accuracy trap with dominant background">
+<style>
+.il{font:12px sans-serif;fill:#1a1a1a;}
+.is{font:10px sans-serif;fill:#555;}
+.ib{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.igt{fill:#cfe6c0;stroke:#2f9e5c;stroke-width:1.5;}
+.ipred{fill:#fbd9c0;stroke:#d6802b;stroke-width:1.5;fill-opacity:0.6;}
+.iback{fill:#eef0f2;stroke:#ccc;stroke-width:1;}
+</style>
+<text class="ib" x="160" y="28" text-anchor="middle">IoU = overlap / union</text>
+<rect class="igt" x="60" y="60" width="120" height="100"/>
+<text class="is" x="95" y="80" text-anchor="middle">ground truth</text>
+<rect class="ipred" x="120" y="90" width="120" height="100"/>
+<text class="is" x="210" y="180" text-anchor="middle">prediction</text>
+<text class="il" x="150" y="130" text-anchor="middle">overlap</text>
+<text class="is" x="160" y="215" text-anchor="middle">IoU = green-orange overlap</text>
+<text class="is" x="160" y="229" text-anchor="middle">divided by total covered</text>
+
+<text class="ib" x="540" y="28" text-anchor="middle">The pixel-accuracy trap</text>
+<rect class="iback" x="430" y="50" width="220" height="150"/>
+<text class="is" x="540" y="120" text-anchor="middle">background = 95% of pixels</text>
+<rect class="igt" x="600" y="160" width="30" height="25"/>
+<text class="is" x="540" y="178" text-anchor="middle">small object = 5%</text>
+<text class="is" x="540" y="222" text-anchor="middle">predict all-background:</text>
+<text class="is" x="540" y="236" text-anchor="middle">accuracy 0.95, mIoU near 0</text>
+</svg>
+<figcaption><strong>Figure 24.6.1:</strong> IoU and the pixel-accuracy trap. Left, IoU is the overlap of prediction and ground truth divided by their union, so both misses and false positives lower it. Right, when background dominates, a model that predicts only background scores 95 percent pixel accuracy yet near-zero mean IoU, because its IoU on the small object is essentially zero. Always report mean IoU, not pixel accuracy.</figcaption>
+</figure>
+
+<p>
+The IoU code below is the foundation of every semantic-segmentation evaluation, and it is the same overlap measure that powered the panoptic quality of <a href="section-24.3.html">Section 24.3</a> and the matching in <a href="../module-23-object-detection/index.html">detection from Chapter 23</a>. It accumulates per-class intersection and union across a whole dataset before dividing, which is the correct way (dataset-level), not averaging per-image IoUs.
+</p>
+
+<pre><code class="language-python">import torch
+
+def update_iou_stats(pred, target, num_classes, inter, union, ignore=255):
+    """Accumulate per-class intersection and union over a dataset.
+    pred, target: (H, W) integer label maps. inter, union: length-C running tensors."""
+    valid = target != ignore                                  # skip unlabeled pixels
+    for c in range(num_classes):
+        p = (pred == c) & valid
+        g = (target == c) & valid
+        inter[c] += (p & g).sum()                             # true positives for class c
+        union[c] += (p | g).sum()                             # TP + FP + FN for class c
+    return inter, union
+
+num_classes = 21
+inter = torch.zeros(num_classes); union = torch.zeros(num_classes)
+# ... loop over the validation set calling update_iou_stats on each image ...
+pred   = torch.randint(0, 21, (256, 256))
+target = torch.randint(0, 21, (256, 256))
+inter, union = update_iou_stats(pred, target, num_classes, inter, union)
+
+per_class_iou = inter / union.clamp(min=1)                    # avoid divide-by-zero
+miou = per_class_iou[union > 0].mean()                        # average over present classes
+print(f"mean IoU: {miou.item():.3f}")</code></pre>
+<div class="code-caption">Dataset-level mean IoU. Intersection and union are accumulated per class across all images and divided once at the end; classes absent from the dataset are excluded from the average. Averaging per-image IoUs instead would over-weight images where a class occupies few pixels.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The all-background segmenter is the lazy student of computer vision: it can score 95 or even 98 percent pixel accuracy while having learned to find absolutely nothing, the dense-prediction cousin of the always-predict-the-majority-class classifier. Reviewers have learned to treat a segmentation paper that headlines pixel accuracy the way a recruiter treats a resume that headlines "punctual." The one-line defense against being fooled: <em>if a metric rewards predicting "background" everywhere, it is not measuring segmentation</em>. That single sentence is why mean IoU, not accuracy, sits at the top of every leaderboard in this chapter.</p>
+</div>
+
+<h2>3. Boundary Metrics, the Right Number per Task, and Common Traps <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Mean IoU is dominated by interior pixels, so two models with very different boundary sharpness can score nearly the same mIoU if they agree on object interiors. When boundary precision is the point, an editing cutout, a medical contour, report the <strong>boundary-F1</strong> score, which evaluates only pixels near the object edge: it computes precision and recall of the predicted boundary against the ground-truth boundary within a small tolerance distance, and takes their harmonic mean. A model can have excellent mIoU and poor boundary-F1, which is exactly the diagnosis the agricultural and pathology teams of earlier sections needed. Table 24.6.1 summarizes which metric goes with which task.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 24.6.1:</strong> <em>The right metric for each segmentation task and concern.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Task or concern</th>
+<th scope="col">Primary metric</th>
+<th scope="col">Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Semantic segmentation</td>
+<td>Mean IoU (mIoU)</td>
+<td>Per-class overlap, equal weight to rare classes; resists the pixel-accuracy trap.</td>
+</tr>
+<tr>
+<td>Instance segmentation</td>
+<td>Mask average precision (mask AP)</td>
+<td>Matches predicted masks to truth across IoU thresholds; rewards finding each instance.</td>
+</tr>
+<tr>
+<td>Panoptic segmentation</td>
+<td>Panoptic quality (PQ)</td>
+<td>Product of recognition and segmentation quality over the partition (Section 24.3).</td>
+</tr>
+<tr>
+<td>Boundary sharpness</td>
+<td>Boundary-F1 (BF)</td>
+<td>Scores only near-edge pixels; catches loose boundaries that mIoU hides.</td>
+</tr>
+<tr>
+<td>Severe class imbalance</td>
+<td>Per-class IoU and Dice</td>
+<td>Report the worst class, not just the mean; the average can hide a failed rare class.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>
+Three traps catch nearly every first segmentation project. The first is reporting pixel accuracy, addressed above. The second is averaging per-image IoUs instead of accumulating dataset-level statistics, which inflates the score on images where a class is tiny; the code in subsection 2 accumulates correctly. The third is the <strong>boundary-versus-interior</strong> confusion: when mIoU stalls, inspect whether your errors are on boundaries (reach for a boundary-aware loss or a decoder with finer skips, per <a href="section-24.1.html">Section 24.1</a>) or on whole small objects (reach for multi-scale features or a Dice or focal loss). Diagnosing <em>where</em> the IoU is lost, not just that it is low, is the difference between a fix and a flail.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Metric That Caught a Silent Regression</div>
+<p><strong>Who:</strong> a medical-imaging team segmenting a small organ in CT scans, 2024. <strong>Situation:</strong> they tracked only mean IoU across their five anatomical classes, and a new model version reported mIoU 0.81, up from 0.79, so it was approved for the next validation round. <strong>Problem:</strong> a radiologist noticed the new model was missing the smallest, clinically critical structure entirely on some scans, despite the higher average. <strong>Decision:</strong> the team broke the single mIoU into per-class IoU and added a per-class Dice and a boundary-F1, following Table 24.6.1's "report the worst class" guidance. <strong>Result:</strong> the per-class view revealed the new model had gained two points on the three large, easy organs and lost twelve points on the small critical one; the average had risen while the thing that mattered collapsed. They reverted, switched to a cross-entropy-plus-Tversky loss biased against false negatives, and the small-class IoU recovered. <strong>Lesson:</strong> a single averaged metric can hide a catastrophic per-class failure. For any imbalanced or safety-critical segmentation task, report the worst class and a boundary metric alongside the headline mean, and never approve a model on the average alone.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Losses and Metrics Off the Shelf</div>
+<p>Implement Dice and IoU once to understand them, then use battle-tested versions that handle the edge cases (empty classes, ignore indices, numerical stability) correctly:</p>
+<pre><code class="language-python"># Losses: segmentation_models.pytorch ships the whole family.
+from segmentation_models_pytorch.losses import DiceLoss, FocalLoss, TverskyLoss
+dice = DiceLoss(mode="multiclass")          # ignore_index, log-loss variants built in
+focal = FocalLoss(mode="multiclass", gamma=2.0)
+
+# Metrics: torchmetrics computes mIoU and per-class IoU with correct accumulation.
+from torchmetrics.classification import MulticlassJaccardIndex   # Jaccard == IoU
+miou_metric = MulticlassJaccardIndex(num_classes=21, ignore_index=255, average="macro")
+# In the eval loop: miou_metric.update(preds, targets); then miou_metric.compute()
+
+# Panoptic quality, instance mask AP: use the COCO/panopticapi evaluators (Section 24.3).</code></pre>
+<div class="code-caption">Off-the-shelf losses and metrics: <code>segmentation_models.pytorch</code> ships the Dice, focal, and Tversky family, and <code>torchmetrics</code> computes mean and per-class IoU with correct dataset-level accumulation, ignore-index handling, and absent-class exclusion built in.</div>
+<p>This replaces dozens of lines of careful loss and metric code, and crucially gets the corner cases right: torchmetrics accumulates IoU at the dataset level (the trap of subsection 3), handles the ignore index, and excludes absent classes from the mean, exactly as the hand-written version must but often does not. Reach for these in any real project.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Evaluating Open-Vocabulary and Promptable Segmenters</div>
+<p>The metrics above assume a fixed class list and dense ground truth, but the foundation models of <a href="section-24.5.html">Section 24.5</a> broke both assumptions, and evaluation is racing to catch up. Open-vocabulary segmenters are now scored on held-out class splits and cross-dataset transfer (train on COCO classes, test on ADE20K names never seen) to measure genuine generalization rather than memorization. Promptable models like SAM are evaluated by interactive protocols, mean IoU after one click, after three clicks, after five, plotting accuracy versus interaction effort, since "one number" no longer captures a model you converse with. And 2024-2025 work on segmentation under distribution shift and on boundary-aware metrics (the Boundary IoU of Cheng et al.) reflects a field realizing that mIoU, the headline for a decade, undersells boundary quality and oversells on easy interiors. The measurement toolkit, like the models, is becoming promptable and open-vocabulary.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.1: Diagnose the Loss Choice <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, name the most appropriate loss (cross-entropy, Dice, Tversky with high false-negative penalty, focal, or a combination) and justify in two sentences: (a) a balanced 4-class indoor-scene segmenter; (b) segmenting a 50-pixel tumor in a million-pixel scan; (c) a screening tool where missing a defect is far worse than a false alarm; (d) a model that segments large objects well but keeps misclassifying a few stubborn boundary pixels. Connect each choice to the "loss encodes what you care about" insight of subsection 1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.2: Reproduce the Pixel-Accuracy Trap <span class="exercise-type coding">Coding</span></div>
+<p>Construct a synthetic ground-truth label map that is 95 percent class 0 (background) and 5 percent class 1 (a small object). Compute both pixel accuracy and mean IoU for two predictions: (a) all-background, and (b) a prediction that correctly finds the object but is shifted by a few pixels. Report all four numbers and write a paragraph explaining why pixel accuracy ranks the two predictions almost identically while mean IoU ranks them very differently, tying back to Figure 24.6.1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.6.3: mIoU Versus Boundary-F1 <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a pretrained DeepLabv3 and a pretrained SegFormer (or any two segmenters) and run both on ten images with intricate boundaries (foliage, hair, lace). Compute mean IoU and a boundary-F1 (you may use the implementation in <code>segmentation_models.pytorch</code> or a simple distance-tolerance version) for each model. Build a small table of mIoU versus boundary-F1 per model and write an analysis: do the two metrics rank the models the same way? If a model wins on mIoU but loses on boundary-F1, what does that tell you about where its errors live, and which model would you ship for a photo-editing cutout tool versus a drivable-area road segmenter? Relate your answer to Table 24.6.1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.5.html">&#8592; Section 24.5: Segment Anything: Promptable Segmentation</a>
+<a href="index.html">Chapter 24</a>
+<a class="next" href="../module-25-self-supervised-foundation-models/index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

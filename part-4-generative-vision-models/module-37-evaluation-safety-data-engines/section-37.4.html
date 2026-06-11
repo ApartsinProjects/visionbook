@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.4: Deepfakes, Detection &amp; Misuse. How face swaps and full synthesis are produced, the spatial and frequency-domain artifacts that detectors hunt for, a from-scratch frequency-fingerprint detector, why detection is a generalization arms race that keeps losing, benchmark datasets, and the realistic threat model for misuse." name="description"/>
+<title>Section 37.4: Deepfakes, Detection &amp; Misuse | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Evaluation, Safety &amp; Generative Data Engines</a></div>
+<h1>Deepfakes, Detection &amp; Misuse</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I can put any face on any body and any words in any mouth. The detector that catches me today will be retired by my next checkpoint. We are not playing a game with a winner; we are playing one with a scoreboard."</p>
+<cite>A Face-Swapping Network With No Remorse</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Once generators are realistic enough to deceive, detection becomes an adversarial arms race fought over statistical artifacts, and it is a race the defender keeps losing on out-of-distribution generators because the artifacts a detector learns are specific to the generators it was trained on.</strong> Deepfakes are produced by face-swapping autoencoders, GAN-based reenactment, and increasingly by diffusion models applied to identity and lip motion. Detectors hunt for the fingerprints these methods leave: spatial inconsistencies, telltale frequency-domain periodicities from upsampling, and physiological impossibilities. Each works well on the generators in its training set and degrades sharply on new ones. Understanding both sides, how fakes are made and why detection generalizes poorly, is what lets you build realistic defenses and reason honestly about the threat rather than trusting a detector blindly.</p>
+</div>
+
+<p>
+Every technique in this part can be turned to harm, and faces are where the harm concentrates because identity is uniquely abusable. This section is the security counterpart to the rest of the chapter: it treats the generator as an adversary and asks what an analyst can actually do. The honest answer is sobering, and the section is built around making that honesty precise rather than alarmist. Detection is useful, layered with the provenance methods of <a href="section-37.5.html">Section 37.5</a>, but it is not a solved problem and will not become one.
+</p>
+
+<h2>1. How Deepfakes Are Made <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+"Deepfake" covers several distinct techniques. The original and still common <strong>face swap</strong> trains a pair of autoencoders (the architecture of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>) with a shared encoder and per-identity decoders, so encoding person A's face and decoding it through person B's decoder transplants A's expression onto B's identity. <strong>Face reenactment</strong> drives a target face with a source's motion, often via GAN-based generators (<a href="../module-32-gans/index.html">Chapter 32</a>) conditioned on facial landmarks or a motion field, animating a still photo to speak. <strong>Lip-sync</strong> alters only the mouth region to match new audio. The newest and hardest to detect is <strong>diffusion-based synthesis and editing</strong> (<a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>), which can generate a whole convincing person from scratch or edit identity with the same machinery used for legitimate photo editing. The common structure across all of them, an encoder that compresses, a manipulation in a compact space, and a decoder that upsamples back to pixels, is exactly what leaves the artifacts detectors exploit.
+</p>
+
+<h2>2. The Artifacts Detectors Hunt <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Generation leaves three families of fingerprints. <strong>Spatial inconsistencies</strong> appear at the boundary where a swapped face is blended into the original frame: mismatched skin tone, lighting that does not match the scene, soft seams around the jaw, or eyes and teeth rendered with subtly wrong geometry. <strong>Frequency-domain fingerprints</strong> are the most reliable and the most generator-specific: the transposed convolutions and upsampling layers that decoders use to grow a small latent into a full image impose periodic patterns in the spectrum that real camera images, with their natural sensor noise from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, do not have. This is the frequency analysis of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> turned into a forensic tool. <strong>Physiological and temporal cues</strong> include unnatural or absent blinking, inconsistent head pose, and (for video) flicker between frames where a per-frame generator fails to maintain temporal coherence. Figure 37.4.1 maps these onto a face.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A stylized face annotated with detector cues: blend seams at the jaw, geometry errors at the eyes and teeth, and a frequency-spectrum panel showing periodic peaks">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10.5px sans-serif;fill:#555;}
+.dface{fill:#fbeee3;stroke:#d6802b;stroke-width:1.5;}
+.dcue{fill:none;stroke:#c0392b;stroke-width:1.4;}
+.dspec{fill:#f6f7f9;stroke:#999;stroke-width:1.2;}
+.dpk{stroke:#2c6fb5;stroke-width:1.5;}
+</style>
+<ellipse class="dface" cx="170" cy="125" rx="80" ry="100"/>
+<circle class="dcue" cx="145" cy="100" r="12"/><circle class="dcue" cx="195" cy="100" r="12"/>
+<text class="ds" x="170" y="70" text-anchor="middle" fill="#c0392b">eye geometry</text>
+<path class="dcue" d="M140,160 Q170,175 200,160"/>
+<text class="ds" x="170" y="200" text-anchor="middle" fill="#c0392b">teeth/mouth detail</text>
+<path class="dcue" d="M95,180 Q170,235 245,180"/>
+<text class="ds" x="290" y="195" fill="#c0392b">blend seam (jawline)</text>
+<rect class="dspec" x="430" y="60" width="250" height="140"/>
+<text class="dl" x="555" y="50" text-anchor="middle">frequency spectrum</text>
+<line class="dpk" x1="450" y1="180" x2="450" y2="120"/>
+<line class="dpk" x1="490" y1="180" x2="490" y2="95"/>
+<line class="dpk" x1="530" y1="180" x2="530" y2="130"/>
+<line class="dpk" x1="570" y1="180" x2="570" y2="100"/>
+<line class="dpk" x1="610" y1="180" x2="610" y2="135"/>
+<line class="dpk" x1="650" y1="180" x2="650" y2="105"/>
+<text class="ds" x="555" y="195" text-anchor="middle" fill="#2c6fb5">periodic upsampling peaks (not in real photos)</text>
+</svg>
+<figcaption><strong>Figure 37.4.1:</strong> The artifact families a deepfake detector exploits. On the face: blend seams at the jawline, geometry errors around the eyes, and texture errors in the teeth and mouth. On the right: the frequency spectrum of a generated image shows periodic peaks from the decoder's upsampling layers, regular structure that real sensor images lack. The spectral fingerprint is the most reliable cue and the one the detector in subsection 3 targets.</figcaption>
+</figure>
+
+<h2>3. A Frequency-Fingerprint Detector From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The most accessible detector exploits the spectral fingerprint. Compute the 2D Fourier transform of an image (the machinery of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>), take the log-magnitude spectrum, and reduce it to a radial profile: the average magnitude at each distance from the center frequency. Real photographs have a smooth, monotonically decaying radial profile (natural images are dominated by low frequencies). Many generators introduce spikes or a raised high-frequency shelf from their upsampling. A simple classifier on the radial profile separates the two surprisingly well, on the generators it was trained on.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def radial_spectrum(gray):
+    """Azimuthally averaged log-magnitude spectrum of a grayscale image.
+
+    gray: 2D float array in [0,1]. Returns a 1D radial profile.
+    """
+    f = np.fft.fftshift(np.fft.fft2(gray))         # center the spectrum
+    mag = np.log1p(np.abs(f))                       # log magnitude
+    h, w = mag.shape
+    cy, cx = h // 2, w // 2
+    y, x = np.indices((h, w))
+    r = np.hypot(x - cx, y - cy).astype(int)        # radius of each pixel
+    # Average magnitude at each integer radius -> radial profile.
+    radial = np.bincount(r.ravel(), mag.ravel()) / np.bincount(r.ravel())
+    return radial[: min(cy, cx)]                     # keep the valid range
+
+def fingerprint_features(gray):
+    """Compact features: high-frequency energy ratio and profile roughness."""
+    prof = radial_spectrum(gray)
+    half = len(prof) // 2
+    hf_ratio = prof[half:].mean() / (prof[:half].mean() + 1e-8)  # raised shelf?
+    roughness = np.abs(np.diff(prof)).mean()                     # spikiness
+    return np.array([hf_ratio, roughness])
+
+# Train a logistic regression on fingerprint_features of real vs fake crops:
+# from sklearn.linear_model import LogisticRegression
+# clf = LogisticRegression().fit(X_train, y_train)   # y: 0=real, 1=fake
+# On the TRAINING generator this routinely exceeds 0.95 AUC.
+</code></pre>
+<div class="code-caption">A from-scratch spectral-fingerprint detector: reduce each image to its radial frequency profile and extract a high-frequency energy ratio and a roughness measure that separate generated images from real ones, for generators resembling the training set.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pretrained Deepfake Detectors</div>
+<p>The hand-crafted spectral features above teach the principle, but production detectors are deep networks trained on large fake-vs-real corpora. Open implementations such as the DeepfakeBench toolkit bundle many detectors and benchmarks behind a uniform interface:</p>
+<pre><code class="language-python"># Conceptual usage of a bundled detector (DeepfakeBench-style API).
+from deepfakebench import load_detector
+
+detector = load_detector("ucf", pretrained=True)   # a learned CNN detector
+prob_fake = detector.predict(face_crop)             # in [0, 1]
+print(f"P(fake) = {prob_fake:.2f}")
+</code></pre>
+<div class="code-caption">A bundled pretrained detector (DeepfakeBench-style API): one model call returns a fake probability, with face cropping, alignment, and the cross-generator protocol handled internally.</div>
+<p>This replaces the feature engineering and a full training run with a model call, and the toolkit handles face cropping, alignment, and the cross-generator evaluation protocol. The catch is the same one the from-scratch detector exposes: high accuracy on in-distribution generators, a sharp drop on unseen ones, which is the subject of the next subsection.</p>
+</div>
+
+<h2>4. Why Detection Loses the Arms Race <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A detector trained to spot one generator's artifacts learns features specific to that generator. When a new architecture appears (a new GAN, a new diffusion sampler) with different upsampling and different artifacts, the detector's accuracy collapses toward chance, often falling from above 0.95 in-distribution AUC to near 0.6 cross-generator. This is the central, repeatedly confirmed finding of deepfake-detection research. The structural reason is adversarial: the generator and detector form the same minimax dynamic you saw inside a single GAN (<a href="../module-32-gans/index.html">Chapter 32</a>), except the loop spans the entire research community and runs on the timescale of publication. Any artifact a detector keys on becomes a loss term the next generator is trained to remove. Worse, common post-processing (JPEG recompression, resizing, the lossy transforms every social platform applies) destroys exactly the high-frequency fingerprints the detector relies on, so a fake that survives one upload round may be undetectable.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Detection Is Necessary but Not Sufficient</div>
+<p>The arms-race structure means passive detection can never be a complete defense. It is genuinely useful as one layer (catching low-effort fakes, flagging suspicious content for human review, raising the cost of attacks) but it cannot provide a guarantee, because the adversary always moves last. This is the argument for the proactive complement in <a href="section-37.5.html">Section 37.5</a>: rather than trying to detect every fake after the fact, watermark and cryptographically sign content at creation so authenticity is asserted rather than inferred. Detection asks "is this fake?" and can be defeated; provenance asks "where did this come from?" and shifts the burden. A serious system uses both, and trusts neither alone.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>Publishing a deepfake detector is like publishing the answer key to a test the other side gets to rewrite. Every artifact you announce becomes a loss term in the next generator's training run, so the detector that wins the benchmark this spring is the cautionary footnote by autumn. The defender's special curse is that the adversary always submits last. Signature phrase for the section: <strong>detection asks "is this fake?" and can be defeated; provenance asks "where did this come from?" and changes the question.</strong></p>
+</div>
+
+<h2>5. Benchmarks and the Threat Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Progress is measured on standard benchmarks: FaceForensics++ (manipulated videos across several methods with quality levels), the large-scale DeepFake Detection Challenge dataset, Celeb-DF (higher-quality swaps that defeated earlier detectors), and newer diffusion-era sets like DiffusionForensics. The crucial evaluation protocol is <em>cross-dataset</em>: train on one, test on another, because in-dataset numbers are optimistic exactly as subsection 4 warns. On the harm side, the realistic threat model spans non-consensual intimate imagery (the largest documented category of real-world deepfake abuse), fraud (voice and video impersonation for financial scams), political disinformation, and identity theft. The technical detail of how fakes are made matters less than situating it: this is a societal harm with a technical surface, and the responsible-deployment framework of <a href="section-37.6.html">Section 37.6</a> treats it as such.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Newsroom's Verification Desk Learns the Limits</div>
+<p><strong>Who:</strong> the visual-verification team at an international news organization, 2024, vetting user-submitted video during a fast-moving event. <strong>Situation:</strong> they had licensed a state-of-the-art deepfake detector that scored above 0.95 on its published benchmark. <strong>Problem:</strong> a viral clip flagged as authentic by the detector turned out to be a diffusion-based fake from a generator newer than the detector's training set, and a genuine clip was flagged as fake because platform recompression had scrambled its frequency statistics. <strong>Decision:</strong> they demoted the detector from a verdict to one input, and built a layered workflow: detector score plus provenance checks (C2PA manifests where present, from <a href="section-37.5.html">Section 37.5</a>), reverse-image search, source contact, and physical-consistency analysis by a trained human. <strong>Result:</strong> the layered process caught both the false negative and the false positive the detector alone had gotten wrong, at the cost of slower verification. <strong>Lesson:</strong> a detector's benchmark number is its best case on its own distribution; in the wild, treat any single detector as one fallible signal among several, never as ground truth, exactly as the arms-race analysis predicts.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Generalizable and Diffusion-Era Detection</div>
+<p>The frontier in 2024 to 2026 is detection that generalizes across generators rather than overfitting to one. Promising directions include detectors built on the features of large pretrained backbones rather than narrow fake-vs-real CNNs (Ojha et al., "Towards Universal Fake Image Detectors that Generalize Across Generative Models," CVPR 2023, arXiv:2302.10174, showed that a frozen CLIP feature space detects unseen generators far better than a trained-from-scratch detector), reconstruction-based detection that flags images a diffusion model can reconstruct suspiciously well (Wang et al.'s DIRE, ICCV 2023, arXiv:2303.09295), and benchmarks such as GenImage and DiffusionForensics built specifically to test cross-generator transfer. The honest consensus across this work is that robustness to <em>unseen</em> generators and to real-world post-processing remains the hard, unsolved core, which keeps the field's center of gravity shifting from after-the-fact detection toward the at-creation provenance of <a href="section-37.5.html">Section 37.5</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.4.1: Why Cross-Dataset Matters <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A vendor advertises 98 percent accuracy for their deepfake detector. Explain in a short paragraph what question you must ask about how that number was computed before trusting it, why an in-dataset 98 percent can coexist with a cross-dataset 60 percent, and how the adversarial structure of subsection 4 makes the cross-dataset number the only one that predicts real-world performance.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.4.2: Build and Break a Spectral Detector <span class="exercise-type coding">Coding</span></div>
+<p>Using <code>fingerprint_features</code> from subsection 3, train a logistic-regression detector on real images versus images from one generator (for example StyleGAN or one diffusion checkpoint), and confirm high AUC on a held-out split of the same generator. Then evaluate the same detector, unchanged, on images from a <em>different</em> generator and report the AUC drop. Finally, JPEG-recompress the test images at quality 60 and measure how much further accuracy falls. Summarize what each experiment demonstrates about the limits of frequency-based detection.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.4.3: Design a Layered Verification Pipeline <span class="exercise-type analysis">Analysis</span></div>
+<p>You are asked to design the verification workflow for a platform that receives user-uploaded images. Sketch a pipeline that combines at least three independent signals (for example a learned detector, a provenance/C2PA check from <a href="section-37.5.html">Section 37.5</a>, and a reverse-image-search step), specify how you would combine them into an action (allow, flag for human review, block), and explain how your design degrades gracefully when the detector is wrong, using the newsroom example as a reference point.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-37.3.html">&#8592; Section 37.3: Generative Models as Data Engines</a>
+<a href="index.html">Chapter 37</a>
+<a class="next" href="section-37.5.html">Section 37.5: Watermarking &amp; Content Provenance &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

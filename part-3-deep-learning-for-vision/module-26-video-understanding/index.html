@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 26: Video Understanding. Add the time axis to deep vision: from frames to clips, action recognition with 3D CNNs and two-stream networks, video transformers, deep optical flow with RAFT, and multi-object tracking with learned features." name="description"/>
+<title>Chapter 26: Video Understanding | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>Chapter 26: Video Understanding</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A single frame told me a man was holding a door. The next frame said he was holding it open. The one after that revealed he was, in fact, walking through it. Time, it turns out, is the only honest narrator."</p>
+<cite>A Frame That Finally Saw the Sequel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A video is not a folder of images; it is a signal in space and time, and the central problem of video understanding is deciding how much of your model's budget to spend on each axis.</strong> An image classifier can tell you a person is in the frame, but only the temporal axis distinguishes sitting down from standing up, opening a door from closing it, a wave from a slap. This chapter adds that axis to everything you have built in Part III. We start by asking what a clip even is and how to feed one to a network without drowning in redundant pixels. We learn the two architectural families that defined action recognition, the 3D convolution and the two-stream network, and then watch the transformer of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> absorb both into a single attention-over-spacetime design. We bring optical flow, introduced classically in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, into the deep era with RAFT, a network that estimates dense motion to sub-pixel accuracy. And we close by turning detection into tracking, following many objects across time with learned appearance features rather than hand-tuned motion models.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Every model in Part III so far has looked at one image at a time. That was a deliberate simplification, and it is also a profound limitation. The world does not arrive as still photographs; it arrives as a stream, and an enormous amount of meaning lives in how that stream changes. A photograph of a pot on a stove cannot tell you whether the water is about to boil or has already boiled over. A photograph of two people cannot tell you whether they are greeting each other or saying goodbye. Action, intent, causation, and physics all live in the time axis, and to read them a model must see more than one frame.
+</p>
+<p>
+Adding time sounds like it should be a small change, and it is not. A ten-second clip at thirty frames per second is three hundred images, and naively stacking them into a network multiplies both compute and memory by an order of magnitude while flooding the model with near-duplicate frames. So the first decision in any video system is how to sample and represent the clip, and that decision shapes everything downstream. <a href="section-26.1.html">Section 26.1</a> works through it: the structure of video data, frame sampling strategies, the redundancy that makes video both expensive and forgiving, and the practical mechanics of decoding clips into tensors with modern tooling.
+</p>
+<p>
+With clips in hand, <a href="section-26.2.html">Section 26.2</a> builds the two architectural families that defined the first decade of deep action recognition. The 3D convolutional network generalizes the learnable kernel of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> from two spatial dimensions to three spatiotemporal ones, sliding a small cube over the clip so that motion patterns become learned features just as edges did in 2D. The two-stream network takes a different bet: split appearance and motion into separate pathways, feeding raw frames to one and precomputed optical flow to the other, then fuse their predictions. We implement both, compare their trade-offs, and meet the factorized designs (R(2+1)D, I3D, SlowFast) that made 3D convolutions efficient.
+</p>
+<p>
+<a href="section-26.3.html">Section 26.3</a> brings the transformer to video. The self-attention you built in <a href="../module-22-vision-transformers/index.html">Chapter 22</a> treats an image as a sequence of patches; a video transformer simply extends that sequence across time, treating a clip as a sequence of spatiotemporal tubelets. The quadratic cost of attention, already a concern for high-resolution images, becomes acute when the token count is multiplied by the number of frames, so the section is largely about the factorization tricks (divided space-time attention, ViViT, TimeSformer, the video masked autoencoders) that keep the cost tractable. <a href="section-26.4.html">Section 26.4</a> returns to optical flow, the dense pixel-level motion field of <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, and rebuilds it with RAFT, a recurrent network that iteratively refines a flow estimate against an all-pairs correlation volume and set a new accuracy standard that still anchors the field. <a href="section-26.5.html">Section 26.5</a> finishes the chapter with multi-object tracking: the tracking-by-detection paradigm, the Kalman-and-Hungarian backbone of SORT, and the learned re-identification embeddings of DeepSORT and ByteTrack that let a tracker hold an identity through occlusion and crowding.
+</p>
+<p>
+The thread that runs through the whole chapter is that time is not free. Every design we study is, at heart, an answer to the same question: where do you spend compute, on the spatial detail of each frame or on the temporal relationships between them, and how do you avoid paying for the redundancy that video is full of? Keep that trade in mind, because it returns transformed in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>, where the same spatiotemporal modeling is turned around to generate video rather than understand it.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should have read <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a>, because the 3D convolution of <a href="section-26.2.html">Section 26.2</a> is a direct generalization of the 2D kernel, and <a href="../module-20-cnn-architectures/index.html">Chapter 20: CNN Architectures</a> for the ResNet backbones that video networks inflate into three dimensions. <a href="../module-22-vision-transformers/index.html">Chapter 22: Vision Transformers</a> is essential for <a href="section-26.3.html">Section 26.3</a>; the video transformer is the patch-and-attend recipe extended over time, and you should be comfortable with self-attention and its quadratic cost. <a href="../module-23-object-detection/index.html">Chapter 23: Object Detection</a> underpins the tracking-by-detection pipeline of <a href="section-26.5.html">Section 26.5</a>. From Part II, <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a> introduced the classical Lucas-Kanade and Horn-Schunck flow and the Kalman filter that this chapter rebuilds with learned components, and the comparison is much sharper if that material is fresh. Comfort with PyTorch tensors of shape (batch, channels, time, height, width) from <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a> will make the code concrete.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">26.1</span>
+<a href="section-26.1.html"><span class="section-title">From Frames to Clips: The Temporal Dimension</span></a>
+<span class="section-desc">What a video tensor is, why thirty redundant frames per second is both a curse and a blessing, frame sampling strategies (dense, uniform, segment-based), and how to decode clips into 5D tensors with current tooling. The data foundation for the whole chapter.</span>
+</li>
+<li>
+<span class="section-num">26.2</span>
+<a href="section-26.2.html"><span class="section-title">Action Recognition: 3D CNNs &amp; Two-Stream Networks</span></a>
+<span class="section-desc">The 3D convolution as a spatiotemporal kernel, the two-stream split of appearance and motion, and the factorized designs (R(2+1)D, I3D, SlowFast) that made 3D networks efficient. Both families built and compared in PyTorch.</span>
+</li>
+<li>
+<span class="section-num">26.3</span>
+<a href="section-26.3.html"><span class="section-title">Video Transformers</span></a>
+<span class="section-desc">The image transformer extended across time: spatiotemporal tubelet tokens, the token-count explosion, and the factorized attention (TimeSformer, ViViT) and masked-autoencoder pretraining (VideoMAE) that keep attention over spacetime tractable.</span>
+</li>
+<li>
+<span class="section-num">26.4</span>
+<a href="section-26.4.html"><span class="section-title">Deep Optical Flow: RAFT &amp; Beyond</span></a>
+<span class="section-desc">Dense motion estimation in the deep era: the all-pairs correlation volume, the recurrent GRU update operator that iteratively refines flow, and why RAFT's design became the template for modern flow, with a look at the transformer-based successors.</span>
+</li>
+<li>
+<span class="section-num">26.5</span>
+<a href="section-26.5.html"><span class="section-title">Multi-Object Tracking with Learned Features</span></a>
+<span class="section-desc">Tracking-by-detection: the Kalman filter and Hungarian assignment of SORT, the learned re-identification embeddings of DeepSORT, and the low-confidence recovery of ByteTrack that holds identities through occlusion. Built on the detectors of Chapter 23.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+Once a model can read the spatial detail of a frame and the temporal structure across frames, it is one short step from understanding a scene to reconstructing it in three dimensions. <a href="../module-27-depth-3d-neural-scenes/index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a> is the immediate sequel: the optical flow of <a href="section-26.4.html">Section 26.4</a> and the multi-view geometry of Part II combine to recover depth and structure from motion, and the same neural backbones power monocular depth estimation and neural scene representations like NeRF and Gaussian splatting. Further out, the spatiotemporal modeling of this chapter returns inverted in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36: Video, 3D Generation &amp; World Models</a>, where instead of classifying or tracking motion a model learns to generate it, and the tracking-as-object-permanence idea of <a href="section-26.5.html">Section 26.5</a> becomes the world model's grasp of how objects persist when they leave the frame. Understanding motion and generating it are two views of the same temporal structure.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Simonyan, K. &amp; Zisserman, A. "Two-Stream Convolutional Networks for Action Recognition in Videos." NeurIPS (2014). <a href="https://arxiv.org/abs/1406.2199" target="_blank" rel="noopener">arXiv:1406.2199</a></div>
+<div class="bib-annotation">The two-stream network of Section 26.2. One stream sees raw RGB frames for appearance, the other sees stacked optical flow for motion, and their softmax scores are fused. The design that established motion as a first-class signal in deep action recognition.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tran, D. et al. "Learning Spatiotemporal Features with 3D Convolutional Networks (C3D)." ICCV (2015). <a href="https://arxiv.org/abs/1412.0767" target="_blank" rel="noopener">arXiv:1412.0767</a></div>
+<div class="bib-annotation">C3D, the first widely used 3D convolutional network for video, central to Section 26.2. It showed that a homogeneous 3x3x3 spatiotemporal kernel learns useful motion features directly from clips, generalizing the 2D convolution of Chapter 19.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Carreira, J. &amp; Zisserman, A. "Quo Vadis, Action Recognition? A New Model and the Kinetics Dataset (I3D)." CVPR (2017). <a href="https://arxiv.org/abs/1705.07750" target="_blank" rel="noopener">arXiv:1705.07750</a></div>
+<div class="bib-annotation">I3D of Section 26.2, which inflates a pretrained 2D ImageNet network into 3D by replicating its kernels along time, inheriting strong spatial features. Also introduced the Kinetics benchmark that powers the field.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tran, D. et al. "A Closer Look at Spatiotemporal Convolutions for Action Recognition (R(2+1)D)." CVPR (2018). <a href="https://arxiv.org/abs/1711.11248" target="_blank" rel="noopener">arXiv:1711.11248</a></div>
+<div class="bib-annotation">The R(2+1)D factorization of Section 26.2: split each 3D convolution into a 2D spatial convolution followed by a 1D temporal one, adding non-linearity and cutting parameters while improving accuracy. The standard efficient 3D block.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Feichtenhofer, C. et al. "SlowFast Networks for Video Recognition." ICCV (2019). <a href="https://arxiv.org/abs/1812.03982" target="_blank" rel="noopener">arXiv:1812.03982</a></div>
+<div class="bib-annotation">SlowFast of Section 26.2: a slow high-detail pathway at a low frame rate and a fast lightweight pathway at a high frame rate, fused laterally. A clean answer to the spatial-versus-temporal budget question that frames the whole chapter.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Teed, Z. &amp; Deng, J. "RAFT: Recurrent All-Pairs Field Transforms for Optical Flow." ECCV (2020), Best Paper. <a href="https://arxiv.org/abs/2003.12039" target="_blank" rel="noopener">arXiv:2003.12039</a></div>
+<div class="bib-annotation">RAFT, the entirety of Section 26.4. An all-pairs correlation volume plus a recurrent GRU update operator that iteratively refines a single high-resolution flow field. The accuracy and design template that modern optical flow is still built around.</div>
+</div>
+
+<h3>Video Transformers (2021-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Bertasius, G. et al. "Is Space-Time Attention All You Need for Video Understanding? (TimeSformer)." ICML (2021). <a href="https://arxiv.org/abs/2102.05095" target="_blank" rel="noopener">arXiv:2102.05095</a></div>
+<div class="bib-annotation">TimeSformer of Section 26.3. Divided space-time attention, applying spatial and temporal attention in separate steps, is the key trick that makes attention over a video tractable. The convolution-free baseline for video transformers.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Arnab, A. et al. "ViViT: A Video Vision Transformer." ICCV (2021). <a href="https://arxiv.org/abs/2103.15691" target="_blank" rel="noopener">arXiv:2103.15691</a></div>
+<div class="bib-annotation">ViViT of Section 26.3, which catalogs the factorized-attention design space (factorized encoder, factorized self-attention, factorized dot-product) and introduces spatiotemporal tubelet embeddings, the 3D analogue of patch embedding.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tong, Z. et al. "VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training." NeurIPS (2022). <a href="https://arxiv.org/abs/2203.12602" target="_blank" rel="noopener">arXiv:2203.12602</a></div>
+<div class="bib-annotation">VideoMAE of Section 26.3, the video extension of the masked-autoencoder pretraining from <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. An extreme 90 percent tube-masking ratio exploits temporal redundancy to make self-supervised video pretraining data-efficient.</div>
+</div>
+
+<h3>Tracking</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Bewley, A. et al. "Simple Online and Realtime Tracking (SORT)." ICIP (2016). <a href="https://arxiv.org/abs/1602.00763" target="_blank" rel="noopener">arXiv:1602.00763</a></div>
+<div class="bib-annotation">SORT of Section 26.5: a Kalman filter for motion prediction plus the Hungarian algorithm for frame-to-frame assignment, the minimal tracking-by-detection pipeline. Fast, simple, and the foundation everything else extends.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wojke, N. et al. "Simple Online and Realtime Tracking with a Deep Association Metric (DeepSORT)." ICIP (2017). <a href="https://arxiv.org/abs/1703.07402" target="_blank" rel="noopener">arXiv:1703.07402</a></div>
+<div class="bib-annotation">DeepSORT of Section 26.5, which adds a learned appearance embedding to SORT so identities survive occlusion when motion prediction alone fails. The bridge from hand-tuned motion to learned re-identification features.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, Y. et al. "ByteTrack: Multi-Object Tracking by Associating Every Detection Box." ECCV (2022). <a href="https://arxiv.org/abs/2110.06864" target="_blank" rel="noopener">arXiv:2110.06864</a></div>
+<div class="bib-annotation">ByteTrack of Section 26.5. The deceptively simple idea of associating low-confidence detection boxes in a second matching pass recovers objects that occlusion has dimmed, setting a strong modern tracking baseline with almost no added machinery.</div>
+</div>
+
+<h3>Tools, Libraries &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">TorchVision video models and the <code>torchvision.io.read_video</code> / VideoReader API. <a href="https://pytorch.org/vision/stable/models.html#video-classification" target="_blank" rel="noopener">pytorch.org/vision</a></div>
+<div class="bib-annotation">Pretrained R(2+1)D, MViT, and S3D video classifiers and the decoding utilities of Section 26.1, the library shortcut behind most of this chapter's clip-loading and action-recognition code.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorchVideo, the Facebook AI video understanding library. <a href="https://pytorchvideo.org/" target="_blank" rel="noopener">pytorchvideo.org</a></div>
+<div class="bib-annotation">SlowFast, X3D, and MViT implementations with data loaders and transforms tuned for Kinetics, the reference codebase for the action models of Sections 26.2 and 26.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kay, W. et al. "The Kinetics Human Action Video Dataset." (2017). <a href="https://arxiv.org/abs/1705.06950" target="_blank" rel="noopener">arXiv:1705.06950</a> · <a href="https://github.com/google-deepmind/kinetics-i3d" target="_blank" rel="noopener">deepmind/kinetics-i3d</a></div>
+<div class="bib-annotation">The Kinetics benchmark (400, 600, and 700 action classes) that every model in Sections 26.2 and 26.3 is trained and reported on, and the dataset that made deep action recognition reproducible across labs.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Jocher, G. et al. Ultralytics YOLO with built-in tracking (<code>model.track</code>, ByteTrack / BoT-SORT). <a href="https://docs.ultralytics.com/modes/track/" target="_blank" rel="noopener">docs.ultralytics.com/modes/track</a></div>
+<div class="bib-annotation">The production multi-object tracker of Section 26.5: a one-line wrapper that runs detection and ByteTrack or BoT-SORT association together, the library shortcut for the from-scratch tracker built in that section.</div>
+</div>
+
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-25-self-supervised-foundation-models/index.html">&#8592; Chapter 25: Self-Supervised Learning &amp; Foundation Models</a>
+<a href="../index.html">Part III</a>
+<a class="next" href="section-26.1.html">Section 26.1: From Frames to Clips &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

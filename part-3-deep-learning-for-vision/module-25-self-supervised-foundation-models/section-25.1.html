@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.1: Pretext Tasks: Learning Without Labels. The core idea of self-supervision, rotation prediction, jigsaw puzzles, and colorization as pretext tasks, the linear-probe transfer protocol, and why a good pretext task forces semantic understanding rather than a shortcut." name="description"/>
+<title>Section 25.1: Pretext Tasks: Learning Without Labels | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models</a></div>
+<h1>Pretext Tasks: Learning Without Labels</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They handed me a photo cut into nine squares and shuffled like a deck of cards, and said: put it back. I had never been told what a dog was, but to win this game I had to learn that ears go above legs. The label was free. The understanding was not."</p>
+<cite>A Jigsaw-Solving Convolutional Network</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Self-supervised learning manufactures its own labels from the raw input, turning an unlabeled image into a supervised problem whose answer the data already contains. The trick is to design a task that the model can only solve by understanding the image's content, not by exploiting a trivial shortcut.</strong> A pretext task is that puzzle: rotate an image and predict the rotation, scramble it into a jigsaw and reassemble it, strip its color and paint it back. Solving the puzzle is never the goal. The goal is the representation the network builds along the way, a representation we then transfer to real tasks with a tiny amount of labeled data. This section establishes the recipe, the evaluation protocol that tells you whether it worked, and the design principle that separates a useful pretext task from a fooled one.</p>
+</div>
+
+<p>
+In the previous chapters you trained networks against human labels: a class index from ImageNet, a bounding box, a per-pixel mask. This section steps off that path entirely. We will train a network with no human labels at all, by inventing a supervision signal that can be computed automatically from any image. The plan is to introduce the general framework, build the simplest pretext task (rotation prediction) end to end in PyTorch, survey two more (jigsaw and colorization) that illustrate different design choices, and then pin down the protocol that measures whether the learned features are any good. By the end you will understand why self-supervision works at all, and why some pretext tasks teach far more than others. This is the foundation that <a href="section-25.2.html">Section 25.2</a> sharpens into contrastive learning.
+</p>
+
+<h2>1. The Self-Supervised Recipe <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The entire field rests on one move. Take an unlabeled image $x$, apply a transformation $t$ whose parameters you choose, and obtain a transformed input $\tilde{x} = t(x)$. Now ask the network to predict something about $t$ from $\tilde{x}$. Because you chose $t$, you know the correct answer, so you have a label for free. The network is trained with ordinary supervised loss (usually cross-entropy) against that automatically generated label. The crucial point is that this is genuine supervised learning; the only difference from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> is the source of the labels.
+</p>
+
+<p>
+Why would this teach anything useful? Because for many well-chosen transformations, the only way to predict $t$ reliably is to recognize what is in the image. To tell that a photo of a dog has been rotated ninety degrees, you must already have an internal sense of which way a dog normally faces; sky is up, legs point down, faces are upright. The network cannot get this from low-level cues alone, so it is pushed to build a representation that encodes object orientation, parts, and layout. That representation, captured in the network's intermediate layers, is the prize. The pretext task is scaffolding we throw away.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pretext Task Is a Means, Never an End</div>
+<p>Nobody needs a production system that predicts image rotations. The pretext task exists only to force the network to learn a representation, and we measure success not by accuracy on the pretext task but by how well the frozen features transfer to a real downstream task such as classification or detection. A pretext task that scores ninety-nine percent but whose features transfer poorly has failed. This decoupling of training objective from evaluation objective is the defining feature of representation learning and runs through the entire chapter, all the way to CLIP in <a href="section-25.4.html">Section 25.4</a>.</p>
+</div>
+
+<h2>2. Rotation Prediction, End to End <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The cleanest pretext task to implement is RotNet (Gidaris et al., 2018). Rotate each image by one of four angles, $0$, $90$, $180$, or $270$ degrees, and train the network to classify which of the four rotations was applied. That is a four-way classification problem with labels generated on the fly. The transformation $t$ is a discrete rotation; the label is the rotation index. Figure 25.1.1 shows the setup: one image becomes four training examples, each tagged with the angle it carries.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One image rotated into four versions, each labeled with its rotation angle, fed to a shared backbone and a four-way classifier head">
+<style>
+.rl{font:12px sans-serif;fill:#1a1a1a;}
+.rs{font:10px sans-serif;fill:#555;}
+.rimg{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.rback{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.rhead{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.rar{stroke:#777;stroke-width:1.5;marker-end:url(#rah);fill:none;}
+</style>
+<defs><marker id="rah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="rimg" x="14" y="20" width="44" height="44"/>
+<text class="rs" x="36" y="78" text-anchor="middle">0&#176; (y=0)</text>
+<rect class="rimg" x="14" y="95" width="44" height="44"/>
+<text class="rs" x="36" y="153" text-anchor="middle">90&#176; (y=1)</text>
+<rect class="rimg" x="14" y="170" width="44" height="44"/>
+<text class="rs" x="36" y="228" text-anchor="middle">180&#176; (y=2)</text>
+<rect class="rimg" x="84" y="95" width="44" height="44"/>
+<text class="rs" x="106" y="153" text-anchor="middle">270&#176; (y=3)</text>
+<line class="rar" x1="132" y1="117" x2="190" y2="117"/>
+<rect class="rback" x="192" y="92" width="120" height="50"/>
+<text class="rl" x="252" y="113" text-anchor="middle">shared backbone</text>
+<text class="rs" x="252" y="130" text-anchor="middle">ResNet / ViT encoder</text>
+<line class="rar" x1="312" y1="117" x2="360" y2="117"/>
+<rect class="rhead" x="362" y="97" width="96" height="40"/>
+<text class="rl" x="410" y="121" text-anchor="middle">4-way head</text>
+<line class="rar" x1="458" y1="117" x2="506" y2="117"/>
+<rect class="rhead" x="508" y="97" width="120" height="40"/>
+<text class="rl" x="568" y="115" text-anchor="middle">predict rotation</text>
+<text class="rs" x="568" y="130" text-anchor="middle">cross-entropy</text>
+<text class="rs" x="252" y="175" text-anchor="middle">the encoder is the part we keep</text>
+</svg>
+<figcaption><strong>Figure 25.1.1:</strong> The RotNet pretext task. Each unlabeled image is rotated into four versions whose labels (the rotation index) are known by construction. A shared backbone and a four-way classification head are trained with ordinary cross-entropy. After training, the head is discarded and the backbone's features are transferred to a downstream task.</figcaption>
+</figure>
+
+<p>
+The code below builds the full pipeline against a torchvision backbone. The key piece is the data transform that produces the four rotations and their labels; everything else is a standard supervised training step you have seen since <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a>.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torchvision
+
+def make_rotations(images):
+    """Given a batch (B, C, H, W), return 4B rotated images and their rotation labels."""
+    rots, labels = [], []
+    for k in range(4):                       # k = number of 90-degree turns
+        rots.append(torch.rot90(images, k, dims=(2, 3)))  # rotate H,W plane
+        labels.append(torch.full((images.size(0),), k, dtype=torch.long))
+    return torch.cat(rots, dim=0), torch.cat(labels, dim=0)
+
+# A ResNet-18 backbone with a fresh 4-way head replacing the 1000-way ImageNet head.
+backbone = torchvision.models.resnet18(weights=None)
+backbone.fc = nn.Linear(backbone.fc.in_features, 4)   # 4 rotation classes
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(backbone.parameters(), lr=0.1, momentum=0.9)
+
+images = torch.randn(8, 3, 64, 64)          # 8 unlabeled images, no class labels needed
+rot_imgs, rot_labels = make_rotations(images)         # -> (32, 3, 64, 64), (32,)
+logits = backbone(rot_imgs)
+loss = criterion(logits, rot_labels)        # supervised loss against free labels
+loss.backward(); optimizer.step()
+print("rotated batch:", rot_imgs.shape, "labels:", rot_labels[:8].tolist())
+# rotated batch: torch.Size([32, 3, 64, 64]) labels: [0, 0, 0, 0, 0, 0, 0, 0]</code></pre>
+<div class="code-caption">RotNet in PyTorch. <code>make_rotations</code> turns one batch of unlabeled images into four times as many labeled examples using <code>torch.rot90</code>; the rest is a vanilla cross-entropy step. The class labels of the images are never used.</div>
+
+<p>
+Notice that no <code>.targets</code> or class annotations appear anywhere. The supervision comes entirely from <code>make_rotations</code>. Once this network is trained on a large unlabeled corpus, we throw away <code>backbone.fc</code> (the rotation head) and keep the convolutional trunk as a feature extractor. Section 4 below explains how we measure whether those features are good.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>RotNet has a famous blind spot: it fails on images with no canonical orientation. A photo of soup from directly above, a microscope slide, an aerial satellite image of farmland, all look equally plausible at any rotation, so the network cannot solve the task and learns little. This is not a bug in the code; it is the task honestly reporting that the pretext signal does not exist for those images. The lesson generalizes: a pretext task only teaches what its assumption about the world makes learnable.</p>
+</div>
+
+<h2>3. Jigsaw Puzzles and Colorization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Rotation is the simplest pretext task, but it is one of many, and the variety illustrates the design space. The <strong>jigsaw</strong> task (Noroozi and Favaro, 2016) cuts the image into a grid of tiles, shuffles them by one of a fixed set of permutations, and asks the network to predict which permutation was used. To reassemble the puzzle the network must understand spatial relationships between parts: a face tile belongs above a body tile, a wheel sits below a fender. Because the number of permutations of nine tiles is enormous, the task uses a curated subset of a few hundred permutations chosen to be maximally distinct, turning it into a manageable classification problem.
+</p>
+
+<p>
+<strong>Colorization</strong> (Zhang et al., 2016) takes the opposite tack: it is a generative pretext task. The network receives a grayscale image and must predict the missing color channels. To color a banana yellow and grass green it must recognize the objects, since color is a semantic property, not a local one. Colorization predicts a dense output (a color per pixel) rather than a single class, so it teaches features useful for dense downstream tasks. The contrast with rotation is instructive: rotation is a global, four-way classification; colorization is a dense, per-pixel regression. Both invent their labels from the data, but they push the representation in different directions.
+</p>
+
+<p>
+A recurring danger unites all three. A pretext task is only as good as the shortcut it forbids. If the network can predict the rotation by reading a camera watermark in the corner, or solve the jigsaw by matching the chromatic aberration at tile edges, or colorize by memorizing a texture statistic, it will do exactly that and learn nothing about content. The practical example below is a real instance of this failure.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pretext Task That Learned the Camera, Not the Content</div>
+<p><strong>Who:</strong> a three-person applied-research group at an agritech startup, 2022, building a crop-disease classifier from a large archive of unlabeled field photos. <strong>Situation:</strong> labels were scarce and expensive (an agronomist had to inspect each leaf), so they pretrained a backbone with the jigsaw pretext task on roughly two hundred thousand unlabeled photos, then planned to fine-tune on their few thousand labeled examples. <strong>Problem:</strong> the jigsaw pretraining reached suspiciously high accuracy, yet the transferred features performed barely better than random initialization on disease classification. <strong>Decision:</strong> they inspected which tile boundaries the model attended to and discovered the photos were captured on two phone models with slightly different JPEG compression, leaving faint blocking artifacts at consistent positions. The network was solving the jigsaw by aligning compression-block grids across tiles, a shortcut with zero semantic content. They added strong color jitter and re-encoded every tile through a fresh random JPEG quality to destroy the artifact, and switched to random tile gaps so edge cues could not be matched. <strong>Result:</strong> pretext accuracy dropped (the easy shortcut was gone), but downstream disease accuracy jumped by eleven points, finally beating the supervised-from-scratch baseline. <strong>Lesson:</strong> a pretext task that is too easy is a warning sign. When self-supervision underperforms, the first suspect is a low-level shortcut; the cure is augmentation aggressive enough to make the shortcut useless, which forces the model back onto content.</p>
+</div>
+
+<h2>4. Measuring Success: The Linear Probe <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Since the pretext accuracy is not the goal, we need a separate yardstick for representation quality. The standard tool is the <strong>linear probe</strong>, an evaluation protocol inherited directly from the transfer-learning discussion of <a href="../module-21-training-recipes/index.html">Chapter 21</a>. Freeze the pretrained backbone so its weights cannot change, extract features for a labeled dataset, and train a single linear classifier (one fully connected layer) on top of those frozen features. The accuracy of that linear classifier measures how linearly separable the learned representation is: if a simple linear boundary can carve the frozen features into the right classes, the features have already done the hard work of organizing the data semantically.
+</p>
+
+<p>
+Formally, if the frozen encoder maps an image to a feature vector $z = f_\theta(x)$ with $\theta$ fixed, the linear probe fits only a weight matrix $W$ and bias $b$ by minimizing
+</p>
+
+<div class="math-block">
+$$\min_{W, b} \; \frac{1}{N}\sum_{i=1}^{N} \mathcal{L}_{\text{CE}}\big(W z_i + b, \; y_i\big), \qquad z_i = f_\theta(x_i) \ \text{(frozen)}$$
+</div>
+
+<p>
+where $\mathcal{L}_{\text{CE}}$ is cross-entropy and $y_i$ are the downstream labels. Only $W$ and $b$ are learned; $\theta$ never moves. The two other common protocols are <strong>fine-tuning</strong> (unfreeze the whole backbone and train end to end on the downstream labels, which measures the representation as a starting point rather than as a fixed feature) and <strong>k-nearest-neighbors</strong> (classify each test feature by a majority vote of its nearest training features, which needs no training at all and is a pure measure of feature-space structure). The code below implements the linear probe directly.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+@torch.no_grad()
+def extract_features(encoder, loader, device):
+    """Run the frozen encoder over a labeled loader and stack features + labels."""
+    encoder.eval()
+    feats, labels = [], []
+    for x, y in loader:
+        feats.append(encoder(x.to(device)).flatten(1).cpu())  # frozen forward pass
+        labels.append(y)
+    return torch.cat(feats), torch.cat(labels)
+
+def linear_probe(train_feats, train_labels, num_classes, epochs=100):
+    """Train ONLY a linear layer on frozen features; the encoder is untouched."""
+    clf = nn.Linear(train_feats.size(1), num_classes)
+    opt = torch.optim.Adam(clf.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = loss_fn(clf(train_feats), train_labels)        # only clf has gradients
+        loss.backward(); opt.step()
+    return clf
+
+# Usage sketch: freeze the RotNet trunk, drop its rotation head, probe on real labels.
+encoder = backbone                       # from Section 2
+encoder.fc = nn.Identity()               # expose 512-d features instead of the 4-way head
+for p in encoder.parameters():
+    p.requires_grad_(False)              # freeze: this is what makes it a linear PROBE
+# feats, labels = extract_features(encoder, labeled_loader, "cuda")
+# clf = linear_probe(feats, labels, num_classes=10)
+print("encoder frozen:", not any(p.requires_grad for p in encoder.parameters()))
+# encoder frozen: True</code></pre>
+<div class="code-caption">The linear-probe protocol. Setting <code>requires_grad_(False)</code> on every encoder parameter is the line that defines the probe: only the final linear layer learns, so the reported accuracy reflects the frozen representation, not a re-trained network.</div>
+
+<p>
+The linear probe is what lets us compare RotNet, jigsaw, colorization, and the contrastive methods of <a href="section-25.2.html">Section 25.2</a> on a level field. It is also why the field converged on the methods it did: contrastive and masked-modeling approaches produce far more linearly separable features than the early pretext tasks, which is exactly the gap the next two sections close.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Frozen Backbone in Two Lines</div>
+<p>You rarely train RotNet yourself today; you load a strong pretrained backbone and probe or fine-tune it. With <code>timm</code> the entire feature-extractor setup of the code above collapses to two lines:</p>
+<pre><code class="language-python">import timm
+# A self-supervised ViT backbone, features only (no classifier), weights downloaded:
+encoder = timm.create_model("vit_small_patch16_224.dino", pretrained=True, num_classes=0)
+features = encoder(torch.randn(1, 3, 224, 224))   # (1, 384) frozen embedding</code></pre>
+<p><code>timm</code> handles the architecture, the pretrained weights (here a DINO checkpoint from <a href="section-25.3.html">Section 25.3</a>), the correct preprocessing, and the removal of the classification head via <code>num_classes=0</code>. What took roughly twenty lines of manual head surgery and weight loading becomes two, and the library exposes hundreds of self-supervised checkpoints through the same call. The from-scratch version above exists so you understand what those two lines do internally.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Hand-Designed Puzzles to Learned Objectives</div>
+<p>The pretext tasks of this section were largely superseded between 2020 and 2023 by contrastive and masked-modeling objectives, but the underlying question, what is the best free supervision signal, is still open and active. Masked image modeling (the MAE of <a href="section-25.3.html">Section 25.3</a>) can be read as a vastly more powerful pretext task: predict the missing patches rather than the rotation. The 2023 to 2024 I-JEPA and V-JEPA work from Meta pushes this further by predicting in representation space instead of pixel space, arguing that pixel-level reconstruction wastes capacity on imperceptible detail; we will return to this in <a href="section-25.6.html">Section 25.6</a>. And the lesson that learned descriptors beat hand-crafted ones, which began with SIFT and ORB back in <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, reaches its sharpest form here: the field has moved from hand-designing features, to hand-designing pretext tasks that learn features, to learning the objective itself.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.1: When Does Rotation Prediction Fail? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>List four categories of images for which RotNet would learn almost nothing because the rotation is not predictable from content, and explain the shared property that makes them fail. Then describe a different pretext task that <em>would</em> learn useful features on those same images, and justify why its free label is recoverable from content where the rotation label is not. Connect your answer to the Key Insight that the pretext task only teaches what its assumption makes learnable.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.2: Build and Probe a RotNet <span class="exercise-type coding">Coding</span></div>
+<p>Using the code in Sections 2 and 4, pretrain a small ResNet on the CIFAR-10 training images with the rotation pretext task (ignore the class labels during pretraining). Then freeze the backbone and run a linear probe using the real CIFAR-10 labels, reporting test accuracy. As a control, run the same linear probe on a randomly initialized (untrained) backbone. The gap between the two numbers is the value the rotation pretext task added. Report both numbers and one sentence interpreting the gap.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.1.3: Diagnosing a Shortcut <span class="exercise-type analysis">Analysis</span></div>
+<p>Reread the agritech practical example. Suppose your own jigsaw pretraining reaches 95 percent permutation accuracy but transfers poorly. Design a three-step diagnostic procedure to determine whether the model is exploiting a low-level shortcut: what would you measure, what augmentation would you add as a test, and what change in pretext accuracy versus downstream accuracy would confirm the shortcut hypothesis? Explain why a <em>drop</em> in pretext accuracy after augmentation is good news in this situation.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 25 Index</a>
+<a href="index.html">Chapter 25</a>
+<a class="next" href="section-25.2.html">Section 25.2: Contrastive Learning: SimCLR &amp; MoCo &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

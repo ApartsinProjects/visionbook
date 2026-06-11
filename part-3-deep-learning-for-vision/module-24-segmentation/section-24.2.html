@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.2: Instance Segmentation: Mask R-CNN. Separating individual objects, not just classes: how Mask R-CNN adds a small per-region mask branch to Faster R-CNN, why RoIAlign replaces RoIPool to fix quantization that broke pixel-accurate features, and the full detect-then-segment pipeline run end to end in torchvision." name="description"/>
+<title>Section 24.2: Instance Segmentation: Mask R-CNN | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a></div>
+<h1>Instance Segmentation: Mask R-CNN</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Semantic segmentation told me there were cars. I asked how many, and it shrugged and pointed at one big car-colored smear. Mask R-CNN finally counted them, and then, with the patience of a saint, drew a tidy outline around each one."</p>
+<cite>An Anchor Box That Grew Up to Cut Out Shapes</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Instance segmentation answers two questions per pixel at once: which class, and which object instance, so two adjacent cars are two separate masks rather than one merged region.</strong> Mask R-CNN gets there by the most pragmatic route imaginable: take the Faster R-CNN detector from the previous chapter, which already finds and boxes objects, and bolt a tiny extra branch onto each detected region that predicts a binary mask. The architecture is detect-then-segment. The one subtle but consequential fix that made it work is RoIAlign, a way of cropping per-region features that avoids the coordinate rounding that had quietly corrupted earlier region-based methods. Get the detector and RoIAlign right, and the mask branch is almost trivial.</p>
+</div>
+
+<p>
+The semantic segmenters of <a href="section-24.1.html">Section 24.1</a> assign each pixel a class, and that is all they do. Stand them in front of a parking lot and every car-pixel gets the label "car," but the model has no idea where one car ends and the next begins; touching objects of the same class fuse into a single connected component. For counting, tracking, or cutting out one specific object, you need <strong>instances</strong>: a separate mask, with its own identity, for each individual object. This section builds the instance segmenter that defined the field, Mask R-CNN, and it leans directly on the detection machinery of <a href="../module-23-object-detection/index.html">Chapter 23</a>.
+</p>
+
+<h2>1. From Detection to Instance Masks <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Recall the two-stage detector from <a href="../module-23-object-detection/index.html">Chapter 23</a>. A backbone extracts a feature map; a Region Proposal Network (RPN) suggests a few hundred candidate object regions; for each region, features are cropped and pooled to a fixed size and fed to two heads, one that classifies the region and one that refines its box. Mask R-CNN keeps this entire pipeline and adds exactly one thing: a third head, parallel to the other two, that takes the same per-region features and predicts a small binary mask, typically $28 \times 28$, indicating which pixels inside the region belong to the object. The mask is then resized to the box and pasted back into the image. Figure 24.2.1 shows the addition.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mask R-CNN pipeline: backbone, region proposal network, RoIAlign, and three parallel heads for class, box, and mask">
+<style>
+.ml{font:12px sans-serif;fill:#1a1a1a;}
+.ms{font:10px sans-serif;fill:#555;}
+.mback{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.mrpn{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.malign{fill:#fff3cd;stroke:#c79100;stroke-width:1.5;}
+.mhead{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.mmask{fill:#f3e8fb;stroke:#8e44ad;stroke-width:2;}
+.mar{stroke:#777;stroke-width:1.5;marker-end:url(#mah);fill:none;}
+</style>
+<defs><marker id="mah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="mback" x="14" y="130" width="76" height="56"/>
+<text class="ml" x="52" y="162" text-anchor="middle">backbone</text>
+<text class="ms" x="52" y="200" text-anchor="middle">+ FPN</text>
+<line class="mar" x1="90" y1="158" x2="120" y2="158"/>
+<rect class="mrpn" x="122" y="130" width="70" height="56"/>
+<text class="ml" x="157" y="155" text-anchor="middle">RPN</text>
+<text class="ms" x="157" y="172" text-anchor="middle">proposals</text>
+<line class="mar" x1="192" y1="158" x2="222" y2="158"/>
+<rect class="malign" x="224" y="130" width="78" height="56"/>
+<text class="ml" x="263" y="155" text-anchor="middle">RoIAlign</text>
+<text class="ms" x="263" y="172" text-anchor="middle">crop+resize</text>
+<line class="mar" x1="302" y1="150" x2="360" y2="80"/>
+<line class="mar" x1="302" y1="158" x2="360" y2="158"/>
+<line class="mar" x1="302" y1="166" x2="360" y2="236"/>
+<rect class="mhead" x="362" y="58" width="120" height="40"/>
+<text class="ml" x="422" y="82" text-anchor="middle">class head</text>
+<rect class="mhead" x="362" y="138" width="120" height="40"/>
+<text class="ml" x="422" y="162" text-anchor="middle">box head</text>
+<rect class="mmask" x="362" y="216" width="120" height="44"/>
+<text class="ml" x="422" y="240" text-anchor="middle">mask head (NEW)</text>
+<text class="ms" x="422" y="256" text-anchor="middle">small FCN -&gt; 28x28</text>
+<line class="mar" x1="482" y1="78" x2="540" y2="120"/>
+<line class="mar" x1="482" y1="158" x2="540" y2="140"/>
+<line class="mar" x1="482" y1="238" x2="540" y2="160"/>
+<rect class="mmask" x="542" y="115" width="86" height="70"/>
+<text class="ml" x="585" y="145" text-anchor="middle">per-instance</text>
+<text class="ml" x="585" y="162" text-anchor="middle">mask + box</text>
+<text class="ms" x="585" y="178" text-anchor="middle">+ class</text>
+</svg>
+<figcaption><strong>Figure 24.2.1:</strong> The Mask R-CNN pipeline. The backbone, FPN, RPN, RoIAlign, and the class and box heads are inherited unchanged from Faster R-CNN (Chapter 23). Mask R-CNN adds the purple mask head: a small fully convolutional network that, for each proposal, predicts a 28x28 binary mask in parallel with classification and box regression.</figcaption>
+</figure>
+
+<p>
+A key design decision in the mask branch is that the mask and the class are decoupled. The mask head predicts one $28 \times 28$ mask <em>per class</em>, and at inference the network simply uses the mask for whichever class the classification head chose. This means the mask branch never has to learn to distinguish classes; it only learns to separate foreground from background within a region, and the much smaller classification problem is left to the dedicated class head. This decoupling, the paper showed, measurably improves mask quality compared with making one branch do both jobs. The mask loss is a per-pixel binary cross-entropy applied only to the mask of the ground-truth class, the binary analog of the dense cross-entropy from <a href="section-24.1.html">Section 24.1</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Decouple Mask from Class</div>
+<p>Mask R-CNN predicts a separate binary mask for every class and selects the one matching the classification head's decision, rather than predicting a single multi-class mask. The total loss is a sum of three terms, $L = L_{\text{cls}} + L_{\text{box}} + L_{\text{mask}}$, and the mask term is averaged only over the ground-truth class channel. Because each class's mask branch sees only positive and negative pixels for that class, "is this pixel part of the object" is cleanly separated from "what is the object," and each task gets a head sized for it. Separating responsibilities so each predictor solves the smaller problem is a recurring pattern in good architecture design.</p>
+</div>
+
+<h2>2. RoIAlign: The Fix That Mattered <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The single most important technical contribution of Mask R-CNN is not the mask branch; it is RoIAlign. To understand why, look at how Faster R-CNN cropped per-region features. A region proposal is a box in image coordinates, say $x$ from 87.6 to 213.4 pixels. The feature map is downsampled, at stride 16 that box lives between feature coordinates 5.475 and 13.3375. The old <strong>RoIPool</strong> operation rounded those to integers, then divided the integer region into a grid of bins and rounded the bin boundaries again. Two rounding steps. For a box classifier those few-pixel misalignments wash out, the box head is tolerant. For a mask, where the goal is a pixel-accurate boundary, that misalignment is poison: the cropped features no longer line up with the image, and the predicted mask is shifted by a pixel or two everywhere.
+</p>
+
+<p>
+RoIAlign removes both roundings. It keeps the region coordinates as floating-point values, divides the region into bins without rounding, places sampling points inside each bin at fractional positions, and reads the feature-map value at each sampling point with <strong>bilinear interpolation</strong>, exactly the interpolation you used for <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">image warping in Chapter 5</a>. Because no coordinate is ever snapped to an integer, the cropped features are spatially faithful to the image. Figure 24.2.2 contrasts the two.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of RoIPool quantization versus RoIAlign bilinear sampling on a feature grid">
+<style>
+.rl{font:12px sans-serif;fill:#1a1a1a;}
+.rs{font:10px sans-serif;fill:#555;}
+.rgrid{fill:none;stroke:#bbb;stroke-width:1;}
+.rroi{fill:none;stroke:#d6802b;stroke-width:2;}
+.rsnap{fill:none;stroke:#c0392b;stroke-width:2;stroke-dasharray:4 3;}
+.rdot{fill:#2f9e5c;}
+.rtitle{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+</style>
+<text class="rtitle" x="150" y="28" text-anchor="middle">RoIPool: snap to grid</text>
+<g>
+<rect class="rgrid" x="40" y="50" width="40" height="40"/><rect class="rgrid" x="80" y="50" width="40" height="40"/><rect class="rgrid" x="120" y="50" width="40" height="40"/><rect class="rgrid" x="160" y="50" width="40" height="40"/><rect class="rgrid" x="200" y="50" width="40" height="40"/>
+<rect class="rgrid" x="40" y="90" width="40" height="40"/><rect class="rgrid" x="80" y="90" width="40" height="40"/><rect class="rgrid" x="120" y="90" width="40" height="40"/><rect class="rgrid" x="160" y="90" width="40" height="40"/><rect class="rgrid" x="200" y="90" width="40" height="40"/>
+<rect class="rgrid" x="40" y="130" width="40" height="40"/><rect class="rgrid" x="80" y="130" width="40" height="40"/><rect class="rgrid" x="120" y="130" width="40" height="40"/><rect class="rgrid" x="160" y="130" width="40" height="40"/><rect class="rgrid" x="200" y="130" width="40" height="40"/>
+<rect class="rroi" x="63" y="68" width="118" height="86"/>
+<rect class="rsnap" x="40" y="50" width="120" height="120"/>
+<text class="rs" x="150" y="200" text-anchor="middle">true RoI (orange) snapped</text>
+<text class="rs" x="150" y="214" text-anchor="middle">to red grid: misaligned</text>
+</g>
+<text class="rtitle" x="540" y="28" text-anchor="middle">RoIAlign: bilinear sample</text>
+<g>
+<rect class="rgrid" x="430" y="50" width="40" height="40"/><rect class="rgrid" x="470" y="50" width="40" height="40"/><rect class="rgrid" x="510" y="50" width="40" height="40"/><rect class="rgrid" x="550" y="50" width="40" height="40"/><rect class="rgrid" x="590" y="50" width="40" height="40"/>
+<rect class="rgrid" x="430" y="90" width="40" height="40"/><rect class="rgrid" x="470" y="90" width="40" height="40"/><rect class="rgrid" x="510" y="90" width="40" height="40"/><rect class="rgrid" x="550" y="90" width="40" height="40"/><rect class="rgrid" x="590" y="90" width="40" height="40"/>
+<rect class="rgrid" x="430" y="130" width="40" height="40"/><rect class="rgrid" x="470" y="130" width="40" height="40"/><rect class="rgrid" x="510" y="130" width="40" height="40"/><rect class="rgrid" x="550" y="130" width="40" height="40"/><rect class="rgrid" x="590" y="130" width="40" height="40"/>
+<rect class="rroi" x="453" y="68" width="118" height="86"/>
+<circle class="rdot" cx="482" cy="90" r="3"/><circle class="rdot" cx="542" cy="90" r="3"/>
+<circle class="rdot" cx="482" cy="132" r="3"/><circle class="rdot" cx="542" cy="132" r="3"/>
+<text class="rs" x="540" y="200" text-anchor="middle">true RoI kept exactly; green</text>
+<text class="rs" x="540" y="214" text-anchor="middle">samples read by interpolation</text>
+</g>
+</svg>
+<figcaption><strong>Figure 24.2.2:</strong> Why RoIAlign matters. Left, RoIPool snaps the floating-point region (orange) to integer grid cells (red dashed), shifting the cropped features off the object. Right, RoIAlign keeps the region exact and reads feature values at fractional sample points (green dots) with bilinear interpolation, so the crop stays spatially faithful. For pixel-accurate masks, this difference is decisive.</figcaption>
+</figure>
+
+<p>
+The effect was large: in the original paper, switching RoIPool to RoIAlign improved mask accuracy by around ten points of mask average precision on the hardest, strict-overlap criteria, and it helped box detection too. The lesson generalized far beyond Mask R-CNN, RoIAlign is now the default region-cropping operator across detection and segmentation. The code below runs it on a feature map to show the shape contract.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.ops import roi_align
+
+# A single feature map (1 image, 256 channels, 50x50 spatial).
+feat = torch.randn(1, 256, 50, 50)
+
+# Two regions of interest as [batch_index, x1, y1, x2, y2] in feature-map coordinates.
+# Note the deliberately fractional coordinates: RoIAlign keeps them exact.
+boxes = torch.tensor([[0, 5.5, 8.2, 22.7, 31.9],
+                      [0, 30.1, 12.4, 47.8, 44.0]])
+
+pooled = roi_align(feat, boxes, output_size=(7, 7),  # fixed-size crop per region
+                   spatial_scale=1.0,                 # boxes already in feature coords
+                   sampling_ratio=2)                  # 2x2 bilinear samples per bin
+print(pooled.shape)   # torch.Size([2, 256, 7, 7]) -> one 7x7 feature crop per region</code></pre>
+<div class="code-caption">torchvision's <code>roi_align</code> turns any number of fractional-coordinate regions into uniform 7x7 feature crops via bilinear sampling, the operation that replaced lossy RoIPool. The mask branch uses a larger 14x14 crop to predict its 28x28 mask.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The entire RoIAlign contribution can be summarized as "stop rounding." Two <code>round()</code> calls, the kind every beginner writes without thinking, were quietly shaving a pixel or two off every region crop, and removing them bought roughly ten points of mask average precision. It is a useful reminder that in dense prediction a half-pixel is not a rounding error you can ignore; it is the difference between a mask that hugs the object and one that floats next to it. The signature phrase to remember the section by: <em>masks live and die by the half-pixel</em>.</p>
+</div>
+
+<h2>3. Running Mask R-CNN End to End <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With the pieces in place, the full model is straightforward to run. torchvision provides Mask R-CNN with a ResNet-50-FPN backbone and COCO-pretrained weights. The model takes a list of image tensors and returns, per image, a dictionary of boxes, labels, confidence scores, and per-instance masks. The code below loads it, runs inference, and filters by confidence, the typical inference recipe.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.models.detection import (maskrcnn_resnet50_fpn,
+                                          MaskRCNN_ResNet50_FPN_Weights)
+
+weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+model = maskrcnn_resnet50_fpn(weights=weights).eval()
+preprocess = weights.transforms()                 # normalization the model expects
+
+# Stand-in for a loaded image (C, H, W) in [0, 1]; replace with read_image(...) / 255.
+image = torch.rand(3, 480, 640)
+batch = [preprocess(image)]                        # model takes a LIST of images
+
+with torch.no_grad():
+    output = model(batch)[0]                        # dict for the single image
+
+keep = output["scores"] > 0.7                       # confidence threshold
+boxes  = output["boxes"][keep]                       # (N, 4)
+labels = output["labels"][keep]                      # (N,) COCO class indices
+masks  = output["masks"][keep]                        # (N, 1, H, W) soft masks in [0, 1]
+print(f"{keep.sum().item()} confident instances")
+binary_masks = masks.squeeze(1) > 0.5                # threshold to hard masks
+print(binary_masks.shape)                            # (N, 480, 640)</code></pre>
+<div class="code-caption">Mask R-CNN inference in torchvision. The model returns soft per-instance masks at full image resolution; thresholding at 0.5 yields the binary mask for each detected object. Each mask is paired with its own box, class label, and score.</div>
+
+<p>
+The output shape <code>(N, 1, H, W)</code> deserves a comment: there are $N$ confident instances, each carrying a single-channel soft mask at full image resolution. Internally the network predicted a small $28 \times 28$ mask in the box's coordinate frame and resized it to the box; torchvision pastes it into a full-frame canvas for you. To visualize, overlay each binary mask in a distinct color, the standard instance-segmentation display where every car gets its own hue rather than one shared "car" color.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting Cells in a Pathology Lab</div>
+<p><strong>Who:</strong> a computational-pathology group automating cell counting in stained tissue slides, 2024. <strong>Situation:</strong> they had trained a U-Net semantic segmenter that labeled every pixel "cell" or "background" with high pixel accuracy. <strong>Problem:</strong> the clinical metric was the <em>number</em> of cells of each type, and in dense regions the cells touched, so the U-Net's mask fused dozens of cells into one giant blob; counting connected components undercounted badly and a single mis-merged boundary could drop the count by a third. <strong>Decision:</strong> they reframed the task from semantic to instance segmentation and fine-tuned a Mask R-CNN, pretrained on COCO, on a few thousand annotated cells, reasoning that per-instance masks would keep touching cells separate by construction. They kept the U-Net as a fast first-pass tissue-versus-background filter. <strong>Result:</strong> instance-level counting error fell by more than half, and the per-cell masks let them also measure individual cell areas, a bonus the pathologists had not even asked for. <strong>Lesson:</strong> when the question is "how many" or "which one," semantic segmentation is the wrong tool no matter how good its pixel accuracy; instances are not a nicety, they are the answer. The reframing, not a bigger model, fixed the metric.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Fine-Tuning on Your Own Classes</div>
+<p>Adapting Mask R-CNN to new classes does not mean rebuilding the RPN, RoIAlign, and three heads from scratch. torchvision lets you swap just the final predictors and keep everything else pretrained:</p>
+<pre><code class="language-python">import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+
+model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+num_classes = 4   # background + 3 of your classes
+
+# Replace the box predictor.
+in_feat = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_feat, num_classes)
+
+# Replace the mask predictor.
+in_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+model.roi_heads.mask_predictor = MaskRCNNPredictor(in_mask, 256, num_classes)
+# Now train as usual; the backbone, FPN, and RPN keep their pretrained weights.</code></pre>
+<div class="code-caption">Retargeting Mask R-CNN to new classes: only the box and mask predictor heads are replaced, while the pretrained backbone, FPN, RPN, and RoIAlign are kept, so fine-tuning needs only a few hundred annotated images rather than COCO-scale data.</div>
+<p>This is roughly ten lines versus reimplementing the entire two-stage detector plus mask branch, and it preserves the expensive-to-learn backbone and region machinery while retargeting only the class-specific output layers. The library owns RoIAlign, the FPN, anchor generation, and the loss combination of subsection 1.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond Detect-Then-Segment</div>
+<p>Mask R-CNN's two-stage detect-then-segment design ruled instance segmentation from 2017 into the early 2020s, but the frontier has moved to single-stage and query-based methods that drop the explicit proposal-and-crop step. YOLACT and SOLO predict masks directly without per-region cropping; more importantly, the mask-transformer family, Mask2Former (<a href="section-24.4.html">Section 24.4</a>), treats instance segmentation as predicting a fixed set of masks with a transformer decoder, eliminating RoIAlign, the RPN, and non-maximum suppression entirely, and beating Mask R-CNN on COCO mask average precision. Newer detectors such as the RT-DETR and YOLO-family segmentation variants of 2024-2025 push real-time instance segmentation onto edge hardware. The "add a branch to a detector" recipe taught here remains the clearest mental model and a strong baseline, but production systems in 2025 increasingly reach for query-based universal segmenters.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.1: Semantic, Instance, or Neither <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, state whether semantic segmentation, instance segmentation, or plain object detection is the right tool, and justify in one sentence: (a) estimating the percentage of a satellite image covered by forest; (b) counting the number of pedestrians waiting at a crosswalk; (c) measuring the area in square millimeters of each individual skin lesion in a dermatology photo; (d) blurring every face in a crowd photo for privacy. Then explain why a perfectly accurate semantic segmenter would still fail task (b).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.2: Measure the RoIAlign Difference <span class="exercise-type coding">Coding</span></div>
+<p>Create a small synthetic feature map containing a sharp diagonal edge. Crop the same fractional-coordinate region twice: once with <code>torchvision.ops.roi_pool</code> and once with <code>torchvision.ops.roi_align</code>, both to a 7x7 output. Display the two crops side by side and compute their mean absolute difference. Write a short paragraph relating what you see to the quantization argument of subsection 2, and explain why this difference would matter more for a mask head than for a box-classification head.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.2.3: Confidence Threshold and the Precision-Recall Trade <span class="exercise-type analysis">Analysis</span></div>
+<p>Run the pretrained Mask R-CNN of subsection 3 on five images containing many overlapping objects. Sweep the score threshold from 0.3 to 0.9 in steps of 0.1 and, for each value, count how many instances survive and inspect (qualitatively) how many are correct versus spurious. Plot instance count versus threshold and write one paragraph connecting the curve to the precision-recall trade-off and the mask average-precision metric, which you will formalize in <a href="section-24.6.html">Section 24.6</a>. What threshold would you ship for the cell-counting application of subsection 3, and why?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-24.1.html">&#8592; Section 24.1: Semantic Segmentation: FCN, U-Net &amp; DeepLab</a>
+<a href="index.html">Chapter 24</a>
+<a class="next" href="section-24.3.html">Section 24.3: Panoptic Segmentation: Unifying Things &amp; Stuff &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

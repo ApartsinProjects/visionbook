@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.5: Sampling, Likelihood and the Quality-Diversity-Speed Trilemma. What sampling computes, why likelihood and visual quality diverge, and the trilemma that no generator escapes: high fidelity, full coverage, and fast sampling rarely come together." name="description"/>
+<title>Section 30.5: Sampling, Likelihood &amp; the Trilemma | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Foundations of Generative Modeling</a></div>
+<h1>Sampling, Likelihood &amp; the Quality-Diversity-Speed Trilemma</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked for pictures that were beautiful, varied, and instant. I drew them two of the three on a napkin and said pick. They kept turning the napkin over hoping a fourth corner would appear. It never does. I have checked many times."</p>
+<cite>A Generative Model With Opinions About Trade-offs</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A generator is judged on three things, and you usually get to keep two. Fidelity (do individual samples look real?), coverage (does the model produce the full variety of the data, or only a slice?), and speed (how many network passes does one sample cost?) pull against each other, and no single family wins all three.</strong> This is the quality-diversity-speed trilemma, and it is the practitioner's compass for the entire part. This section first separates two ideas that beginners often conflate, the likelihood a model assigns and the visual quality of its samples, which can move in opposite directions. It then states the trilemma, locates each family from <a href="section-30.2.html">Section 30.2</a> on it, and explains why diffusion's position, top quality and full coverage but slow sampling, launched a research wave aimed squarely at the speed corner. Reading a generative paper, you can usually predict its contribution by asking which corner of this triangle it is trying to bend.</p>
+</div>
+
+<p>
+The map of <a href="section-30.2.html">Section 30.2</a> told you the families; the latent and score machinery of <a href="section-30.3.html">Section 30.3</a> and <a href="section-30.4.html">Section 30.4</a> told you how they work. This section gives you the lens for judging the result. We start with what sampling and likelihood actually mean, show why a model can have excellent likelihood and mediocre-looking samples (or the reverse), then formalize the three-way trade that governs every design decision in the part. By the end you will read each subsequent chapter not as a parade of methods but as a series of moves on one triangle, which is exactly how the field thinks about its own progress.
+</p>
+
+<h2>1. What Sampling Actually Computes <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+<strong>Sampling</strong> means drawing an $\mathbf{x}$ such that, over many draws, the empirical distribution matches the model's $p_\theta(\mathbf{x})$. The cost of one draw, the <strong>sampling cost</strong>, is the number of expensive operations (network forward passes) it takes, and it varies enormously across families, as the sampling-signature code in <a href="section-30.2.html">Section 30.2</a> showed. A VAE, GAN, or flow samples in a single pass; an autoregressive model needs one pass per pixel; a diffusion model needs one pass per reverse step. Speed is therefore not an implementation detail but a structural property of the family, set by the shape of the sampling loop. The table below restates the cost in concrete numbers for a typical image, to make the orders of magnitude vivid.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 30.5.1:</strong> <em>Typical sampling cost for one image, by family (order-of-magnitude, 2026).</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Family</th>
+<th scope="col">Network passes per sample</th>
+<th scope="col">Why</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>VAE / GAN / Flow</td><td>1</td><td>One forward pass: latent or noise to image</td></tr>
+<tr><td>Diffusion (vanilla)</td><td>50 to 1000</td><td>One pass per reverse denoising step</td></tr>
+<tr><td>Diffusion (fast samplers)</td><td>4 to 50</td><td>Better solvers and distillation cut the steps</td></tr>
+<tr><td>Consistency / few-step</td><td>1 to 4</td><td>Distilled to approach single-pass sampling</td></tr>
+<tr><td>Autoregressive (per-pixel)</td><td>thousands</td><td>One pass per pixel or token, sequentially</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>
+The spread in Table 30.5.1, from one pass to thousands, is three orders of magnitude, and it is the single biggest practical difference between families. It is why a GAN can run as a real-time video filter while a vanilla diffusion model cannot, and why the fast-sampler and distillation rows exist at all: they are the field's response to diffusion's cost. We return to them at the end of the section.
+</p>
+
+<h2>2. Likelihood Is Not Quality <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A model's <strong>likelihood</strong> on held-out data, $p_\theta(\mathbf{x})$ for real test images, measures how much probability mass the model puts where the data actually is. It is the natural training objective for the probabilistic families (flows, autoregressive models, the VAE's bound). It is tempting to assume that higher likelihood means better-looking samples. It does not, and the disconnect is one of the most important facts in generative modeling. Theis, van den Oord, and Bethge made the point sharply in 2016: log-likelihood and sample quality are largely independent, and optimizing one is no guarantee of the other.
+</p>
+
+<p>
+Two mechanisms drive them apart. First, in high dimensions, average log-likelihood is dominated by getting the bulk statistics and the low-frequency structure right; a model can score well on likelihood while its samples look slightly blurry, because the perceptually crucial high-frequency detail contributes little to the likelihood number. This is the VAE's characteristic failure (good bound, soft samples). Second, a model can produce gorgeous samples while assigning near-zero probability to large regions of the true data, that is, high quality but terrible coverage; a GAN suffering mode collapse is the extreme case, and GANs do not even define a likelihood to expose the problem. The lesson is that you must measure what you care about: if you care about how samples look and how varied they are, likelihood is the wrong yardstick, and the perceptual and distributional metrics of <a href="section-30.6.html">Section 30.6</a> are the right ones.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Models, Same Likelihood, Opposite Samples</div>
+<p>Imagine two models of a face dataset with identical held-out log-likelihood. Model A spreads its mass slightly too broadly, so it covers every kind of face but its individual samples are a touch soft. Model B concentrates on the most common face types, so its individual samples are crisp but it never produces the rarer faces at all. Same likelihood, completely different behavior: A trades fidelity for coverage, B trades coverage for fidelity. Likelihood, a single scalar, cannot tell them apart, which is exactly why generative evaluation needs at least two numbers, one for fidelity and one for coverage. This insight is the bridge from this section's trilemma to the precision-and-recall metrics of <a href="section-30.6.html">Section 30.6</a>.</p>
+</div>
+
+<h2>3. The Trilemma, Stated <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Putting the pieces together gives the central organizing principle of the part. Every generator is scored on three desiderata, and improving any two tends to cost you the third:
+</p>
+
+<ul>
+<li><strong>Fidelity (quality):</strong> do individual samples look like real, sharp, artifact-free images?</li>
+<li><strong>Diversity (coverage):</strong> does the model reproduce the full variety of the data distribution, every mode, rather than a favored subset?</li>
+<li><strong>Speed:</strong> how few network passes does one sample cost?</li>
+</ul>
+
+<p>
+This is the <strong>quality-diversity-speed trilemma</strong> (named as such by Xiao, Kreis, and Vahdat in 2022, in the context of denoising diffusion). Figure 30.5.1 places the families at the trilemma's corners and edges, and the geometry tells the story: each family sits near the two corners it favors and far from the one it sacrifices.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A triangle with corners labeled fidelity, diversity, and speed; generative families placed inside according to which two corners they favor">
+<style>
+.tt{font:bold 13px sans-serif;fill:#14385c;}
+.tl{font:12px sans-serif;fill:#1a1a1a;}
+.ts{font:10px sans-serif;fill:#555;}
+.tri{fill:#f4f7fb;stroke:#2c6fb5;stroke-width:2;}
+.fam{fill:#fff;stroke:#2f9e5c;stroke-width:1.3;}
+.famd{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.6;}
+</style>
+<polygon class="tri" points="350,40 70,330 630,330"/>
+<text class="tt" x="350" y="30" text-anchor="middle">Fidelity</text>
+<text class="tt" x="60" y="352" text-anchor="end">Diversity</text>
+<text class="tt" x="640" y="352" text-anchor="start">Speed</text>
+<!-- GAN: fidelity + speed, low diversity (top-right edge) -->
+<rect class="fam" x="455" y="150" width="64" height="26" rx="4"/><text class="tl" x="487" y="168" text-anchor="middle">GAN</text>
+<text class="ts" x="487" y="190" text-anchor="middle">sharp + fast,</text>
+<text class="ts" x="487" y="202" text-anchor="middle">collapse risk</text>
+<!-- VAE / Flow: diversity + speed, lower fidelity (bottom edge) -->
+<rect class="fam" x="250" y="290" width="86" height="26" rx="4"/><text class="tl" x="293" y="308" text-anchor="middle">VAE / Flow</text>
+<text class="ts" x="293" y="332" text-anchor="middle">varied + fast, softer</text>
+<!-- Autoregressive: fidelity + diversity, slow (left edge) -->
+<rect class="fam" x="150" y="170" width="120" height="26" rx="4"/><text class="tl" x="210" y="188" text-anchor="middle">Autoregressive</text>
+<text class="ts" x="210" y="210" text-anchor="middle">crisp + varied,</text>
+<text class="ts" x="210" y="222" text-anchor="middle">very slow</text>
+<!-- Diffusion: fidelity + diversity, slow but improving (upper-left, drifting toward speed) -->
+<rect class="famd" x="300" y="120" width="98" height="26" rx="4"/><text class="tl" x="349" y="138" text-anchor="middle">Diffusion</text>
+<text class="ts" x="349" y="160" text-anchor="middle">top quality + coverage;</text>
+<text class="ts" x="349" y="172" text-anchor="middle">slow, getting faster &#8594;</text>
+</svg>
+<figcaption><strong>Figure 30.5.1:</strong> The quality-diversity-speed trilemma. Each corner is a desideratum; each family sits near the two it favors. GANs hug the fidelity-speed edge but risk losing diversity to mode collapse. VAEs and flows hug the diversity-speed edge but give up some fidelity. Autoregressive models reach fidelity and diversity but sit far from the speed corner. Diffusion (highlighted) reaches both fidelity and diversity at the cost of speed, and the arrow marks the active research direction: dragging diffusion toward the speed corner without giving up the other two.</figcaption>
+</figure>
+
+<p>
+The code below makes the diversity axis concrete by quantifying mode coverage on a toy mixture, the measurement that distinguishes a collapsed generator from a healthy one. It is the simplest possible diversity probe and the conceptual seed of the recall metric in <a href="section-30.6.html">Section 30.6</a>.
+</p>
+
+<pre><code class="language-python">import torch
+
+# A toy data distribution with 8 well-separated modes arranged in a ring.
+modes = torch.stack([torch.tensor([torch.cos(a), torch.sin(a)]) * 4
+                     for a in torch.linspace(0, 6.28, 9)[:-1]])
+
+def mode_coverage(samples, modes, radius=0.7):
+    """Fraction of the 8 modes that have at least one nearby sample (a recall proxy)."""
+    d = torch.cdist(samples, modes)                  # (n_samples, 8) distances
+    covered = (d.min(dim=0).values < radius)         # is each mode hit by some sample?
+    return covered.float().mean().item()
+
+# A healthy generator hits all modes; a collapsed one hits only a few.
+healthy   = modes[torch.randint(0, 8, (500,))] + 0.1 * torch.randn(500, 2)
+collapsed = modes[torch.randint(0, 2, (500,))] + 0.1 * torch.randn(500, 2)  # only 2 modes
+print("healthy coverage:  ", mode_coverage(healthy, modes))     # healthy coverage:   1.0
+print("collapsed coverage:", mode_coverage(collapsed, modes))   # collapsed coverage: 0.25</code></pre>
+<div class="code-caption">Measuring mode coverage on an eight-mode toy distribution. The healthy generator places samples near all eight modes (coverage 1.0); the collapsed generator covers only two of them (coverage 0.25) even though each of its individual samples may look perfectly sharp. Fidelity per sample and coverage of the distribution are genuinely different quantities, which is why the trilemma needs both as separate axes.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Synthetic-Data Generator That Looked Great and Failed</div>
+<p><strong>Who:</strong> a machine-learning team generating synthetic images to augment a medical-imaging classifier for a rare condition. <strong>Situation:</strong> real positive examples were scarce, so they trained a GAN on the available positives and planned to flood the training set with synthetic ones. <strong>Problem:</strong> the GAN's samples looked superb, radiologists on the team could not distinguish them from real scans, and yet the downstream classifier trained on the augmented set barely improved, and on some rare presentations got worse. <strong>Decision:</strong> rather than trust the eye-test fidelity, they measured coverage with a mode-coverage probe like the one above, computed in a feature space. The result was stark: the GAN had collapsed onto the two or three most common presentations of the condition and was producing almost none of the rare variants, which were exactly the cases the classifier needed help with. They switched to a diffusion-based generator, accepting slower sampling, because its coverage was far better, and retrained. <strong>Result:</strong> the diffusion-augmented classifier improved on the rare presentations the GAN had silently dropped. <strong>Lesson:</strong> per-sample fidelity, however convincing to a human, says nothing about coverage, and for data augmentation coverage is the property that matters. The trilemma is not abstract; choosing the wrong corner here would have shipped a classifier blind to the cases it most needed to catch. This data-engine use of generators returns in full in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>Beautiful, varied, and instant: pick two. This is the project-management triangle in a lab coat, and generative models obey it with the same grim reliability as your last software deadline. The whole research literature is the sound of thousands of people turning the napkin over, hoping a fourth corner appears. It still does not.</p>
+</div>
+
+<h2>4. Why Diffusion's Speed Problem Launched a Field <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Diffusion models landed in the enviable position of Figure 30.5.1: top fidelity and full coverage, the two corners hardest to get together. Their single weakness was the speed corner, vanilla sampling needed hundreds to a thousand network passes per image. Because the other two corners were already won, an enormous research effort poured into the third, and it is worth knowing the shape of that effort because it organizes much of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. The attacks come in two flavors. <strong>Better solvers</strong> treat sampling as numerically integrating a differential equation (the score-SDE or its deterministic ODE form) and use higher-order integrators (DDIM, DPM-Solver) to take far fewer, larger steps, cutting a thousand passes to twenty or fifty with little quality loss. <strong>Distillation</strong> trains a student network to reproduce in one or a few passes what the teacher diffusion model does in many, the route of progressive distillation and consistency models, pushing toward the single-pass speed of a GAN while keeping diffusion's coverage.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Trading Steps for Speed With One Argument</div>
+<p>You do not implement these fast samplers yourself; you select them. In <code>diffusers</code>, swapping a slow scheduler for a fast one and changing the step count is a two-line edit that moves you along the speed axis of the trilemma:</p>
+<pre><code class="language-python">from diffusers import DDPMScheduler, DPMSolverMultistepScheduler
+
+# Slow but simple: hundreds to a thousand steps.
+slow = DDPMScheduler.from_pretrained("model-id")          # ~1000 passes per image
+# Fast solver: comparable quality in far fewer steps.
+fast = DPMSolverMultistepScheduler.from_pretrained("model-id")
+# pipe.scheduler = fast; pipe(num_inference_steps=20)     # ~20 passes per image</code></pre>
+<div class="code-caption">Moving along the speed axis of the trilemma with a scheduler swap. Replacing the basic <code>DDPMScheduler</code> (about a thousand passes) with a higher-order <code>DPMSolverMultistepScheduler</code> at twenty steps keeps the same trained model but samples roughly fifty times faster at similar quality, the library form of trading the speed corner against nothing it already owns.</div>
+<p>The same trained model, sampled with a higher-order solver and 20 steps instead of a basic sampler at 1000, runs roughly fifty times faster at similar quality. The line-count cost of the speedup is one scheduler swap; the mathematics it packages (treating sampling as ODE integration) is the content of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>. The trilemma is, in practice, a set of knobs the library exposes.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Bending the Speed Corner to One Step</div>
+<p>The 2023 to 2026 frontier is the drive to collapse diffusion's step count toward one while keeping its quality and coverage, exactly the arrow in Figure 30.5.1. Consistency models (Song et al., 2023) and latent consistency models (Luo et al., 2023) distill multi-step diffusion into one-to-four-step samplers; adversarial distillation methods such as SDXL-Turbo and SD3-Turbo (Sauer et al., 2023 to 2024) reintroduce a GAN-style discriminator on top of a diffusion student to recover sharpness at a single step, a literal fusion of two corners of the triangle. Flow matching and rectified flow (Lipman et al. and Liu et al., 2023) straighten the noise-to-data path so that even few-step integration stays accurate, the basis of Stable Diffusion 3. The remarkable thing is that none of this work touches fidelity or coverage; it is a concentrated, multi-year assault on the single corner diffusion did not already own. Watching which corner a new method targets, and what it gives up to get there, is the fastest way to understand its contribution.</p>
+</div>
+
+<h2>5. The Compass for the Rest of the Part <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+You now hold the practitioner's compass. Sampling cost is structural, set by the family; likelihood and visual quality are different things that can move in opposite directions; and fidelity, diversity, and speed form a triangle on which every generator and every advance can be placed. When you read <a href="../module-32-gans/index.html">Chapter 32</a> on GANs, watch the diversity corner (mode collapse and its fixes); when you read <a href="../module-33-diffusion-models/index.html">Chapter 33</a> on diffusion, watch the speed corner. The only remaining foundational tool is how to actually measure the fidelity and diversity axes for real images, since the eye-test is not enough, as the medical-imaging story showed. That measurement problem is the subject of the final section.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.5.1: Same Likelihood, Different Samples <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Reread the Key Insight describing two models with identical held-out likelihood but opposite sample behavior. Construct your own concrete example with a one-dimensional or two-dimensional toy distribution: describe two models that would plausibly tie on average log-likelihood while one favors fidelity and the other coverage. Explain which single scalar metric would fail to separate them and which pair of metrics would succeed, connecting your answer forward to <a href="section-30.6.html">Section 30.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.5.2: Plot the Trade <span class="exercise-type coding">Coding</span></div>
+<p>Using the mode-coverage probe from Section 3, run a small experiment that makes the fidelity-versus-diversity trade visible. Generate samples from the eight-mode toy distribution under a parameter that controls how concentrated the generator is (for example, sample modes from a temperature-scaled categorical: low temperature concentrates on few modes, high temperature spreads out). Sweep that parameter, and for each value record both a per-sample fidelity proxy (mean distance to the nearest true mode) and the mode-coverage number. Plot fidelity against coverage across the sweep and describe the trade-off curve you see in one or two sentences.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.5.3: Diagnose the Knob <span class="exercise-type analysis">Analysis</span></div>
+<p>A teammate reports that switching their diffusion sampler from 1000 steps to 8 steps made generation forty times faster but their images now look slightly oversmoothed and a few previously distinct output styles have disappeared. Using the trilemma and the two attack strategies (better solvers versus distillation) from Section 4, diagnose what likely happened on each of the three axes, and recommend two concrete things they could try to recover the lost quality and diversity without returning all the way to 1000 steps. Justify each recommendation by naming the corner it targets.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-30.4.html">&#8592; Section 30.4: Energy-Based Models &amp; Score Matching</a>
+<a href="index.html">Chapter 30</a>
+<a class="next" href="section-30.6.html">Section 30.6: Evaluating Generators: A First Look &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

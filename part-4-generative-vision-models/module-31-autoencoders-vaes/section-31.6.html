@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.6: Discrete Latents: VQ-VAE &amp; Learned Codebooks. Replacing the continuous code with a learned discrete codebook: vector quantization, the straight-through estimator, the codebook and commitment losses, VQ-VAE-2 and VQGAN, and why a grid of discrete tokens became the alphabet that latent diffusion and autoregressive image models speak. Built from scratch in PyTorch." name="description"/>
+<title>Section 31.6: Discrete Latents: VQ-VAE &amp; Learned Codebooks | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders</a></div>
+<h1>Discrete Latents: VQ-VAE &amp; Learned Codebooks</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I do not deal in shades of meaning. I have eight thousand words in my dictionary, and every patch of every image must choose one. It is a brutal vocabulary, but you would be amazed what you can say with it."</p>
+<cite>A Codebook With Strong Opinions About Vocabulary</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Instead of a continuous code, the VQ-VAE snaps each piece of the encoder's output to the nearest entry in a learned dictionary, turning an image into a grid of discrete tokens drawn from a finite vocabulary.</strong> That single change has outsized consequences. A discrete token grid is exactly the kind of input a transformer or autoregressive model loves, so VQ-VAE turns image generation into the same problem as language modeling: predict the next token. The non-differentiable nearest-neighbor lookup is bridged by the straight-through estimator, which copies the gradient past the quantization as if it were the identity, and the codebook is trained with a small commitment loss. VQ-VAE-2 stacked codebooks for sharp high-resolution images, and VQGAN added a perceptual and adversarial loss to make the code crisp and compact. The grid of tokens you learn to produce here is the literal vocabulary that latent diffusion, autoregressive image models, and multimodal systems speak, the bridge from this chapter to the rest of Part IV.</p>
+</div>
+
+<p>
+Every latent in this chapter so far has been continuous: a real-valued vector, Gaussian-distributed, smooth. This section takes the opposite stance and makes the latent discrete. The motivation is partly that many things we model are inherently categorical (a phoneme, an object class, a word) and partly strategic: a discrete latent lets you put a powerful, expressive prior over the codes, a transformer or autoregressive model, and sample from it, which sidesteps the blur of a Gaussian decoder. The continuous VAE of <a href="section-31.3.html">Section 31.3</a> and the discrete VQ-VAE are the two great branches of the autoencoder family, and the discrete branch turned out to dominate the largest modern image generators.
+</p>
+
+<h2>1. Vector Quantization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A VQ-VAE keeps the encoder and decoder but inserts a quantization step between them. The encoder, a convolutional network, maps an image to a grid of continuous vectors, one vector per spatial location, say a $32 \times 32$ grid of $D$-dimensional vectors for a $256 \times 256$ image. A learned <strong>codebook</strong> holds $K$ embedding vectors $e_1, \ldots, e_K$ (the dictionary, the vocabulary). Each encoder output vector $z_e(x)$ is replaced by its nearest codebook entry:
+</p>
+
+<div class="math-block">
+$$z_q(x) = e_k, \quad \text{where} \quad k = \arg\min_j \lVert z_e(x) - e_j \rVert_2$$
+</div>
+
+<p>
+The decoder then reconstructs from the quantized grid $z_q$. The latent representation of the image is now just the grid of integer indices $k$, one per location, each pointing into the $K$-entry codebook. A $32 \times 32$ grid with a codebook of size $K = 8192$ describes the image with 1024 tokens, each a number from 0 to 8191, the image as a short paragraph in an 8192-word language. Figure 31.6.1 shows the encode, quantize, decode pipeline and the token grid it produces.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VQ-VAE pipeline: encoder produces a grid of continuous vectors, each snapped to the nearest codebook entry, producing a token grid that the decoder reconstructs from">
+<style>
+.ql{font:12px sans-serif;fill:#1a1a1a;}
+.qs{font:10px sans-serif;fill:#555;}
+.qin{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.qenc{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.qgrid{fill:#fff;stroke:#888;stroke-width:1;}
+.qcode{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.qtok{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1;}
+.qar{stroke:#777;stroke-width:1.5;marker-end:url(#qah);fill:none;}
+</style>
+<defs><marker id="qah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="qin" x="14" y="100" width="56" height="70"/>
+<text class="ql" x="42" y="92" text-anchor="middle">image x</text>
+<line class="qar" x1="70" y1="135" x2="92" y2="135"/>
+<rect class="qenc" x="94" y="110" width="58" height="50"/>
+<text class="ql" x="123" y="139" text-anchor="middle">encoder</text>
+<line class="qar" x1="152" y1="135" x2="174" y2="135"/>
+<g>
+<rect class="qgrid" x="176" y="108" width="18" height="18"/><rect class="qgrid" x="194" y="108" width="18" height="18"/><rect class="qgrid" x="212" y="108" width="18" height="18"/>
+<rect class="qgrid" x="176" y="126" width="18" height="18"/><rect class="qgrid" x="194" y="126" width="18" height="18"/><rect class="qgrid" x="212" y="126" width="18" height="18"/>
+<rect class="qgrid" x="176" y="144" width="18" height="18"/><rect class="qgrid" x="194" y="144" width="18" height="18"/><rect class="qgrid" x="212" y="144" width="18" height="18"/>
+</g>
+<text class="qs" x="205" y="178" text-anchor="middle">continuous z_e grid</text>
+<rect class="qcode" x="250" y="40" width="90" height="60"/>
+<text class="ql" x="295" y="58" text-anchor="middle">codebook</text>
+<text class="qs" x="295" y="74" text-anchor="middle">K entries</text>
+<text class="qs" x="295" y="90" text-anchor="middle">e&#8321; ... e_K</text>
+<line class="qar" x1="232" y1="120" x2="262" y2="100"/>
+<text class="qs" x="250" y="118" text-anchor="middle">nearest</text>
+<g>
+<rect class="qtok" x="350" y="108" width="18" height="18"/><rect class="qtok" x="368" y="108" width="18" height="18"/><rect class="qtok" x="386" y="108" width="18" height="18"/>
+<rect class="qtok" x="350" y="126" width="18" height="18"/><rect class="qtok" x="368" y="126" width="18" height="18"/><rect class="qtok" x="386" y="126" width="18" height="18"/>
+<rect class="qtok" x="350" y="144" width="18" height="18"/><rect class="qtok" x="368" y="144" width="18" height="18"/><rect class="qtok" x="386" y="144" width="18" height="18"/>
+</g>
+<text class="qs" x="377" y="178" text-anchor="middle">token grid z_q (indices)</text>
+<line class="qar" x1="320" y1="135" x2="348" y2="135"/>
+<line class="qar" x1="404" y1="135" x2="430" y2="135"/>
+<rect class="qenc" x="432" y="110" width="58" height="50"/>
+<text class="ql" x="461" y="139" text-anchor="middle">decoder</text>
+<line class="qar" x1="490" y1="135" x2="512" y2="135"/>
+<rect class="qin" x="514" y="100" width="56" height="70"/>
+<text class="ql" x="542" y="92" text-anchor="middle">x&#770;</text>
+<text class="qs" x="630" y="120" text-anchor="middle">latent = a grid of</text>
+<text class="qs" x="630" y="136" text-anchor="middle">integer token indices,</text>
+<text class="qs" x="630" y="152" text-anchor="middle">ready for a transformer</text>
+</svg>
+<figcaption><strong>Figure 31.6.1:</strong> The VQ-VAE pipeline. The encoder produces a spatial grid of continuous vectors; each is snapped to its nearest entry in the learned codebook, yielding a grid of integer token indices; the decoder reconstructs the image from the quantized grid. The image is now represented as a grid of discrete tokens from a finite vocabulary, exactly the format an autoregressive model or transformer consumes.</figcaption>
+</figure>
+
+<h2>2. The Straight-Through Estimator and the Losses <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The $\arg\min$ that picks the nearest codebook entry is not differentiable: its gradient is zero almost everywhere, so backpropagation cannot pass through it to train the encoder. VQ-VAE bridges this with the <strong>straight-through estimator</strong>. On the forward pass it uses the quantized vector $z_q$; on the backward pass it pretends the quantization was the identity and copies the gradient from the decoder input straight back to the encoder output, as if $z_q = z_e$. In code this is the elegant trick <code>z_q = z_e + (quantized - z_e).detach()</code>: the values equal <code>quantized</code> in the forward pass, but the gradient flows only through <code>z_e</code> because the difference is detached.
+</p>
+
+<p>
+That handles the encoder, but the codebook itself still needs a learning signal, and the encoder needs to be discouraged from producing outputs that drift far from any code. Two extra loss terms do this. The <strong>codebook loss</strong> $\lVert \text{sg}[z_e] - e \rVert^2$ pulls the chosen codebook entry toward the encoder output (sg is stop-gradient), and the <strong>commitment loss</strong> $\beta \lVert z_e - \text{sg}[e] \rVert^2$ pulls the encoder output toward its chosen code so the encoder "commits" to the codebook rather than oscillating. The full objective is
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{VQ}} = \underbrace{\lVert x - \hat{x} \rVert^2}_{\text{reconstruction}} + \underbrace{\lVert \text{sg}[z_e] - e \rVert^2}_{\text{codebook}} + \beta \underbrace{\lVert z_e - \text{sg}[e] \rVert^2}_{\text{commitment}}$$
+</div>
+
+<p>
+Notice there is no KL term and no fixed prior during this stage. Unlike the continuous VAE, a VQ-VAE is trained purely as a reconstruction autoencoder with codebook upkeep; the generative prior over tokens is learned separately afterward (subsection 3). The next block implements the whole quantizer, including the straight-through estimator and both losses.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_codes=512, dim=64, beta=0.25):
+        super().__init__()
+        self.codebook = nn.Embedding(num_codes, dim)
+        self.codebook.weight.data.uniform_(-1 / num_codes, 1 / num_codes)
+        self.beta = beta
+
+    def forward(self, z_e):                 # z_e: (B, dim, H, W)
+        B, D, H, W = z_e.shape
+        flat = z_e.permute(0, 2, 3, 1).reshape(-1, D)        # (B*H*W, D)
+        # Nearest codebook entry by squared Euclidean distance.
+        dist = (flat.pow(2).sum(1, keepdim=True)
+                - 2 * flat @ self.codebook.weight.t()
+                + self.codebook.weight.pow(2).sum(1))
+        idx = dist.argmin(1)                                  # token indices
+        quantized = self.codebook(idx).view(B, H, W, D).permute(0, 3, 1, 2)
+        # Codebook loss (move codes to encoder) + commitment loss (move encoder to codes).
+        codebook_loss = F.mse_loss(quantized, z_e.detach())
+        commit_loss = F.mse_loss(z_e, quantized.detach())
+        loss = codebook_loss + self.beta * commit_loss
+        # Straight-through: forward uses `quantized`, gradient flows to z_e.
+        quantized = z_e + (quantized - z_e).detach()
+        return quantized, loss, idx.view(B, H, W)
+
+vq = VectorQuantizer()
+z_e = torch.randn(4, 64, 8, 8)             # encoder output: 8x8 grid of 64-dim vecs
+zq, vq_loss, tokens = vq(z_e)
+print("token grid:", tokens.shape)         # token grid: torch.Size([4, 8, 8])</code></pre>
+<div class="code-caption">A complete vector quantizer. It finds each location's nearest codebook entry, computes the codebook and commitment losses, and applies the straight-through estimator so gradients reach the encoder despite the non-differentiable lookup. The returned token grid is the discrete latent.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Discrete Grid Is a Sentence the Model Can Predict</div>
+<p>The reason discrete latents took over the largest image models is not better reconstruction; continuous VAEs reconstruct at least as well. It is that a grid of tokens is the <em>same data type</em> as text, so the entire machinery of autoregressive and masked transformers from the language world applies unchanged. Once an image is 1024 tokens from a vocabulary of 8192, "generate an image" becomes "generate a sequence of tokens," exactly the problem GPT-style and BERT-style models solve. This is the conceptual bridge that made text-to-image models like the autoregressive members of the <a href="../module-34-text-to-image/index.html">Chapter 34</a> family possible, and it is why the VQ tokenizer sits at the input of so many multimodal systems. A continuous latent forces you to invent a new generative model for it; a discrete latent lets you borrow the most powerful sequence models that already exist.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Every Picture Is Now a Thousand-Word Essay, Literally</div>
+<p>The old saying promised a picture was worth a thousand words; the VQ-VAE took that as a build specification. A 32 by 32 grid with an 8192-entry codebook spells each image out in 1024 tokens, give or take, each token a "word" chosen from a brutal little dictionary that has no synonyms and no shades of meaning. It is the world's least poetic language, every patch forced to pick exactly one of eight thousand stock phrases, and yet a transformer reading these essays can be taught to write entirely new ones. The cliche turned out to be an architecture diagram.</p>
+</div>
+
+<h2>3. Learning a Prior Over Tokens <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A trained VQ-VAE is only an autoencoder; it cannot generate yet, because nothing tells you which token grids are plausible. The second stage fixes this by training a generative model over the token grids the encoder produces on the training set. Originally this was a PixelCNN-style autoregressive model predicting each token from those above and to the left; modern systems use a transformer, predicting tokens in raster order (autoregressive) or filling masked tokens (masked, BERT-style). To sample a new image you generate a fresh token grid from this prior, look up each token in the codebook to get the quantized grid, and decode. The two-stage structure, learn a tokenizer, then learn a prior over tokens, is the template for an enormous family of generative models. The next block shows the sampling procedure.
+</p>
+
+<pre><code class="language-python">import torch
+
+# Stage 1 (done): a trained VQ-VAE with encoder, codebook, decoder.
+# Stage 2: a transformer `prior` trained to model sequences of token indices.
+
+@torch.no_grad()
+def sample_image(prior, vqvae, grid_hw=(8, 8), start_token=0):
+    H, W = grid_hw
+    tokens = torch.full((1, H * W), start_token, dtype=torch.long)
+    for i in range(H * W):                       # autoregressive token generation
+        logits = prior(tokens)[:, i]             # predict token i
+        tokens[:, i] = torch.distributions.Categorical(logits=logits).sample()
+    tokens = tokens.view(1, H, W)
+    quantized = vqvae.quantizer.codebook(tokens).permute(0, 3, 1, 2)  # indices -> vecs
+    return vqvae.decoder(quantized)              # decode the token grid to an image
+# The transformer prior does the generating; the VQ-VAE decoder only renders.
+# This is the same recipe behind token-based text-to-image models.</code></pre>
+<div class="code-caption">Two-stage generation with a VQ-VAE. A transformer prior generates a grid of token indices autoregressively; those indices are looked up in the codebook and decoded into an image. The tokenizer and the prior are trained separately, the template for autoregressive image generation.</div>
+
+<h2>4. VQ-VAE-2, VQGAN, and the Road to Diffusion <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Two refinements turned the VQ-VAE from a clever idea into production infrastructure. VQ-VAE-2 (2019) stacked the codebooks into a hierarchy, a top codebook for global structure and a bottom codebook for detail, the discrete cousin of the hierarchical VAE in <a href="section-31.5.html">Section 31.5</a>, and paired it with a powerful autoregressive prior to produce sharp, large, diverse images, proving discrete latents scale. VQGAN (2021) made the autoencoder itself much better by adding a <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">perceptual loss</a> and an adversarial discriminator (the <a href="../module-32-gans/index.html">GAN</a> idea of <a href="../module-32-gans/index.html">Chapter 32</a>, used here only to sharpen the decoder) so that a small token grid could be decoded into a crisp high-resolution image. That compact, crisp tokenizer is exactly what made transformer-based image generation efficient, since the transformer only has to model a short sequence.
+</p>
+
+<p>
+The line from here to the rest of Part IV is direct. VQGAN's autoencoder is the ancestor of the autoencoder that latent diffusion runs inside, and the continuous-latent <code>AutoencoderKL</code> of <a href="section-31.3.html">Section 31.3</a> and the discrete VQGAN tokenizer are the two options every latent-space generator chooses between. Latent diffusion (<a href="../module-33-diffusion-models/index.html">Chapter 33</a>) mostly took the continuous route; autoregressive and masked-token image models took the discrete route. Both run their heavy generative model in the compressed latent space that an autoencoder from this chapter provides, which is the single most important practical lesson of Chapter 31: the autoencoder is the compression layer that makes large-scale generation affordable.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Vector Quantization in a Few Lines</div>
+<p>The quantizer above is about thirty lines and has subtle correctness traps (the distance computation, the straight-through detach, codebook collapse where most entries go unused). The <code>vector-quantize-pytorch</code> library packages a battle-tested <code>VectorQuantize</code> module plus modern variants, residual VQ, finite scalar quantization (FSQ), and lookup-free quantization, behind a one-line call (<code>VectorQuantize(dim=64, codebook_size=512)</code>), and it handles codebook reinitialization and exponential-moving-average updates that prevent the dead-code problem internally. For the diffusion-grade autoencoder, Hugging Face Diffusers ships <code>VQModel</code> with pretrained weights. Write the from-scratch quantizer once to understand the straight-through estimator; reach for the library the moment you train anything real, because the codebook-utilization tricks it implements are exactly the part that is easy to get wrong.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tokenizing a Product Catalog for a Multimodal Search</div>
+<p><strong>Who:</strong> an engineer at an online retailer building a system that lets shoppers search the catalog with images and text in one model, 2024. <strong>Situation:</strong> they wanted a single transformer to handle both modalities, but images are continuous and text is discrete, so the two did not fit one model. <strong>Problem:</strong> bolting a separate image encoder onto a text transformer made the system complex and hard to train jointly. <strong>Decision:</strong> they ran every product image through a pretrained VQGAN tokenizer, turning each image into a short grid of discrete tokens, and then treated image tokens and text tokens as one shared vocabulary fed to a single transformer. <strong>Result:</strong> one model consumed both modalities natively, image-token sequences sitting alongside word tokens, which simplified training and let the model learn cross-modal associations directly. <strong>Lesson:</strong> discretizing images with a VQ tokenizer is the standard move for unifying vision and language in a single sequence model; the moment your images become tokens, every tool built for text sequences becomes available, which is precisely why discrete latents anchor so many multimodal systems.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Tokenizers Are the Bottleneck Everyone Is Optimizing</div>
+<p>In 2024 to 2026 the image tokenizer is one of the most actively optimized components of the generative stack, because its compression ratio and reconstruction quality cap what every downstream model can achieve. Finite scalar quantization (FSQ, 2023) and lookup-free quantization (2024) replace the learned codebook with a fixed quantization grid, eliminating the codebook-collapse problem and simplifying training while matching VQ quality. Magvit-v2-style tokenizers brought very large codebooks and strong video tokenization, and several 2024 to 2025 systems push toward "one tokenizer for image and video" so a single model can generate both. There is also active debate over continuous versus discrete latents for the largest models, with diffusion favoring continuous and autoregressive models favoring discrete, and hybrid designs blurring the line. The straight-through estimator and commitment loss you implemented here remain the conceptual core of the discrete branch, and the codebook you trained is the direct ancestor of the tokenizers feeding the frontier multimodal models of <a href="../module-34-text-to-image/index.html">Chapter 34</a> and <a href="../module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.6.1: Why Straight-Through Works <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The straight-through estimator pretends the quantization is the identity on the backward pass even though it is not on the forward pass. Explain in three or four sentences why this biased gradient still trains the encoder usefully, and what role the commitment loss plays in making the lie harmless (hint: think about keeping the encoder output close to its chosen code so the "identity" approximation stays accurate). Then explain why a VQ-VAE needs the separate codebook loss in addition, and what would go wrong if you trained the codebook entries with the straight-through gradient alone.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.6.2: Build a VQ-VAE and Inspect Codebook Usage <span class="exercise-type coding">Coding</span></div>
+<p>Assemble a convolutional VQ-VAE for MNIST or CIFAR-10 using the <code>VectorQuantizer</code> of subsection 2: a convolutional encoder down to an $8 \times 8$ grid, the quantizer with a 256-entry codebook, and a transposed-convolution decoder. Train it and reconstruct test images. Then diagnose <strong>codebook collapse</strong>: count how many of the 256 codebook entries are actually used across the test set, and plot a histogram of usage. If many entries are dead (never selected), describe one fix (codebook reinitialization or an EMA update) and explain why dead codes waste capacity, connecting to the library-shortcut note about why production quantizers implement these fixes.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.6.3: Continuous vs Discrete Latent Trade-offs <span class="exercise-type analysis">Analysis</span></div>
+<p>Write a one-page comparison of the continuous VAE latent of <a href="section-31.3.html">Section 31.3</a> against the discrete VQ-VAE latent of this section, organized around four axes: (1) how you generate (sample a Gaussian and decode, versus learn and sample a prior over tokens), (2) interpolation behavior (smooth versus discrete jumps), (3) what generative model the latent invites (custom continuous model versus borrowed sequence transformer), and (4) the failure modes (posterior collapse versus codebook collapse). Conclude with a recommendation: for a system that wants to reuse a powerful pretrained sequence model and one that wants smooth latent-space editing, which latent would you choose and why? Connect your answer to the continuous-versus-discrete choice that <a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s latent diffusion faces.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-31.5.html">&#8592; Section 31.5: Hierarchical VAEs: From Ladder Networks to NVAE</a>
+<a href="index.html">Chapter 31</a>
+<a class="next" href="../module-32-gans/index.html">Chapter 32: Generative Adversarial Networks &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

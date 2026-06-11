@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.5: COLMAP &amp; Modern Reconstruction Pipelines. Running COLMAP end to end, reading its database and reconstruction outputs, the learned-feature upgrade with hloc, GLOMAP's global solver, and how reconstructions feed NeRF and Gaussian splatting." name="description"/>
+<title>Section 14.5: COLMAP &amp; Modern Reconstruction Pipelines | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>COLMAP &amp; Modern Reconstruction Pipelines</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You spent four sections teaching me to find tracks, register cameras, triangulate points, and balance the whole thing with bundle adjustment. Adorable. There is a button for that. It is called <code>colmap automatic_reconstructor</code>, and it has read your homework."</p>
+<cite>A Reconstruction Pipeline That Has Seen Every Tutorial Ever Written</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Everything the previous four sections built by hand, feature tracks, two-view seeding, incremental registration, triangulation, and bundle adjustment, is packaged in COLMAP into a tool you drive with a few commands, and understanding the pieces is exactly what lets you read its output, diagnose its failures, and upgrade it.</strong> This section runs the production pipeline: the COLMAP graphical and command-line workflows, the SQLite database and the binary model files it writes, the learned-feature swap with <code>hloc</code> that rescues the hard image pairs of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, the global solver GLOMAP that trades the slow incremental loop of <a href="section-14.2.html">Section 14.2</a> for a single fast estimate, and the dense and neural reconstructions, multi-view stereo, NeRF, and Gaussian splatting, that consume the poses this chapter produces. By the end you can turn a folder of photographs into a posed, point-rich 3D model and know which knob to turn when it comes out wrong.</p>
+</div>
+
+<p>
+The last four sections were a from-scratch education: <a href="section-14.1.html">Section 14.1</a> chained matches into tracks, <a href="section-14.2.html">Section 14.2</a> grew a model camera by camera, <a href="section-14.3.html">Section 14.3</a> polished it with bundle adjustment, and <a href="section-14.4.html">Section 14.4</a> turned the same machinery into a real-time map. That education was not wasted effort to be replaced by a library call; it is the only thing that makes the library call diagnosable. When COLMAP returns a reconstruction that has split into two disconnected pieces, or registers eleven of your forty images and gives up, the fix is never in the documentation. It is in knowing that two-view seeding needs a wide baseline, that PnP registration needs enough existing points in view, and that a drifting model is a bundle-adjustment-and-track-length problem. This section is the bridge from the textbook pipeline to the one practitioners actually run, and it keeps one foot on each side of that bridge.
+</p>
+
+<h2>1. COLMAP: The Pipeline in Five Commands <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+COLMAP (Sch&#246;nberger and Frahm, "Structure-from-Motion Revisited," CVPR 2016) is the default open-source structure-from-motion tool, and its design follows the chapter exactly. It runs in three logical stages: <strong>feature extraction</strong> (detect and describe keypoints in every image, the SIFT of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>), <strong>matching</strong> (find correspondences between image pairs and verify them with the two-view geometry of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>), and <strong>mapping</strong> (the incremental loop of <a href="section-14.2.html">Section 14.2</a> with the bundle adjustment of <a href="section-14.3.html">Section 14.3</a> folded in). Figure 14.5.1 lays the stages out alongside the section that taught each one.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="COLMAP pipeline as five stacked stages: images flow into feature extraction, then matching with geometric verification, then incremental mapping with bundle adjustment, producing a sparse model, which optionally flows into dense MVS or neural reconstruction. Each stage is annotated with the chapter section that teaches it">
+<g font-family="sans-serif" font-size="13">
+<!-- input -->
+<rect x="20" y="100" width="110" height="50" rx="6" fill="#eef2f7" stroke="#2980b9" stroke-width="1.6"/>
+<text x="75" y="122" text-anchor="middle" font-weight="bold" fill="#2c3e50">image set</text>
+<text x="75" y="140" text-anchor="middle" fill="#5a626c" font-size="11">a folder of photos</text>
+<!-- feature extraction -->
+<rect x="160" y="100" width="120" height="50" rx="6" fill="#eaf6ee" stroke="#1e8449" stroke-width="1.6"/>
+<text x="220" y="120" text-anchor="middle" font-weight="bold" fill="#2c3e50">extract</text>
+<text x="220" y="137" text-anchor="middle" fill="#5a626c" font-size="11">SIFT (Ch 10)</text>
+<!-- matching -->
+<rect x="310" y="100" width="120" height="50" rx="6" fill="#eaf6ee" stroke="#1e8449" stroke-width="1.6"/>
+<text x="370" y="120" text-anchor="middle" font-weight="bold" fill="#2c3e50">match + verify</text>
+<text x="370" y="137" text-anchor="middle" fill="#5a626c" font-size="11">F matrix (Ch 13)</text>
+<!-- mapping -->
+<rect x="460" y="100" width="130" height="50" rx="6" fill="#fdf0e3" stroke="#d68910" stroke-width="1.6"/>
+<text x="525" y="118" text-anchor="middle" font-weight="bold" fill="#2c3e50">incremental map</text>
+<text x="525" y="135" text-anchor="middle" fill="#5a626c" font-size="11">PnP + BA (14.2/14.3)</text>
+<!-- sparse model -->
+<rect x="620" y="100" width="110" height="50" rx="6" fill="#f4ecf7" stroke="#8e44ad" stroke-width="1.6"/>
+<text x="675" y="120" text-anchor="middle" font-weight="bold" fill="#2c3e50">sparse model</text>
+<text x="675" y="137" text-anchor="middle" fill="#5a626c" font-size="11">poses + points</text>
+<!-- dense / neural -->
+<rect x="620" y="185" width="220" height="46" rx="6" fill="#fdeeee" stroke="#c0392b" stroke-width="1.6"/>
+<text x="730" y="205" text-anchor="middle" font-weight="bold" fill="#2c3e50">dense MVS / NeRF / 3DGS</text>
+<text x="730" y="222" text-anchor="middle" fill="#5a626c" font-size="11">Section 4 of this section, and Ch 27</text>
+<!-- arrows -->
+<g stroke="#5a626c" stroke-width="2" fill="#5a626c">
+<line x1="130" y1="125" x2="156" y2="125"/><polygon points="158,125 148,120 148,130"/>
+<line x1="280" y1="125" x2="306" y2="125"/><polygon points="308,125 298,120 298,130"/>
+<line x1="430" y1="125" x2="456" y2="125"/><polygon points="458,125 448,120 448,130"/>
+<line x1="590" y1="125" x2="616" y2="125"/><polygon points="618,125 608,120 608,130"/>
+<line x1="675" y1="150" x2="675" y2="183"/><polygon points="675,185 670,175 680,175"/>
+</g>
+</g>
+</svg>
+<figcaption><strong>Figure 14.5.1</strong> The COLMAP pipeline, annotated with the section that teaches each stage. Feature extraction and matching are Chapters 10 and 13; the incremental mapper is Sections 14.2 and 14.3; the sparse model (camera poses plus a sparse point cloud) is the deliverable, optionally densified or handed to a neural renderer (Section 4 below and Chapter 27). Nothing here is new physics; it is the chapter, productionized.</figcaption>
+</figure>
+
+<p>
+The fastest path is the one-shot driver, which chooses sensible defaults and runs all three stages. Given a directory <code>project/images/</code>, the entire reconstruction is one command:
+</p>
+
+<pre><code class="language-bash"># One-shot reconstruction. COLMAP picks GPU SIFT, exhaustive matching for small
+# sets, and writes everything under project/.
+colmap automatic_reconstructor \
+    --workspace_path project \
+    --image_path project/images
+
+# project/ now contains:
+#   database.db                  SQLite: keypoints, descriptors, matches, two-view geometries
+#   sparse/0/{cameras,images,points3D}.bin   the reconstructed model(s)
+#   dense/                       (if dense stereo ran) depth maps + fused point cloud</code></pre>
+<div class="code-caption">The single-command COLMAP workflow. <code>automatic_reconstructor</code> wraps the same extract / match / map stages the chapter built by hand; the multiple <code>sparse/N/</code> folders appear only when the image set splits into separate connected components, the productionized form of the disconnected-graph problem from <a href="section-14.1.html">Section 14.1</a>.</div>
+
+<p>
+For anything beyond a quick look you run the stages explicitly, because each exposes parameters that decide success. The matcher choice is the most consequential: <code>exhaustive_matcher</code> compares every pair (quadratic, fine for tens of images), <code>sequential_matcher</code> matches each frame to its temporal neighbors plus loop-closure candidates (ideal for video, echoing <a href="section-14.4.html">Section 14.4</a>), and <code>vocab_tree_matcher</code> uses a visual vocabulary to propose likely pairs for large unordered collections, the "Building Rome in a Day" idea from <a href="section-14.1.html">Section 14.1</a>.
+</p>
+
+<pre><code class="language-bash"># Explicit five-command pipeline, the form you actually tune.
+colmap feature_extractor \
+    --database_path project/database.db \
+    --image_path project/images \
+    --SiftExtraction.estimate_affine_shape 1   # better repeatability under viewpoint change
+
+colmap sequential_matcher \                    # use exhaustive_ or vocab_tree_ for unordered sets
+    --database_path project/database.db \
+    --SequentialMatching.loop_detection 1      # enable loop closure for video
+
+colmap mapper \
+    --database_path project/database.db \
+    --image_path project/images \
+    --output_path project/sparse \
+    --Mapper.ba_global_function_tolerance 1e-6 # bundle-adjustment convergence (Section 14.3)
+
+colmap model_converter \                        # export to a human-readable text model
+    --input_path project/sparse/0 \
+    --output_path project/sparse_text \
+    --output_type TXT</code></pre>
+<div class="code-caption">The explicit pipeline. Each <code>colmap</code> subcommand is one of the chapter's stages; the flags that matter most are the matcher choice (exhaustive / sequential / vocab-tree, depending on whether the images are ordered) and the mapper's bundle-adjustment tolerances, which trade reconstruction time against final reprojection error.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: COLMAP Has No Magic, Only Defaults</div>
+<p>Every COLMAP failure maps onto a concept from this chapter. A reconstruction that registers a fraction of the images has a track-and-matching problem (<a href="section-14.1.html">Section 14.1</a>): the unregistered images share too few verified correspondences with the model. A model that splits into two <code>sparse/N/</code> folders has a disconnected view graph. A banana-shaped reconstruction of a straight corridor is drift, the bundle-adjustment-and-loop-closure issue of Sections <a href="section-14.3.html">14.3</a> and <a href="section-14.4.html">14.4</a>. A reconstruction that collapses to a plane chose a degenerate seed pair. The tool is a fast, well-tuned implementation of the pipeline you now understand; debugging it is applied chapter content, not documentation archaeology.</p>
+</div>
+
+<h2>2. Reading the Database and the Model <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+COLMAP's two outputs are a SQLite database and a reconstruction model, and reading them directly turns the tool from a black box into an instrument. The <strong>database</strong> (<code>database.db</code>) holds everything from the front end: a <code>cameras</code> table of intrinsic models, an <code>images</code> table, a <code>keypoints</code> table (one blob of detected points per image), a <code>descriptors</code> table, a <code>matches</code> table (raw putative matches per pair), and a <code>two_view_geometries</code> table (the inlier matches that survived geometric verification, plus the fundamental, essential, or homography matrix). That last table is the chapter's correspondence-and-RANSAC pipeline frozen on disk.
+</p>
+
+<p>
+The <strong>model</strong> is three binary files in <code>sparse/0/</code>: <code>cameras.bin</code> (intrinsics), <code>images.bin</code> (one entry per registered image: its quaternion-and-translation pose plus the 2D-to-3D observations), and <code>points3D.bin</code> (each triangulated point's XYZ, color, reprojection error, and the track of images that see it, the track from <a href="section-14.1.html">Section 14.1</a> made concrete). COLMAP ships <code>pycolmap</code>, a Python binding that reads both without you parsing the binary format. The following listing opens a finished model and computes the diagnostics every reconstruction should be checked against.
+</p>
+
+<pre><code class="language-python">import pycolmap
+import numpy as np
+
+# Load a finished reconstruction (the sparse/0 folder COLMAP wrote).
+rec = pycolmap.Reconstruction("project/sparse/0")
+print(rec.summary())            # quick stats: #images registered, #points, mean track length
+
+# How many images actually got registered, and which were dropped?
+n_reg = rec.num_reg_images()
+print(f"registered {n_reg} images, {len(rec.points3D)} points")
+
+# Track length: the count of images observing each 3D point. Short tracks
+# (seen by only 2 cameras) are poorly constrained; long tracks are gold.
+track_lengths = np.array([p.track.length() for p in rec.points3D.values()])
+print(f"mean track length {track_lengths.mean():.2f}, "
+      f"fraction length-2 {np.mean(track_lengths == 2):.2%}")
+
+# Reprojection error: the bundle-adjustment residual (Section 14.3) per point.
+errors = np.array([p.error for p in rec.points3D.values()])
+print(f"mean reprojection error {errors.mean():.3f} px")  # healthy models: well under 1 px
+
+# Per-image camera centers, for plotting the trajectory or a top-down map.
+centers = np.array([img.projection_center() for img in rec.images.values()])
+print("scene extent (m, in the model's arbitrary scale):",
+      centers.max(0) - centers.min(0))</code></pre>
+<div class="code-caption">Reading a COLMAP model with <code>pycolmap</code>. The four printed diagnostics, registration count, track-length distribution, mean reprojection error, and scene extent, are the health check for any reconstruction; a model with many length-2 tracks and a sub-pixel mean error is well constrained, while a high registration drop-out signals a matching problem upstream.</div>
+
+<p>
+A typical healthy run on a 40-image object scan prints something like <code>registered 40 images, 18204 points</code>, a mean track length near 4, a length-2 fraction below 25 percent, and a mean reprojection error around 0.6 px. Those numbers are the quantitative version of "the bundle adjustment converged and the tracks are long." When the registration count is far below the image count, the cure is upstream, in matching, which is exactly where the next subsection improves the tool.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Pipeline in Python</div>
+<p><code>pycolmap</code> exposes not just the readers above but the entire reconstruction pipeline as functions. The hand-built incremental mapper of <a href="section-14.2.html">Section 14.2</a> (several hundred lines of seeding, PnP registration, triangulation, and filtering) collapses to roughly five calls: <code>pycolmap.extract_features(db, image_dir)</code>, <code>pycolmap.match_exhaustive(db)</code>, then <code>pycolmap.incremental_mapping(db, image_dir, output_dir)</code>, with optional <code>pycolmap.triangulate_points(...)</code> and <code>pycolmap.bundle_adjustment(...)</code>. The library handles the database schema, GPU SIFT, the geometric-verification RANSAC, the next-best-view scheduling, robust triangulation, and the sparse Schur-complement bundle adjustment (<a href="section-14.3.html">Section 14.3</a>) internally. You write five lines; COLMAP runs the thousands that took the field two decades to get right.</p>
+</div>
+
+<h2>3. Upgrading the Front End: Learned Features with hloc <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+COLMAP's classical SIFT front end is excellent on well-textured, well-lit, densely-overlapping image sets and fragile everywhere else: low texture, repetitive structure, day-to-night or seasonal change, and especially wide baselines, the cases where the hand-crafted descriptors of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> were always going to struggle. The modern fix is to keep COLMAP's mapper (the geometry is sound) and replace only the front end with learned detection and matching. The Hierarchical Localization toolbox, <strong>hloc</strong>, is the standard wrapper for doing exactly that. It detects keypoints with SuperPoint, matches them with SuperGlue or the lighter LightGlue, optionally proposes image pairs with a global retrieval network (NetVLAD), and feeds the verified matches into COLMAP's database for triangulation and mapping.
+</p>
+
+<p>
+The architectural point is the same as <a href="section-14.4.html">Section 14.4</a>'s "geometry is solved, learning replaces perception": the bundle adjustment, triangulation, and pose estimation are unchanged classical machinery, while the perception layer (what is a keypoint, do these two patches match) becomes a network trained on the failures that broke SIFT. The result is dramatically higher registration rates on hard scenes for a few extra lines of orchestration.
+</p>
+
+<pre><code class="language-python">from pathlib import Path
+from hloc import extract_features, match_features, reconstruction, pairs_from_retrieval
+
+images = Path("project/images")
+outputs = Path("project/hloc")
+
+# Pre-defined configs select the network and its weights.
+retrieval_conf = extract_features.confs["netvlad"]      # global descriptor for pair proposal
+feature_conf   = extract_features.confs["superpoint_aachen"]  # learned local keypoints
+matcher_conf   = match_features.confs["superglue"]      # learned matcher (or "lightglue")
+
+# 1. Global descriptors, then propose the 20 most similar pairs per image
+#    (the learned analogue of vocab-tree matching from Section 14.1).
+retrieval_path = extract_features.main(retrieval_conf, images, outputs)
+sfm_pairs = outputs / "pairs-netvlad.txt"
+pairs_from_retrieval.main(retrieval_path, sfm_pairs, num_matched=20)
+
+# 2. Learned local features and matches.
+feature_path = extract_features.main(feature_conf, images, outputs)
+match_path = match_features.main(matcher_conf, sfm_pairs, feature_conf["output"], outputs)
+
+# 3. Hand the verified matches to COLMAP's incremental mapper unchanged.
+model = reconstruction.main(outputs / "sfm", images, sfm_pairs, feature_path, match_path)
+print(model.summary())   # same pycolmap Reconstruction object as Section 2</code></pre>
+<div class="code-caption">A SuperPoint + SuperGlue front end driving COLMAP's mapper through <code>hloc</code>. Only the perception layer changed; the output is the identical <code>pycolmap.Reconstruction</code> from the previous subsection, so the same health checks apply. On wide-baseline or appearance-changing scenes this routinely lifts registration from a minority of images to nearly all of them.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">From the Field: The Cathedral That Would Not Connect</div>
+<p>A cultural-heritage team was digitizing a Gothic cathedral interior from 1,200 visitor photographs spanning a decade, different cameras, different seasons, harsh window backlight against deep-shadow vaulting. Stock COLMAP with SIFT registered 430 of the 1,200 images and produced three disconnected models: the nave, a chapel, and a confused blob of the rose window. The lead engineer's instinct was to throw more images at it; the result was a fourth disconnected model. The actual problem was perception, not geometry: SIFT could not match a sunlit afternoon photo of a pillar to a flash-lit evening photo of the same pillar. Swapping the front end to SuperPoint + SuperGlue through hloc, with NetVLAD proposing cross-appearance pairs, registered 1,150 of the 1,200 into a single connected model on the same hardware. The decision that mattered was diagnostic: reading the database showed that the unregistered images had plenty of detected keypoints but almost no <em>verified</em> matches, which pointed at the matcher rather than at coverage. The lesson: when a reconstruction fragments, check whether the missing images lack correspondences (a front-end fix) or lack overlap (a capture fix); the cure is completely different, and only the database tells you which you have.</p>
+</div>
+
+<h2>4. Global SfM and the Neural Hand-off <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Incremental SfM (<a href="section-14.2.html">Section 14.2</a>) is accurate but slow: it solves a fresh bundle adjustment after every camera, so cost grows steeply with image count. <strong>Global</strong> SfM takes a different route. It first estimates all relative rotations and translations from the pairwise two-view geometries, then solves two global problems, a <em>rotation averaging</em> that makes every pairwise rotation mutually consistent and a <em>translation averaging</em> (and triangulation) that fixes the global geometry, finishing with a single bundle adjustment over everything at once. Historically global methods were faster but more fragile, especially in translation averaging. GLOMAP (Pan et al., ECCV 2024) closed that gap: it reuses COLMAP's database and front end, runs a robust global solver, and produces reconstructions of comparable accuracy to incremental COLMAP while being an order of magnitude or more faster on large scenes.
+</p>
+
+<pre><code class="language-bash"># GLOMAP consumes a COLMAP database (same feature_extractor + matcher as Section 1),
+# then solves the whole reconstruction globally instead of camera-by-camera.
+colmap feature_extractor --database_path project/database.db --image_path project/images
+colmap exhaustive_matcher --database_path project/database.db
+
+glomap mapper \
+    --database_path project/database.db \
+    --image_path project/images \
+    --output_path project/sparse_glomap   # writes the same cameras/images/points3D format</code></pre>
+<div class="code-caption">GLOMAP as a drop-in global mapper. It reads the identical COLMAP database the classical pipeline produces and emits the same model format, so <code>pycolmap</code> and the Section 2 diagnostics work unchanged; the difference is internal, a global rotation-and-translation solve replacing the incremental loop, which on large unordered collections is the difference between hours and minutes.</div>
+
+<p>
+Whichever solver produces it, the sparse model is rarely the final deliverable. A sparse cloud of triangulated keypoints is enough to localize cameras but too thin to look like a scene. Two routes densify it. The classical route is <strong>multi-view stereo</strong> (MVS): COLMAP's <code>patch_match_stereo</code> estimates a depth map per image by the dense matching ideas of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> generalized from two views to many, then <code>stereo_fusion</code> merges them into a dense point cloud, which meshing turns into a textured surface. The modern route hands the poses to a neural scene representation, and this is the chapter's most important forward link.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: COLMAP Poses Are the Currency of Neural 3D</div>
+<p>Neural Radiance Fields (NeRF) and 3D Gaussian Splatting do not estimate camera poses; they assume them. The standard input to both is a set of images plus the exact camera intrinsics and extrinsics, which in practice means a COLMAP reconstruction. Every "drop your photos here" NeRF or splatting demo you have used runs COLMAP first, silently, to recover the poses this chapter taught you to compute. The classical geometry of Part II is therefore not superseded by the neural era; it is the load-bearing first stage of it. When a NeRF comes out blurry, the cause is very often bad poses, which is a structure-from-motion problem you can now diagnose with <code>pycolmap</code>.</p>
+</div>
+
+<p>
+The hand-off is mechanical. NeRF (Mildenhall et al., 2020) trains a small network to map a 3D position and viewing direction to color and density, optimizing it so that volume-rendering the network along camera rays reproduces the input images; 3D Gaussian Splatting (Kerbl et al., SIGGRAPH 2023) replaces the network with millions of explicit oriented Gaussians that rasterize in real time, and crucially initializes them from the COLMAP sparse point cloud, so this chapter's <code>points3D.bin</code> is literally the splatting model's starting state. Both are the subject of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>; here it is enough to see that the COLMAP folder feeds them directly.
+</p>
+
+<pre><code class="language-python"># The neural hand-off in its most common form: convert a COLMAP model into the
+# transforms.json that NeRF / Gaussian-splatting trainers (e.g. nerfstudio) expect.
+import pycolmap, numpy as np, json
+
+rec = pycolmap.Reconstruction("project/sparse/0")
+frames = []
+for img in rec.images.values():
+    # COLMAP stores world-to-camera; renderers want camera-to-world (the inverse).
+    world_to_cam = img.cam_from_world.matrix()          # 3x4 [R | t]
+    T = np.eye(4); T[:3, :4] = world_to_cam
+    cam_to_world = np.linalg.inv(T)
+    frames.append({"file_path": f"images/{img.name}",
+                   "transform_matrix": cam_to_world.tolist()})
+
+cam = next(iter(rec.cameras.values()))                   # shared intrinsics (Chapter 12)
+meta = {"fl_x": cam.focal_length_x, "fl_y": cam.focal_length_y,
+        "cx": cam.principal_point_x, "cy": cam.principal_point_y,
+        "w": cam.width, "h": cam.height, "frames": frames}
+json.dump(meta, open("project/transforms.json", "w"), indent=2)
+print(f"wrote {len(frames)} posed frames for neural training")</code></pre>
+<div class="code-caption">Converting a COLMAP reconstruction into the posed-image format neural renderers consume. The one subtlety is the world-to-camera versus camera-to-world inversion (and, in full converters, an axis-convention flip), but the intrinsics are exactly the $K$ matrix of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> and the poses are exactly this chapter's output; the neural stage simply reads them.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The End-to-End Reconstructors (2024-2026)</div>
+<p>The newest work attacks the entire pipeline of this chapter with a single feed-forward network, no incremental loop, often no calibration, sometimes no poses at all. DUSt3R (Wang et al., CVPR 2024) and its follow-up MASt3R regress aligned pointmaps directly from an uncalibrated image pair, recovering depth, intrinsics, and relative pose in one pass. VGGT (Wang et al., CVPR 2025, the 2025 best-paper) extends this to hundreds of views, predicting cameras, depth, and 3D points in a single transformer forward pass that takes seconds where COLMAP takes minutes. MASt3R-SfM and follow-ons feed these predictions into a lightweight global optimizer for COLMAP-quality models without SIFT. On the rendering side, GLOMAP-plus-3DGS and pose-free splatting methods are collapsing the "estimate poses then train a renderer" two-step into one. The throughline for a reader of this chapter: these systems do not abolish structure from motion, they amortize it; they learn, from millions of scenes, a fast approximation of the very geometry, correspondence, triangulation, pose, and bundle adjustment, that Sections 14.1 through 14.4 derived from first principles. Understanding the classical pipeline is what lets you read their failure modes and know when the trustworthy slow tool is still the right call.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "transforms.json" pose file that nearly every NeRF and Gaussian-splatting codebase reads was popularized by NVIDIA's Instant-NGP, and its camera convention is subtly different from COLMAP's, OpenCV's, and Blender's. The resulting "my reconstruction is mirrored / upside down / inside out" bug is so common that converting between camera conventions is, by a wide margin, the most frequent question in NeRF community forums. Every one of those bugs is a sign-and-axis disagreement in exactly the extrinsic matrices this chapter taught you to build.</p>
+</div>
+
+<h2>5. Choosing a Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With several tools on the table, the practical question is which to reach for. The decision turns on three properties of your images: are they ordered (video or a planned capture) or an unordered pile; how many are there; and how hard is the appearance (texture, lighting, baseline). The table below summarizes the chapter's working advice.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 14.5.1:</strong> <em>Choosing a reconstruction pipeline for the common cases.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Situation</th>
+<th scope="col">Reach for</th>
+<th scope="col">Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tens of well-textured photos, good overlap</td>
+<td>COLMAP, exhaustive matcher</td>
+<td>SIFT is plenty; exhaustive matching is cheap at this scale and most thorough.</td>
+</tr>
+<tr>
+<td>Ordered video / planned scan</td>
+<td>COLMAP sequential matcher (or visual SLAM, <a href="section-14.4.html">Section 14.4</a>)</td>
+<td>Temporal order makes matching linear; loop detection closes drift.</td>
+</tr>
+<tr>
+<td>Hundreds-plus unordered images</td>
+<td>GLOMAP, or COLMAP vocab-tree</td>
+<td>Global solve or vocab-tree pairing avoids quadratic matching and incremental slowdown.</td>
+</tr>
+<tr>
+<td>Hard appearance: low texture, lighting / seasonal change, wide baselines</td>
+<td>hloc (SuperPoint + SuperGlue / LightGlue) into COLMAP</td>
+<td>Learned perception rescues the matches SIFT cannot make; geometry stays classical.</td>
+</tr>
+<tr>
+<td>Need a photorealistic render, not just poses</td>
+<td>COLMAP / GLOMAP poses, then 3DGS or NeRF (<a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>)</td>
+<td>The sparse model and its point cloud initialize the neural renderer.</td>
+</tr>
+<tr>
+<td>Seconds-scale preview, calibration unknown</td>
+<td>VGGT / DUSt3R-family feed-forward models</td>
+<td>One network pass; trade peak accuracy for speed and zero setup.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>
+Reading the table top to bottom traces the chapter's own arc: the classical tool first, then the upgrades that target a specific weakness (scale, perception, rendering, speed), each leaving the core geometry intact. That is the honest state of the field in 2026. The neural reconstructors are extraordinary and getting better monthly, but the structure-from-motion pipeline of this chapter remains the accuracy reference they are measured against and the silent first stage inside most of them.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.1: Read a Reconstruction's Vital Signs <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You run COLMAP on 60 photos and <code>pycolmap</code> reports: 38 images registered, mean track length 2.3, length-2 fraction 71 percent, mean reprojection error 1.9 px, and the model split into <code>sparse/0/</code> (31 images) and <code>sparse/1/</code> (7 images). Diagnose the reconstruction. Which two numbers are unhealthy and what does each indicate? Is the split more likely a matching failure or a coverage gap, and which single diagnostic from Section 2 would settle it? Propose the most likely single change (from Sections 1, 3, or 4) that would merge the model and lengthen the tracks.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.2: SIFT Versus Learned, Head to Head <span class="exercise-type coding">Coding</span></div>
+<p>Take a small image set with at least one hard pair (a strong viewpoint or lighting change). Reconstruct it twice: once with stock COLMAP (SIFT) and once with hloc (SuperPoint + SuperGlue) into COLMAP's mapper. For each, report registered-image count, mean track length, and mean reprojection error from <code>pycolmap</code>. Then identify, in the database's <code>two_view_geometries</code> table, the hard pair, and compare the number of verified inliers each front end produced on it. Write two sentences explaining the registration difference in terms of verified matches rather than detected keypoints.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.5.3: The Pose Hand-off Bug Hunt <span class="exercise-type analysis">Analysis</span></div>
+<p>You convert a COLMAP model to <code>transforms.json</code> using the Section 4 listing, train a Gaussian-splatting model, and the render comes out correctly shaped but mirrored left-to-right. The point cloud and reprojection errors from <code>pycolmap</code> are healthy. Where is the bug, in COLMAP, in your conversion, or in the renderer, and why do the healthy <code>pycolmap</code> diagnostics rule out two of the three? Name the specific operation in the conversion most likely responsible (hint: it is not the world-to-camera inversion, which is already in the listing) and explain why a mirrored-but-otherwise-correct result points squarely at a coordinate-convention disagreement rather than at the geometry.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.4.html">&#8592; Section 14.4: Visual SLAM: Mapping While Moving</a>
+<a href="index.html">Chapter 14</a>
+<a class="next" href="../module-15-motion-flow-tracking/index.html">Chapter 15: Motion, Optical Flow &amp; Tracking &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

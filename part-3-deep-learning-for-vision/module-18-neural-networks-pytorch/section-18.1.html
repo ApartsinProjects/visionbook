@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.1: From Linear Models to Multi-Layer Perceptrons. Why stacked linear layers collapse, how a nonlinear activation restores expressivity, and the MLP as the simplest network that learns curved decision boundaries." name="description"/>
+<title>Section 18.1: From Linear Models to Multi-Layer Perceptrons | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>From Linear Models to Multi-Layer Perceptrons</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Give me one matrix and I will draw you a straight line through anything. Give me two matrices with nothing between them and I will draw you the exact same line, twice the work, none the wiser."</p>
+<cite>A Linear Classifier With Delusions of Depth</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A neural network earns its power not from depth alone but from the nonlinear activation squeezed between its linear layers; remove that nonlinearity and any tower of layers collapses, algebraically, into a single linear map.</strong> This section starts from the linear classifier your linear algebra already supports, proves why stacking it changes nothing, inserts one nonlinear function to break the collapse, and arrives at the multi-layer perceptron: the simplest model that can separate classes a straight line cannot.</p>
+</div>
+<p>
+Part II ended with classical recognition pipelines that fed hand-crafted features into a linear classifier, the support vector machine and its relatives in <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>. The classifier was a single matrix; all the cleverness lived upstream in the features a human designed. Deep learning moves the cleverness inside the model, but the journey starts from that same linear classifier. We will build it, ask what we gain by stacking copies of it, discover the answer is "nothing", and then make one small change that turns it into a function approximator powerful enough to motivate the entire rest of this book.
+</p>
+<h2>1. The Linear Classifier, Revisited <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+A linear classifier scores an input vector $\mathbf{x} \in \mathbb{R}^d$ against $C$ classes with a single affine map. We stack the per-class weight vectors into a matrix $W \in \mathbb{R}^{C \times d}$ and add a bias $\mathbf{b} \in \mathbb{R}^C$:
+</p>
+<p>
+$$ \mathbf{z} = W\mathbf{x} + \mathbf{b}, \qquad \mathbf{z} \in \mathbb{R}^C. $$
+</p>
+<p>
+Each component $z_c$ is the unnormalized score (the <em>logit</em>) for class $c$. To turn logits into a probability distribution we apply the <strong>softmax</strong> function, which exponentiates and normalizes:
+</p>
+<p>
+$$ p_c = \frac{e^{z_c}}{\sum_{k=1}^{C} e^{z_k}}. $$
+</p>
+<p>
+For a vision input this $\mathbf{x}$ is, for now, a flattened image: a $28 \times 28$ grayscale picture becomes a length-784 vector by reading its pixels in row-major order. That flattening discards every spatial relationship between neighboring pixels, which is exactly the sin <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> will repair. For this section it is a feature, not a bug: it keeps the model a plain matrix multiply so we can reason about it cleanly. The code below builds the classifier with nothing but NumPy, to show there is no framework magic in a forward pass.
+</p>
+<pre><code class="language-python">import numpy as np
+
+def softmax(z):
+    # subtract the row max for numerical stability before exponentiating
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+rng = np.random.default_rng(0)
+batch, d, C = 4, 784, 10            # 4 flattened 28x28 images, 10 classes
+X = rng.standard_normal((batch, d))
+W = rng.standard_normal((C, d)) * 0.01
+b = np.zeros(C)
+
+Z = X @ W.T + b                     # logits, shape (4, 10)
+P = softmax(Z)                      # class probabilities, shape (4, 10)
+print(P.shape, P.sum(axis=1))       # (4, 10) [1. 1. 1. 1.]</code></pre>
+<div class="code-caption">A linear image classifier in pure NumPy: one matrix multiply produces logits, and a numerically stable softmax turns them into per-image class probabilities that each sum to one.</div>
+<p>
+The output confirms the shape and that each row of <code>P</code> is a valid distribution. This single linear layer is the entire model. The only question deep learning answers differently from Chapter 16 is where $W$ comes from: there it was fit by a convex solver on hand-crafted features; here it will be discovered by gradient descent (<a href="section-18.2.html">Section 18.2</a>) directly on pixels.
+</p>
+<h2>2. Why Stacking Linear Layers Gains Nothing <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+The obvious idea for more power is depth: send $\mathbf{x}$ through one linear layer, then another. Let the first layer be $W_1, \mathbf{b}_1$ producing a hidden vector $\mathbf{h} = W_1\mathbf{x} + \mathbf{b}_1$, and the second be $W_2, \mathbf{b}_2$ producing $\mathbf{z} = W_2\mathbf{h} + \mathbf{b}_2$. Substituting one into the other:
+</p>
+<p>
+$$ \mathbf{z} = W_2(W_1\mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2 = \underbrace{(W_2 W_1)}_{W'}\,\mathbf{x} + \underbrace{(W_2\mathbf{b}_1 + \mathbf{b}_2)}_{\mathbf{b}'}. $$
+</p>
+<p>
+The two-layer network is <em>identically</em> a one-layer network with weights $W' = W_2 W_1$ and bias $\mathbf{b}' = W_2\mathbf{b}_1 + \mathbf{b}_2$. No matter how many linear layers you stack, the composition is one matrix; the family of functions you can represent never grows beyond "straight cuts through input space". This is not an approximation or a training difficulty: it is an algebraic identity. The experiment below verifies it numerically.
+</p>
+<pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(1)
+x = rng.standard_normal((5, 6))           # batch of 5, input dim 6
+W1, b1 = rng.standard_normal((8, 6)), rng.standard_normal(8)
+W2, b2 = rng.standard_normal((3, 8)), rng.standard_normal(3)
+
+# two linear layers, no nonlinearity between them
+h = x @ W1.T + b1
+z_deep = h @ W2.T + b2
+
+# the equivalent single linear layer
+W_eq = W2 @ W1                            # (3, 6)
+b_eq = W2 @ b1 + b2                       # (3,)
+z_flat = x @ W_eq.T + b_eq
+
+print(np.allclose(z_deep, z_flat))        # True</code></pre>
+<div class="code-caption">A numerical proof that two stacked linear layers equal one: the deep output and the collapsed single-matrix output agree to floating-point precision, confirming the algebraic identity above.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Depth Without Nonlinearity Is an Illusion</div>
+<p>The representational power of a network comes from interleaving linear maps with nonlinear functions, never from the linear maps alone. A "deep" net with no activations is a costly way to compute a single matrix product. This is why the activation function is not a tuning detail but the load-bearing wall of the architecture: it is the only thing standing between you and a glorified linear regression.</p>
+</div>
+<h2>3. The Nonlinearity That Breaks the Collapse <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+Insert a nonlinear function $\sigma$ applied element-wise after the first linear layer, and the collapse argument fails because $W_2 \sigma(W_1 \mathbf{x})$ cannot be folded into a single matrix. The simplest and now-dominant choice is the <strong>rectified linear unit</strong>, $\mathrm{ReLU}(u) = \max(0, u)$, which zeroes negative values and passes positive ones unchanged. Its appeal is brutal simplicity: cheap to compute, a gradient of exactly $1$ for positive inputs (so signal does not shrink as it backpropagates through depth), and a hard zero elsewhere that yields sparse activations. Two older alternatives, the logistic sigmoid $\sigma(u) = 1/(1+e^{-u})$ and $\tanh$, squash inputs into a bounded range but saturate: for large magnitudes their gradient is near zero, which starves the deep layers of learning signal, the vanishing-gradient problem ReLU was introduced to sidestep.
+</p>
+<p>
+Geometrically, each ReLU unit folds input space along a hyperplane, and a layer of them tiles space into linear regions. Stacking layers multiplies the number of regions, which is how a network builds a curved decision boundary out of many flat pieces. Figure 18.1.1 contrasts the three activation shapes that the prose just described.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three activation functions plotted: ReLU as a flat-then-rising hinge, sigmoid as an S-curve saturating at 0 and 1, and tanh as an S-curve saturating at minus 1 and plus 1">
+  <g font-family="sans-serif" font-size="12">
+    <!-- ReLU panel -->
+    <text x="120" y="24" text-anchor="middle" font-weight="bold" fill="#1b4f72">ReLU(u) = max(0, u)</text>
+    <line x1="30" y1="200" x2="210" y2="200" stroke="#5a626c" stroke-width="1"/>
+    <line x1="120" y1="60" x2="120" y2="210" stroke="#5a626c" stroke-width="1"/>
+    <polyline points="40,200 120,200 200,80" fill="none" stroke="#2980b9" stroke-width="2.5"/>
+    <text x="120" y="232" text-anchor="middle" fill="#5a626c">gradient 0 or 1</text>
+    <!-- sigmoid panel -->
+    <text x="360" y="24" text-anchor="middle" font-weight="bold" fill="#9c4a00">sigmoid(u)</text>
+    <line x1="270" y1="200" x2="450" y2="200" stroke="#5a626c" stroke-width="1"/>
+    <line x1="360" y1="60" x2="360" y2="210" stroke="#5a626c" stroke-width="1"/>
+    <path d="M280,195 C330,193 340,90 360,80 C380,70 390,67 440,65" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+    <text x="360" y="232" text-anchor="middle" fill="#5a626c">saturates: gradient to 0</text>
+    <!-- tanh panel -->
+    <text x="600" y="24" text-anchor="middle" font-weight="bold" fill="#145a32">tanh(u)</text>
+    <line x1="510" y1="130" x2="690" y2="130" stroke="#5a626c" stroke-width="1"/>
+    <line x1="600" y1="60" x2="600" y2="210" stroke="#5a626c" stroke-width="1"/>
+    <path d="M520,195 C570,193 585,135 600,130 C615,125 630,67 680,65" fill="none" stroke="#1e8449" stroke-width="2.5"/>
+    <text x="600" y="232" text-anchor="middle" fill="#5a626c">zero-centered, also saturates</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 18.1.1</strong> The three classic activation functions. ReLU is a hinge with gradient exactly 0 or 1, which preserves signal through depth. Sigmoid and tanh are smooth S-curves that saturate at their extremes, where their near-zero gradient stalls learning in deep stacks. ReLU's non-saturating positive branch is why it became the default after 2012.</figcaption>
+</figure>
+<p>
+With a nonlinearity in place, a two-layer network $\mathbf{z} = W_2\,\sigma(W_1\mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2$ is genuinely more expressive than a single layer. This is the <strong>multi-layer perceptron</strong> (MLP), and the layer producing $\mathbf{h}$ is the <em>hidden</em> layer because its outputs are never observed directly, only consumed by the next layer.
+</p>
+<h2>4. The Multi-Layer Perceptron <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+An MLP is a chain of (linear layer, activation) pairs ending in a final linear layer that produces logits. With one hidden layer of width $H$, the forward pass on a flattened image is two matrix multiplies with a ReLU between them. The code makes a complete forward pass explicit, still in NumPy, so the only new ingredient beyond Section 1 is the single <code>maximum(0, ...)</code> call.
+</p>
+<pre><code class="language-python">import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+rng = np.random.default_rng(2)
+batch, d, H, C = 8, 784, 128, 10           # hidden layer of width 128
+X  = rng.standard_normal((batch, d))
+W1 = rng.standard_normal((H, d)) * np.sqrt(2.0 / d)   # He init for ReLU
+b1 = np.zeros(H)
+W2 = rng.standard_normal((C, H)) * np.sqrt(2.0 / H)
+b2 = np.zeros(C)
+
+h = np.maximum(0.0, X @ W1.T + b1)         # hidden activations (ReLU)
+Z = h @ W2.T + b2                          # output logits
+P = softmax(Z)
+print(h.shape, P.shape)                    # (8, 128) (8, 10)</code></pre>
+<div class="code-caption">A one-hidden-layer MLP forward pass: the only structural difference from the linear classifier is the elementwise ReLU between the two weight matrices, and the He-scaled initialization tuned for ReLU's variance.</div>
+<p>
+Notice the initialization scale $\sqrt{2/d}$, the <strong>He initialization</strong> matched to ReLU. Section 18.2 will explain why the scale of initial weights matters for gradient flow; for now treat it as the recipe that keeps activations from exploding or vanishing as they pass through the layer. The remarkable fact about this humble architecture is the <strong>universal approximation theorem</strong>: a single hidden layer of sufficient width can approximate any continuous function on a bounded domain to arbitrary accuracy. The theorem says nothing about <em>how wide</em> (it can be impractically large) or <em>how to find</em> the weights, which is exactly why depth and good optimization, not just width, drive practice.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Same MLP in Four Lines of PyTorch</div>
+<p>Everything above, the two weight matrices, the bias vectors, the ReLU, and the correct ReLU-tuned initialization, is a single <code>nn.Sequential</code> in PyTorch: <code>nn.Sequential(nn.Flatten(), nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 10))</code>. That replaces roughly 15 lines of manual NumPy (weight allocation, init scaling, the forward pass) with four, and the framework also wires up automatic differentiation so the backward pass of <a href="section-18.2.html">Section 18.2</a> comes for free, computes He initialization by default for layers followed by ReLU, and moves the whole thing to a GPU with one <code>.to(device)</code> call. We meet <code>nn.Module</code> and <code>nn.Sequential</code> properly in <a href="section-18.3.html">Section 18.3</a>.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Tabular Team That Reached for a CNN</div>
+<p><strong>Who:</strong> A data team at a logistics startup predicting next-day package volume per depot from a few dozen numeric and categorical features.</p>
+<p><strong>Situation:</strong> A new hire, fresh from a computer-vision course, proposed a convolutional network because "deep learning won vision". The features were tabular: counts, day-of-week, weather codes, prior-day volumes.</p>
+<p><strong>Problem:</strong> Convolution assumes a spatial or sequential neighborhood structure, which tabular columns do not have; column 7 being adjacent to column 8 means nothing. The CNN trained slowly, overfit, and never beat the gradient-boosted-tree baseline.</p>
+<p><strong>Decision:</strong> The team stepped back to the right tool. They kept a plain MLP (a few hidden layers with ReLU and dropout) for the neural baseline, fed it normalized features, and used it mainly to learn embeddings for the high-cardinality categorical columns, which the trees could not do cleanly.</p>
+<p><strong>Result:</strong> The MLP matched the tree baseline and the learned category embeddings gave a small but real lift when fed back into the ensemble. No convolution was harmed in the making of the model.</p>
+<p><strong>Lesson:</strong> The MLP, not the CNN, is the general-purpose neural network for unstructured-but-not-spatial data. Convolution is a structural prior for grids of pixels; reach for it in <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> when the data actually is a grid, not because the phrase "deep learning" appears in the project brief.</p>
+</div>
+<h2>5. Decision Boundaries: What the Hidden Layer Buys You <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The clearest way to feel the difference is the exclusive-or problem: four points labeled so that no straight line separates the two classes. A linear classifier provably cannot solve it (this is the historical result that froze neural-network research for a decade). A two-layer MLP solves it easily, because the hidden ReLU units carve input space into regions the output layer can then combine. The snippet evaluates an MLP whose weights are set by hand to the known XOR solution, to show the mechanism without yet invoking training.
+</p>
+<pre><code class="language-python">import numpy as np
+
+# XOR: class 1 when exactly one input is 1
+X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=float)
+y = np.array([0, 1, 1, 0])
+
+# Hand-set weights: two hidden ReLU units detect the two "exactly one on" cases
+W1 = np.array([[1.0, 1.0], [1.0, 1.0]])
+b1 = np.array([0.0, -1.0])
+W2 = np.array([[1.0, -2.0]])      # combine the two hidden features
+b2 = np.array([0.0])
+
+h = np.maximum(0.0, X @ W1.T + b1)
+score = (h @ W2.T + b2).ravel()
+pred = (score &gt; 0.5).astype(int)
+print(pred, "matches labels:", np.array_equal(pred, y))   # [0 1 1 0] matches labels: True</code></pre>
+<div class="code-caption">An MLP solving XOR with hand-set weights: the hidden ReLU layer creates two features whose linear combination separates a problem that defeats any single linear layer, demonstrating concretely what depth-plus-nonlinearity buys.</div>
+<p>
+The output <code>[0 1 1 0]</code> matches the labels exactly. The single hidden layer transformed the inputs into a new space where the classes <em>are</em> linearly separable, and the output layer drew the now-trivial line. That is the entire principle behind every network in Part III: learn a representation in which the final decision is easy. In <a href="section-18.2.html">Section 18.2</a> we stop setting weights by hand and let gradient descent discover them; in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> we will see networks learn representations so good that the final linear layer barely has to do anything.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The XOR problem is the gremlin that nearly killed neural networks. In 1969 Minsky and Papert pointed out that a single-layer perceptron cannot solve it, and the field promptly went into a decade-long sulk now politely called the first "AI winter". The fix was hiding in plain sight all along: one hidden layer and one bend in the function. The moral worth tattooing on a sticky note is <strong>"if a straight line cannot cut it, bend the space, not the line"</strong>, which is the entire job description of every hidden layer you will ever write.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The MLP Refuses to Retire</div>
+<p>The lowly MLP keeps resurfacing at the research frontier. MLP-Mixer (Tolstikhin et al., 2021) showed that an architecture built entirely from MLPs, mixing across spatial locations and across channels in alternation, could rival convolutional and transformer vision models, questioning how much of their success is the convolution versus the training recipe. The 2024 wave of Kolmogorov-Arnold Networks (KANs) replaces the MLP's fixed activations with learnable spline functions on the edges, reviving interest in where exactly an MLP's nonlinearity should live. And in modern transformers (<a href="../module-22-vision-transformers/index.html">Chapter 22</a>), the position-wise feed-forward block, which holds the majority of the parameters, is just an MLP. The two-layer perceptron you built in this section is not a historical stepping stone you leave behind; it is a recurring component you will meet inside almost every architecture that follows.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.1: The Collapse, Generalized <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Prove that a network of $L$ linear layers (no activations) with weight matrices $W_1, \ldots, W_L$ and biases $\mathbf{b}_1, \ldots, \mathbf{b}_L$ is equivalent to a single affine map, and write the resulting effective weight and bias in terms of the originals. Then explain in one sentence why adding any single nonlinear layer anywhere in the chain breaks this equivalence, and identify which property of matrix multiplication the collapse relies on.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.2: Counting Linear Regions <span class="exercise-type coding">Coding</span></div>
+<p>Build a small MLP in NumPy with two inputs, a hidden ReLU layer of width $H$, and one output, with random weights. Sample a fine grid over the input square $[-3, 3]^2$, run the forward pass, and color each grid point by which hidden units are active (the activation pattern). Visualize the result for $H = 2, 4, 8, 16$ and count the distinct linear regions. Describe how the number of regions grows with $H$, and connect your observation to the claim in subsection 3 that more units carve space into more flat pieces.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.1.3: When Width Is Not Enough <span class="exercise-type analysis">Analysis</span></div>
+<p>The universal approximation theorem guarantees a single wide hidden layer can fit any continuous function, yet practice favors depth. Using the spiral-dataset thought experiment (two interleaved spiral arms as two classes), argue why a shallow-but-wide MLP might need exponentially many units to separate the arms while a deeper-but-narrower MLP needs far fewer. Frame your argument in terms of how each successive hidden layer can reuse the regions built by the previous one, and relate it to the representation-learning view stated at the end of subsection 5.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 18: Neural Networks &amp; PyTorch for Vision</a>
+<a href="index.html">Chapter 18</a>
+<a class="next" href="section-18.2.html">Section 18.2: Backpropagation &amp; Optimization in a Nutshell &#8594;</a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

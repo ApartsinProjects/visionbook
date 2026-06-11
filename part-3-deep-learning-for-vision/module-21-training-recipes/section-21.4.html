@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.4: Regularization, Schedules & the Modern Training Recipe. Warmup and cosine learning-rate schedules, weight decay done correctly with AdamW, label smoothing, stochastic depth, model EMA, and mixed-precision training, assembled into one reproducible recipe." name="description"/>
+<title>Section 21.4: Regularization, Schedules &amp; the Modern Training Recipe | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Regularization, Schedules &amp; the Modern Training Recipe</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"For the first five hundred steps they let me walk slowly so I would not trip. Then they let me run. Then, gently, over thousands of steps, they asked me to slow to a stop right at the finish. I have never trained any other way and I cannot imagine why I once did."</p>
+<cite>An Optimizer Describing Its Cosine Schedule</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every competitive modern vision result rests on the same small bundle of training techniques used together, and learning them as a single recipe rather than a list of unrelated tricks is what lets you reproduce strong numbers reliably.</strong> The recipe has six staples: a learning-rate schedule with warmup and cosine decay, weight decay applied correctly through AdamW, label smoothing to stop overconfidence, stochastic depth to regularize deep stacks, an exponential moving average of the weights for a smoother final model, and mixed-precision training to make it all fast. None of these is individually dramatic; together they are the difference between a baseline and a leaderboard entry. This section assembles them into one coherent, reproducible recipe.</p>
+</div>
+
+<p>
+In <a href="section-21.3.html">Section 21.3</a> you decided what to fine-tune. This section decides how to run the optimization itself. The motivating fact, established in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, is that "ResNet strikes back" showed a 2015 ResNet-50 gaining several accuracy points purely from a modern recipe, no architecture change at all. That result is this section's thesis made measurable: the recipe is a first-class part of the model. We will take each ingredient in turn, explain the problem it solves, and then assemble them, because the ingredients interact and the bundle is what works.
+</p>
+
+<h2>1. The Learning-Rate Schedule: Warmup and Cosine Decay <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A constant learning rate is almost never optimal. Early in training the weights are far from any good solution and large steps help, but a freshly-initialized network (especially with the noisy gradients of a new head from <a href="section-21.3.html">Section 21.3</a>) can diverge if the rate starts high. Late in training, large steps cause the loss to bounce around the minimum instead of settling into it. The modern schedule solves both ends. <strong>Warmup</strong> ramps the learning rate linearly from near zero up to its peak over the first few hundred steps, so the network stabilizes before taking big steps. <strong>Cosine decay</strong> then smoothly lowers the rate following a half-cosine curve from the peak down to near zero over the rest of training, $\eta_t = \frac{1}{2}\eta_{\max}\left(1 + \cos\frac{\pi t}{T}\right)$, so the model settles gently into the minimum.
+</p>
+
+<p>
+Figure 21.4.1 shows the combined warmup-then-cosine curve that is now the default in essentially every vision recipe.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Learning rate schedule with linear warmup followed by cosine decay">
+<style>
+.ax{stroke:#999;stroke-width:1.2;}
+.lr{stroke:#2c6fb5;stroke-width:2.5;fill:none;}
+.lbl{font:12px sans-serif;fill:#1a1a1a;}
+.sm{font:10px sans-serif;fill:#555;}
+.gd{stroke:#ddd;stroke-width:1;}
+</style>
+<line class="ax" x1="70" y1="200" x2="680" y2="200"/>
+<line class="ax" x1="70" y1="40" x2="70" y2="200"/>
+<text class="lbl" x="375" y="235" text-anchor="middle">training step</text>
+<text class="lbl" x="24" y="120" transform="rotate(-90 24 120)" text-anchor="middle">learning rate</text>
+<!-- warmup: linear from (70,200) to (170,60) -->
+<line class="gd" x1="170" y1="40" x2="170" y2="200"/>
+<path class="lr" d="M70,200 L170,60"/>
+<!-- cosine: from (170,60) to (680,198) following half cosine -->
+<path class="lr" d="M170,60 C300,62 380,120 425,140 C520,182 600,196 680,198"/>
+<text class="sm" x="120" y="55" text-anchor="middle">warmup</text>
+<text class="sm" x="120" y="68" text-anchor="middle">(linear up)</text>
+<text class="sm" x="420" y="100" text-anchor="middle">cosine decay (smooth down to ~0)</text>
+<circle cx="170" cy="60" r="3.5" fill="#d6802b"/>
+<text class="sm" x="185" y="50">peak LR</text>
+</svg>
+<figcaption><strong>Figure 21.4.1:</strong> The standard warmup-then-cosine learning-rate schedule. A short linear warmup ramps from near zero to the peak so a fresh network does not diverge, then a half-cosine curve decays smoothly to near zero so the model settles cleanly into the minimum. This single schedule replaced the hand-tuned step-decay drops of earlier eras.</figcaption>
+</figure>
+
+<h2>2. Weight Decay Done Right: AdamW <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Weight decay shrinks weights toward zero each step, a regularizer that discourages large weights and improves generalization. For plain SGD, adding an L2 penalty to the loss and applying weight decay are mathematically the same operation. For adaptive optimizers like Adam, they are not, and this surprised the field for years. Adam scales each parameter's update by a running estimate of its gradient magnitude; if the L2 penalty rides inside the gradient, it gets scaled too, so parameters with large gradients are decayed less than intended. The fix, AdamW, <strong>decouples</strong> the decay: it applies the adaptive gradient step and then separately shrinks the weights by a fixed factor, $\theta \leftarrow \theta - \eta\,\lambda\,\theta$, independent of the gradient scaling. AdamW is now the default optimizer for training the vision transformers of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> and modern CNNs alike.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Do Not Decay Norms and Biases</div>
+<p>A subtle but important detail: weight decay should be applied to the convolution and linear weight matrices, but generally <em>not</em> to bias terms or to the scale and shift parameters of normalization layers (the batch-norm and layer-norm parameters from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>). Decaying a normalization layer's learned scale toward zero fights against the very calibration the layer exists to provide, and decaying biases offers no real regularization benefit. Production recipes split parameters into two groups, one with weight decay and one without, a five-line distinction that is easy to miss and quietly costs accuracy when omitted.</p>
+</div>
+
+<h2>3. Label Smoothing, Stochastic Depth, and EMA <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Three more regularizers round out the bundle. <strong>Label smoothing</strong> replaces the hard one-hot target with a softened one: instead of asking the model to predict probability $1.0$ for the true class and $0.0$ elsewhere, it asks for $1 - \epsilon$ on the true class and $\epsilon / (K-1)$ spread over the others, with $\epsilon$ around $0.1$. This stops the model from driving its logits to infinity chasing perfect confidence, which improves both generalization and the calibration we discussed for MixUp in <a href="section-21.2.html">Section 21.2</a>. <strong>Stochastic depth</strong> randomly drops entire residual blocks during training (replacing them with the identity skip connection from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>), which regularizes very deep networks and, as a bonus, speeds up training since dropped blocks are not computed.
+</p>
+
+<p>
+<strong>Exponential moving average (EMA)</strong> of the weights maintains a slowly-updated shadow copy, $\theta_{\text{EMA}} \leftarrow \alpha\,\theta_{\text{EMA}} + (1-\alpha)\,\theta$ with $\alpha$ near $0.9999$, and uses that averaged copy for evaluation. Because SGD bounces around the minimum, the average sits closer to the center of the basin than any single iterate, typically buying a fraction of a point of accuracy for almost no cost. Label smoothing in PyTorch is a one-argument change.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+# Label smoothing is a single argument to the standard loss.
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+# A minimal model-EMA: keep a shadow copy, update it after each optimizer step.
+class ModelEMA:
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone()
+                       for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+# Usage: opt.step(); ema.update(model)   then evaluate with ema.shadow weights.</code></pre>
+<div class="code-caption">Label smoothing as a loss argument and a compact model-EMA. The EMA shadow weights, used only at evaluation, sit nearer the center of the loss basin than any single training iterate.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>An EMA decay of $0.9999$ sounds like rounding error, but it means each new set of weights contributes only one ten-thousandth of the average, so the shadow copy effectively remembers roughly the last ten thousand training steps. The model you finally ship is therefore never a model that actually existed during training; it is a committee average of ten thousand slightly different networks that briefly flickered into being and were never evaluated on their own. The single best-performing weights of your run usually belong to a network nobody ever trained directly.</p>
+</div>
+
+<h2>4. Mixed Precision and the Assembled Recipe <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The last ingredient is about speed, not accuracy. <strong>Mixed-precision training</strong> runs most operations in 16-bit floating point (half the memory and roughly twice the throughput on modern GPUs with tensor cores) while keeping a 32-bit master copy of the weights and a loss scaler to prevent tiny gradients from underflowing to zero. It typically halves memory use and noticeably speeds up training with no accuracy loss, which is why it is standard. PyTorch 2.x provides it through the device-generic <code>torch.amp.autocast</code> and a gradient scaler. With every ingredient introduced, the assembled recipe below is close to what timm and other production frameworks run by default.
+</p>
+
+<pre><code class="language-python">import torch
+from torch.amp import autocast, GradScaler         # PyTorch 2.x device-generic AMP
+from torch.optim.lr_scheduler import OneCycleLR   # warmup + cosine-like decay
+
+model = model.cuda()
+# Split params: decay weights, no-decay for norms/biases (subsection 2 insight).
+decay, no_decay = [], []
+for name, p in model.named_parameters():
+    (no_decay if p.ndim &lt;= 1 or name.endswith("bias") else decay).append(p)
+opt = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.05},
+     {"params": no_decay, "weight_decay": 0.0}], lr=1e-3)
+
+steps_per_epoch, epochs = len(loader), 100
+sched = OneCycleLR(opt, max_lr=1e-3, total_steps=steps_per_epoch * epochs,
+                   pct_start=0.05)               # 5% of steps as warmup
+scaler = GradScaler("cuda")
+criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+
+for epoch in range(epochs):
+    for images, labels in loader:               # loader already does RandAugment
+        images, labels = images.cuda(), labels.cuda()
+        opt.zero_grad()
+        with autocast("cuda"):                   # run forward in fp16
+            loss = criterion(model(images), labels)
+        scaler.scale(loss).backward()            # scaled backward to avoid underflow
+        scaler.step(opt); scaler.update()
+        sched.step()                             # per-step cosine schedule</code></pre>
+<div class="code-caption">The modern recipe assembled: AdamW with split decay groups, a warmup-plus-decay schedule, label smoothing, and mixed precision in one loop. Adding MixUp from <a href="section-21.2.html">Section 21.2</a> and a model EMA completes the timm-style recipe.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Six-Point Gap That Was Pure Recipe</div>
+<p><strong>Who:</strong> a research engineer reproducing a published ConvNeXt-Tiny ImageNet result, 2024. <strong>Situation:</strong> their from-scratch training plateaued about six points below the paper's reported top-1 accuracy, using the identical architecture and dataset. <strong>Problem:</strong> the architecture was byte-for-byte correct, so the gap had to be elsewhere. <strong>Decision:</strong> they diffed their training script against the paper's recipe line by line and found three omissions: no label smoothing, plain Adam instead of AdamW with split decay groups, and a step-decay schedule instead of warmup-plus-cosine. They added all three and re-ran. <strong>Result:</strong> accuracy climbed to within a few tenths of a point of the published number, no architecture change whatsoever. <strong>Lesson:</strong> when a reproduction misses by several points, suspect the recipe before the architecture. The bundle in this section is not optional polish; it is load-bearing, and missing even a couple of ingredients can account for the entire gap.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Entire Recipe via the timm Training Script</div>
+<p>The loop above is correct but still leaves you wiring EMA, MixUp, and schedulers together. timm's reference training script accepts the whole recipe as command-line flags, turning hundreds of lines into one invocation:</p>
+<pre><code class="language-python"># timm's train.py reproduces the full modern recipe from flags:
+#   python train.py /imagenet \
+#     --model convnext_tiny --opt adamw --weight-decay 0.05 \
+#     --sched cosine --warmup-epochs 5 --epochs 300 \
+#     --smoothing 0.1 --mixup 0.8 --cutmix 1.0 \
+#     --aa rand-m9-mstd0.5 --drop-path 0.1 --model-ema --amp
+
+# Programmatic equivalents of the key pieces:
+from timm.scheduler import CosineLRScheduler
+from timm.loss import SoftTargetCrossEntropy   # for MixUp/CutMix soft labels
+from timm.utils import ModelEmaV2
+from timm.data import Mixup</code></pre>
+<p>timm bundles AdamW with the no-decay split, the cosine scheduler with warmup, label smoothing, MixUp and CutMix, RandAugment, stochastic depth (<code>--drop-path</code>), model EMA, and mixed precision (<code>--amp</code>), every ingredient of this section, validated together. For reproducing or fine-tuning a published result, matching its timm flags is the single most reliable path.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Optimizers Beyond AdamW</div>
+<p>AdamW has been the default for years, but 2023-2026 brought serious challengers. The Lion optimizer (discovered by symbolic program search) uses only the sign of a momentum term, halving optimizer memory while matching or beating AdamW on large vision and language models. Sharpness-Aware Minimization (SAM) explicitly seeks flat minima by taking a worried step toward the local worst case before each update, improving generalization at roughly double the compute. Newer second-order-inspired methods like Sophia and the matrix-preconditioned Muon push training efficiency further still. The schedule story is also evolving: schedule-free optimizers aim to remove the learning-rate decay schedule entirely. The recipe in this section is the robust 2026 default, but the optimizer slot is the most actively contested ingredient, and it is worth re-checking the leaderboards when you start a large training run.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.4.1: Why Decouple the Decay? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, with the update equations, why L2 regularization and weight decay coincide for plain SGD but diverge for Adam. Specifically, show how Adam's per-parameter gradient scaling causes an in-loss L2 penalty to be applied unevenly across parameters, and how AdamW's decoupled decay restores the intended uniform shrinkage. Then state in one sentence why this matters more for parameters with consistently large gradients.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.4.2: Ablate the Recipe <span class="exercise-type coding">Coding</span></div>
+<p>Train a ResNet-18 on CIFAR-100 with the full recipe from subsection 4, then re-train it five more times, each time removing exactly one ingredient (warmup, cosine decay, label smoothing, the no-decay parameter split, mixed precision). Report final test accuracy and wall-clock time for each run. Rank the ingredients by how much accuracy each one contributed, and note which one only affected speed. Relate your ranking to the practical example's six-point gap.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.4.3: Plot the Schedule You Are Running <span class="exercise-type analysis">Analysis</span></div>
+<p>Instantiate the <code>OneCycleLR</code> scheduler from subsection 4 (or timm's <code>CosineLRScheduler</code>) and, without training anything, step it through all <code>total_steps</code> iterations while recording <code>opt.param_groups[0]['lr']</code> at each step. Plot the learning rate against step number and confirm it matches the warmup-then-cosine shape of Figure 21.4.1. Then change the warmup fraction from 5% to 0% and re-plot, and write two sentences predicting what would go wrong in early training without the warmup, referring to the fresh-head argument of subsection 1.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.3.html">&#8592; Section 21.3: Transfer Learning</a>
+<a href="index.html">Chapter 21</a>
+<a class="next" href="section-21.5.html">Section 21.5: Class Imbalance &amp; Label Noise &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.1: Semantic Segmentation: FCN, U-Net &amp; DeepLab. A label per pixel and the resolution problem of dense prediction, solved three ways: the fully convolutional network with skip fusion, the symmetric U-Net encoder-decoder built from scratch in PyTorch, and DeepLab's dilated convolutions with atrous spatial pyramid pooling." name="description"/>
+<title>Section 24.1: Semantic Segmentation: FCN, U-Net &amp; DeepLab | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Segmentation: Semantic, Instance &amp; Promptable</a></div>
+<h1>Semantic Segmentation: FCN, U-Net &amp; DeepLab</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"A classifier squints at the whole picture and shouts one word. I was asked to whisper a word to every pixel, and to make the whispers agree along the edges. The hard part was never the whispering; it was remembering, after all that pooling, where the edges had been."</p>
+<cite>A Decoder Trying to Undo the Encoder's Forgetting</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Semantic segmentation assigns a class label to every pixel, which turns a classification network into a dense predictor and creates one central engineering problem: the backbone destroys spatial resolution through pooling and strides, and the segmenter must recover it.</strong> Every architecture in this section is a different answer to that one problem. The fully convolutional network upsamples its coarse prediction and fuses in earlier, finer feature maps through skip connections. U-Net makes that fusion symmetric and complete, with a skip at every resolution. DeepLab refuses to lose the resolution in the first place, using dilated convolutions to grow the receptive field while keeping the feature map large. Learn to see all three as variations on "keep the semantics, get the detail back," and the rest of dense prediction becomes familiar.</p>
+</div>
+
+<p>
+In <a href="../module-23-object-detection/index.html">Chapter 23</a> a network learned to localize objects with boxes; a box is a rectangle, and the world is not made of rectangles. Semantic segmentation asks the finest spatial question we can pose to a vision model: for every pixel, what category does it belong to? The output is no longer a single label or a handful of boxes but a full-resolution map the same size as the input, where each location holds a class index. There is no notion of separate objects yet, two adjacent cars become one connected blob of the "car" class, that is the job of <a href="section-24.2.html">Section 24.2</a>. Here the question is purely "what," answered everywhere at once.
+</p>
+
+<h2>1. The Task and the Resolution Problem <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Take any image classifier from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, say a ResNet. It alternates convolutions with downsampling so that a $224 \times 224$ input becomes a $7 \times 7$ grid of deep feature vectors before a global pool and a linear layer produce one label. That downsampling is not incidental; it is how the receptive field grows large enough to recognize whole objects, and it is how the network stays affordable. But a segmenter needs an output the size of the input, and a $7 \times 7$ map cannot localize a thin road sign or a hair-thin boundary. This is the resolution problem, and it has a precise shape: deep features are <em>semantically rich but spatially coarse</em>, while shallow features are <em>spatially precise but semantically shallow</em>. Good segmentation needs both.
+</p>
+
+<p>
+The first move, due to the fully convolutional network (FCN) of Long, Shelhamer, and Darrell in 2015, is almost embarrassingly simple. A classifier's final layers are fully connected, which forces a fixed input size and discards spatial layout. Replace each of them with an equivalent $1 \times 1$ convolution, and the network becomes "fully convolutional": it accepts any input size and produces a coarse spatial map of class scores instead of one vector. Upsample that coarse map back to the input resolution and you have a segmentation, blurry, but a segmentation. The genuine contribution was fixing the blur, and Figure 24.1.1 shows how.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Fully convolutional network with skip connections fusing coarse deep predictions with finer shallow feature maps">
+<style>
+.fl{font:12px sans-serif;fill:#1a1a1a;}
+.fs{font:10px sans-serif;fill:#555;}
+.fenc{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.fpred{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.ffuse{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.far{stroke:#777;stroke-width:1.5;marker-end:url(#fah);fill:none;}
+.fskip{stroke:#2f9e5c;stroke-width:1.5;stroke-dasharray:4 3;marker-end:url(#fah);fill:none;}
+</style>
+<defs><marker id="fah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="fenc" x="14" y="130" width="44" height="60"/>
+<text class="fs" x="36" y="205" text-anchor="middle">input</text>
+<rect class="fenc" x="74" y="138" width="40" height="44"/>
+<text class="fs" x="94" y="197" text-anchor="middle">pool/2</text>
+<rect class="fenc" x="130" y="146" width="34" height="30"/>
+<text class="fs" x="147" y="191" text-anchor="middle">pool/4</text>
+<rect class="fenc" x="180" y="150" width="26" height="22"/>
+<text class="fs" x="193" y="187" text-anchor="middle">pool/8</text>
+<rect class="fenc" x="222" y="153" width="18" height="16"/>
+<text class="fs" x="231" y="186" text-anchor="middle">/16</text>
+<rect class="fpred" x="258" y="153" width="14" height="14"/>
+<text class="fs" x="265" y="184" text-anchor="middle">/32</text>
+<line class="far" x1="58" y1="160" x2="74" y2="160"/>
+<line class="far" x1="114" y1="160" x2="130" y2="160"/>
+<line class="far" x1="164" y1="160" x2="180" y2="160"/>
+<line class="far" x1="206" y1="160" x2="222" y2="160"/>
+<line class="far" x1="240" y1="160" x2="258" y2="160"/>
+<text class="fl" x="265" y="135" text-anchor="middle">coarse</text>
+<text class="fl" x="265" y="120" text-anchor="middle">scores</text>
+<rect class="ffuse" x="330" y="120" width="90" height="80"/>
+<text class="fl" x="375" y="155" text-anchor="middle">upsample +</text>
+<text class="fl" x="375" y="172" text-anchor="middle">fuse skips</text>
+<line class="far" x1="272" y1="160" x2="330" y2="160"/>
+<line class="fskip" x1="193" y1="172" x2="345" y2="200"/>
+<line class="fskip" x1="147" y1="176" x2="340" y2="205"/>
+<text class="fs" x="250" y="230" text-anchor="middle" fill="#2f9e5c">skips carry fine detail</text>
+<rect class="fpred" x="470" y="120" width="80" height="80"/>
+<text class="fl" x="510" y="155" text-anchor="middle">dense</text>
+<text class="fl" x="510" y="172" text-anchor="middle">label map</text>
+<line class="far" x1="420" y1="160" x2="470" y2="160"/>
+<text class="fs" x="510" y="215" text-anchor="middle">H x W x classes</text>
+</svg>
+<figcaption><strong>Figure 24.1.1:</strong> The fully convolutional network. The encoder downsamples to a coarse but semantically rich score map (right of the encoder). Upsampling alone gives a blurry result; the skip connections (dashed green) add back higher-resolution feature maps from earlier stages, so the final dense label map has both correct categories and sharp boundaries.</figcaption>
+</figure>
+
+<p>
+The skip connections are the heart of FCN. The coarse prediction from the deepest layer (stride 32) knows <em>what</em> is in the scene but not precisely <em>where</em>. So FCN upsamples it by 2 and adds the prediction computed from the stride-16 feature map, then upsamples again and adds the stride-8 prediction. Each addition injects spatial detail the deep layer had thrown away. The result, called FCN-8s, has the semantics of the deep layers and boundaries sharp enough to be useful. This pattern, fuse a coarse-but-deep map with a fine-but-shallow one, is the same multi-scale idea you met as the <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Gaussian and Laplacian pyramids of Chapter 4</a>, now learned instead of hand-built.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Segmentation Is Classification, Tiled</div>
+<p>A semantic segmenter is, mathematically, a classifier applied independently at every output location. If the final layer produces a tensor of shape (batch, classes, height, width), then for each spatial position you have a vector of class logits, exactly as a classifier produces for a whole image. The loss is a per-pixel cross-entropy averaged over all positions. This single reframing means every tool from image classification, backbones, transfer learning, the softmax and cross-entropy of <a href="../module-18-neural-networks-pytorch/index.html">Chapter 18</a>, carries over unchanged. The only new ingredient is keeping spatial resolution alive.</p>
+</div>
+
+<h2>2. U-Net: Symmetric Encoder-Decoder <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+U-Net, published the same year as FCN for biomedical images, took the skip idea to its logical conclusion and became the most widely used segmentation architecture ever written. Its shape is a U: a contracting encoder that halves resolution and doubles channels stage by stage, then an expanding decoder that mirrors the encoder, doubling resolution and halving channels. The crucial detail is that at every decoder stage, the upsampled feature map is concatenated with the encoder feature map of the same resolution before further convolution. Where FCN added a few coarse skips, U-Net wires a skip at <em>every</em> level, so detail is reinjected continuously, not just at the end. Figure 24.1.2 shows the symmetry.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="U-Net architecture with a contracting encoder, expanding decoder, and skip connections at every resolution level">
+<style>
+.ul{font:12px sans-serif;fill:#1a1a1a;}
+.us{font:10px sans-serif;fill:#555;}
+.uenc{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.udec{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.ubot{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.udn{stroke:#777;stroke-width:1.5;marker-end:url(#uah);fill:none;}
+.uup{stroke:#777;stroke-width:1.5;marker-end:url(#uah);fill:none;}
+.uskip{stroke:#2f9e5c;stroke-width:1.5;stroke-dasharray:5 3;marker-end:url(#uahg);fill:none;}
+</style>
+<defs>
+<marker id="uah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="uahg" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2f9e5c"/></marker>
+</defs>
+<rect class="uenc" x="40" y="40" width="60" height="40"/><text class="us" x="70" y="64" text-anchor="middle">enc 64</text>
+<rect class="uenc" x="70" y="100" width="60" height="36"/><text class="us" x="100" y="122" text-anchor="middle">enc 128</text>
+<rect class="uenc" x="100" y="156" width="60" height="30"/><text class="us" x="130" y="175" text-anchor="middle">enc 256</text>
+<rect class="ubot" x="130" y="210" width="80" height="36"/><text class="us" x="170" y="232" text-anchor="middle">bottleneck 512</text>
+<rect class="udec" x="100" y="156" width="0" height="0"/>
+<rect class="udec" x="560" y="40" width="60" height="40"/><text class="us" x="590" y="64" text-anchor="middle">dec 64</text>
+<rect class="udec" x="530" y="100" width="60" height="36"/><text class="us" x="560" y="122" text-anchor="middle">dec 128</text>
+<rect class="udec" x="500" y="156" width="60" height="30"/><text class="us" x="530" y="175" text-anchor="middle">dec 256</text>
+<line class="udn" x1="70" y1="80" x2="100" y2="100"/>
+<line class="udn" x1="100" y1="136" x2="130" y2="156"/>
+<line class="udn" x1="130" y1="186" x2="170" y2="210"/>
+<line class="uup" x1="210" y1="222" x2="530" y2="171"/>
+<line class="uup" x1="560" y1="156" x2="560" y2="136"/>
+<line class="uup" x1="560" y1="100" x2="590" y2="80"/>
+<line class="uskip" x1="100" y1="60" x2="560" y2="60"/>
+<line class="uskip" x1="130" y1="118" x2="530" y2="118"/>
+<line class="uskip" x1="160" y1="171" x2="500" y2="171"/>
+<rect class="udec" x="640" y="40" width="50" height="40"/><text class="us" x="665" y="64" text-anchor="middle">1x1</text>
+<line class="uup" x1="620" y1="60" x2="640" y2="60"/>
+<text class="ul" x="665" y="100" text-anchor="middle">labels</text>
+<text class="us" x="360" y="50" text-anchor="middle" fill="#2f9e5c">skip-concatenate at every level</text>
+<text class="ul" x="120" y="290" text-anchor="middle">contracting encoder</text>
+<text class="ul" x="560" y="290" text-anchor="middle">expanding decoder</text>
+</svg>
+<figcaption><strong>Figure 24.1.2:</strong> The U-Net. The encoder (blue, left) contracts resolution while growing channels; the decoder (purple, right) mirrors it. At every level a skip connection (dashed green) concatenates the encoder's full-resolution features into the matching decoder stage, so fine detail is reinjected continuously. A final 1x1 convolution maps to per-class logits.</figcaption>
+</figure>
+
+<p>
+The code below implements a compact U-Net. Read it against Figure 24.1.2: <code>DoubleConv</code> is the two-convolution block at each level, the encoder stores its outputs in <code>skips</code>, and each decoder stage upsamples and concatenates the matching skip before convolving. This is a complete, trainable model.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DoubleConv(nn.Module):
+    """Two 3x3 convs, each followed by BatchNorm and ReLU. The U-Net building block."""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.block(x)
+
+class UNet(nn.Module):
+    def __init__(self, in_ch=3, num_classes=21, widths=(64, 128, 256, 512)):
+        super().__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(2)
+        prev = in_ch
+        for w in widths:                       # build the contracting path
+            self.downs.append(DoubleConv(prev, w))
+            prev = w
+        self.bottleneck = DoubleConv(widths[-1], widths[-1] * 2)
+        for w in reversed(widths):             # build the expanding path
+            self.ups.append(nn.ConvTranspose2d(w * 2, w, 2, stride=2))  # learnable upsample
+            self.ups.append(DoubleConv(w * 2, w))   # in_ch = w (up) + w (skip)
+        self.head = nn.Conv2d(widths[0], num_classes, 1)   # 1x1 -> per-pixel logits
+
+    def forward(self, x):
+        skips = []
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)                    # save full-resolution features
+            x = self.pool(x)
+        x = self.bottleneck(x)
+        skips = skips[::-1]                     # deepest skip first
+        for i in range(0, len(self.ups), 2):
+            x = self.ups[i](x)                  # transposed conv: upsample
+            skip = skips[i // 2]
+            if x.shape[-2:] != skip.shape[-2:]: # guard odd sizes
+                x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
+            x = torch.cat([skip, x], dim=1)     # concatenate the skip
+            x = self.ups[i + 1](x)              # fuse with a DoubleConv
+        return self.head(x)                     # (B, num_classes, H, W)
+
+model = UNet(num_classes=21)
+logits = model(torch.randn(2, 3, 256, 256))
+print(logits.shape)       # torch.Size([2, 21, 256, 256])</code></pre>
+<div class="code-caption">A complete U-Net in roughly 45 lines. The output tensor has one logit per class at every input pixel, ready for a per-pixel cross-entropy loss.</div>
+
+<p>
+The output shape, <code>(2, 21, 256, 256)</code>, is the whole point: a 21-class logit vector at each of the $256 \times 256$ pixels of each of the 2 images in the batch. To train it, you pass these logits and an integer label map of shape <code>(2, 256, 256)</code> to <code>nn.CrossEntropyLoss</code>, which treats every pixel as an independent classification example. The transposed convolution (<code>ConvTranspose2d</code>) is a learnable upsampler; we will compare it with simple interpolation and with the dilated approach next.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>U-Net was designed for cell-microscopy images where labeled training data is scarce, sometimes only 30 annotated images. To compensate, the original paper leaned heavily on elastic deformations as augmentation, warping the training images and their masks together. The architecture proved so robust to small data that the same U on a slightly modified diet became the denoising network at the heart of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion models in Chapter 33</a>. A 2015 microscopy tool quietly became the workhorse of generative AI a decade later.</p>
+</div>
+
+<h2>3. DeepLab: Dilated Convolutions and Atrous Spatial Pyramid Pooling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+FCN and U-Net both let the backbone shrink the feature map and then fight to rebuild it. DeepLab questions the premise: why lose the resolution at all? The trick is the <strong>dilated</strong> (also called atrous) convolution, which inserts gaps between the kernel taps. A standard $3 \times 3$ kernel with dilation rate $r$ samples the input at positions spaced $r$ apart, so its receptive field grows from $3$ to $1 + 2r$ in each dimension while the number of weights, and the output resolution, stay the same. Set $r = 2$ and a $3 \times 3$ kernel covers a $5 \times 5$ region; set $r = 4$ and it covers $9 \times 9$. You enlarge the receptive field, the thing that downsampling was buying you, without ever downsampling.
+</p>
+
+<p>
+The output size of a convolution with kernel $k$, dilation $r$, padding $p$, and stride $s$ on an input of size $n$ is
+</p>
+
+<div class="math-block">
+$$n_{\text{out}} = \left\lfloor \frac{n + 2p - r(k-1) - 1}{s} \right\rfloor + 1$$
+</div>
+
+<p>
+With the effective kernel size $k_{\text{eff}} = r(k-1) + 1$ standing in for $k$, this is just the ordinary convolution-size formula from <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>. DeepLab keeps the backbone's late stages at stride 8 or 16 instead of 32, replacing the lost stride with dilation so the receptive field still reaches whole objects. On top of the high-resolution feature map it places <strong>atrous spatial pyramid pooling</strong> (ASPP): several parallel dilated convolutions at different rates, plus a global pooling branch, all concatenated. Because each branch sees a different effective scale, ASPP captures objects from small to large in one shot, the learned analog of running a detector over an image pyramid. The code below shows dilation in action and a minimal ASPP.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+# A dilated 3x3 conv keeps spatial size but enlarges the receptive field.
+x = torch.randn(1, 64, 64, 64)
+plain   = nn.Conv2d(64, 64, 3, padding=1, dilation=1)  # RF 3x3, out 64x64
+dilated = nn.Conv2d(64, 64, 3, padding=4, dilation=4)  # RF 9x9, out 64x64
+print(plain(x).shape, dilated(x).shape)   # both torch.Size([1, 64, 64, 64])
+
+class ASPP(nn.Module):
+    """Atrous Spatial Pyramid Pooling: parallel dilated convs + image-level pooling."""
+    def __init__(self, in_ch, out_ch=256, rates=(6, 12, 18)):
+        super().__init__()
+        self.branches = nn.ModuleList(
+            [nn.Conv2d(in_ch, out_ch, 1)] +                       # 1x1 branch
+            [nn.Conv2d(in_ch, out_ch, 3, padding=r, dilation=r)   # dilated branches
+             for r in rates]
+        )
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1),        # global context
+                                  nn.Conv2d(in_ch, out_ch, 1))
+        self.project = nn.Conv2d(out_ch * (len(rates) + 2), out_ch, 1)
+
+    def forward(self, x):
+        feats = [b(x) for b in self.branches]
+        g = self.pool(x)
+        g = nn.functional.interpolate(g, size=x.shape[-2:], mode="bilinear",
+                                      align_corners=False)         # broadcast to map size
+        feats.append(g)
+        return self.project(torch.cat(feats, dim=1))
+
+print(ASPP(64)(x).shape)   # torch.Size([1, 256, 64, 64])</code></pre>
+<div class="code-caption">Dilated convolution preserves spatial size while enlarging the receptive field, and ASPP fuses several dilation rates plus global context. Both outputs stay at 64x64, the resolution DeepLab refuses to give up.</div>
+
+<p>
+DeepLabv3+ then adds a small decoder, a single U-Net-style skip from an early high-resolution layer, to sharpen boundaries that even the dilated features leave a little soft. So the three architectures converge: FCN fuses a few skips, U-Net fuses skips everywhere, and DeepLab avoids most of the loss then fuses one skip to clean up. All three are answering the same resolution problem stated in subsection 1.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing a Segmenter for an Agricultural Drone</div>
+<p><strong>Who:</strong> a three-engineer startup mapping weed coverage in crop fields from a low-flying drone, 2024. <strong>Situation:</strong> their first model was a from-scratch U-Net trained on a few hundred hand-labeled aerial tiles, and it segmented dense weed patches well. <strong>Problem:</strong> isolated single weeds, a few pixels across, were missed, and the field boundaries it drew were jagged, which corrupted the per-field coverage statistics the agronomists actually bought. <strong>Decision:</strong> they kept U-Net as a baseline but switched the production model to DeepLabv3+ with a ResNet-50 backbone, reasoning that the ASPP multi-scale branches would catch both the tiny isolated weeds and the large contiguous patches, and that the decoder skip would sharpen the field edges. They fine-tuned from ImageNet weights rather than training from scratch, following the transfer-learning recipe of <a href="../module-21-training-recipes/index.html">Chapter 21</a>. <strong>Result:</strong> mean IoU on the validation tiles rose by about seven points, driven almost entirely by the small-object and boundary classes; the coverage statistics stabilized enough to ship. <strong>Lesson:</strong> the resolution problem is not abstract. When your errors cluster on small objects and boundaries, the architecture that preserves resolution and reasons at multiple scales is the one to reach for, and starting from pretrained weights beats more from-scratch epochs almost every time.</p>
+</div>
+
+<h2>4. Training and Inference in Practice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+At inference, the network produces logits of shape <code>(B, C, H, W)</code>, and the predicted label map is simply the argmax over the class dimension. The thresholding-and-argmax step is the dense version of the <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">thresholding you met in Chapter 2</a> and the per-pixel decision that <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">morphology in Chapter 6</a> then cleans up. The training loss, as established in subsection 2, is a per-pixel cross-entropy; the full menu of losses for imbalanced and boundary-heavy cases is the subject of <a href="section-24.6.html">Section 24.6</a>. The short training and inference loop below ties the model from subsection 2 to real tensors.
+</p>
+
+<pre><code class="language-python">import torch, torch.nn as nn
+
+model = UNet(num_classes=21)                       # from subsection 2
+criterion = nn.CrossEntropyLoss(ignore_index=255)  # 255 = "unlabeled", skipped in the loss
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+# One training step on a dummy batch.
+images = torch.randn(4, 3, 256, 256)               # (B, 3, H, W)
+targets = torch.randint(0, 21, (4, 256, 256))      # (B, H, W) integer class per pixel
+logits = model(images)                             # (B, 21, H, W)
+loss = criterion(logits, targets)                  # per-pixel cross-entropy, auto-averaged
+loss.backward(); optimizer.step(); optimizer.zero_grad()
+print(f"loss: {loss.item():.3f}")                  # e.g. loss: 3.085
+
+# Inference: argmax over the class channel gives the predicted label map.
+model.eval()
+with torch.no_grad():
+    pred = model(images).argmax(dim=1)             # (B, H, W) predicted classes
+print(pred.shape, pred.unique().numel(), "classes present")</code></pre>
+<div class="code-caption">The end-to-end dense-prediction loop. Note <code>ignore_index=255</code>, the standard convention for pixels that should not contribute to the loss, and the final <code>argmax(dim=1)</code> that turns logits into a label map.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained Segmenter in Four Lines</div>
+<p>The U-Net above is about 45 lines and the ASPP another 25, excellent for understanding, but you would not write them for production. torchvision ships DeepLabv3 and FCN with COCO-pretrained weights behind a uniform API:</p>
+<pre><code class="language-python">import torch
+from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+
+weights = DeepLabV3_ResNet50_Weights.DEFAULT
+model = deeplabv3_resnet50(weights=weights).eval()   # backbone + ASPP + classifier
+preprocess = weights.transforms()                    # resize, normalize, to-tensor
+
+img = torch.rand(3, 520, 520)                         # stand-in for a loaded PIL image tensor
+batch = preprocess(img).unsqueeze(0)
+with torch.no_grad():
+    out = model(batch)["out"]                         # (1, 21, H, W) logits
+mask = out.argmax(1)[0]                               # predicted label map
+print(mask.shape)                                     # torch.Size([520, 520])</code></pre>
+<div class="code-caption">A COCO-pretrained DeepLabv3 loaded and run in four lines via torchvision: the bundled <code>weights.transforms()</code> applies the exact preprocessing the model was trained with, and <code>argmax(1)</code> turns the logits into a label map.</div>
+<p>This replaces about 70 lines of model code plus a weights-download-and-load step with four lines, and the library handles the backbone construction, the ASPP rates, the pretrained-weight loading, and the exact preprocessing the model was trained with. For specialized backbones and ready-made losses, <code>segmentation_models.pytorch</code> constructs a U-Net or DeepLab on any of dozens of encoders with one call. Build the model once by hand to learn it; import it forever after.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Dense Prediction in the Foundation-Model Era</div>
+<p>The FCN-U-Net-DeepLab lineage still trains the fastest, most reliable specialized segmenters, but the frontier has moved to general-purpose backbones and architectures. Transformer encoders such as SegFormer (<a href="section-24.4.html">Section 24.4</a>) now match or beat DeepLab on Cityscapes and ADE20K with better efficiency, and self-supervised backbones like DINOv2 (2024, the subject of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>) produce features so strong that a tiny linear segmentation head on frozen features rivals fully fine-tuned older models. Most strikingly, the Segment Anything Model (<a href="section-24.5.html">Section 24.5</a>) and 2024-2025 open-vocabulary segmenters such as the Grounded-SAM family let you segment classes that were never in any training label set, by naming them in text. The convolutional encoder-decoder is no longer the only way to recover resolution; it is now one option among learned-attention and prompt-driven alternatives.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.1: Why Skips, Not Just Upsampling <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An engineer proposes dropping all skip connections from U-Net and instead upsampling the bottleneck straight to full resolution with one large transposed convolution, arguing it is simpler. Explain in three or four sentences what would degrade in the output and why, using the "semantically rich but spatially coarse" framing from subsection 1. Which kinds of pixels (interior of large objects, thin structures, boundaries) would suffer most, and which would be largely unaffected?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.2: Receptive Field of a Dilated Stack <span class="exercise-type coding">Coding</span></div>
+<p>Write a short function that, given a list of (kernel_size, dilation) pairs for a stack of convolutions (all stride 1), computes the total receptive field in pixels. Verify it on the DeepLab-style stack [(3,1), (3,2), (3,4), (3,8)] and report the result. Then compute, for comparison, how many stride-2 downsampling stages a plain CNN would need to reach the same receptive field, and write one sentence on the resolution cost of that alternative.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 24.1.3: Compare Three Segmenters Empirically <span class="exercise-type analysis">Analysis</span></div>
+<p>Using torchvision's pretrained <code>fcn_resnet50</code>, <code>deeplabv3_resnet50</code>, and a from-scratch U-Net trained briefly on the Oxford-IIIT Pet segmentation set, run all three on the same ten validation images and compute mean IoU per model (use the metric code from <a href="section-24.6.html">Section 24.6</a>). Produce a side-by-side figure of the predicted masks and write a short paragraph: where do the boundaries differ, which model is sharpest on thin structures, and does the ranking match what subsections 2 and 3 would predict?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 24 Index</a>
+<a href="index.html">Chapter 24</a>
+<a class="next" href="section-24.2.html">Section 24.2: Instance Segmentation: Mask R-CNN &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

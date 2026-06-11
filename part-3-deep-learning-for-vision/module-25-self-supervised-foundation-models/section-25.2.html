@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.2: Contrastive Learning: SimCLR &amp; MoCo. Pulling two augmented views of one image together and pushing other images apart, the InfoNCE loss, why augmentation is the real architecture, SimCLR's large batches, and MoCo's momentum encoder and queue of negatives." name="description"/>
+<title>Section 25.2: Contrastive Learning: SimCLR &amp; MoCo | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models</a></div>
+<h1>Contrastive Learning: SimCLR &amp; MoCo</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Show me the same dog cropped, recolored, and flipped, and I will swear it is the same dog. Show me a different dog, and I will fight you on it. This is the entire personality I was trained to have, and it turns out to be most of what intelligence looks like."</p>
+<cite>A Contrastive Encoder With Strong Opinions About Sameness</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Contrastive learning replaces hand-designed pretext puzzles with a single, powerful objective: two augmented views of the same image must land close together in feature space, and views of different images must land far apart. Solving this forces the network to encode what is invariant about an image (its content) and discard what the augmentations change (crop, color, blur).</strong> The objective is a softmax over similarities called InfoNCE, and the design decisions that actually move the needle are the choice of augmentations, the number of negatives, and the temperature. This section builds the loss from scratch, shows why SimCLR needed enormous batches to supply enough negatives, and shows how MoCo's momentum encoder and memory queue gave the same number of negatives without the batch.</p>
+</div>
+
+<p>
+The pretext tasks of <a href="section-25.1.html">Section 25.1</a> each encoded one specific assumption about images (orientation, spatial layout, color semantics) and learned only what that assumption exposed. Contrastive learning generalizes the idea into a single objective that subsumes them: instead of predicting a chosen transformation, predict which images are the same under transformation. The goal, as throughout the chapter, is the learned descriptor itself, the data-driven successor to the hand-crafted SIFT and ORB vectors of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>. We will define the notion of a positive pair and negative pairs, write down the InfoNCE loss, implement SimCLR end to end on the ResNet backbones of <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, and then dissect MoCo's two engineering ideas that made contrastive learning practical without a supercomputer. The features this produces are the ones the linear probe of Section 25.1 finally rewards, and they set up the negative-free methods of <a href="section-25.3.html">Section 25.3</a>.
+</p>
+
+<h2>1. Positives, Negatives, and the InfoNCE Loss <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Start with one image $x$. Apply two independent random augmentations to it, producing two views $\tilde{x}_a$ and $\tilde{x}_b$. These form a <strong>positive pair</strong>: they show the same content, so their representations should be close. Every other image in the batch, under any augmentation, is a <strong>negative</strong> for this pair: different content, so its representation should be far away. The network's job is to pull the positive pair together and push the negatives apart, in a learned feature space. Figure 25.2.1 shows the two-branch structure that produces these embeddings.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One image augmented into two views, each passed through a shared encoder and projection head, with the two embeddings pulled together and other images pushed apart">
+<style>
+.cl{font:12px sans-serif;fill:#1a1a1a;}
+.cs{font:10px sans-serif;fill:#555;}
+.cimg{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.cenc{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.cproj{fill:#fff6e0;stroke:#d6a32b;stroke-width:1.5;}
+.cemb{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.car{stroke:#777;stroke-width:1.5;marker-end:url(#cah);fill:none;}
+.cpull{stroke:#2f9e5c;stroke-width:2;fill:none;}
+.cpush{stroke:#c0392b;stroke-width:2;stroke-dasharray:4 3;fill:none;}
+</style>
+<defs><marker id="cah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="cimg" x="14" y="120" width="44" height="44"/>
+<text class="cs" x="36" y="178" text-anchor="middle">image x</text>
+<line class="car" x1="58" y1="130" x2="100" y2="70"/>
+<line class="car" x1="58" y1="154" x2="100" y2="214"/>
+<text class="cs" x="78" y="92" text-anchor="middle">aug a</text>
+<text class="cs" x="78" y="206" text-anchor="middle">aug b</text>
+<rect class="cimg" x="102" y="50" width="40" height="40"/>
+<rect class="cimg" x="102" y="194" width="40" height="40"/>
+<line class="car" x1="142" y1="70" x2="172" y2="70"/>
+<line class="car" x1="142" y1="214" x2="172" y2="214"/>
+<rect class="cenc" x="174" y="48" width="74" height="44"/>
+<text class="cl" x="211" y="74" text-anchor="middle">encoder f</text>
+<rect class="cenc" x="174" y="192" width="74" height="44"/>
+<text class="cl" x="211" y="218" text-anchor="middle">encoder f</text>
+<text class="cs" x="211" y="150" text-anchor="middle">shared weights</text>
+<line class="car" x1="248" y1="70" x2="278" y2="70"/>
+<line class="car" x1="248" y1="214" x2="278" y2="214"/>
+<rect class="cproj" x="280" y="50" width="66" height="40"/>
+<text class="cl" x="313" y="74" text-anchor="middle">proj g</text>
+<rect class="cproj" x="280" y="194" width="66" height="40"/>
+<text class="cl" x="313" y="218" text-anchor="middle">proj g</text>
+<line class="car" x1="346" y1="70" x2="392" y2="110"/>
+<line class="car" x1="346" y1="214" x2="392" y2="174"/>
+<circle class="cemb" cx="410" cy="110" r="12"/>
+<text class="cs" x="410" y="114" text-anchor="middle">z_a</text>
+<circle class="cemb" cx="410" cy="174" r="12"/>
+<text class="cs" x="410" y="178" text-anchor="middle">z_b</text>
+<path class="cpull" d="M420,120 Q445,142 420,164"/>
+<text class="cs" x="470" y="146" text-anchor="middle">pull together</text>
+<circle cx="560" cy="90" r="10" fill="#ddd" stroke="#999"/>
+<circle cx="600" cy="200" r="10" fill="#ddd" stroke="#999"/>
+<circle cx="640" cy="120" r="10" fill="#ddd" stroke="#999"/>
+<path class="cpush" d="M422,108 L548,90"/>
+<path class="cpush" d="M422,176 L590,198"/>
+<text class="cs" x="600" y="240" text-anchor="middle">other images = negatives (push away)</text>
+</svg>
+<figcaption><strong>Figure 25.2.1:</strong> The SimCLR two-branch design. One image is augmented twice; both views pass through a shared encoder $f$ and projection head $g$ to produce embeddings $z_a$ and $z_b$. The loss pulls the positive pair $(z_a, z_b)$ together (green) and pushes every other image's embedding away (red dashed). The negatives come for free from the other images in the same batch.</figcaption>
+</figure>
+
+<p>
+The loss that implements pull-together-push-apart is <strong>InfoNCE</strong> (also called NT-Xent in SimCLR). For a positive pair $(z_i, z_j)$ with cosine similarity $\text{sim}(u, v) = u^\top v / (\|u\|\|v\|)$ and temperature $\tau$, the loss for view $i$ is
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_i = -\log \frac{\exp\!\big(\text{sim}(z_i, z_j)/\tau\big)}{\sum_{k \neq i} \exp\!\big(\text{sim}(z_i, z_k)/\tau\big)}$$
+</div>
+
+<p>
+Read this as a classification problem with $2N - 1$ candidates: among all the other embeddings in the batch, which one is the true partner of $z_i$? The numerator is the positive's similarity; the denominator sums over the positive plus all negatives. Minimizing the loss maximizes the positive similarity relative to the negatives. The temperature $\tau$ (typically around $0.1$) sharpens the softmax: small $\tau$ makes the model focus on the hardest negatives, the ones already close to the positive. This is the same softmax-over-similarities structure that will reappear, almost unchanged, as the CLIP objective in <a href="section-25.4.html">Section 25.4</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Negatives Come Free From the Batch</div>
+<p>The reason contrastive learning needs no labels is that the negatives require no annotation. Any two images that are not the same image are, with overwhelming probability, different content, so the batch itself supplies all the negatives for free. The consequence, though, is that quality scales with the <em>number</em> of negatives: more negatives means a harder, more informative classification problem and a sharper representation. This single fact explains the entire engineering arc of the section. SimCLR gets negatives by using a giant batch; MoCo gets them from a queue. Everything else is detail.</p>
+</div>
+
+<h2>2. SimCLR: Augmentation Is the Architecture <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SimCLR (Chen et al., 2020) is the cleanest contrastive framework: a shared encoder, a small projection head (a two-layer MLP that maps features to the space where the loss is computed and is discarded afterward), and the InfoNCE loss over a large batch. Its most important and most surprising finding is that the <strong>composition of data augmentations is the real design decision</strong>. The single most valuable augmentation pair is random cropping combined with random color distortion. Cropping alone lets the network cheat by matching color histograms between the two views; color distortion alone lets it cheat by matching spatial layout. Only together do they force the network onto content. The augmentation pipeline you learned in <a href="../module-21-training-recipes/index.html">Chapter 21</a> is here promoted from a regularizer to the heart of the method.
+</p>
+
+<p>
+The code below implements the SimCLR loss for a batch of $2N$ embeddings (two views per image, stacked). It builds the full similarity matrix, masks out self-comparisons, and applies cross-entropy with the positive partner as the target.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def simclr_loss(z, temperature=0.1):
+    """z: (2N, d) = N images x 2 views, stacked as [view_a(0..N-1), view_b(0..N-1)]."""
+    N2 = z.size(0)
+    N = N2 // 2
+    z = F.normalize(z, dim=1)                        # cosine sim = dot product of unit vectors
+    sim = z @ z.t() / temperature                    # (2N, 2N) all pairwise similarities
+    sim.fill_diagonal_(float("-inf"))                # an embedding is not its own negative
+
+    # The positive of row i is its other view: i<->i+N (and i+N<->i).
+    targets = torch.arange(N2, device=z.device)
+    targets = (targets + N) % N2                     # partner index for every row
+    return F.cross_entropy(sim, targets)             # InfoNCE = cross-entropy over candidates
+
+torch.manual_seed(0)
+z = torch.randn(8, 128)                              # 4 images x 2 views, 128-d embeddings
+print("SimCLR loss:", round(simclr_loss(z).item(), 4))
+# SimCLR loss: 2.0794   (near log(2N-1)=log7 for random embeddings, as expected)</code></pre>
+<div class="code-caption">The SimCLR NT-Xent loss in a dozen lines. The <code>(targets + N) % N2</code> trick names each row's positive partner; <code>fill_diagonal_</code> removes the trivial self-match. The printed loss near $\log 7$ confirms random embeddings score at chance over the seven candidates.</div>
+
+<p>
+This is correct but expensive in one specific way: the similarity matrix is $2N \times 2N$, and the quality depends on $N$ being large. SimCLR's published results used batch sizes up to 4096, which requires many accelerators working in concert simply to hold one step in memory. That hardware requirement is precisely the problem MoCo solves.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>SimCLR's projection head is thrown away after pretraining, and using the features from <em>before</em> the projection head for downstream tasks works noticeably better than using the projected embeddings the loss was computed on. The contrastive objective apparently destroys some information useful for classification (color, orientation) in service of invariance, so you stop one layer short of where the loss lives. It is a rare case where the layer you optimized is not the layer you want.</p>
+</div>
+
+<h2>3. MoCo: A Momentum Encoder and a Queue <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+MoCo (He et al., 2020) reframes contrastive learning as building a <strong>dictionary lookup</strong>. One view (the query) is encoded by the main encoder; the other views and many past images (the keys) live in a dictionary, and the query must match its positive key against all the others. The insight is that the dictionary of keys does not need to come from the current batch. If we keep a queue of key embeddings from recent batches, we get tens of thousands of negatives while the batch stays small enough for a single machine. MoCo decouples the number of negatives from the batch size, the constraint that made SimCLR so hardware-hungry.
+</p>
+
+<p>
+This raises a problem: if the encoder's weights change every step, then keys computed several batches ago were produced by a stale, inconsistent encoder, and comparing them to a fresh query is meaningless. MoCo's fix is the <strong>momentum encoder</strong>: a second copy of the encoder whose weights $\theta_k$ are not trained by gradient descent but are updated as a slow exponential moving average of the query encoder's weights $\theta_q$,
+</p>
+
+<div class="math-block">
+$$\theta_k \leftarrow m\,\theta_k + (1 - m)\,\theta_q, \qquad m \approx 0.999$$
+</div>
+
+<p>
+With $m$ close to one, the key encoder evolves slowly and smoothly, so keys produced batches apart remain mutually consistent, yet it still tracks the improving query encoder. Figure 25.2.2 contrasts the two designs side by side.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Side by side comparison: SimCLR uses one shared encoder and in-batch negatives, MoCo uses a query encoder plus a momentum key encoder feeding a queue of negatives">
+<style>
+.ml{font:12px sans-serif;fill:#1a1a1a;}
+.ms{font:10px sans-serif;fill:#555;}
+.mt{font:13px sans-serif;font-weight:bold;fill:#1a1a1a;}
+.menc{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.mmom{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.mq{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.mar{stroke:#777;stroke-width:1.5;marker-end:url(#mah);fill:none;}
+.mema{stroke:#d6802b;stroke-width:1.5;stroke-dasharray:3 2;marker-end:url(#mah);fill:none;}
+</style>
+<defs><marker id="mah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="mt" x="150" y="22" text-anchor="middle">SimCLR</text>
+<rect class="menc" x="60" y="50" width="86" height="40"/>
+<text class="ml" x="103" y="74" text-anchor="middle">encoder f</text>
+<line class="mar" x1="103" y1="90" x2="103" y2="130"/>
+<text class="ms" x="103" y="150" text-anchor="middle">in-batch negatives</text>
+<text class="ms" x="103" y="166" text-anchor="middle">need batch ~ 4096</text>
+<line x1="300" y1="20" x2="300" y2="240" stroke="#ccc" stroke-width="1"/>
+<text class="mt" x="510" y="22" text-anchor="middle">MoCo</text>
+<rect class="menc" x="360" y="50" width="80" height="40"/>
+<text class="ml" x="400" y="74" text-anchor="middle">query enc</text>
+<rect class="mmom" x="360" y="130" width="80" height="40"/>
+<text class="ml" x="400" y="150" text-anchor="middle">momentum</text>
+<text class="ml" x="400" y="164" text-anchor="middle">key enc</text>
+<line class="mema" x1="400" y1="90" x2="400" y2="128"/>
+<text class="ms" x="470" y="112" text-anchor="middle">EMA update</text>
+<rect class="mq" x="540" y="120" width="120" height="60"/>
+<text class="ml" x="600" y="146" text-anchor="middle">queue</text>
+<text class="ms" x="600" y="162" text-anchor="middle">~65k keys</text>
+<line class="mar" x1="440" y1="150" x2="538" y2="150"/>
+<text class="ms" x="600" y="200" text-anchor="middle">negatives decoupled</text>
+<text class="ms" x="600" y="216" text-anchor="middle">from batch size</text>
+</svg>
+<figcaption><strong>Figure 25.2.2:</strong> SimCLR versus MoCo. SimCLR uses a single encoder and draws all negatives from the current batch, so a huge batch is required. MoCo adds a momentum (EMA-updated) key encoder feeding a queue of tens of thousands of past keys, supplying many negatives while keeping the batch small. The dashed orange arrow is the no-gradient momentum update of equation above.</figcaption>
+</figure>
+
+<p>
+The momentum update and queue are short to express in code. Note that the key encoder receives no gradients; it is updated only by the moving average.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def momentum_update(query_enc, key_enc, m=0.999):
+    """Key encoder = slow EMA of the query encoder. No gradients flow here."""
+    for q_param, k_param in zip(query_enc.parameters(), key_enc.parameters()):
+        k_param.data.mul_(m).add_(q_param.data, alpha=1 - m)   # k <- m*k + (1-m)*q
+
+def moco_loss(q, k, queue, temperature=0.07):
+    """q, k: (N, d) query and positive-key embeddings; queue: (K, d) negative keys."""
+    q, k = F.normalize(q, 1), F.normalize(k, 1)
+    queue = F.normalize(queue, 1)
+    l_pos = (q * k).sum(1, keepdim=True)            # (N, 1) positive similarity per query
+    l_neg = q @ queue.t()                           # (N, K) similarity to every queued key
+    logits = torch.cat([l_pos, l_neg], dim=1) / temperature   # positive is column 0
+    targets = torch.zeros(q.size(0), dtype=torch.long, device=q.device)
+    return F.cross_entropy(logits, targets)         # classify the positive against K negatives
+
+q = torch.randn(4, 128); k = torch.randn(4, 128); queue = torch.randn(4096, 128)
+print("MoCo loss:", round(moco_loss(q, k, queue).item(), 4))
+# MoCo loss: 8.3...  (near log(4097) for random embeddings: many negatives, harder task)</code></pre>
+<div class="code-caption">MoCo's loss and momentum update. The positive key sits in column 0 of the logits and the 4096 queued keys are the negatives, so the target is always class 0. <code>momentum_update</code> runs under <code>no_grad</code> because the key encoder is never trained directly.</div>
+
+<p>
+After each step the current batch's keys are enqueued and the oldest keys dequeued, keeping a rolling window of recent, mutually-consistent negatives. MoCo v2 later adopted SimCLR's MLP projection head and stronger augmentation, and the two lines of work effectively merged. The practical lesson, though, is durable, and worth memorizing as a one-line mental model: <strong>contrastive learning needs negatives, not a giant batch; a queue buys negatives when you cannot buy GPUs.</strong>
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>When BYOL first showed that contrastive learning works with no negatives at all, the result was so surprising that researchers suspected a hidden mechanism was secretly doing the contrasting. A widely-read 2020 blog post argued the secret ingredient was batch normalization, which subtly leaks batch statistics and acts like an implicit comparison to other images. The BYOL authors responded with a careful ablation showing the method still works when batch norm is replaced with group norm plus weight standardization, no batch statistics involved. The momentum target and stop-gradient, not a sneaky normalization trick, are what prevent collapse. A rare case where the community debugged a paper in public and the paper survived.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Pretraining on Unlabeled Inventory Photos</div>
+<p><strong>Who:</strong> the perception team at a mid-size e-commerce company, 2021, with roughly twelve million unlabeled product photographs and only about forty thousand human-categorized examples. <strong>Situation:</strong> they wanted a strong backbone for several downstream tasks (category classification, near-duplicate detection, attribute tagging) but could not label twelve million images. <strong>Problem:</strong> their largest available training node could fit a batch of only 256 images, far below SimCLR's 4096, and a small batch starved SimCLR of negatives, leaving its linear-probe accuracy well behind a supervised baseline. <strong>Decision:</strong> they switched to MoCo with a 65,536-entry queue, so the effective number of negatives rose from 511 (the SimCLR batch) to over 65,000 without changing the hardware, and they tuned the augmentation to include the crop-plus-color-jitter pair SimCLR identified as essential. <strong>Result:</strong> the MoCo backbone's linear-probe accuracy on their forty-thousand labeled examples matched supervised pretraining and, used as a near-duplicate detector through cosine similarity of features, outperformed their previous hand-tuned hashing pipeline. <strong>Lesson:</strong> the number of negatives, not the batch size, is what contrastive learning actually needs; MoCo's queue is the way to buy negatives when you cannot buy GPUs.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Contrastive Pretraining With Lightly</div>
+<p>The loss, momentum encoder, queue, and augmentation pipeline above are all provided by self-supervised libraries. With <code>lightly</code>, a full MoCo training step is a few lines:</p>
+<pre><code class="language-python">from lightly.loss import NTXentLoss
+from lightly.transforms import MoCoV2Transform
+# The crop+color-jitter+blur augmentation SimCLR identified, prebuilt:
+transform = MoCoV2Transform(input_size=224)
+criterion = NTXentLoss(temperature=0.1, memory_bank_size=(65536, 128))  # queue built in
+# loss = criterion(query_embeddings, key_embeddings)</code></pre>
+<p>The library supplies the validated augmentation recipe (replacing roughly twenty lines of <code>torchvision.transforms</code> tuning), the memory-bank queue, and the InfoNCE math, and ships matching implementations of SimCLR, MoCo, BYOL, and DINO behind one interface. What you hand-wrote across this section becomes a configuration choice; the from-scratch code exists so the configuration is not a mystery.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Do We Even Need Negatives?</div>
+<p>The negatives that drove this entire section turned out to be optional. BYOL (Grill et al., 2020) and SimSiam (Chen and He, 2021) showed that a network can learn strong representations with positive pairs only, no negatives at all, as long as a momentum target encoder and a stop-gradient prevent the trivial collapse to a constant output. This reframed the field: the momentum encoder MoCo introduced for consistency turned out to be the key ingredient for a whole family of negative-free methods, and DINO in <a href="section-25.3.html">Section 25.3</a> takes this to its conclusion. As of 2024 to 2026 the dominant self-supervised backbones (DINOv2) combine this negative-free self-distillation with masked modeling rather than classical contrastive learning, though contrastive learning remains the heart of the language-supervised CLIP of <a href="section-25.4.html">Section 25.4</a>, where the negatives are other captions and come naturally.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.1: Why Crop-Plus-Color, Not Either Alone <span class="exercise-type conceptual">Conceptual</span></div>
+<p>SimCLR found that random cropping alone, or color distortion alone, gives much weaker features than the two combined. Explain the shortcut the network can exploit when only cropping is used, and the different shortcut available when only color distortion is used. Then argue why composing the two removes both shortcuts simultaneously, and connect this to the pretext-task shortcut failure from <a href="section-25.1.html">Section 25.1</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.2: Negatives Versus Batch Size <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>moco_loss</code> code, run a small experiment: fix the batch size at 64 and vary the queue length over the values 128, 1024, 8192, and 65536, training a small ResNet on an unlabeled image set for a fixed number of steps each time. Linear-probe each resulting backbone and plot probe accuracy against queue length. Write one paragraph relating the curve you observe to the Key Insight that contrastive quality scales with the number of negatives, and note where the curve flattens.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.3: The Momentum Coefficient <span class="exercise-type analysis">Analysis</span></div>
+<p>The momentum coefficient $m$ controls how fast the key encoder tracks the query encoder. Derive what happens at the two extremes: $m = 0$ (key encoder equals query encoder every step) and $m = 1$ (key encoder never updates). Explain why $m = 0$ reintroduces the consistency problem the momentum encoder was meant to fix, and why $m = 1$ makes the keys useless over time. Given that MoCo uses $m \approx 0.999$, estimate roughly how many steps it takes for the key encoder to reflect a given query-encoder update, and relate this to the queue length.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.1.html">&#8592; Section 25.1: Pretext Tasks: Learning Without Labels</a>
+<a href="index.html">Chapter 25</a>
+<a class="next" href="section-25.3.html">Section 25.3: Self-Distillation &amp; Masked Image Modeling &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

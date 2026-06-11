@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.2: Reconstruction Tooling: COLMAP, OpenMVG &amp; Friends. The structure-from-motion and multi-view-stereo toolchain: COLMAP and pycolmap in practice, GLOMAP's global SfM, OpenMVG plus OpenMVS, Meshroom, SLAM frameworks, the Ceres/g2o/GTSAM optimizers underneath, and a decision guide for picking the right pipeline." name="description"/>
+<title>Section 17.2: Reconstruction Tooling: COLMAP, OpenMVG &amp; Friends | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Tools of the Trade: The Classical CV Stack</a></div>
+<h1>Reconstruction Tooling: COLMAP, OpenMVG &amp; Friends</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"Give me four hundred holiday photos in random order, no GPS, no timestamps, and a weekend. I will hand you back a building, the camera that took each picture, and a polite note about the three blurry ones I refused to use."</p>
+<cite>An Incremental Reconstruction Pipeline, Mildly Smug</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Reconstructing 3D from images is not a function call but a pipeline, and a small number of mature open-source tools implement that pipeline end to end so you almost never write it yourself.</strong> COLMAP is the reference incremental structure-from-motion engine; GLOMAP is its faster global-SfM sibling; OpenMVG plus OpenMVS and AliceVision's Meshroom round out the ecosystem; SLAM frameworks do the same job in real time; and underneath all of them sit the nonlinear optimizers (Ceres, g2o, GTSAM) that perform the bundle adjustment of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>. This section is the decision guide.</p>
+</div>
+<p>
+<a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> derived the algorithm: detect features, match them across images, estimate relative poses, triangulate points, and refine everything jointly with bundle adjustment. Writing that pipeline from scratch, robustly, for hundreds of unordered images, is a multi-year software project, which is precisely why nobody does it. The community converged on a handful of tools that are correct, fast, and battle-tested. This section maps them, runs the canonical one, and explains the optimization machinery they share, so you can pick the right tool the first time a project needs a 3D model.
+</p>
+<h2>1. The Reconstruction Pipeline, and Where the Tools Sit <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Every photogrammetry tool implements the same conceptual stages, then differs in how it orders and optimizes them. Figure 17.2.1 lays out the canonical flow from images to a textured mesh and marks which tool owns which stage, because the most common architecture in practice is a hybrid: one tool for the sparse reconstruction (the cameras and a point cloud) and another for the dense reconstruction (the surface).
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Reconstruction pipeline: images flow through feature extraction and matching to sparse SfM producing camera poses and a sparse point cloud, then to multi-view stereo producing a dense cloud, then to meshing and texturing">
+<style>
+.stg { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; }
+.stg2 { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; }
+.stgt { font-family: Verdana, Arial, sans-serif; font-size: 12.5px; font-weight: bold; fill: #111827; text-anchor: middle; }
+.stgs { font-family: Verdana, Arial, sans-serif; font-size: 10px; fill: #4b5563; text-anchor: middle; }
+.own { font-family: Consolas, monospace; font-size: 10px; fill: #6d28d9; text-anchor: middle; }
+.pflow { stroke: #374151; stroke-width: 2.2; fill: none; marker-end: url(#ar172); }
+.brace { font-family: Verdana, Arial, sans-serif; font-size: 10.5px; font-weight: bold; fill: #6d28d9; text-anchor: middle; }
+</style>
+<defs>
+<marker id="ar172" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+<path d="M0,0 L7,3 L0,6 z" fill="#374151"/>
+</marker>
+</defs>
+<rect class="stg" x="15" y="90" width="120" height="70" rx="6"/>
+<text class="stgt" x="75" y="118">Images</text>
+<text class="stgs" x="75" y="138">unordered set</text>
+<rect class="stg" x="165" y="90" width="130" height="70" rx="6"/>
+<text class="stgt" x="230" y="115">Features +</text>
+<text class="stgt" x="230" y="132">Matching</text>
+<text class="stgs" x="230" y="150">SIFT, FLANN</text>
+<rect class="stg" x="325" y="90" width="130" height="70" rx="6"/>
+<text class="stgt" x="390" y="115">Sparse SfM</text>
+<text class="stgs" x="390" y="133">poses +</text>
+<text class="stgs" x="390" y="148">sparse cloud</text>
+<rect class="stg2" x="485" y="90" width="130" height="70" rx="6"/>
+<text class="stgt" x="550" y="115">Multi-View</text>
+<text class="stgt" x="550" y="132">Stereo</text>
+<text class="stgs" x="550" y="150">dense cloud</text>
+<rect class="stg2" x="645" y="90" width="130" height="70" rx="6"/>
+<text class="stgt" x="710" y="115">Mesh +</text>
+<text class="stgt" x="710" y="132">Texture</text>
+<text class="stgs" x="710" y="150">surface</text>
+<path class="pflow" d="M135,125 L163,125"/>
+<path class="pflow" d="M295,125 L323,125"/>
+<path class="pflow" d="M455,125 L483,125"/>
+<path class="pflow" d="M615,125 L643,125"/>
+<text class="brace" x="295" y="215">COLMAP / GLOMAP / OpenMVG own this</text>
+<path d="M165,180 L165,170 M620,180 L620,170 M165,180 L620,180" stroke="#6d28d9" stroke-width="1.5" fill="none"/>
+<text class="brace" x="630" y="255">OpenMVS / COLMAP dense own this</text>
+<path d="M485,240 L485,230 M775,240 L775,230 M485,240 L775,240" stroke="#16a34a" stroke-width="1.5" fill="none"/>
+<text class="own" x="710" y="285">Meshroom wraps the whole row</text>
+</svg>
+<figcaption><strong>Figure 17.2.1:</strong> The image-to-mesh pipeline and tool ownership. Sparse SfM (left) recovers cameras and a point cloud; multi-view stereo and meshing (right) recover the surface. COLMAP and GLOMAP excel at the sparse stage, OpenMVS at the dense stage, and Meshroom packages the entire row behind a node graph.</figcaption>
+</figure>
+<p>
+The crucial architectural choice is at the SfM stage: <strong>incremental</strong> versus <strong>global</strong>. Incremental SfM (COLMAP) starts from a good two-view pair and adds one image at a time, running bundle adjustment repeatedly; it is extremely robust but scales super-linearly because of the repeated optimization. Global SfM (GLOMAP, OpenMVG's global mode) estimates all camera rotations and translations at once from the pairwise relations, then bundle-adjusts once; it is far faster on large sets but historically more fragile. The 2024 GLOMAP work narrowed that robustness gap considerably, which is why it now appears in the tooling conversation as a serious COLMAP alternative.
+</p>
+<h2>2. COLMAP: The Reference Pipeline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+COLMAP (Schönberger and Frahm, CVPR 2016) is the tool to learn first, because it is the de facto standard: its sparse output format is what neural scene methods in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> expect, and its database schema is the interchange format the rest of this section's tools read and write. It offers three ways in: a GUI, a command-line interface, and the <code>pycolmap</code> Python bindings. For a quick result, the <code>automatic_reconstructor</code> wraps the whole pipeline; for control and scripting, <code>pycolmap</code> exposes each stage. Code 17.2.1 runs a full sparse-plus-pose reconstruction from a folder of images in a dozen lines.
+</p>
+<pre><code class="language-python">import pycolmap
+from pathlib import Path
+
+image_dir = Path("photos/")
+out = Path("reconstruction/"); out.mkdir(exist_ok=True)
+db = out / "database.db"
+
+# 1. Detect SIFT features and write them to the COLMAP database.
+pycolmap.extract_features(db, image_dir)
+# 2. Match features (exhaustive for small sets; use sequential/vocab-tree for large).
+pycolmap.match_exhaustive(db)
+# 3. Incremental SfM: build the sparse model (cameras + 3D points).
+maps = pycolmap.incremental_mapping(db, image_dir, out)
+
+rec = maps[0]                          # the largest reconstructed model
+print(f"registered {rec.num_reg_images()} images, "
+      f"{rec.num_points3D()} 3D points")
+rec.write(out)                         # cameras.bin, images.bin, points3D.bin</code></pre>
+<div class="code-caption"><strong>Code 17.2.1:</strong> A complete sparse reconstruction with <code>pycolmap</code>. The three calls map exactly onto the <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> pipeline: feature extraction, matching, and incremental mapping with bundle adjustment folded into the third call. The output <code>.bin</code> files are the format Chapter 27's NeRF and Gaussian-splatting tools read directly.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: 12 Lines Replace a Reconstruction Codebase</div>
+<p>The pipeline in Code 17.2.1 is, line for line, the entire structure-from-motion system of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>: correspondence search, robust two-view initialization, incremental registration via PnP, triangulation, and global bundle adjustment, plus the failure handling for degenerate pairs, drift, and duplicate points that the chapter only sketched. A research-grade implementation of that pipeline is tens of thousands of lines of C++; COLMAP is exactly that codebase, and <code>pycolmap</code> hands it to you in twelve lines of Python. The one judgment call the shortcut still demands is the matching strategy: <code>match_exhaustive</code> is $O(n^2)$ in the image count and only suits sets up to a few hundred images; larger collections need <code>match_sequential</code> (for video) or vocabulary-tree matching (for unordered internet photos).</p>
+</div>
+<p>
+The matching strategy is the single biggest lever on both runtime and quality, summarized in Table 17.2.1. Choosing it correctly is the difference between a reconstruction that finishes overnight and one that never finishes.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 17.2.1:</strong> <em>COLMAP matching strategies. The right choice depends on how the images are ordered and how many there are.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Strategy</th><th scope="col">Cost</th><th scope="col">Use when</th></tr>
+</thead>
+<tbody>
+<tr><td>Exhaustive</td><td>$O(n^2)$ pairs</td><td>Small unordered set (up to a few hundred images)</td></tr>
+<tr><td>Sequential</td><td>$O(n)$ pairs</td><td>Video frames or an ordered capture; matches neighbors in time</td></tr>
+<tr><td>Vocabulary tree</td><td>$O(n \log n)$</td><td>Large unordered collections; retrieves likely overlapping pairs</td></tr>
+<tr><td>Spatial</td><td>$O(n)$ with GPS</td><td>Geotagged aerial or street imagery; matches by location</td></tr>
+</tbody>
+</table>
+</div>
+<h2>3. The Ecosystem: GLOMAP, OpenMVG/OpenMVS &amp; Meshroom <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+COLMAP is the default, not the only option, and the alternatives win in specific regimes. Table 17.2.2 is the comparison to keep; the prose below it explains when each tool earns its place.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 17.2.2:</strong> <em>The open-source reconstruction tools and where each one is the right choice.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Tool</th><th scope="col">SfM type</th><th scope="col">Strength</th><th scope="col">Reach for it when</th></tr>
+</thead>
+<tbody>
+<tr><td>COLMAP</td><td>Incremental</td><td>Robust, standard format, huge ecosystem</td><td>Default for sparse SfM and Chapter 27 poses</td></tr>
+<tr><td>GLOMAP</td><td>Global</td><td>Much faster on large sets, COLMAP-compatible output</td><td>Hundreds-to-thousands of images, time matters</td></tr>
+<tr><td>OpenMVG</td><td>Incr. + global</td><td>Clean, readable, modular CLI stages</td><td>Studying the algorithms or composing custom stages</td></tr>
+<tr><td>OpenMVS</td><td>Dense (MVS)</td><td>Best open dense cloud, mesh, texture</td><td>You have sparse poses and need a surface</td></tr>
+<tr><td>Meshroom (AliceVision)</td><td>Incremental</td><td>GUI node graph, full image-to-mesh</td><td>Artists and non-coders; end-to-end with a UI</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+<strong>GLOMAP</strong> (Pan et al., ECCV 2024) is the headline update to the classical toolchain: it performs global SfM that matches incremental COLMAP's accuracy while running an order of magnitude faster on large scenes, and it reads COLMAP's database, so adopting it is a one-binary swap in an existing pipeline. <strong>OpenMVG</strong> is valued less for raw performance than for clarity: its command-line stages map one-to-one onto the geometry of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, making it the best codebase to read alongside the theory. The common production pattern is a hybrid: run COLMAP or GLOMAP for the sparse cameras, then hand the result to <strong>OpenMVS</strong> for the dense point cloud, mesh, and texture. <strong>Meshroom</strong>, the GUI front-end for AliceVision, wraps an entire pipeline behind a visual node graph and is the tool of choice for artists and anyone who would rather not script.
+</p>
+<h2>4. What Runs Underneath: Bundle Adjustment Solvers <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Every tool above shares a beating heart: a nonlinear least-squares solver that performs <strong>bundle adjustment</strong>, the joint refinement of all camera poses and all 3D points to minimize total reprojection error. From <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, the objective is
+</p>
+<p>
+$$ \min_{\{C_j\},\,\{X_i\}} \; \sum_{i,j} v_{ij} \, \rho\!\left( \left\lVert \pi(C_j, X_i) - x_{ij} \right\rVert^2 \right), $$
+</p>
+<p>
+where $\pi$ projects 3D point $X_i$ through camera $C_j$, $x_{ij}$ is the observed image point, $v_{ij}$ flags whether point $i$ is visible in image $j$, and $\rho$ is a robust loss (Huber or Cauchy) that prevents a few mismatched correspondences from dominating the fit. This is a giant sparse problem, the visibility pattern $v_{ij}$ is mostly zero, and the solvers exploit that sparsity. Three libraries dominate, and which one a tool uses tells you something about its design, as Table 17.2.3 shows.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 17.2.3:</strong> <em>The three bundle-adjustment solver libraries and their natural homes.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Solver</th><th scope="col">Model</th><th scope="col">Used by</th><th scope="col">Character</th></tr>
+</thead>
+<tbody>
+<tr><td>Ceres Solver</td><td>General nonlinear least squares</td><td>COLMAP, GLOMAP</td><td>Auto-diff, flexible cost functions, batch SfM</td></tr>
+<tr><td>g2o</td><td>Graph optimization</td><td>ORB-SLAM2/3</td><td>Hyper-graph of poses and landmarks, real-time</td></tr>
+<tr><td>GTSAM</td><td>Factor graphs (iSAM)</td><td>Many SLAM back-ends</td><td>Incremental smoothing, marginalization, IMU factors</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+You rarely call these directly, but knowing they exist demystifies the tools. <strong>Ceres</strong> (Agarwal, Mierle et al.) is a general-purpose solver with automatic differentiation, so COLMAP can express the projection cost in plain C++ and let Ceres compute derivatives; it is the batch-SfM workhorse. <strong>g2o</strong> models the problem as a graph of pose and landmark vertices joined by measurement edges and is tuned for the real-time loop of <strong>ORB-SLAM3</strong> (Campos et al., IEEE T-RO 2021). <strong>GTSAM</strong> uses factor graphs and incremental smoothing (iSAM2) to update a solution as new measurements arrive without re-solving from scratch, which is why it underpins many SLAM and visual-inertial back-ends.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Offline Reconstruction and SLAM Are the Same Math at Different Speeds</div>
+<p>COLMAP and ORB-SLAM3 look like different worlds, one is a batch tool you run on a photo folder, the other a real-time system on a robot, but they solve the identical optimization: minimize reprojection error over poses and points. The difference is the budget. Offline SfM can afford repeated global bundle adjustment over every image, so it chooses Ceres and incremental registration. SLAM must answer in milliseconds per frame, so it optimizes a sliding window of recent keyframes (g2o or GTSAM), keeps a separate slow loop-closure thread to correct drift, and accepts a slightly less accurate map in exchange for keeping up with the camera. Understanding that they share an objective means a debugging instinct from one transfers directly to the other. The phrase to keep: <strong>SLAM is bundle adjustment on a deadline.</strong></p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>COLMAP's reach quietly outgrew its paper. Released in 2016 as a structure-from-motion tool, it has since become the unglamorous first step of nearly every shiny 3D result you have seen: the radiance fields of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> need camera poses, and the field reached such consensus that "poses from COLMAP" appears in the methods section of thousands of NeRF and Gaussian-splatting papers, usually in a single sentence that hides several CPU-hours of bundle adjustment. A 2016 classical-geometry tool is the silent prerequisite of the 2026 generative-3D boom. The most-cited line in modern 3D is one nobody bothers to write out in full.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Reconstruction That Split in Two</div>
+<p><strong>Who:</strong> A heritage-preservation group digitizing a stone archway from a phone-camera walkaround.</p>
+<p><strong>Situation:</strong> They captured 220 images circling the arch and ran COLMAP with exhaustive matching, expecting one clean model.</p>
+<p><strong>Problem:</strong> COLMAP returned <em>two</em> disconnected reconstructions, the front face and the back face, each internally consistent but with no shared cameras. The arch's two sides had almost no overlapping views, so no feature matches bridged them, and incremental SfM had no way to know the two halves belonged together.</p>
+<p><strong>Decision:</strong> Instead of fighting the matcher, they shot a short connecting sequence of images sweeping around one edge of the arch, then re-ran with sequential matching enabled on that bridge so the two halves shared correspondences. They also enabled loop-closure-style re-matching of geometrically verified pairs.</p>
+<p><strong>Result:</strong> The next run produced a single connected model registering 214 of 220 images. The six dropped images were genuinely blurry, and COLMAP's refusal to register them was correct behavior, not a bug.</p>
+<p><strong>Lesson:</strong> Disconnected reconstructions are a coverage problem, not a software failure. SfM can only connect what shares features; plan the capture so that consecutive views overlap by roughly sixty to eighty percent and that loops close. The tool is honest about what it cannot see.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Feed-Forward Reconstruction Is Eating the Pipeline</div>
+<p>The 2024 to 2025 frontier collapses the multi-stage pipeline of Figure 17.2.1 into a single neural network forward pass. <strong>DUSt3R</strong> (Wang et al., CVPR 2024) regresses a dense, aligned 3D point map directly from an uncalibrated image pair, skipping explicit matching and SfM entirely, and its successor <strong>MASt3R</strong> adds metric scale and a matching head. <strong>VGGT</strong> (Wang et al., CVPR 2025) pushes this to many images at once, predicting cameras, depth, and 3D points for a whole set in seconds where COLMAP would take minutes to hours. In parallel, the classical pipeline is being upgraded rather than replaced: the <strong>hloc</strong> toolbox (Sarlin et al.) swaps SuperPoint and LightGlue into COLMAP's front-end, and <strong>GLOMAP</strong> modernizes the back-end. The honest 2026 picture: feed-forward models win on speed and on hard sparse-view cases, while COLMAP-class pipelines still win on large, high-accuracy reconstructions and remain the trusted ground truth that the learned methods are benchmarked against. The feed-forward methods reappear as first-class tools in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.1: Match the Tool to the Job <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, name the tool or tool combination from Table 17.2.2 you would reach for and justify it in one sentence: (a) recovering camera poses for a 60-image NeRF capture; (b) reconstructing a textured mesh of a sculpture for a museum web viewer, by a curator who does not code; (c) building a sparse model from 3,000 crowd-sourced photos of a landmark, overnight; (d) studying exactly how global rotation averaging works by reading source code.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.2: Reconstruct and Inspect <span class="exercise-type coding">Coding</span></div>
+<p>Capture or download 30 to 80 overlapping images of a small object. Run the Code 17.2.1 <code>pycolmap</code> pipeline. Then load the result and report: how many images registered versus how many you provided, the number of 3D points, and the mean reprojection error (<code>rec.compute_mean_reprojection_error()</code>). Re-run with <code>match_sequential</code> instead of <code>match_exhaustive</code> and compare registered-image counts and runtime. Explain the difference in terms of Table 17.2.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 17.2.3: Why Robust Loss Matters <span class="exercise-type analysis">Analysis</span></div>
+<p>The bundle-adjustment objective uses a robust loss $\rho$ rather than plain squared error. Consider a reconstruction with 10,000 correspondences, of which 50 are gross mismatches with reprojection errors of 200 pixels while the rest sit near 1 pixel. Estimate how much a single gross outlier contributes to the total cost under squared loss versus under a Huber loss with threshold 4 pixels. Argue quantitatively why removing $\rho$ would let the 50 outliers bend the entire camera solution, connecting this to the RANSAC pre-filtering of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-17.1.html"><span class="nav-label">Section 17.1: OpenCV Beyond the Basics</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 17</span></a>
+<a class="next" href="section-17.3.html"><span class="nav-label">Section 17.3: Datasets &amp; Benchmarks for Geometry, Flow &amp; Tracking</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

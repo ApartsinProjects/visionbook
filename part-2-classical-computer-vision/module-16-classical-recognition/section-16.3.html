@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.3: HOG + SVM: The Pedestrian Detection Era. Histograms of oriented gradients, block normalization, maximum-margin linear classification, sliding windows over image pyramids, hard negative mining, non-maximum suppression, and miss-rate evaluation." name="description"/>
+<title>Section 16.3: HOG + SVM: The Pedestrian Detection Era | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Classical Recognition Pipelines</a></div>
+<h1>HOG + SVM: The Pedestrian Detection Era</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Forget the pixels; tell me which way the brightness leans, and I will tell you whether that is a person. I have been doing it since 2005, one sliding window at a time."</p>
+<cite>A Histogram of Oriented Gradients, Quietly Confident</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Replace pixels with the local distribution of gradient orientations, slide a single linear classifier over the image at every position and scale, and you get the detector that defined an entire decade.</strong> The Dalal-Triggs pipeline is the most complete worked example of classical recognition in this chapter, and every stage teaches a transferable lesson. The HOG descriptor captures shape while discarding texture and lighting. The linear support vector machine finds the maximum-margin boundary between "person" and "not person." The sliding window plus image pyramid turns a classifier into a detector. Hard negative mining fixes the data imbalance that detection always creates. Non-maximum suppression cleans the redundant detections, and the miss-rate curve measures the result honestly. Hold these pieces in mind: <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>'s deep detectors keep every one of them and only replace the features.</p>
+</div>
+
+<p>
+The previous section turned an image into a single histogram for whole-image classification. Detection is harder: we must find <em>where</em> an object is, not just whether one is present, and the same object can appear at any position and any size. This section follows the canonical solution, Dalal and Triggs's human detector (CVPR 2005), from the descriptor that made it work to the evaluation that proved it. It is the natural sequel to the gradient machinery of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> and <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>: HOG is built entirely from image gradients.
+</p>
+
+<h2>1. The HOG Descriptor: Shape as a Gradient Distribution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The insight behind <strong>histograms of oriented gradients</strong> is that an object's shape is captured well by the local distribution of edge directions, even when its exact pixel values vary wildly. A pedestrian has roughly vertical gradients along the legs and torso and a characteristic head-and-shoulders outline, and those orientation statistics are remarkably stable across clothing, lighting, and skin tone, the things templates could not survive. HOG throws away absolute brightness and keeps only which way the brightness changes and how strongly.
+</p>
+<p>
+The construction proceeds in four steps. First, compute the gradient at every pixel using a simple $[-1, 0, 1]$ filter (Dalal and Triggs found this plain kernel beat fancier ones), giving magnitude $m = \sqrt{g_x^2 + g_y^2}$ and orientation $\theta = \arctan(g_y / g_x)$ at each pixel. Second, divide the window into small <strong>cells</strong> (typically $8 \times 8$ pixels) and, within each cell, build a histogram of orientations: each pixel votes for its orientation bin (usually $9$ bins over $0$ to $180$ degrees, unsigned) weighted by its gradient magnitude. Third, group cells into overlapping <strong>blocks</strong> (typically $2 \times 2$ cells) and normalize each block's concatenated histogram to unit length, which is what grants invariance to local contrast and illumination. Fourth, concatenate all block descriptors into one long feature vector for the window. Figure 16.3.1 lays out the cell-and-block geometry and shows the orientation histogram inside one cell.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The HOG descriptor construction: a detection window divided into 8 by 8 pixel cells, an orientation histogram with 9 bins inside one cell, and a 2 by 2 block of cells that is normalized together and slides with overlap across the window.">
+  <text x="130" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Window in cells</text>
+  <rect x="40" y="44" width="180" height="240" fill="#fbfcfc" stroke="#5a626c" stroke-width="1.5"/>
+  <g stroke="#d5d8dc" stroke-width="0.8">
+    <line x1="70" y1="44" x2="70" y2="284"/><line x1="100" y1="44" x2="100" y2="284"/>
+    <line x1="130" y1="44" x2="130" y2="284"/><line x1="160" y1="44" x2="160" y2="284"/>
+    <line x1="190" y1="44" x2="190" y2="284"/>
+    <line x1="40" y1="74" x2="220" y2="74"/><line x1="40" y1="104" x2="220" y2="104"/>
+    <line x1="40" y1="134" x2="220" y2="134"/><line x1="40" y1="164" x2="220" y2="164"/>
+    <line x1="40" y1="194" x2="220" y2="194"/><line x1="40" y1="224" x2="220" y2="224"/>
+    <line x1="40" y1="254" x2="220" y2="254"/>
+  </g>
+  <rect x="70" y="74" width="60" height="60" fill="#aed6f1" opacity="0.6" stroke="#2980b9" stroke-width="2"/>
+  <text x="100" y="108" font-family="sans-serif" font-size="10" fill="#1f618d" text-anchor="middle">2x2 block</text>
+  <rect x="100" y="104" width="30" height="30" fill="none" stroke="#c0392b" stroke-width="1.8"/>
+  <text x="130" y="305" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">8x8 cells, 2x2 blocks</text>
+
+  <text x="380" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">One cell's 9-bin histogram</text>
+  <line x1="300" y1="240" x2="470" y2="240" stroke="#5a626c" stroke-width="1.4"/>
+  <line x1="300" y1="240" x2="300" y2="90" stroke="#5a626c" stroke-width="1.4"/>
+  <g fill="#2980b9">
+    <rect x="306" y="180" width="14" height="60"/>
+    <rect x="324" y="140" width="14" height="100"/>
+    <rect x="342" y="110" width="14" height="130"/>
+    <rect x="360" y="160" width="14" height="80"/>
+    <rect x="378" y="200" width="14" height="40"/>
+    <rect x="396" y="190" width="14" height="50"/>
+    <rect x="414" y="170" width="14" height="70"/>
+    <rect x="432" y="150" width="14" height="90"/>
+    <rect x="450" y="195" width="14" height="45"/>
+  </g>
+  <text x="385" y="258" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">orientation bin (0 to 180 deg)</text>
+  <text x="294" y="100" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="end">vote</text>
+
+  <text x="640" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Dominant edge in cell</text>
+  <rect x="560" y="80" width="160" height="160" fill="#fef9e7" stroke="#aab7b8" stroke-width="1.2"/>
+  <g stroke="#c0392b" stroke-width="2.4">
+    <line x1="600" y1="220" x2="600" y2="100"/>
+    <line x1="640" y1="220" x2="640" y2="100"/>
+    <line x1="680" y1="220" x2="680" y2="100"/>
+  </g>
+  <text x="640" y="262" font-family="sans-serif" font-size="11" fill="#922b21" text-anchor="middle">strong vertical gradients (a leg)</text>
+</svg>
+<figcaption><strong>Figure 16.3.1</strong>: The HOG descriptor. The window is tiled into $8 \times 8$ cells (left); each cell accumulates a $9$-bin orientation histogram weighted by gradient magnitude (center); cells are grouped into overlapping $2 \times 2$ blocks that are normalized together (the blue block). A cell dominated by vertical gradients, as on a pedestrian's leg, produces a histogram peaked at the vertical bin (right).</figcaption>
+</figure>
+
+<p>
+The block overlap is not an accident. Each cell appears in multiple blocks and is normalized differently in each, so the descriptor encodes the same cell relative to several different local contexts. That redundancy is what makes HOG robust to the local lighting variation that defeated <a href="section-16.1.html">Section 16.1</a>'s templates. The code below computes a HOG descriptor for a detection window using scikit-image, which exposes the cell and block geometry directly so you can see the parameters that Figure 16.3.1 names.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage.feature import hog
+
+# A pedestrian detection window is canonically 64 wide x 128 tall.
+window = cv2.imread("person_crop.png", cv2.IMREAD_GRAYSCALE)
+window = cv2.resize(window, (64, 128))
+
+features, hog_image = hog(
+    window,
+    orientations=9,                 # 9 unsigned orientation bins
+    pixels_per_cell=(8, 8),         # 8x8 pixel cells
+    cells_per_block=(2, 2),         # 2x2 cell blocks, normalized together
+    block_norm="L2-Hys",            # L2 norm with clipping, the Dalal-Triggs choice
+    visualize=True,
+    feature_vector=True)
+
+print(f"HOG feature length: {features.shape[0]}")
+# 7 blocks wide x 15 tall x (2*2 cells) x 9 bins = 3780
+# HOG feature length: 3780</code></pre>
+<div class="code-caption">Computing the $3780$-dimensional HOG descriptor of a $64 \times 128$ window with the canonical Dalal-Triggs parameters; <code>L2-Hys</code> is L2 normalization followed by clipping large values and renormalizing, which suppresses the influence of very strong gradients.</div>
+
+<h2>2. The Linear SVM: Maximum-Margin Classification <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+HOG turns each window into a $3780$-dimensional vector; now we need a classifier that decides "person" or "not person." Dalal and Triggs used a <strong>linear support vector machine</strong>, and the choice was deliberate. A linear SVM learns a weight vector $\mathbf{w}$ and bias $b$ so the decision is simply the sign of $\mathbf{w} \cdot \mathbf{x} + b$, and among all hyperplanes that separate the training classes it picks the one with the largest <strong>margin</strong>, the widest gap to the nearest examples of either class. Maximizing the margin is a principled defense against overfitting: the boundary depends only on the borderline examples (the support vectors) and ignores the easy interior ones. Formally the soft-margin SVM minimizes
+</p>
+<p>
+$$ \frac{1}{2}\lVert \mathbf{w} \rVert^2 \;+\; C \sum_i \max\!\big(0,\; 1 - y_i(\mathbf{w}\cdot \mathbf{x}_i + b)\big), $$
+</p>
+<p>
+where $y_i \in \{-1, +1\}$ are the labels and $C$ trades margin width against training errors. The first term widens the margin; the hinge-loss sum penalizes points on the wrong side. Two properties made the linear SVM ideal for detection. It is extremely fast at test time, one dot product per window, which matters enormously when you evaluate millions of windows per image. And the learned weight vector $\mathbf{w}$ is itself a HOG-shaped template you can visualize: positive weights mark "person-like gradient here," negative weights mark "background-like gradient here," and rendering $\mathbf{w}$ produces a ghostly average pedestrian.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Linear SVM on HOG Is a Learned, Soft Template</div>
+<p>Section 16.1's template matching correlated a fixed pixel patch against the image. A linear SVM on HOG correlates a <em>learned</em> weight vector against the HOG feature image, and that is the whole conceptual upgrade in one sentence. The template is no longer a single photographed example; it is the maximum-margin combination of thousands of examples, expressed in a gradient-orientation space that already discards lighting and texture. When you reach the first convolutional layer of a CNN in <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> and find filters that look like oriented edge detectors, you are seeing this same idea, learned rather than designed, and stacked many layers deep.</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.svm import LinearSVC
+
+# X: (n_windows, 3780) HOG vectors; y: +1 for person crops, -1 for background.
+svm = LinearSVC(C=0.01, max_iter=20000)
+svm.fit(X_train, y_train)
+
+# The learned weight vector is itself a HOG-shaped detector you can score with.
+w = svm.coef_.ravel()           # shape (3780,)
+score = w @ hog_window + svm.intercept_[0]   # > 0 means "person"
+print(f"decision score: {score:.3f}  ({'person' if score > 0 else 'background'})")
+# decision score: 1.842  (person)</code></pre>
+<div class="code-caption">Training the linear SVM on HOG vectors: <code>coef_</code> is the learned weight vector $\mathbf{w}$, and classifying any window reduces to a single dot product with it, the one-operation test-time cost that makes dense sliding-window search feasible.</div>
+
+<h2>3. From Classifier to Detector: Sliding Windows Over a Pyramid <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A classifier answers "is this window a person?" A detector answers "where are the people?", and the bridge is exhaustive search. Slide the $64 \times 128$ window across the image in small steps, scoring each placement with the SVM; then resize the image down and repeat, so a single fixed-size window finds people at every scale. This is the same image pyramid from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a> that powered the multi-scale template search in <a href="section-16.1.html">Section 16.1</a>, now feeding a learned classifier instead of a correlation. The result is a dense field of scores; thresholding it yields candidate detections, typically thousands per image before cleanup.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage.feature import hog
+
+def detect(image, svm_w, svm_b, win=(128, 64), stride=8, scales=10, downscale=1.2):
+    """Sliding-window HOG+SVM detection across an image pyramid."""
+    detections = []
+    for s in range(scales):
+        scale = downscale ** s
+        resized = cv2.resize(image, None, fx=1 / scale, fy=1 / scale)
+        if resized.shape[0] &lt; win[0] or resized.shape[1] &lt; win[1]:
+            break
+        for y in range(0, resized.shape[0] - win[0], stride):
+            for x in range(0, resized.shape[1] - win[1], stride):
+                patch = resized[y:y + win[0], x:x + win[1]]
+                f = hog(patch, orientations=9, pixels_per_cell=(8, 8),
+                        cells_per_block=(2, 2), block_norm="L2-Hys")  # match the training descriptor exactly
+                score = svm_w @ f + svm_b
+                if score &gt; 0.5:                      # detection threshold
+                    detections.append((int(x * scale), int(y * scale),
+                                       int(win[1] * scale), int(win[0] * scale), score))
+    return detections
+
+raw = detect(cv2.imread("street.png", cv2.IMREAD_GRAYSCALE), svm.coef_.ravel(),
+             svm.intercept_[0])
+print(f"raw detections before NMS: {len(raw)}")
+# raw detections before NMS: 1473</code></pre>
+<div class="code-caption">The detection loop: at each pyramid scale the window slides with an $8$-pixel stride, each placement is HOG-encoded and scored by the SVM, and above-threshold windows are kept with their box mapped back to original-image coordinates. Note the $1473$ raw detections, mostly redundant overlaps that the next stage removes.</div>
+
+<h2>4. Hard Negative Mining and Non-Maximum Suppression <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Two practical problems break the naive pipeline, and both fixes became permanent fixtures of detection. The first is data imbalance: a training image contains a handful of person windows and literally millions of background windows, so a classifier trained on a random sample of negatives never sees the <em>hard</em> negatives (a lamppost, a tree trunk, a doorway) that actually trigger false positives. <strong>Hard negative mining</strong> solves this by bootstrapping: train on an initial set, run the detector on negative images, collect every high-scoring false positive (the hard negatives), add them to the training set, and retrain. Iterate until false positives stop appearing. This focuses the SVM's capacity exactly where it matters, on the boundary cases, and it typically halves the miss rate.
+</p>
+<p>
+The second problem is redundancy. A real pedestrian triggers the detector at many nearby positions and scales, producing a cluster of overlapping boxes (the $1473$ in the code above). <strong>Non-maximum suppression</strong> (NMS) collapses each cluster to one box: sort detections by score, greedily keep the highest, remove every remaining box that overlaps it by more than an intersection-over-union threshold, and repeat. Figure 16.3.2 shows both stages, the bootstrap loop that hardens the classifier and the greedy suppression that cleans its output.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two detection fixes. Left: the hard negative mining loop trains, runs on negatives, collects false positives, adds them and retrains. Right: non-maximum suppression takes many overlapping boxes around one person and keeps only the highest-scoring box.">
+  <text x="195" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Hard negative mining loop</text>
+  <rect x="70" y="46" width="120" height="34" rx="6" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="130" y="68" font-family="sans-serif" font-size="11.5" fill="#1f618d" text-anchor="middle">train SVM</text>
+  <rect x="70" y="100" width="120" height="34" rx="6" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="130" y="122" font-family="sans-serif" font-size="11.5" fill="#1f618d" text-anchor="middle">run on negatives</text>
+  <rect x="70" y="154" width="120" height="34" rx="6" fill="#fadbd8" stroke="#c0392b" stroke-width="1.5"/>
+  <text x="130" y="176" font-family="sans-serif" font-size="11" fill="#922b21" text-anchor="middle">collect false +ves</text>
+  <rect x="70" y="208" width="120" height="34" rx="6" fill="#d5f5e3" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="130" y="230" font-family="sans-serif" font-size="11" fill="#196f3d" text-anchor="middle">add &amp; retrain</text>
+  <line x1="130" y1="80" x2="130" y2="98" stroke="#5a626c" stroke-width="1.6"/><polygon points="130,100 125,92 135,92" fill="#5a626c"/>
+  <line x1="130" y1="134" x2="130" y2="152" stroke="#5a626c" stroke-width="1.6"/><polygon points="130,154 125,146 135,146" fill="#5a626c"/>
+  <line x1="130" y1="188" x2="130" y2="206" stroke="#5a626c" stroke-width="1.6"/><polygon points="130,208 125,200 135,200" fill="#5a626c"/>
+  <path d="M 70 225 C 30 225 30 63 68 63" fill="none" stroke="#7f8c8d" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <polygon points="70,63 60,58 60,68" fill="#7f8c8d"/>
+  <text x="195" y="285" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">repeat until no new false positives</text>
+
+  <text x="585" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Non-maximum suppression</text>
+  <text x="500" y="56" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#5a626c">before</text>
+  <rect x="460" y="64" width="90" height="160" fill="#fef9e7" stroke="#aab7b8" stroke-width="1"/>
+  <rect x="470" y="80" width="50" height="130" fill="none" stroke="#e67e22" stroke-width="1.5" opacity="0.8"/>
+  <rect x="478" y="74" width="50" height="130" fill="none" stroke="#e67e22" stroke-width="1.5" opacity="0.8"/>
+  <rect x="486" y="86" width="50" height="130" fill="none" stroke="#e67e22" stroke-width="1.5" opacity="0.8"/>
+  <rect x="466" y="90" width="50" height="130" fill="none" stroke="#e67e22" stroke-width="1.5" opacity="0.8"/>
+  <line x1="560" y1="144" x2="600" y2="144" stroke="#5a626c" stroke-width="2"/><polygon points="602,144 592,139 592,149" fill="#5a626c"/>
+  <text x="700" y="56" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#5a626c">after</text>
+  <rect x="655" y="64" width="90" height="160" fill="#fef9e7" stroke="#aab7b8" stroke-width="1"/>
+  <rect x="670" y="80" width="50" height="130" fill="none" stroke="#1e8449" stroke-width="2.6"/>
+  <text x="695" y="248" font-family="sans-serif" font-size="11" fill="#196f3d" text-anchor="middle">keep highest score,</text>
+  <text x="695" y="264" font-family="sans-serif" font-size="11" fill="#196f3d" text-anchor="middle">drop the overlaps</text>
+</svg>
+<figcaption><strong>Figure 16.3.2</strong>: The two fixes detection cannot live without. Left: hard negative mining is a bootstrap loop that repeatedly mines the detector's own false positives and retrains on them, concentrating SVM capacity on the confusing background. Right: non-maximum suppression replaces a cluster of overlapping boxes around one person with the single highest-scoring box.</figcaption>
+</figure>
+
+<p>
+NMS is so fundamental that it survived the deep-learning transition almost unchanged; the box-cleanup stage of the detectors in <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> is the same greedy algorithm. The implementation below is the classic vectorized version.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def nms(boxes, scores, iou_thresh=0.4):
+    """Greedy non-maximum suppression; boxes as (x, y, w, h)."""
+    if len(boxes) == 0:
+        return []
+    b = np.array(boxes, dtype=np.float32)
+    x1, y1 = b[:, 0], b[:, 1]
+    x2, y2 = b[:, 0] + b[:, 2], b[:, 1] + b[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = np.argsort(scores)[::-1]               # highest score first
+    keep = []
+    while order.size &gt; 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])     # overlap with the rest
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        order = order[1:][iou &lt; iou_thresh]        # drop boxes that overlap the kept one
+    return keep
+
+kept = nms([d[:4] for d in raw], [d[4] for d in raw])
+print(f"after NMS: {len(kept)} detections")
+# after NMS: 6 detections</code></pre>
+<div class="code-caption">Greedy non-maximum suppression: detections are processed highest-score-first, and every box overlapping a kept box by more than the IoU threshold is discarded, collapsing the $1473$ raw windows of Section 3 to $6$ clean detections.</div>
+
+<h2>5. Measuring Detection Honestly: Miss Rate Versus FPPI <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Detection cannot be scored by accuracy, because the overwhelming majority of windows are background and a detector that says "no person" everywhere would score near-perfect accuracy while finding nobody. The pedestrian-detection community settled on a curve instead: <strong>miss rate versus false positives per image</strong> (FPPI), traced out by sweeping the detection threshold. Lowering the threshold finds more true pedestrians (lower miss rate) but also raises false alarms (higher FPPI); the curve shows the full trade-off, and detectors are summarized by their log-average miss rate over a standard FPPI range. The Caltech Pedestrian study (Doll&#225;r et al., IEEE TPAMI 2012) made this protocol the field standard and benchmarked sixteen detectors under it, which is why HOG-era results are quoted as miss rates, not accuracies. The mean average precision (mAP) of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> is the same idea generalized: integrate precision over recall instead of miss rate over FPPI.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Why You Cannot Brag About Accuracy</div>
+<p>Imagine a pedestrian detector that simply answers "no person" to every window it ever sees. On a typical street image it would be correct about $99.99$ percent of the time, because almost every window really is background. It would also be utterly useless, having never found a single person. That is why the field threw out accuracy and adopted the miss-rate-versus-FPPI curve: when the negatives outnumber the positives a million to one, a high score is not an achievement, it is an accident of arithmetic. The keeper phrase for the whole detector is <strong>slide, score, suppress, then count the misses, not the hits</strong>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Parking Garage That Counted Cars but Missed People</div>
+<p><strong>Who &amp; situation:</strong> a building-security integrator deployed a HOG+SVM pedestrian detector across a chain of parking garages to trigger lighting and alert guards to people in low-traffic zones at night. <strong>Problem:</strong> the detector worked beautifully in daytime tests but in production it missed roughly a third of real pedestrians and fired constantly on pillars and parked-car edges. <strong>Decision:</strong> the team realized the public Dalal-Triggs model had been trained on upright, well-lit, unoccluded pedestrians, nothing like a crouching person between cars under sodium lighting. They ran hard negative mining directly on a week of the garages' own background footage to learn the pillar and bumper false positives, and they retrained the positive set with garage-specific crops including partially occluded and bent poses. <strong>Result:</strong> the log-average miss rate on their own validation footage fell by more than half, and the false-alarm rate dropped to a level the guards stopped ignoring. <strong>Lesson:</strong> a classical detector is exactly as good as the negatives it was hardened against and the positives it was shown; hard negative mining on the deployment distribution, not the benchmark distribution, is what separates a demo from a system.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: HOG's Ideas, Still Running</div>
+<p>HOG+SVM is no longer state of the art, but its structure is everywhere in modern detection. The sliding window became the dense prediction head; the image pyramid became the feature pyramid network; hard negative mining became focal loss and online hard example mining; non-maximum suppression remains a literal final stage in most detectors. The 2024-2026 frontier even revisits HOG's gradient-orientation idea: edge and gradient maps are now standard conditioning inputs for controllable generation (the ControlNet edge condition of <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a> is a soft HOG), and real-time detectors in the YOLO line (which <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> covers) keep the slide-score-suppress skeleton while replacing the HOG features and the linear SVM with a single learned network. The 2005 pipeline was not discarded; its feature extractor and classifier were fused and made learnable, and everything around them stayed.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Pretrained Detector in Three Lines</div>
+<p>The pipeline above, descriptor plus SVM plus pyramid plus NMS, is well over a hundred lines to assemble from scratch. OpenCV ships a complete, pretrained Dalal-Triggs pedestrian detector behind <code>HOGDescriptor</code> with a built-in people SVM, the sliding-window search, the pyramid, and NMS-style grouping all handled internally; you write three lines. It returns boxes and confidences directly, so the entire Sections 1 through 4 reduce to one call to <code>detectMultiScale</code>.</p>
+<pre><code class="language-python">import cv2
+hog = cv2.HOGDescriptor()
+hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())  # pretrained SVM
+boxes, weights = hog.detectMultiScale(image, winStride=(8, 8), scale=1.05)
+# boxes: (n, 4) pedestrian rectangles; weights: their SVM scores</code></pre>
+<div class="code-caption">OpenCV's batteries-included pedestrian detector: <code>detectMultiScale</code> runs the full HOG+SVM sliding-window pyramid and grouping internally, collapsing the hundred-plus lines of Sections 1 through 4 into a single call returning boxes and scores.</div>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.1: Why a Linear Classifier? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Dalal and Triggs reported that a linear SVM on HOG nearly matched a much slower kernel SVM, and they chose the linear one. Explain the two reasons a linear classifier is preferable for sliding-window detection specifically, referring to the per-window test-time cost and to the visualizability of the weight vector. Then argue why the same speed argument does not hold for the whole-image classification of <a href="section-16.2.html">Section 16.2</a>, where kernel SVMs were the norm.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.2: Implementing and Tuning NMS <span class="exercise-type coding">Coding</span></div>
+<p>Run the Section 3 detector on a few street images, then apply the Section 4 NMS with IoU thresholds of $0.2$, $0.4$, and $0.7$. Visualize the kept boxes for each threshold over the same image and count detections. Describe what goes wrong at the extremes: which threshold merges two close pedestrians into one box, and which leaves duplicate boxes on a single pedestrian? Then implement soft-NMS (decay overlapping scores instead of deleting the boxes) and report whether it resolves the two-close-pedestrians failure.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.3.3: The Value of Hard Negatives <span class="exercise-type analysis">Analysis</span></div>
+<p>Train two HOG+SVM detectors on the same positive set: one with negatives sampled randomly from background images, and one with two rounds of hard negative mining. Evaluate both with a miss-rate-versus-FPPI curve on a held-out test set. Quantify the improvement at a fixed FPPI of $1$ false positive per image, and inspect the hard negatives the mining collected; describe the three most common false-positive structures it found and explain, in terms of gradient orientations, why each one fooled the initial detector.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.2.html">&#8592; Section 16.2: Bag of Visual Words &amp; Spatial Pyramids</a>
+<a href="index.html">Chapter 16</a>
+<a class="next" href="section-16.4.html">Section 16.4: Viola-Jones: Real-Time Face Detection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

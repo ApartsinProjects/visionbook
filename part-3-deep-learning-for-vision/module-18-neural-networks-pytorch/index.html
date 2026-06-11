@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 18: Neural Networks &amp; PyTorch for Vision. Tensors, automatic differentiation, the nn.Module abstraction, data pipelines, a training loop you fully understand, and the GPU and reproducibility practices that all of Part III depends on." name="description"/>
+<title>Chapter 18: Neural Networks &amp; PyTorch for Vision | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>Neural Networks &amp; PyTorch for Vision</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I do not learn rules. I learn a million small corrections, each one a little less wrong than the last, until the loss stops complaining."</p>
+<cite>A Gradient That Refuses to Vanish</cite>
+</blockquote>
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+For seventeen chapters, every transformation we applied to an image was something we wrote down by hand. A Sobel kernel, a homography, a SIFT descriptor, a histogram of oriented gradients: humans designed the operation, and the computer executed it faithfully. Part III inverts that relationship. From here on, we specify only the <em>shape</em> of the computation and a measure of how wrong its output is, and an optimization procedure discovers the operation itself from data. This is the deep learning bargain, and Chapter 18 is where we sign the contract: not by training a state-of-the-art network, but by building, from tensors upward, a training loop simple enough that nothing in it is magic.
+</p>
+<p>
+The chapter has a deliberate arc. <a href="section-18.1.html">Section 18.1</a> starts where your linear-algebra intuition already lives, with a linear classifier, and shows precisely why stacking linear layers gains nothing until a nonlinearity is inserted between them, turning a single matrix multiply into a multi-layer perceptron that can carve curved decision boundaries. <a href="section-18.2.html">Section 18.2</a> opens the optimization engine: backpropagation as the chain rule applied mechanically to a computation graph, and gradient descent with its modern refinements (momentum, Adam, learning-rate schedules) as the procedure that turns gradients into learning. These two sections are framework-agnostic; they would be true in any language.
+</p>
+<p>
+The remaining four sections make it real in PyTorch, the framework that dominates vision research and a large share of production. <a href="section-18.3.html">Section 18.3</a> introduces the three primitives every later chapter assumes you know cold: the <code>Tensor</code> (a GPU-aware array), <code>autograd</code> (the engine that records operations and replays them backward), and <code>nn.Module</code> (the container that organizes parameters and forward passes). <a href="section-18.4.html">Section 18.4</a> builds the input side, <code>Dataset</code> and <code>DataLoader</code>, the unglamorous plumbing that decides whether your expensive accelerator sits idle or stays fed. <a href="section-18.5.html">Section 18.5</a> assembles the canonical training loop with losses, metrics, validation, and checkpointing, the loop you will recognize, lightly disguised, inside every training script in this book. <a href="section-18.6.html">Section 18.6</a> closes with the practical machinery that separates a notebook demo from a real run: moving work to the GPU, mixed-precision training, and the reproducibility discipline that lets you trust a number twice.
+</p>
+<p>
+Nothing here is computer-vision-specific yet; the classifier in this chapter eats flattened pixel vectors, which is exactly the wrong way to treat an image. That is intentional. <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> will fix the architecture by reintroducing the convolution you already met as a hand-designed filter in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, this time with learnable kernels. But a convolutional network is trained by the very same loop you build here. Master this chapter and the rest of Part III becomes a story about better architectures and better data, told over an optimization machine you already understand end to end.
+</p>
+</div>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Deep learning is not a new kind of mathematics; it is a single, reusable loop: feed data forward through a parameterized function, measure the error with a loss, propagate gradients backward, and nudge every parameter downhill, repeated until the loss stops falling.</strong> Everything in Part III, every CNN, transformer, detector, and diffusion model, is that loop wrapped around a different function and a different dataset. Chapter 18 builds the loop once, transparently, so that for the next twenty chapters you can take it for granted.</p>
+</div>
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Explain why a stack of linear layers collapses to a single linear layer, and how a nonlinear activation rescues expressivity, turning a perceptron into a universal-approximating multi-layer perceptron.</li>
+<li>Derive backpropagation as the chain rule on a computation graph, and state what stochastic gradient descent, momentum, and Adam each contribute.</li>
+<li>Manipulate PyTorch tensors fluently: shapes, broadcasting, device placement, and the difference between an in-place and an out-of-place operation.</li>
+<li>Use <code>autograd</code> to compute gradients automatically, and read a <code>.grad_fn</code> chain to debug a backward pass.</li>
+<li>Define models with <code>nn.Module</code>, feed them with <code>Dataset</code> and <code>DataLoader</code>, and write a training loop with losses, metrics, validation, and checkpointing from scratch.</li>
+<li>Move training to a GPU, enable automatic mixed precision for a speed and memory win, and seed a run so that its results are reproducible.</li>
+</ul>
+</div>
+<div class="prerequisites">
+<h2>Prerequisites</h2>
+<p>
+This chapter assumes the linear-algebra comfort the book has required throughout: vectors, matrices, the dot product, and matrix multiplication. It leans on three earlier ideas in particular. The convolution and kernel intuition from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> is the hand-designed ancestor of the learnable layers ahead. The classifier-and-evaluation thinking from the classical recognition pipelines of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a> sets up what a learned classifier replaces. And the histogram-and-statistics view from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> returns as the normalization statistics that every input pipeline computes. No prior PyTorch or neural-network experience is needed; we build from the tensor up. A machine with a GPU helps for <a href="section-18.6.html">Section 18.6</a> but is not required to follow the code.
+</p>
+</div>
+<section class="chapter-roadmap">
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<a class="section-card" href="section-18.1.html">
+<span class="section-num">18.1</span>
+<span class="section-title">From Linear Models to Multi-Layer Perceptrons</span>
+<span class="section-desc">Why a stack of linear layers must collapse to one, how a single nonlinearity restores expressivity, and the multi-layer perceptron as the simplest network that learns curved decision boundaries.</span>
+</a>
+</li>
+<li>
+<a class="section-card" href="section-18.2.html">
+<span class="section-num">18.2</span>
+<span class="section-title">Backpropagation &amp; Optimization in a Nutshell</span>
+<span class="section-desc">The chain rule applied mechanically to a computation graph, and the gradient-descent family from plain SGD through momentum and Adam to the learning-rate schedules that decide convergence.</span>
+</a>
+</li>
+<li>
+<a class="section-card" href="section-18.3.html">
+<span class="section-num">18.3</span>
+<span class="section-title">PyTorch Essentials: Tensors, Autograd &amp; nn.Module</span>
+<span class="section-desc">The three abstractions every later chapter assumes: the GPU-aware tensor, the autograd engine that replays operations backward, and the nn.Module container, all built and exercised by hand.</span>
+</a>
+</li>
+<li>
+<a class="section-card" href="section-18.4.html">
+<span class="section-num">18.4</span>
+<span class="section-title">Datasets, DataLoaders &amp; Input Pipelines</span>
+<span class="section-desc">Feeding the accelerator: map-style datasets, batching and shuffling, worker parallelism, transforms and augmentation, and the normalization statistics that keep training stable.</span>
+</a>
+</li>
+<li>
+<a class="section-card" href="section-18.5.html">
+<span class="section-num">18.5</span>
+<span class="section-title">The Training Loop: Losses, Metrics &amp; Checkpointing</span>
+<span class="section-desc">The canonical loop with train and validation phases, the loss-versus-metric distinction, early stopping, and saving the best model, the code that recurs in every later chapter.</span>
+</a>
+</li>
+<li>
+<a class="section-card" href="section-18.6.html">
+<span class="section-num">18.6</span>
+<span class="section-title">GPUs, Mixed Precision &amp; Reproducibility</span>
+<span class="section-desc">Device placement, automatic mixed precision with loss scaling for a speed and memory win, and the seeding discipline that makes a reported number trustworthy.</span>
+</a>
+</li>
+</ul>
+</section>
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+You will leave this chapter with a working training loop and an MLP that classifies flattened images, badly, because flattening throws away the very spatial structure that makes an image an image. <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19: Convolutional Neural Networks</a> repairs the architecture without touching the loop. It reintroduces the convolution from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> as a layer whose kernels are learned rather than hand-tuned, adds pooling and the receptive-field idea, and shows the same loop you built here driving a network that respects the geometry of pixels. From there, Part III is a tour of better functions to plug into this machine: deeper and smarter architectures in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>, the training recipes and transfer learning of <a href="../module-21-training-recipes/index.html">Chapter 21</a>, and the attention-based vision transformers of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. Every one of them is trained by the loop in Section 18.5.
+</p>
+</section>
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Rumelhart, D.E., Hinton, G.E., and Williams, R.J. "Learning representations by back-propagating errors." Nature 323 (1986). <a href="https://www.nature.com/articles/323533a0" target="_blank" rel="noopener">Nature</a></div>
+<p class="bib-annotation">The paper that popularized backpropagation for training multi-layer networks; the algorithm Section 18.2 derives is exactly this, expressed on a computation graph.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kingma, D.P. and Ba, J. "Adam: A Method for Stochastic Optimization." ICLR (2015). <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">arXiv:1412.6980</a></div>
+<p class="bib-annotation">The adaptive optimizer that is still the default first choice in 2026; Section 18.2 explains its per-parameter learning rates and Section 18.5 uses its decoupled-weight-decay variant AdamW.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Loshchilov, I. and Hutter, F. "Decoupled Weight Decay Regularization." ICLR (2019). <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></div>
+<p class="bib-annotation">The AdamW paper: shows why weight decay should be decoupled from the gradient update, fixing a subtle bug in how Adam regularizes; AdamW is the optimizer the training loop in Section 18.5 reaches for.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Micikevicius, P. et al. "Mixed Precision Training." ICLR (2018). <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a></div>
+<p class="bib-annotation">The paper behind the loss-scaling and FP16 mechanics that Section 18.6 invokes through <code>torch.amp</code>; explains why naive half precision underflows and how scaling rescues it.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Paszke, A. et al. "PyTorch: An Imperative Style, High-Performance Deep Learning Library." NeurIPS (2019). <a href="https://arxiv.org/abs/1912.01703" target="_blank" rel="noopener">arXiv:1912.01703</a></div>
+<p class="bib-annotation">The system paper for the framework this entire chapter teaches; describes the define-by-run autograd engine that Section 18.3 exercises by hand.</p>
+</div>
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Goodfellow, I., Bengio, Y., and Courville, A. "Deep Learning." MIT Press (2016). <a href="https://www.deeplearningbook.org/" target="_blank" rel="noopener">Free online edition</a></div>
+<p class="bib-annotation">The standard graduate reference; its chapters on feedforward networks and optimization are the natural deep dive behind Sections 18.1 and 18.2.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Prince, S.J.D. "Understanding Deep Learning." MIT Press (2023). <a href="https://udlbook.github.io/udlbook/" target="_blank" rel="noopener">Free online edition</a></div>
+<p class="bib-annotation">A modern, exceptionally clear textbook with free PDF and notebooks; its early chapters on MLPs and backpropagation track this chapter's pedagogy closely.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Stevens, E., Antiga, L., and Viehmann, T. "Deep Learning with PyTorch." Manning (2020). <a href="https://www.manning.com/books/deep-learning-with-pytorch" target="_blank" rel="noopener">Publisher page</a></div>
+<p class="bib-annotation">A practitioner's tour of tensors, autograd, and training loops in PyTorch; the closest book-length companion to Sections 18.3 through 18.5.</p>
+</div>
+<h3>Tools &amp; Documentation</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch documentation and tutorials (current 2.x). <a href="https://pytorch.org/docs/stable/index.html" target="_blank" rel="noopener">pytorch.org/docs</a></div>
+<p class="bib-annotation">The authoritative API reference for every <code>torch</code>, <code>torch.nn</code>, and <code>torch.utils.data</code> symbol used in this chapter, including the autograd mechanics and AMP guides.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch. "A Gentle Introduction to torch.autograd." Official tutorial. <a href="https://pytorch.org/tutorials/beginner/blitz/autograd_tutorial.html" target="_blank" rel="noopener">pytorch.org/tutorials</a></div>
+<p class="bib-annotation">The canonical walkthrough of the reverse-mode autodiff engine that Section 18.3 unpacks; pairs the <code>requires_grad</code> and <code>.backward()</code> mechanics with diagrams.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">torchvision documentation: datasets, transforms (v2), and models. <a href="https://pytorch.org/vision/stable/index.html" target="_blank" rel="noopener">pytorch.org/vision</a></div>
+<p class="bib-annotation">The vision companion library whose <code>datasets</code> and <code>transforms.v2</code> APIs Section 18.4 uses to build input pipelines in a few lines instead of dozens.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch. "Reproducibility" notes. <a href="https://pytorch.org/docs/stable/notes/randomness.html" target="_blank" rel="noopener">pytorch.org/docs randomness</a></div>
+<p class="bib-annotation">The official checklist for deterministic runs: seeding, <code>use_deterministic_algorithms</code>, and the cuDNN flags that Section 18.6 turns into a reusable seeding utility.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">PyTorch Lightning documentation. <a href="https://lightning.ai/docs/pytorch/stable/" target="_blank" rel="noopener">lightning.ai/docs</a></div>
+<p class="bib-annotation">A higher-level wrapper that absorbs the boilerplate of the Section 18.5 loop (device handling, AMP, checkpointing, logging) once you understand what it is automating.</p>
+</div>
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Xiao, H., Rasul, K., and Vollgraf, R. "Fashion-MNIST: a Novel Image Dataset for Benchmarking Machine Learning Algorithms." (2017). <a href="https://arxiv.org/abs/1708.07747" target="_blank" rel="noopener">arXiv:1708.07747</a></div>
+<p class="bib-annotation">The drop-in, harder replacement for MNIST used as the running example dataset across this chapter's code; 70,000 grayscale clothing images in ten classes.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Krizhevsky, A. "Learning Multiple Layers of Features from Tiny Images (CIFAR-10/100)." Technical report (2009). <a href="https://www.cs.toronto.edu/~kriz/cifar.html" target="_blank" rel="noopener">Dataset page</a></div>
+<p class="bib-annotation">The small natural-image benchmark that Section 18.4 uses to compute channel normalization statistics; the bridge from grayscale toy data to real RGB images for Chapter 19.</p>
+</div>
+</section>
+<nav class="chapter-nav">
+<a class="prev" href="../../part-2-classical-computer-vision/module-17-tools-of-the-trade/index.html"><span class="nav-label">Chapter 17: Tools of the Trade: The Classical CV Stack</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part III: Deep Learning for Computer Vision</span></a>
+<a class="next" href="section-18.1.html"><span class="nav-label">Section 18.1: From Linear Models to Multi-Layer Perceptrons</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

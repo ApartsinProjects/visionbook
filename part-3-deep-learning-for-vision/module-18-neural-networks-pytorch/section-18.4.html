@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.4: Datasets, DataLoaders &amp; Input Pipelines. Map-style datasets, batching and shuffling, worker parallelism, transforms, and the normalization statistics that keep an accelerator fed and training stable." name="description"/>
+<title>Section 18.4: Datasets, DataLoaders &amp; Input Pipelines | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>Datasets, DataLoaders &amp; Input Pipelines</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The model is a hungry teenager and I am the kitchen. Stall me for one second and the whole expensive household sits around waiting for a sandwich."</p>
+<cite>A DataLoader Running Slightly Behind Schedule</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The input pipeline is the unglamorous half of training that decides whether your expensive accelerator runs at full utilization or sits idle waiting for the next batch; PyTorch splits it into a Dataset that returns one example at a time and a DataLoader that batches, shuffles, and parallelizes their retrieval.</strong> This section builds both, applies the transforms and normalization statistics that make training stable, and explains the worker and pinned-memory settings that keep the GPU fed.</p>
+</div>
+<p>
+A training loop is only as fast as its slowest stage, and for many real vision projects that stage is not the network at all but reading and preparing data: decoding JPEGs, resizing, augmenting, moving bytes to the GPU. The loop of <a href="section-18.5.html">Section 18.5</a> assumes a stream of ready-to-eat batches; this section produces that stream. PyTorch's design cleanly separates two responsibilities. A <code>Dataset</code> answers "give me example number $i$" and knows nothing about batching. A <code>DataLoader</code> wraps a dataset and answers "give me the next batch", handling shuffling, collation into tensors, and parallel prefetching with worker processes.
+</p>
+<h2>1. The Dataset: One Example at a Time <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+A map-style <code>Dataset</code> is any object implementing two methods: <code>__len__</code> (how many examples) and <code>__getitem__(i)</code> (return the $i$-th example, typically an <code>(image, label)</code> pair). That is the entire contract. The code defines a tiny dataset over an in-memory tensor of images to show how little is required, then notes the far more common case of loading from disk.
+</p>
+<pre><code class="language-python">import torch
+from torch.utils.data import Dataset
+
+class TensorImageDataset(Dataset):
+    """Wraps an (N,1,28,28) image tensor and an (N,) label tensor."""
+    def __init__(self, images, labels, transform=None):
+        self.images, self.labels, self.transform = images, labels, transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, i):
+        img, label = self.images[i], self.labels[i]
+        if self.transform is not None:
+            img = self.transform(img)        # per-example preprocessing/augmentation
+        return img, label
+
+imgs = torch.rand(200, 1, 28, 28)            # 200 fake grayscale images
+lbls = torch.randint(0, 10, (200,))
+ds = TensorImageDataset(imgs, lbls)
+print(len(ds), ds[0][0].shape, ds[0][1].item())   # 200 torch.Size([1, 28, 28]) 7</code></pre>
+<div class="code-caption">A minimal map-style <code>Dataset</code>: <code>__len__</code> and <code>__getitem__</code> are the whole contract, and the optional <code>transform</code> hook is where per-example preprocessing and augmentation are applied, lazily, only when an example is fetched.</div>
+<p>
+The key design property is laziness: <code>__getitem__</code> runs only when an example is requested, so a disk-backed dataset reads and decodes one image at a time rather than loading the entire dataset into memory. This is what lets a single laptop train on a dataset of millions of images that would never fit in RAM. For the standard benchmarks, torchvision ships ready-made datasets (<code>torchvision.datasets.FashionMNIST</code>, <code>CIFAR10</code>, <code>ImageFolder</code> for your own labeled folders) that implement exactly this contract, so you rarely write the class by hand.
+</p>
+<h2>2. The DataLoader: Batching, Shuffling, Parallelism <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+The <code>DataLoader</code> turns a stream of single examples into a stream of batched tensors. Its constructor exposes the four settings that matter most. <code>batch_size</code> sets how many examples per batch (the $N$ in <code>(N, C, H, W)</code>). <code>shuffle=True</code> reorders examples every epoch, which is essential for training because it decorrelates consecutive gradients (see the stochastic-gradient argument in <a href="section-18.2.html">Section 18.2</a>) and must be <code>False</code> for validation so results are repeatable. <code>num_workers</code> spawns that many subprocesses to fetch and transform examples in parallel while the GPU is busy on the previous batch. <code>pin_memory=True</code> stages batches in page-locked host memory so the host-to-GPU copy is faster. The code wires them up and iterates one batch.
+</p>
+<pre><code class="language-python">from torch.utils.data import DataLoader
+
+train_loader = DataLoader(
+    ds,
+    batch_size=64,
+    shuffle=True,        # reshuffle every epoch; decorrelates gradients
+    num_workers=4,       # 4 subprocesses prefetch while the GPU computes
+    pin_memory=True,     # faster host-to-device transfer
+    drop_last=True,      # drop a final ragged batch so all batches are size 64
+)
+
+xb, yb = next(iter(train_loader))
+print(xb.shape, yb.shape)        # torch.Size([64, 1, 28, 28]) torch.Size([64])
+print(f"{len(train_loader)} batches per epoch")   # 3 batches per epoch (200//64)</code></pre>
+<div class="code-caption">A <code>DataLoader</code> over the toy dataset: it collates 64 single examples into one <code>(64, 1, 28, 28)</code> tensor, reshuffles each epoch, prefetches with four workers, and drops the ragged final batch so every batch has a uniform size.</div>
+<p>
+The <code>num_workers</code> setting is the single biggest lever on input throughput. With <code>num_workers=0</code> (the default), data loading happens in the main process, serially, so the GPU waits idle during every fetch and transform. With several workers, loading overlaps computation and the GPU stays fed. The right number is hardware-dependent (a common starting point is the number of CPU cores, then tune by watching GPU utilization), and on Windows or in notebooks worker processes have launch quirks that the PyTorch data-loading docs spell out. Figure 18.4.1 shows why workers matter, contrasting a serial pipeline that strands the GPU with a parallel one that keeps it busy.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Timeline comparison of data loading. With zero workers the GPU sits idle between batches while the CPU loads serially. With four workers the CPU prefetches the next batch during GPU compute so the GPU never waits.">
+  <g font-family="sans-serif" font-size="12">
+    <text x="380" y="22" text-anchor="middle" font-weight="bold" fill="#1b4f72">num_workers = 0 (serial): the GPU waits</text>
+    <text x="40" y="60" fill="#5a626c">CPU load</text>
+    <rect x="120" y="48" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="300" y="48" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="480" y="48" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <text x="40" y="92" fill="#5a626c">GPU compute</text>
+    <rect x="190" y="80" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <rect x="370" y="80" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <rect x="550" y="80" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="225" y="124" text-anchor="middle" fill="#c0392b">GPU idle during every load (gaps)</text>
+
+    <text x="380" y="172" text-anchor="middle" font-weight="bold" fill="#145a32">num_workers = 4 (parallel): the GPU stays fed</text>
+    <text x="40" y="204" fill="#5a626c">CPU load</text>
+    <rect x="120" y="192" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="195" y="192" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="270" y="192" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <rect x="345" y="192" width="70" height="20" fill="#fdebd0" stroke="#e67e22"/>
+    <text x="40" y="236" fill="#5a626c">GPU compute</text>
+    <rect x="195" y="224" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <rect x="270" y="224" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <rect x="345" y="224" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <rect x="420" y="224" width="70" height="20" fill="#d5f5e3" stroke="#1e8449"/>
+    <text x="430" y="262" text-anchor="middle" fill="#145a32">loads overlap compute: no GPU gaps</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 18.4.1</strong> Why workers matter. With no workers (top), the CPU loads each batch serially and the GPU sits idle in the gaps. With several workers (bottom), the next batch is prefetched while the GPU computes the current one, so the green GPU bars run back to back. On a fast accelerator, a starved input pipeline can leave most of the hardware unused.</figcaption>
+</figure>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>There is a particular flavor of heartbreak reserved for the engineer who rents a four-thousand-dollar-a-month GPU, launches training, and then watches <code>nvidia-smi</code> report 9 percent utilization. The accelerator is not slow; it is bored, tapping its fingers while a single-threaded CPU peels JPEGs one at a time. <strong>A starved GPU is the most expensive idle hardware on Earth</strong>, and <code>num_workers</code> is the line that hires enough sous-chefs to keep the plates coming. Check utilization before you blame the model.</p>
+</div>
+<h2>3. Transforms and Normalization <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+A <code>transform</code> is a function applied to each example in <code>__getitem__</code>. It serves two purposes: <em>preprocessing</em> that every example needs (convert to tensor, resize, normalize) and <em>augmentation</em> that only the training set gets (random crops, flips, color jitter) to enlarge the effective dataset and reduce overfitting. The geometric augmentations are the same homographies and warps you met as image-processing tools in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, now repurposed as a regularizer; <a href="../module-21-training-recipes/index.html">Chapter 21</a> makes augmentation policy a central topic. The single most important preprocessing step is normalization: subtracting the per-channel mean and dividing by the per-channel standard deviation so each input channel is roughly zero-mean and unit-variance, which keeps the activations in the well-behaved range that the initialization of <a href="section-18.2.html">Section 18.2</a> assumed. Those statistics are computed from the training set, the modern echo of the histogram statistics from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>.
+</p>
+<pre><code class="language-python">import torch
+from torchvision.transforms import v2
+
+# training transform: augment, then to-tensor, then normalize
+train_tf = v2.Compose([
+    v2.RandomHorizontalFlip(p=0.5),                 # cheap, label-preserving augmentation
+    v2.ToImage(),                                   # PIL/ndarray -&gt; tensor image
+    v2.ToDtype(torch.float32, scale=True),          # uint8 [0,255] -&gt; float [0,1]
+    v2.Normalize(mean=[0.2860], std=[0.3530]),      # Fashion-MNIST channel stats
+])
+# validation transform: NO augmentation, same normalization
+val_tf = v2.Compose([
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.2860], std=[0.3530]),
+])
+
+# computing the mean/std yourself from a training tensor:
+imgs = torch.rand(1000, 1, 28, 28)
+mean = imgs.mean(dim=(0, 2, 3))                     # per-channel mean over N,H,W
+std  = imgs.std(dim=(0, 2, 3))
+print(mean.item(), std.item())                     # ~0.5  ~0.29 for uniform data</code></pre>
+<div class="code-caption">Train and validation transform pipelines with torchvision's v2 API: the training pipeline adds a random flip the validation one omits, both share the same normalization, and the final lines show how the per-channel mean and standard deviation are computed from the training set.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Augment Train, Never Validate</div>
+<p>Augmentation belongs only in the training pipeline. The validation and test transforms must be deterministic, no random flips, crops, or jitter, because their job is to measure the model on a fixed, realistic distribution. Worse still is computing normalization statistics from the test set, which leaks information about it into training. Compute mean and standard deviation from the training split alone, then apply those same frozen numbers to validation and test. Getting this wrong inflates your reported accuracy and produces a model that disappoints in production, the data-pipeline equivalent of grading your own exam.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torchvision Datasets in Two Lines</div>
+<p>The hand-written <code>Dataset</code> of subsection 1 is instructive, but for any standard benchmark torchvision hands you a fully implemented, downloaded, transform-aware dataset: <code>train = torchvision.datasets.FashionMNIST(root="data", train=True, download=True, transform=train_tf)</code> and the matching <code>train=False</code> for the test split. That single call replaces the dozens of lines you would write to download the archive, parse its binary format, and wrap it in the Dataset contract, and it ships the canonical splits so your numbers are comparable to published ones (see the <a href="index.html">chapter bibliography</a> for the Fashion-MNIST and CIFAR references). For your own data, <code>ImageFolder</code> infers labels from directory names with zero custom code.</p>
+</div>
+<h2>4. Splits, Class Imbalance, and Samplers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+A dataset must be split into train, validation, and test partitions, and the cardinal rule is that the test set is touched exactly once, at the very end. The validation set guides every decision during development (which model, which hyperparameters, when to stop); the test set delivers the single honest final number. <code>torch.utils.data.random_split</code> performs the partition reproducibly when seeded. When classes are imbalanced, a common vision reality where defects, rare diseases, or rare objects are vastly outnumbered, a uniform shuffle over-samples the majority class and the model learns to ignore the minority. A <code>WeightedRandomSampler</code> fixes this by drawing examples with probability inversely proportional to class frequency, so each batch is roughly balanced; you pass it to the <code>DataLoader</code> via the <code>sampler</code> argument (and then leave <code>shuffle</code> at its default, since the sampler controls ordering). This connects directly to the evaluation thinking of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>: an imbalanced dataset also demands metrics beyond raw accuracy, which <a href="section-18.5.html">Section 18.5</a> takes up.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The 92 Percent Model That Caught Nothing</div>
+<p><strong>Who:</strong> A team building an automated quality gate for a circuit-board assembly line, classifying each board as pass or fail from a top-down photo.</p>
+<p><strong>Situation:</strong> Their first classifier reported 92 percent validation accuracy and was approved for a pilot. On the line it flagged almost no defective boards.</p>
+<p><strong>Problem:</strong> Real defect rates were about 8 percent, so the dataset was 92 percent "pass". A model that predicts "pass" for every board scores 92 percent accuracy while catching zero defects, exactly the degenerate solution the imbalanced data rewarded. The DataLoader's uniform shuffle fed batches that were almost entirely "pass", so the gradient barely ever pushed toward recognizing a defect.</p>
+<p><strong>Decision:</strong> The team switched to a <code>WeightedRandomSampler</code> that up-weighted the rare "fail" class so batches were roughly balanced, and changed the reported metric from accuracy to per-class recall and the F1 score on the defect class.</p>
+<p><strong>Result:</strong> Defect recall rose from near zero to the mid-eighties, accuracy dropped to a more honest 88 percent (because the model now made some false-positive calls it had previously avoided by never flagging anything), and the pilot actually caught bad boards. The "drop" in accuracy was the model finally doing its job.</p>
+<p><strong>Lesson:</strong> The data pipeline shapes what the model can learn. An imbalanced sampler and an accuracy-only metric will happily certify a model that has learned the prior and nothing else. Balance the batches and measure the metric you actually care about.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: When the Bottleneck Moves to Storage</div>
+<p>As accelerators have gotten faster, the input pipeline has increasingly become the limiting factor at scale, and 2024 to 2026 work targets exactly this. WebDataset and the maturing <code>torchdata</code> / StatefulDataLoader stack stream sharded tar archives so training reads data sequentially off cloud object storage instead of random-accessing millions of small files. NVIDIA DALI moves JPEG decode and augmentation onto the GPU itself, removing the CPU from the critical path. FFCV showed order-of-magnitude throughput gains for ImageNet-scale training by compiling the loading pipeline and using a custom on-disk format. The Dataset and DataLoader abstractions in this section remain the interface; what is changing underneath is how the bytes get from storage to tensor fast enough that the GPU, not the kitchen, is again the bottleneck.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.1: Why Shuffle Train but Not Validation <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain why <code>shuffle=True</code> is important for the training DataLoader but should be <code>False</code> for validation and test. Address two effects of training-time shuffling: its impact on the correlation between consecutive mini-batch gradients (link to the stochastic-gradient argument in <a href="section-18.2.html">Section 18.2</a>), and what happens to a model if the data arrives sorted by class. Then explain why shuffling validation would not change the reported metric but would still be undesirable for reproducibility.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.2: Compute and Apply Real Normalization Stats <span class="exercise-type coding">Coding</span></div>
+<p>Download CIFAR-10 with torchvision, compute the per-channel (R, G, B) mean and standard deviation over the training split only, and compare your numbers to the widely published constants. Then build two transform pipelines, one normalizing with your computed stats and one skipping normalization, train the chapter's MLP briefly on each, and report the difference in how fast the training loss falls in the first few hundred steps. Explain the result in terms of keeping activations in the range the initialization assumes.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.4.3: Diagnose an Input Bottleneck <span class="exercise-type analysis">Analysis</span></div>
+<p>Set up a DataLoader with an artificially slow transform (insert a small <code>time.sleep</code> in <code>__getitem__</code>) and measure epoch wall-clock time for <code>num_workers</code> in {0, 2, 4, 8}. Plot time against worker count and identify the point of diminishing returns. Then, using the timeline picture of Figure 18.4.1, explain why adding workers helps up to a point and what determines that ceiling. State how you would tell, from GPU utilization alone, whether a real training run is input-bound or compute-bound.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-18.3.html">&#8592; Section 18.3: PyTorch Essentials: Tensors, Autograd &amp; nn.Module</a>
+<a href="index.html">Chapter 18</a>
+<a class="next" href="section-18.5.html">Section 18.5: The Training Loop: Losses, Metrics &amp; Checkpointing &#8594;</a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

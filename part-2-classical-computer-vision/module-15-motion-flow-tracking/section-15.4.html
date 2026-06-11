@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.4: Background Subtraction &amp; Change Detection. Modeling a static background per pixel, running-average and Gaussian-mixture models, shadow removal, and what changes when the camera itself moves." name="description"/>
+<title>Section 15.4: Background Subtraction &amp; Change Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Background Subtraction &amp; Change Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I have stared at this hallway for nine thousand frames. I know exactly what nothing looks like. The instant something is not nothing, I will let you know."</p>
+<cite>A Patient Background Model With Excellent Object Permanence</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>If the camera holds still, you do not need to track motion at all; you only need to remember what the scene looks like when nothing is happening, then flag every pixel that disagrees.</strong> That is background subtraction, the cheapest and most widely deployed motion primitive in all of computer vision. The flow methods of <a href="section-15.2.html">Section 15.2</a> and <a href="section-15.3.html">Section 15.3</a> answer "how did this pixel move?"; background subtraction answers the simpler, often more useful question "is this pixel part of the scene or part of something new?" The whole game is building a per-pixel statistical model of "background", updating it as lighting drifts, and deciding the threshold at which a pixel has become "foreground". Get that model right and a $30 camera counts cars, watches a doorway, or triggers a recording. Get it wrong and every passing cloud becomes an intruder.</p>
+</div>
+
+<p>
+In the previous three sections the camera and the scene were both allowed to move, and we worked hard to estimate that motion densely or sparsely. This section makes one strong assumption, that the camera is fixed, and is rewarded with an enormous simplification. Under a static camera, the projected position of every static 3D point is constant: the floor, the walls, the parked cars never move in the image. Anything that does move, a person, a vehicle, a falling box, lights up as a difference from the remembered scene. We never compute a velocity; we compute a membership label, foreground or background, at every pixel of every frame. This is change detection, and background subtraction is its dominant classical form.
+</p>
+
+<h2>1. The Static-Camera Assumption and the Simplest Detector <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Start with the most naive idea that could possibly work: keep one reference image $B(x, y)$ of the empty scene, and for each new frame $I_t$, mark a pixel as foreground when it differs from the reference by more than a threshold $\tau$:
+</p>
+<p>
+$$ F_t(x, y) = \begin{cases} 1 & \text{if } \lvert I_t(x, y) - B(x, y) \rvert > \tau \\ 0 & \text{otherwise.} \end{cases} $$
+</p>
+<p>
+This is frame differencing against a fixed reference, and it has exactly one virtue and many flaws. The virtue is speed: one subtraction and one comparison per pixel. The flaws are that you need a clean empty frame to begin with (rare in practice), and that the reference goes stale the moment a cloud passes, a light switches, or the sun moves. The fix for staleness is to let the background <em>adapt</em>. The simplest adaptive model is a running average: blend a little of each new frame into the background so it slowly tracks lighting changes while ignoring transient foreground.
+</p>
+<p>
+$$ B_t = (1 - \alpha) B_{t-1} + \alpha I_t, \qquad 0 < \alpha \ll 1. $$
+</p>
+<p>
+The learning rate $\alpha$ controls the model's memory: small $\alpha$ (say $0.01$) means a slow, stable background that needs roughly $1/\alpha$ frames to forget the past, while large $\alpha$ lets fast lighting changes in but also bakes a slow-moving foreground object into the background, where it leaves a ghost. Listing 15.4.1 implements the running-average detector and shows the staleness-versus-stability tradeoff in one parameter.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+cap = cv2.VideoCapture("hallway.mp4")
+ok, frame = cap.read()
+bg = frame.astype(np.float32)        # running-average background, kept in float
+alpha = 0.02                         # learning rate: ~50-frame memory
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    cur = frame.astype(np.float32)
+    # per-pixel absolute difference, collapsed across color channels
+    diff = cv2.absdiff(cur, bg).max(axis=2)
+    fg = (diff > 25).astype(np.uint8) * 255          # tau = 25 gray levels
+
+    # update the background ONLY where we believe it is background,
+    # so moving objects are not blended in and do not leave ghosts
+    mask = (fg == 0)[..., None]
+    bg = np.where(mask, (1 - alpha) * bg + alpha * cur, bg)
+
+    cv2.imshow("foreground", fg)
+    if cv2.waitKey(1) == 27:
+        break
+# Typical result: clean silhouettes of walkers; the floor stays black,
+# and the model re-absorbs a bag left on the floor over ~50 frames.</code></pre>
+<div class="code-caption"><strong>Listing 15.4.1:</strong> A selective running-average background subtractor. The crucial line is the masked update: blending new pixels into the background only where the current label is "background" prevents a slow walker from being learned as scenery, the single most common bug in homemade detectors.</div>
+
+<p>
+The masked update in Listing 15.4.1 is the difference between a toy and something usable. If you update the background everywhere, a person who pauses for a few seconds gets absorbed into the model and vanishes from the foreground mask; worse, when they leave, the spot they occupied now differs from the (contaminated) background and flickers as a false positive. Updating only the background-labeled pixels keeps the model honest. Even so, a single mean per pixel cannot represent a background that legitimately takes more than one value, and most real backgrounds do.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Background Is Not One Color, It Is a Distribution</div>
+<p>The reason a single running average fails outdoors is that genuine background pixels are <em>multimodal</em>. A pixel on a tree sees leaf, then sky, then leaf as the branch sways; a pixel over a fountain sees water and spray alternating; a pixel on a flickering monitor cycles through colors. None of these is foreground, yet a unimodal model calls every switch a change. The whole evolution of background modeling, from running average to Gaussian mixtures to the non-parametric and learned models, is one long answer to a single question: how do you describe "all the things this pixel is allowed to be" without also accepting the intruder you are trying to catch?</p>
+</div>
+
+<h2>2. The Gaussian Mixture Model: MOG2 <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The dominant classical answer, and still the default in OpenCV, is to model each pixel's history as a <strong>mixture of Gaussians</strong> (Stauffer and Grimson, 1999; refined by Zivkovic, 2004, into the MOG2 used today). Instead of one mean, each pixel keeps $K$ Gaussian components (typically three to five), each with a weight $w_k$, mean $\mu_k$, and variance $\sigma_k^2$. The recurring background values, leaf and sky, water and spray, occupy the high-weight, low-variance components; rare or transient values do not. A new pixel value matches a component if it lands within a few standard deviations of that component's mean. The components are sorted by $w_k / \sigma_k$ (high weight and low spread first), and the top components whose weights sum past a fraction $T$ of the total are declared "background". A pixel is foreground when it matches none of the background components.
+</p>
+<p>
+On each frame, a matched component nudges its mean and variance toward the new value and increases its weight, while unmatched components decay; if nothing matches, the weakest component is replaced by a new Gaussian centered on the current value. This online update is why a swaying branch's two states both survive as background components, while a person walking through, an unrepeated value, never accumulates enough weight to be accepted. Figure 15.4.1 contrasts the unimodal and mixture views of a single oscillating pixel.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A pixel intensity histogram with two background peaks. A single Gaussian centered between them accepts the intruder value lying in the valley, while a two-component mixture places a narrow Gaussian on each peak and correctly rejects the valley value as foreground.">
+  <defs>
+    <marker id="arr154" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#922b21"/>
+    </marker>
+  </defs>
+  <!-- axes -->
+  <line x1="60" y1="220" x2="700" y2="220" stroke="#5a626c" stroke-width="1.5"/>
+  <text x="700" y="240" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="end">pixel intensity</text>
+  <text x="60" y="40" font-family="sans-serif" font-size="12" fill="#5a626c">frequency over time</text>
+  <!-- two histogram peaks (background: leaf and sky) -->
+  <path d="M120,220 C160,220 170,80 200,80 C230,80 240,220 280,220 Z" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.5"/>
+  <path d="M430,220 C470,220 480,90 510,90 C540,90 550,220 590,220 Z" fill="#d6eaf8" stroke="#2471a3" stroke-width="1.5"/>
+  <text x="200" y="240" font-family="sans-serif" font-size="11.5" fill="#1a5276" text-anchor="middle">background mode A (leaf)</text>
+  <text x="510" y="240" font-family="sans-serif" font-size="11.5" fill="#1a5276" text-anchor="middle">background mode B (sky)</text>
+  <!-- the intruder value sits in the valley -->
+  <line x1="355" y1="220" x2="355" y2="120" stroke="#922b21" stroke-width="2" marker-end="url(#arr154)"/>
+  <text x="355" y="112" font-family="sans-serif" font-size="11.5" fill="#922b21" text-anchor="middle" font-weight="bold">intruder value</text>
+  <!-- single broad Gaussian spanning both -->
+  <path d="M110,220 C220,220 250,150 355,150 C460,150 490,220 600,220" fill="none" stroke="#7f8c8d" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="355" y="178" font-family="sans-serif" font-size="11.5" fill="#7f8c8d" text-anchor="middle">one broad Gaussian accepts the valley (false negative)</text>
+  <!-- narrow mixture components -->
+  <path d="M150,220 C185,220 190,108 200,108 C210,108 215,220 250,220" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <path d="M460,220 C495,220 500,118 510,118 C520,118 525,220 560,220" fill="none" stroke="#1e8449" stroke-width="2"/>
+  <text x="355" y="262" font-family="sans-serif" font-size="11.5" fill="#1e8449" text-anchor="middle" font-weight="bold">two narrow mixture components reject the valley (correct)</text>
+</svg>
+<figcaption><strong>Figure 15.4.1</strong> Why a Gaussian mixture beats a single Gaussian on multimodal pixels. A pixel that alternates between two background values produces two histogram peaks. A single broad Gaussian (gray dashed) covers both peaks but also accepts the intruder value in the valley between them, a false negative. Two narrow mixture components (green) sit tightly on each peak and correctly reject the valley value as foreground.</figcaption>
+</figure>
+
+<p>
+OpenCV ships two production background subtractors, <code>MOG2</code> (the Gaussian mixture above) and <code>KNN</code> (a non-parametric k-nearest-neighbor model that compares each pixel against a buffer of recent samples). Both expose a <code>detectShadows</code> option and an online learning rate. Listing 15.4.2 runs MOG2 and then cleans its raw mask with the morphological opening and closing of <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>, which is essential because raw subtraction masks are always speckled with noise pixels and pocked with holes.
+</p>
+
+<pre><code class="language-python">import cv2
+
+cap = cv2.VideoCapture("street.mp4")
+
+# history: frames of memory; varThreshold: Mahalanobis^2 match gate;
+# detectShadows: label soft shadows as gray (127) instead of foreground
+mog2 = cv2.createBackgroundSubtractorMOG2(
+    history=500, varThreshold=16, detectShadows=True)
+
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    fg = mog2.apply(frame, learningRate=-1)   # -1 = auto rate from history
+
+    fg[fg == 127] = 0                          # drop shadow pixels (kept as 127)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)   # remove speckle
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel)  # fill small holes
+
+    # connected components give per-object blobs ready for tracking (Section 15.5)
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(fg)
+    movers = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] > 400]
+    print(f"frame: {len(movers)} moving blobs above 400 px")
+</code></pre>
+<div class="code-caption"><strong>Listing 15.4.2:</strong> MOG2 background subtraction with a shadow-aware mask, morphological cleanup from Chapter 6, and a connected-components pass that converts the binary mask into per-object blobs. The area filter discards the residual speckle that morphology missed.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Production Subtractor in Two Lines</div>
+<p>A from-scratch Gaussian-mixture subtractor with online weight updates, component replacement, shadow detection, and an adaptive learning rate is roughly 150 lines of careful numerical code. OpenCV reduces it to two: <code>mog2 = cv2.createBackgroundSubtractorMOG2()</code> then <code>fg = mog2.apply(frame)</code> per frame. The library handles the per-pixel mixture state in a packed C++ buffer, the sorting by weight-over-variance, the shadow chromaticity test, and the auto learning-rate from the <code>history</code> parameter. Write the from-scratch version once to understand what "background is a distribution" means in code; ship MOG2 or KNN.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Vanishing Napper</div>
+<p>Sit perfectly still in front of an unmasked running-average subtractor and something unsettling happens: over a few hundred frames you fade out of the foreground entirely. The model has decided that a person who never moves is simply part of the furniture and quietly absorbed you into the background. Stand up to leave and you reappear as a perfect human-shaped hole, a ghost of where you were learned. Office "is anyone there?" sensors have shut off the lights on motionless workers for exactly this reason, which is the most literal possible demonstration of why the masked update in Listing 15.4.1 exists.</p>
+</div>
+
+<h2>3. Shadows, Light Changes, and the Chromaticity Trick <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The most persistent practical failure of background subtraction is the <strong>cast shadow</strong>. A person's shadow on the floor differs from the remembered background, so a naive detector labels the shadow as foreground and the silhouette balloons, merging neighboring people and ruining any downstream counting or tracking. The fix exploits a physical fact: a shadow scales a surface's brightness down roughly uniformly across color channels while leaving its <em>chromaticity</em> (the ratio of channels, the surface's color) nearly unchanged. A true foreground object, by contrast, usually changes the color, not just the brightness. So a candidate foreground pixel is reclassified as shadow when its value is a darkened version of the background value at the same hue and saturation, which is exactly the test MOG2's <code>detectShadows</code> applies in a normalized color space. We dropped those shadow-labeled pixels (value 127) in Listing 15.4.2.
+</p>
+<p>
+The harder failure is the <strong>sudden global light change</strong>: someone flips a light switch, or the sun emerges, and every pixel changes at once. No incremental model can adapt within a single frame, so the entire image flares as foreground for the seconds it takes the learning rate to catch up. Robust systems detect this case explicitly (when more than, say, 70 percent of pixels are flagged foreground at once, treat it as a global illumination event, not an army of intruders) and respond by temporarily boosting the learning rate to re-seed the background fast. This connects back to the photometric normalization ideas of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>: working in a normalized or gradient-based representation, rather than raw intensity, buys robustness to the lighting changes that wreck raw-intensity models.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Counting Cars at a Toll-Free Bridge</div>
+<p><strong>Who:</strong> A transportation-analytics startup retrofitting a municipal bridge with a single fixed roadside camera to produce hourly vehicle counts for a traffic study.</p>
+<p><strong>Situation:</strong> One mast-mounted camera, no loop sensors in the road, a fixed view of three lanes, and a hard requirement to run on a $60 single-board computer at the pole with no cloud connection.</p>
+<p><strong>Problem:</strong> The first MOG2 deployment counted beautifully at noon and fell apart at dawn and dusk. Long, raking shadows from the low sun stretched across two lanes and merged adjacent cars into single giant blobs, so a five-car cluster counted as one. Passing clouds triggered global-illumination flares that briefly counted the whole bridge as a vehicle.</p>
+<p><strong>Decision:</strong> Three targeted fixes rather than a model swap. Enable <code>detectShadows</code> and discard shadow pixels (cutting merged blobs by roughly half). Add the global-flare guard: if foreground exceeds 60 percent of the frame, skip counting for that frame and raise the learning rate for ten frames. And add a per-lane region of interest with a minimum and maximum blob area, so a shadow sliver or a bird could never register as a car.</p>
+<p><strong>Result:</strong> Counting accuracy against a hand-labeled hour rose from 71 percent to 96 percent across a full day, dawn to dusk, with no GPU and no retraining. The shadow fix alone accounted for most of the dawn and dusk gains.</p>
+<p><strong>Lesson:</strong> Background subtraction rarely fails in the math; it fails on shadows and light changes. Two cheap, physically motivated guards (chromaticity-based shadow rejection and a global-flare detector) recover most of the accuracy a static-camera deployment leaves on the table.</p>
+</div>
+
+<h2>4. When the Camera Moves: Compensated and Panoramic Backgrounds <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Every model so far assumed a fixed camera. The instant the camera pans, tilts, or rides on a moving platform, the static-background assumption collapses: the whole scene shifts in the image, so every pixel differs from its remembered value and the entire frame reads as foreground. There are two classical escapes. The first is <strong>motion compensation</strong>: estimate the dominant frame-to-frame motion as a global transform, a homography from <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> for a rotating or distant-scene camera, warp the previous background into the current frame's coordinates, and only then subtract. What remains after compensating the camera's own motion is <em>independent</em> motion, objects moving differently from the static world, which is exactly what you wanted to detect. The global transform is estimated with the same RANSAC-on-keypoint-matches machinery from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, or from the sparse optical flow of <a href="section-15.2.html">Section 15.2</a> by fitting a model to the dominant flow vectors.
+</p>
+<p>
+The second escape, for a camera that pans across a fixed scene (a security PTZ unit on a tour, for instance), is to build a <strong>panoramic background</strong>: stitch the views into one large mosaic, register each incoming frame into the mosaic via homography, and subtract against the corresponding mosaic region. This turns a moving-camera problem back into a static-background problem in mosaic coordinates. Listing 15.4.3 sketches the compensation idea: estimate the inter-frame homography, warp the running background forward, and subtract.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+prev_gray = None
+bg = None
+orb = cv2.ORB_create(1000)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+def estimate_homography(g0, g1):
+    """Dominant global motion g0 -> g1 as a homography (Chapter 5 / Chapter 10)."""
+    k0, d0 = orb.detectAndCompute(g0, None)
+    k1, d1 = orb.detectAndCompute(g1, None)
+    m = sorted(bf.match(d0, d1), key=lambda x: x.distance)[:300]
+    p0 = np.float32([k0[x.queryIdx].pt for x in m])
+    p1 = np.float32([k1[x.trainIdx].pt for x in m])
+    H, _ = cv2.findHomography(p0, p1, cv2.RANSAC, 3.0)   # robust to movers
+    return H
+
+cap = cv2.VideoCapture("panning_camera.mp4")
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if prev_gray is None:
+        bg = gray.astype(np.float32)
+    else:
+        H = estimate_homography(prev_gray, gray)         # camera motion
+        h, w = gray.shape
+        bg = cv2.warpPerspective(bg, H, (w, h))          # align bg to new frame
+        diff = cv2.absdiff(gray.astype(np.float32), bg)
+        fg = (diff > 25).astype(np.uint8) * 255          # residual = movers
+        bg = 0.98 * bg + 0.02 * gray                     # adapt in new frame
+        cv2.imshow("independent motion", fg)
+        if cv2.waitKey(1) == 27:
+            break
+    prev_gray = gray
+</code></pre>
+<div class="code-caption"><strong>Listing 15.4.3:</strong> Motion-compensated background subtraction for a panning camera. The ORB-plus-RANSAC homography from Chapters 5 and 10 captures the camera's own motion; warping the background into the new frame before subtracting leaves only objects that move independently of the static world.</div>
+
+<p>
+The catch in Listing 15.4.3 is that a single homography is exact only when the scene is planar or the camera rotates about its optical center. For a freely translating camera viewing a 3D scene, parallax makes the global model leak, near objects move more than far ones, so background near depth discontinuities is misclassified as motion. Handling that properly requires the multi-view geometry of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, or it is simply deferred to the learned motion-segmentation models that the research frontier below describes.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Promptable and Learned Change Detection (2024-2026)</div>
+<p>Classical background subtraction is being absorbed into video segmentation. The CDNet 2014 benchmark long set the bar; learned methods on it (FgSegNet and successors) now top it but need scene-specific training. The more disruptive shift is open-world video segmentation: Segment Anything 2 (SAM 2, Meta, 2024, <a href="https://arxiv.org/abs/2408.00714" target="_blank" rel="noopener">arXiv:2408.00714</a>) tracks any prompted object through a video with a memory bank, doing per-object change detection without any background model at all, and DEVA / Tracking-Anything pipelines chain it with detectors for label-free moving-object discovery. For unsupervised motion segmentation specifically, recent work treats the residual after camera-motion compensation as a learnable signal rather than a thresholded difference. The practical takeaway for 2026: for a genuinely static camera on cheap hardware, MOG2 remains unbeaten on cost; the moment the camera moves or you need semantic labels, a promptable segmenter such as SAM 2 is the modern replacement, and it connects directly to the deep video understanding of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.1: The Learning-Rate Tradeoff <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For the running-average model $B_t = (1-\alpha)B_{t-1} + \alpha I_t$, explain in terms of "memory length" what happens at the two extremes $\alpha \to 0$ and $\alpha \to 1$. A person stands still in front of the camera for $N$ frames. Derive, approximately, how large $\alpha$ must be for them to be absorbed into the background within those $N$ frames, and explain why the selective (masked) update in Listing 15.4.1 changes the answer. Which failure mode does each extreme produce: stale backgrounds, or ghosting?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.2: Shadow Rejection by Chromaticity <span class="exercise-type coding">Coding</span></div>
+<p>Take any clip of a person walking on a sunny pavement. Run MOG2 twice, once with <code>detectShadows=False</code> and once with <code>detectShadows=True</code> (discarding the gray shadow label). Overlay both masks on the frame and measure the foreground blob area in each. Then implement your own shadow test: convert frame and background to HSV, label a candidate foreground pixel as shadow when its value (V) is between 0.4 and 0.9 of the background V while hue and saturation are within small tolerances. Compare your mask to MOG2's shadow output and report where they disagree.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.4.3: Diagnosing a Moving-Camera Failure <span class="exercise-type analysis">Analysis</span></div>
+<p>Run MOG2 unmodified on a clip from a slowly panning camera and observe the whole frame flagging as foreground. Now apply the motion-compensation scheme of Listing 15.4.3. Identify the regions where compensated subtraction still produces false positives, and argue from the parallax discussion why they cluster near depth discontinuities (object edges, foreground-background boundaries). What property of the scene would make the single-homography compensation exact, and how does this relate to the planar and pure-rotation cases of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.3.html">&#8592; Section 15.3: Dense Flow: Horn-Schunck to Variational Methods</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="section-15.5.html">Section 15.5: Object Tracking: Mean-Shift, Correlation Filters &amp; Re-Detection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

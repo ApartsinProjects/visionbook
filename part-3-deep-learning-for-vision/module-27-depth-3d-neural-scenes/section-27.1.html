@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.1: Monocular Depth Estimation. Recovering depth from a single image: the learned cues, the scale-invariant loss, the encoder-decoder architecture, self-supervised training from video, and the 2024 foundation models for depth." name="description"/>
+<title>Section 27.1: Monocular Depth Estimation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>Monocular Depth Estimation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Give me two eyes and I will measure the world. Give me one and I will guess it, confidently, from the way the railroad tracks pretend to meet at the horizon."</p>
+<cite>A Single Lens With Surprisingly Strong Opinions About Distance</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Recovering depth from a single image is geometrically impossible and practically routine, because a network can learn the pictorial cues that disambiguate what projection threw away.</strong> A lone photograph cannot determine absolute scale: a dollhouse and a real house produce identical pixels. But it is dense with relative cues, perspective convergence, texture gradients, occlusion, shading, and the familiar sizes of known objects, and a network trained on enough images learns to read them just as a one-eyed person does. This section explains why the supervision must be scale-invariant, builds the encoder-decoder that predicts a depth map, shows how to train it without ground truth by warping video frames, and ends with the 2024 foundation models that turned monocular depth into a reliable off-the-shelf tool.</p>
+</div>
+
+<p>
+In the previous chapter we added the time axis to vision; now we add the depth axis, and we begin with the hardest possible version of the problem. <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a> recovered depth from two views by triangulation, a clean geometric procedure: find the same point in both images, measure its disparity, and invert. With a single image there is no disparity to measure and no triangulation to perform. Yet monocular depth estimation works, and works well, because the missing geometric constraint is replaced by a learned statistical prior over how real scenes look. This section is about how a network acquires that prior and what it can and cannot deliver.
+</p>
+
+<h2>1. Why a Single Image Has No Absolute Scale <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Recall the pinhole projection from <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. A 3D point $(X, Y, Z)$ in camera coordinates lands at the pixel
+</p>
+
+<div class="math-block">
+$$u = f_x \frac{X}{Z} + c_x, \qquad v = f_y \frac{Y}{Z} + c_y$$
+</div>
+
+<p>
+Notice that only the ratios $X/Z$ and $Y/Z$ appear. If you scale the entire scene, multiply every $X$, $Y$, and $Z$ by some constant $\alpha$, the ratios are unchanged and every pixel lands in exactly the same place. The image is invariant to the scale of the scene. This is the depth-scale ambiguity, and it is not a limitation of any particular method; it is a property of projection itself. A single image can, at best, recover depth <em>up to an unknown global scale</em>. To pin down the absolute meters, you need extra information: a known object size, a calibrated stereo baseline, an inertial sensor, or metadata such as the camera's focal length and sensor size.
+</p>
+
+<p>
+This has a direct consequence for how we train. If we naively penalize the squared error between predicted and true depth, the network is punished for getting the scale wrong even when its relative structure is perfect, an unfair penalty given that scale is genuinely unrecoverable from the pixels. The fix, introduced by Eigen and colleagues in 2014, is a <strong>scale-invariant loss</strong>: compare predicted and true depth only after factoring out the global scale.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Predict Log-Depth, Penalize Only Relative Structure</div>
+<p>Working in log-depth turns a global multiplicative scale into a global additive shift, which is far easier to remove. Let $d_i = \log \hat{z}_i - \log z_i$ be the log-error at pixel $i$. The scale-invariant loss subtracts the <em>mean</em> log-error before squaring, so a uniform offset (the scale ambiguity) costs nothing:
+$$\mathcal{L}_{\text{SI}} = \frac{1}{n}\sum_i d_i^2 - \frac{\lambda}{n^2}\Big(\sum_i d_i\Big)^2$$
+With $\lambda = 1$ the loss measures only the variance of the log-error, that is, how well the <em>shape</em> of the depth map matches, independent of overall scale. This single idea is what lets one network generalize across indoor rooms, outdoor streets, and close-up objects whose absolute depths differ by orders of magnitude.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Dollhouse Defense</div>
+<p>This is exactly the trick behind every miniature special effect ever filmed. A model train set photographed at the right angle is indistinguishable from a real railway, because the camera, like a monocular depth network, has no way to know the scale. Film crews exploit the ambiguity on purpose; depth networks suffer from it by accident. The difference between Hollywood and a confused neural net is that Hollywood knew the scale all along and simply declined to tell you.</p>
+</div>
+
+<h2>2. The Cues a Network Learns <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+What does the network actually key on? The same monocular cues that let a person with one eye closed still reach for a coffee cup. Figure 27.1.1 names the four that dominate. <strong>Perspective</strong>: parallel lines converge with distance, so the angle of convergence encodes depth. <strong>Relative size</strong>: a familiar object (a car, a person, a door) that appears small is far away. <strong>Texture gradient</strong>: a regular texture like grass or brick compresses as it recedes. <strong>Occlusion</strong>: if object A hides part of object B, then A is nearer. None of these is geometrically exact, but together, over millions of training images, they form a powerful prior. The network is not doing geometry; it is doing learned pattern completion constrained by how real 3D scenes project.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four monocular depth cues: perspective convergence, relative size, texture gradient, and occlusion">
+<style>
+.dl{font:13px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.dline{stroke:#2c6fb5;stroke-width:1.5;fill:none;}
+.dbox{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.dgnd{fill:#fdeee3;stroke:#d6802b;stroke-width:1;}
+.dpanel{fill:#fafafa;stroke:#ccc;stroke-width:1;}
+</style>
+<rect class="dpanel" x="8" y="20" width="166" height="180"/>
+<text class="dl" x="91" y="220" text-anchor="middle">Perspective</text>
+<line class="dline" x1="20" y1="190" x2="91" y2="40"/>
+<line class="dline" x1="162" y1="190" x2="91" y2="40"/>
+<line class="dline" x1="35" y1="150" x2="147" y2="150"/>
+<line class="dline" x1="55" y1="100" x2="127" y2="100"/>
+<rect class="dpanel" x="186" y="20" width="166" height="180"/>
+<text class="dl" x="269" y="220" text-anchor="middle">Relative Size</text>
+<rect class="dbox" x="200" y="150" width="44" height="34"/>
+<rect class="dbox" x="280" y="95" width="24" height="18"/>
+<rect class="dbox" x="320" y="70" width="13" height="10"/>
+<text class="ds" x="222" y="200" text-anchor="middle">near</text>
+<text class="ds" x="326" y="62" text-anchor="middle">far</text>
+<rect class="dpanel" x="364" y="20" width="166" height="180"/>
+<text class="dl" x="447" y="220" text-anchor="middle">Texture Gradient</text>
+<line class="dgnd" x1="378" y1="184" x2="516" y2="184"/>
+<line class="dgnd" x1="384" y1="150" x2="510" y2="150"/>
+<line class="dgnd" x1="392" y1="120" x2="502" y2="120"/>
+<line class="dgnd" x1="400" y1="98" x2="494" y2="98"/>
+<line class="dgnd" x1="406" y1="82" x2="488" y2="82"/>
+<rect class="dpanel" x="542" y="20" width="170" height="180"/>
+<text class="dl" x="627" y="220" text-anchor="middle">Occlusion</text>
+<rect class="dbox" x="600" y="80" width="60" height="80"/>
+<rect class="dbox" x="565" y="110" width="60" height="70" fill="#cfe8d8"/>
+<text class="ds" x="595" y="150" text-anchor="middle">in front</text>
+</svg>
+<figcaption><strong>Figure 27.1.1:</strong> The four dominant monocular depth cues a network learns to read. None determines absolute distance on its own, but jointly they constrain the relative depth ordering of a scene tightly enough that a trained model can produce a dense, coherent depth map from a single photograph.</figcaption>
+</figure>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Real-Estate Startup Discovers the Scale Trap</div>
+<p><strong>Who:</strong> a three-person team at a property-tech startup, 2023, building a tool that estimates room dimensions from listing photos so buyers can check if their furniture fits. <strong>Situation:</strong> they wired up a pretrained monocular depth network, fed it apartment photos, and got beautiful, plausible depth maps. <strong>Problem:</strong> when they read off "the sofa wall is 4.2 meters", the number was wrong by a factor that varied from photo to photo, sometimes 0.7x, sometimes 1.5x. The relative structure was perfect, but the absolute meters drifted. <strong>Decision:</strong> instead of fighting the model, they accepted the scale ambiguity of subsection 1 and added a single anchor per photo: they detected a standard object of known size (an electrical outlet, a doorway at a regulated height) and rescaled the whole depth map so that object measured correctly. <strong>Result:</strong> measurements came within roughly 5 percent, good enough to answer "will the couch fit". <strong>Lesson:</strong> a monocular depth model gives you shape for free and scale never; design the product around recovering scale from one known reference rather than trusting the raw meters.</p>
+</div>
+
+<h2>3. The Architecture: An Encoder-Decoder for Dense Regression <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Structurally, monocular depth estimation is a dense per-pixel regression problem, and that makes it a close cousin of the semantic segmentation you built in <a href="../module-24-segmentation/index.html">Chapter 24</a>. The architecture is the same encoder-decoder shape: a convolutional or transformer <strong>encoder</strong> compresses the image into a low-resolution, high-channel feature map that captures global context (essential, because depth cues like perspective are global), and a <strong>decoder</strong> upsamples back to full resolution, fusing skip connections from the encoder so fine boundaries survive. The only differences from segmentation are the head, one continuous output channel instead of per-class logits, and the loss, the scale-invariant regression loss of subsection 1 instead of cross-entropy.
+</p>
+
+<p>
+The code below sketches a compact encoder-decoder depth network on a ResNet backbone of the kind you met in <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. It is deliberately small enough to read; production models are deeper and often transformer-based, but the skeleton is identical.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torchvision
+
+class DepthNet(nn.Module):
+    """Encoder-decoder for monocular depth: ResNet encoder, conv decoder with skips."""
+    def __init__(self):
+        super().__init__()
+        backbone = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+        # Encoder stages, kept separately so we can grab skip features.
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)  # 1/2
+        self.pool = backbone.maxpool                                            # 1/4
+        self.enc1, self.enc2 = backbone.layer1, backbone.layer2                 # 1/4, 1/8
+        self.enc3, self.enc4 = backbone.layer3, backbone.layer4                 # 1/16, 1/32
+
+        def up(cin, cout):  # upsample-then-conv decoder block
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(inplace=True))
+        self.dec4, self.dec3 = up(512, 256), up(256 + 256, 128)
+        self.dec2, self.dec1 = up(128 + 128, 64), up(64 + 64, 32)
+        self.head = nn.Sequential(up(32, 16), nn.Conv2d(16, 1, 1))  # 1 depth channel
+
+    def forward(self, x):
+        s0 = self.stem(x); s1 = self.enc1(self.pool(s0))
+        s2 = self.enc2(s1); s3 = self.enc3(s2); s4 = self.enc4(s3)
+        d = self.dec4(s4)
+        d = self.dec3(torch.cat([d, s3], 1))   # fuse encoder skip for sharp edges
+        d = self.dec2(torch.cat([d, s2], 1))
+        d = self.dec1(torch.cat([d, s1], 1))
+        return torch.sigmoid(self.head(d))      # in (0,1); rescale to a depth range
+
+net = DepthNet()
+print("output:", net(torch.randn(1, 3, 256, 256)).shape)  # output: torch.Size([1, 1, 256, 256])</code></pre>
+<div class="code-caption">A minimal monocular depth network: a pretrained ResNet-18 encoder feeds an upsampling decoder whose skip connections (the <code>torch.cat</code> calls) restore the fine spatial detail the encoder discarded, ending in a single depth channel at full input resolution.</div>
+
+<p>
+The scale-invariant loss from subsection 1 is just as compact. The implementation below operates on log-depth and matches the formula exactly; it is the supervision signal you pair with the network above when ground-truth depth (from a laser scanner or RGB-D sensor) is available.
+</p>
+
+<pre><code class="language-python">def scale_invariant_loss(pred, target, mask, lam=0.85):
+    """pred, target: depth maps (>0). mask: valid-pixel boolean. Eigen et al. 2014."""
+    d = torch.log(pred[mask]) - torch.log(target[mask])   # per-pixel log error
+    n = d.numel()
+    return (d ** 2).mean() - lam * (d.sum() ** 2) / (n ** 2)
+
+# With lam close to 1 the loss is fully scale-invariant; lam<1 keeps a little
+# absolute-scale pressure, which helps when some weak metric supervision exists.</code></pre>
+<div class="code-caption">The scale-invariant log-depth loss. The first term penalizes per-pixel error; the second subtracts the squared mean error, removing the global scale the camera can never recover. The <code>mask</code> excludes pixels with no valid ground-truth depth.</div>
+
+<h2>4. Training Without Ground Truth: Self-Supervision from Video <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Ground-truth depth is expensive: it needs a LiDAR rig or an RGB-D camera, and those produce sparse, noisy, indoor-biased data. The breakthrough that scaled monocular depth was learning <em>without</em> any depth labels, using only ordinary video or stereo pairs. The idea, from Godard and colleagues, exploits a geometric identity you already know: if you knew the depth of every pixel in frame $t$ and the camera's motion to frame $t+1$, you could <strong>warp</strong> frame $t$ to predict what frame $t+1$ should look like. The network is trained to make that prediction match the real frame $t+1$. Depth is never supervised directly; it is supervised through the photometric reconstruction error it produces.
+</p>
+
+<p>
+Concretely, the network predicts depth $\hat{z}$ for the source frame and a small pose network predicts the relative camera motion $T$ between frames. Each source pixel $p_s$ is back-projected to 3D using $\hat{z}$ and the intrinsics $K$ (from <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>), transformed by $T$, and reprojected into the target frame:
+</p>
+
+<div class="math-block">
+$$p_t \sim K\, T\, \hat{z}(p_s)\, K^{-1} p_s$$
+</div>
+
+<p>
+Sampling the target image at those reprojected coordinates gives a reconstruction of the source, and the photometric loss (a blend of pixel difference and structural similarity) drives both networks. The depth that minimizes the reconstruction error is, by the geometry, the correct relative depth. This is the same warping you would use in stereo, turned into a self-supervised objective, and it inherits the depth-scale ambiguity of subsection 1: monocular self-supervision recovers depth only up to scale, while stereo self-supervision (with a known baseline) recovers it metrically.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Differentiable Warping in One Call</div>
+<p>The back-project, transform, reproject, and sample pipeline is fiddly to write correctly by hand (it is roughly 40 lines with easy-to-flip sign conventions). The Kornia library implements the entire warp as differentiable building blocks:</p>
+<pre><code class="language-python">import kornia
+# depth_warp reprojects src into the frame of dst using predicted depth + pose.
+# K: (B,3,3) intrinsics; T_src_to_dst: (B,4,4); depth_src: (B,1,H,W)
+warped_src = kornia.geometry.depth.warp_frame_depth(
+    image_src=dst_img, depth_dst=depth_src,
+    src_trans_dst=T_src_to_dst, camera_matrix=K)
+photometric = (warped_src - src_img).abs().mean()  # the self-supervision signal</code></pre>
+<p>Kornia handles the homogeneous coordinates, the grid sampling, and the gradient flow, so you supply only the predicted depth and pose and read off the reconstruction. This is the core of every self-supervised depth codebase (Monodepth2, ManyDepth) and replaces dozens of error-prone lines with a single, tested call.</p>
+</div>
+
+<h2>5. The 2024 Foundation Models for Depth <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+For years, monocular depth was a per-dataset affair: a model trained on indoor scenes failed outdoors, and vice versa. The shift that changed this, beginning with MiDaS in 2020 and reaching maturity in 2024, was scale and a scale-and-shift-invariant loss that let a single model train on a mixture of dozens of datasets at once. The result is <strong>zero-shot relative depth</strong>: a model that produces a sensible, sharp relative depth map on essentially any image it is shown, including domains it never saw in training. The current default, <strong>Depth Anything</strong> (and its V2), was trained on 62 million unlabeled images through a teacher-student loop on a <a href="../module-25-self-supervised-foundation-models/index.html">DINOv2</a> self-supervised backbone, exactly the foundation-model recipe of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> applied to geometry.
+</p>
+
+<p>
+Running one is now a few lines. The Hugging Face <code>transformers</code> pipeline below loads Depth Anything V2 and produces a relative depth map for any image, the off-the-shelf tool that the real-estate team of subsection 2 wished they had.
+</p>
+
+<pre><code class="language-python">from transformers import pipeline
+from PIL import Image
+
+# Loads a 2024 foundation depth model; "Small" runs on a CPU, "Large" needs a GPU.
+depth = pipeline(task="depth-estimation",
+                 model="depth-anything/Depth-Anything-V2-Small-hf")
+
+image = Image.open("street.jpg")
+result = depth(image)
+result["depth"].save("street_depth.png")   # a relative-depth visualization (PIL Image)
+# result["predicted_depth"] is the raw tensor; larger = nearer in this model's convention.
+print(result["predicted_depth"].shape)      # e.g. torch.Size([1, 518, 518])</code></pre>
+<div class="code-caption">Running a 2024 foundation depth model in five lines. The pipeline downloads weights, normalizes the input, and returns both a visualization and the raw relative-depth tensor; no training, no per-scene tuning, and it generalizes to images far outside any single dataset.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Metric Depth and Diffusion Depth (2024-2026)</div>
+<p>Two fronts are active. The first is closing the scale gap. Apple's <strong>Depth Pro</strong> (2024, arXiv:2410.02073) produces sharp <em>metric</em> depth (in meters, not just relative) from a single image in under a second by estimating focal length internally, attacking the very ambiguity of subsection 1 with a learned camera prior. <strong>Metric3D</strong> and <strong>UniDepth</strong> push the same goal by conditioning on or predicting intrinsics. The second front borrows the generative prior of Part IV: <strong>Marigold</strong> (2024, arXiv:2312.02145) fine-tunes a Stable Diffusion latent model to emit depth, treating depth estimation as conditional image generation and inheriting the diffusion model's crisp detail and strong prior from very little labeled data. The convergence is telling: the same denoising machinery you will build for image generation in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> turns out to be an excellent geometry estimator, because predicting plausible depth is, like generation, a problem of completing structure under a strong prior.</p>
+</div>
+
+<p>
+With a depth map in hand, by whatever route, the natural next question is where to put it. A depth map is still a 2D array; to reason about the scene in 3D, to rotate it, measure it, or feed it to a 3D network, we must lift it into an explicit three-dimensional representation. That is the subject of <a href="section-27.2.html">Section 27.2</a>.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.1.1: Why Scale Cannot Be Recovered <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the pinhole projection equations of subsection 1, prove algebraically that scaling a scene by a factor $\alpha$ (multiplying every $X$, $Y$, $Z$ by $\alpha$) leaves every pixel coordinate $(u, v)$ unchanged, provided the camera intrinsics are fixed. Then explain in two or three sentences why this means a single uncalibrated image cannot recover absolute depth, and name one piece of additional information that would break the ambiguity. Connect your answer to the stereo triangulation of <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a>: what does the second camera provide that resolves the scale?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.1.2: Run and Probe a Foundation Depth Model <span class="exercise-type coding">Coding</span></div>
+<p>Install <code>transformers</code> and run the Depth Anything V2 pipeline of subsection 5 on three of your own photos: one indoor scene, one outdoor scene with strong perspective (a road or hallway), and one close-up of a single object on a plain background. For each, visualize the depth map and write one sentence identifying which of the four cues from Figure 27.1.1 the model appears to be using. Then take the perspective photo and digitally remove the converging lines (crop to a flat wall), re-run, and report how the depth map degrades. What does this tell you about the model's reliance on global context?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.1.3: Scale-Invariant versus Plain L2 <span class="exercise-type analysis">Analysis</span></div>
+<p>Take a single ground-truth depth map and a predicted depth map that has the correct relative structure but is uniformly 1.5 times too large. Compute both the plain mean-squared log error and the scale-invariant loss of subsection 1 for this pair. Show numerically that the scale-invariant loss is near zero while the plain loss is large, and explain in a short paragraph why training with the plain loss would push the network to memorize dataset-specific average scales rather than learn transferable relative structure. Relate this to why MiDaS and Depth Anything use a scale-and-shift-invariant loss to train on mixed datasets.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 27 Index</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="section-27.2.html">Section 27.2: 3D Representations: Point Clouds, Voxels &amp; Meshes &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

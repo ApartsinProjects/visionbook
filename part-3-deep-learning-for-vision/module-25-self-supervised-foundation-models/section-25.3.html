@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 25.3: Self-Distillation &amp; Masked Image Modeling: DINO &amp; MAE. Learning without negatives via student-teacher self-distillation with centering and sharpening, DINO's emergent object segmentation, and MAE's asymmetric masked autoencoder that reconstructs 75 percent hidden patches." name="description"/>
+<title>Section 25.3: Self-Distillation &amp; Masked Image Modeling: DINO &amp; MAE | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 25: Self-Supervised Learning &amp; Vision Foundation Models</a></div>
+<h1>Self-Distillation &amp; Masked Image Modeling: DINO &amp; MAE</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My teacher and I are the same network, separated only by time. She is a slow, smoothed average of everything I used to be, and my one job is to agree with her. Somehow, in the act of agreeing with my own past, I learned where the objects are."</p>
+<cite>A Student Network Distilling From Its Own Echo</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Two ideas closed the gap between self-supervision and supervised pretraining. Self-distillation trains a student network to match a teacher that is a slow moving average of the student itself, learning without labels and without negatives; DINO's version produces attention maps that segment foreground objects with no segmentation supervision at all. Masked image modeling hides most of an image and trains the network to reconstruct the missing parts, importing into vision the masked-prediction recipe that built large language models.</strong> MAE makes this cheap by encoding only the visible patches with a large encoder and reconstructing with a small decoder. Between them, these two families produce the backbones that anchor modern computer vision, and they set up the foundation-model landscape of <a href="section-25.6.html">Section 25.6</a>.</p>
+</div>
+
+<p>
+The contrastive methods of <a href="section-25.2.html">Section 25.2</a> needed many negatives, and the research frontier there hinted that negatives might be unnecessary. This section makes good on that hint twice. First we build self-distillation, where a network learns by matching a smoothed copy of itself, and see why DINO's attention maps light up on objects. Then we build masked image modeling, where the supervision is reconstructing hidden content, and see why MAE's asymmetric design made it both effective and efficient. Both use the Vision Transformer of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> as their backbone, and both exploit its patch structure. By the end you will understand the two pretraining objectives that, combined, produce DINOv2, the general-purpose backbone of <a href="section-25.6.html">Section 25.6</a>.
+</p>
+
+<h2>1. Self-Distillation Without Labels <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Self-distillation borrows the teacher-student framing from knowledge distillation but removes the external teacher. Instead, the teacher is a copy of the student whose weights are an exponential moving average of the student's, exactly the momentum encoder from <a href="section-25.2.html">Section 25.2</a>, now promoted from a source of consistent negatives to the entire mechanism. The student sees one augmented view of an image and the teacher sees another; the student is trained to make its output distribution match the teacher's. There are no negatives and no labels: the only signal is "your two views of this image should produce the same soft prediction".
+</p>
+
+<p>
+This immediately raises the collapse problem. If both networks simply output the same constant vector for every image, the matching loss is zero and nothing has been learned. DINO (Caron et al., 2021) prevents collapse with two operations applied to the <em>teacher's</em> output. <strong>Centering</strong> subtracts a running mean from the teacher's logits, which stops any single dimension from dominating. <strong>Sharpening</strong> uses a low temperature in the teacher's softmax, which makes its output confident and peaked. Centering alone would push toward a uniform distribution (collapse to uniform); sharpening alone would push toward a one-hot spike (collapse to a constant class). Applied together they balance, and the only stable solution is one where the network genuinely distinguishes images. Figure 25.3.1 shows the asymmetric flow.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DINO self-distillation: student and teacher each see a view, teacher output is centered and sharpened, student matches it, teacher updated by EMA with stop-gradient">
+<style>
+.dl{font:12px sans-serif;fill:#1a1a1a;}
+.ds{font:10px sans-serif;fill:#555;}
+.dstu{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.dtea{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.dop{fill:#fff6e0;stroke:#d6a32b;stroke-width:1.5;}
+.dar{stroke:#777;stroke-width:1.5;marker-end:url(#dah);fill:none;}
+.dema{stroke:#d6802b;stroke-width:1.5;stroke-dasharray:3 2;marker-end:url(#dah);fill:none;}
+</style>
+<defs><marker id="dah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="ds" x="60" y="60" text-anchor="middle">view 1</text>
+<rect class="dstu" x="30" y="70" width="80" height="40"/>
+<text class="dl" x="70" y="94" text-anchor="middle">student</text>
+<text class="ds" x="60" y="210" text-anchor="middle">view 2</text>
+<rect class="dtea" x="30" y="180" width="80" height="40"/>
+<text class="dl" x="70" y="204" text-anchor="middle">teacher</text>
+<line class="dar" x1="110" y1="90" x2="180" y2="120"/>
+<line class="dar" x1="110" y1="200" x2="180" y2="172"/>
+<rect class="dop" x="182" y="180" width="120" height="40"/>
+<text class="dl" x="242" y="198" text-anchor="middle">center + sharpen</text>
+<text class="ds" x="242" y="213" text-anchor="middle">(anti-collapse)</text>
+<rect class="dstu" x="182" y="100" width="120" height="40"/>
+<text class="dl" x="242" y="124" text-anchor="middle">softmax</text>
+<line class="dar" x1="302" y1="120" x2="380" y2="135"/>
+<line class="dar" x1="302" y1="200" x2="380" y2="160"/>
+<rect class="dop" x="382" y="125" width="120" height="46"/>
+<text class="dl" x="442" y="145" text-anchor="middle">match: student</text>
+<text class="dl" x="442" y="160" text-anchor="middle">to teacher (CE)</text>
+<text class="ds" x="442" y="100" text-anchor="middle">gradient updates student only</text>
+<path class="dema" d="M70,112 C70,140 70,150 70,178"/>
+<text class="ds" x="150" y="148" text-anchor="middle">EMA, stop-grad</text>
+<text class="ds" x="600" y="148" text-anchor="middle">no negatives,</text>
+<text class="ds" x="600" y="164" text-anchor="middle">no labels</text>
+</svg>
+<figcaption><strong>Figure 25.3.1:</strong> DINO self-distillation. Student and teacher each encode a different augmented view. The teacher's output is centered and sharpened to prevent collapse, then the student is trained by cross-entropy to match the teacher's distribution. Gradients flow only into the student (the teacher has a stop-gradient); the teacher is updated as an exponential moving average of the student.</figcaption>
+</figure>
+
+<p>
+The code below implements the DINO loss, including the centering buffer update. The stop-gradient on the teacher is enforced by <code>detach</code>; the teacher weights are updated separately by the same <code>momentum_update</code> from <a href="section-25.2.html">Section 25.2</a>.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+class DINOLoss:
+    def __init__(self, out_dim, teacher_temp=0.04, student_temp=0.1, center_m=0.9):
+        self.center = torch.zeros(1, out_dim)   # running center subtracted from teacher
+        self.tt, self.st, self.cm = teacher_temp, student_temp, center_m
+
+    def __call__(self, student_out, teacher_out):
+        # Student: ordinary softmax at higher temperature.
+        student = F.log_softmax(student_out / self.st, dim=-1)
+        # Teacher: center (anti-collapse) then sharpen (low temp), and stop gradient.
+        teacher = F.softmax((teacher_out - self.center) / self.tt, dim=-1).detach()
+        loss = -(teacher * student).sum(dim=-1).mean()        # cross-entropy to teacher
+        # Update the center as an EMA of this batch's teacher outputs.
+        self.center = self.cm * self.center + (1 - self.cm) * teacher_out.mean(0, keepdim=True)
+        return loss
+
+torch.manual_seed(0)
+loss_fn = DINOLoss(out_dim=2048)
+s, t = torch.randn(16, 2048), torch.randn(16, 2048)   # student & teacher projections
+print("DINO loss:", round(loss_fn(s, t).item(), 4))
+# DINO loss: 7.6...   (high for random outputs; drops as student learns to match teacher)</code></pre>
+<div class="code-caption">The DINO loss with centering and sharpening. The teacher branch uses a low temperature (<code>0.04</code>) to sharpen and subtracts the running <code>center</code>; <code>detach()</code> is the stop-gradient that keeps the teacher a fixed target within the step.</div>
+
+<p>
+DINO's most celebrated result is emergent: the self-attention of the trained ViT's class token, with no segmentation labels anywhere in training, attends almost exactly to the foreground object. You can threshold those attention maps to get a usable object segmentation for free. This is the strongest evidence in the chapter that a good self-supervised objective does not just memorize textures; it discovers the structure of scenes. The descriptor the book has been learning to learn since <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> now localizes objects on its own.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Centering and Sharpening Are Opposing Forces in Balance</div>
+<p>Collapse is the central danger of any negative-free method, and DINO's defense is an equilibrium, not a barrier. Sharpening (low teacher temperature) pushes the output toward a confident peak; centering pushes it away from any one dimension dominating. Each alone causes a different collapse; together they cancel at the only fixed point where the network must actually tell images apart. The momentum teacher provides the stability that lets this equilibrium converge. Remove any one of the three (centering, sharpening, momentum) and DINO collapses, which is why all three appear in every reimplementation.</p>
+</div>
+
+<h2>2. Masked Image Modeling: Predict the Hidden Patches <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The second family takes a completely different route to free supervision, one borrowed directly from language models. In masked language modeling, a model is shown a sentence with some words hidden and trained to predict them; the supervision is the missing words, which require no labeling because they are simply removed from the input. Masked image modeling does the same with patches: hide a fraction of the image's patches and train the network to reconstruct them from the visible ones. The patch tokenization of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> is what makes this natural; an image is already a sequence of patch tokens, so masking patches is exactly analogous to masking words.
+</p>
+
+<p>
+The difficulty is that images are far more redundant than text. A masked word usually has few plausible completions, but a masked image patch can often be guessed by copying a neighbor, so masking a small fraction teaches little. MAE (He et al., 2022) made two decisions that turned this from a weak signal into a strong one. First, mask aggressively: hide seventy-five percent of patches, so reconstruction genuinely requires understanding the whole scene, not local interpolation. Second, build an <strong>asymmetric encoder-decoder</strong>: a large ViT encoder processes only the twenty-five percent visible patches (a quarter of the usual sequence, so it is cheap even though the encoder is big), and a small, shallow decoder reconstructs the full image from the encoded visible patches plus learnable mask tokens at the hidden positions. Figure 25.3.2 lays out the pipeline.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MAE pipeline: patchify image, drop 75 percent of patches, encode only visible patches with a large encoder, insert mask tokens, reconstruct full image with a small decoder">
+<style>
+.el{font:12px sans-serif;fill:#1a1a1a;}
+.es{font:10px sans-serif;fill:#555;}
+.epatch{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.2;}
+.emask{fill:#e8e8e8;stroke:#aaa;stroke-width:1;stroke-dasharray:2 2;}
+.eenc{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.edec{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.ear{stroke:#777;stroke-width:1.5;marker-end:url(#eah);fill:none;}
+</style>
+<defs><marker id="eah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="epatch" x="14" y="60" width="18" height="18"/><rect class="emask" x="34" y="60" width="18" height="18"/><rect class="emask" x="54" y="60" width="18" height="18"/>
+<rect class="emask" x="14" y="80" width="18" height="18"/><rect class="epatch" x="34" y="80" width="18" height="18"/><rect class="emask" x="54" y="80" width="18" height="18"/>
+<rect class="emask" x="14" y="100" width="18" height="18"/><rect class="emask" x="34" y="100" width="18" height="18"/><rect class="epatch" x="54" y="100" width="18" height="18"/>
+<text class="es" x="43" y="134" text-anchor="middle">mask 75%</text>
+<line class="ear" x1="74" y1="89" x2="120" y2="89"/>
+<text class="es" x="97" y="80" text-anchor="middle">visible</text>
+<text class="es" x="97" y="106" text-anchor="middle">only</text>
+<rect class="eenc" x="122" y="64" width="90" height="50"/>
+<text class="el" x="167" y="85" text-anchor="middle">large</text>
+<text class="el" x="167" y="100" text-anchor="middle">encoder</text>
+<text class="es" x="167" y="132" text-anchor="middle">sees 25% of patches</text>
+<line class="ear" x1="212" y1="89" x2="258" y2="89"/>
+<rect class="epatch" x="260" y="70" width="14" height="14"/><rect class="emask" x="276" y="70" width="14" height="14"/>
+<rect class="emask" x="260" y="86" width="14" height="14"/><rect class="epatch" x="276" y="86" width="14" height="14"/>
+<text class="es" x="277" y="118" text-anchor="middle">+ mask tokens</text>
+<line class="ear" x1="296" y1="89" x2="342" y2="89"/>
+<rect class="edec" x="344" y="69" width="82" height="42"/>
+<text class="el" x="385" y="86" text-anchor="middle">small</text>
+<text class="el" x="385" y="101" text-anchor="middle">decoder</text>
+<line class="ear" x1="426" y1="89" x2="472" y2="89"/>
+<rect class="epatch" x="474" y="64" width="50" height="50"/>
+<text class="es" x="499" y="132" text-anchor="middle">reconstruct</text>
+<text class="es" x="499" y="146" text-anchor="middle">full image</text>
+<text class="es" x="610" y="82" text-anchor="middle">loss only on</text>
+<text class="es" x="610" y="98" text-anchor="middle">masked patches</text>
+</svg>
+<figcaption><strong>Figure 25.3.2:</strong> The MAE asymmetric autoencoder. After patchifying, 75 percent of patches are dropped. A large encoder processes only the visible 25 percent (cheap, since the sequence is short), then mask tokens are inserted at the hidden positions and a small decoder reconstructs the full image. The reconstruction loss is computed only on the masked patches.</figcaption>
+</figure>
+
+<p>
+The reconstruction loss is mean squared error between the predicted and true pixel values of the <em>masked</em> patches only,
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{MAE}} = \frac{1}{|\mathcal{M}|} \sum_{p \in \mathcal{M}} \big\| \hat{x}_p - x_p \big\|_2^2$$
+</div>
+
+<p>
+where $\mathcal{M}$ is the set of masked patch indices, $x_p$ is the true patch, and $\hat{x}_p$ is the decoder's prediction. Computing the loss only on masked patches (not the visible ones) is deliberate: predicting patches you were shown is trivial and dilutes the signal. The masking and loss are short to express.
+</p>
+
+<pre><code class="language-python">import torch
+
+def random_masking(x, mask_ratio=0.75):
+    """x: (B, N, D) patch tokens. Keep a random (1-mask_ratio) subset; return kept + mask."""
+    B, N, D = x.shape
+    keep = int(N * (1 - mask_ratio))
+    noise = torch.rand(B, N, device=x.device)            # random score per patch
+    order = noise.argsort(dim=1)                          # shuffle patch indices
+    keep_idx = order[:, :keep]                            # indices of visible patches
+    x_visible = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(-1, -1, D))
+    mask = torch.ones(B, N, device=x.device)
+    mask.scatter_(1, keep_idx, 0)                         # 1 where masked, 0 where visible
+    return x_visible, mask, order
+
+def mae_loss(pred, target, mask):
+    """MSE on masked patches only. pred, target: (B, N, patch_dim); mask: (B, N)."""
+    per_patch = ((pred - target) ** 2).mean(dim=-1)       # (B, N) MSE per patch
+    return (per_patch * mask).sum() / mask.sum()          # average over MASKED patches only
+
+x = torch.randn(2, 196, 768)                              # 2 images, 14x14 patches, dim 768
+x_vis, mask, _ = random_masking(x)
+print("visible patches:", x_vis.shape[1], "of", x.shape[1], "| masked:", int(mask[0].sum()))
+# visible patches: 49 of 196 | masked: 147</code></pre>
+<div class="code-caption">MAE masking and reconstruction loss. <code>random_masking</code> keeps a random 25 percent of patches so only 49 of 196 reach the encoder; <code>mae_loss</code> multiplies by the mask so error on the visible patches contributes nothing, exactly the design choice that focuses the signal.</div>
+
+<p>
+The asymmetry is the efficiency win: because the heavy encoder sees only forty-nine of the one hundred ninety-six patches, MAE pretraining is several times faster than processing the full image, while the representations it learns are strong under fine-tuning. The contrast with DINO is worth holding onto: DINO produces features that are excellent under a linear probe and even segment objects, while MAE produces features that shine after fine-tuning. The two objectives push representations in complementary directions, which is exactly why DINOv2 in <a href="section-25.6.html">Section 25.6</a> combines them.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>MAE's reconstructions, viewed directly, look like impressionist smudges: blurry, low-frequency, often missing fine texture. This is not a failure. The model is graded on pixel MSE, which is dominated by getting the broad structure right, so it spends its capacity on layout and shape rather than crisp edges. The blurry reconstructions are a feature: they show the model learned what a region <em>is</em> rather than memorizing its exact pixels, which is precisely what makes the representation transfer. This same MSE-prefers-blur effect is why pixel-space generation needs the perceptual and adversarial losses you will meet in <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pretrained DINO and MAE Backbones</div>
+<p>Pretraining either method from scratch costs many GPU-days; in practice you load the published weights. Both DINO and MAE backbones are one call away through <code>torch.hub</code> or <code>timm</code>:</p>
+<pre><code class="language-python">import torch, timm
+# DINOv2 ViT-S/14, self-distilled + masked, features ready for a frozen probe:
+dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+# An MAE-pretrained ViT-B/16, set up for fine-tuning (classifier head attached):
+mae = timm.create_model("vit_base_patch16_224.mae", pretrained=True, num_classes=1000)</code></pre>
+<p>These two lines replace the masking pipeline, the projection heads, the momentum teacher, the multi-crop augmentation, and the multi-day training run, fetching weights that were trained on tens of millions to hundreds of millions of images. The library handles the exact architecture, the matching preprocessing, and the head wiring. The from-scratch losses above exist so you can read those checkpoints' training code and know what every term means.</p>
+</div>
+
+<h2>3. Choosing Between the Two <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+DINO and MAE are not interchangeable, and knowing which to reach for matters in practice. DINO-style self-distillation produces features that are immediately useful without any task training: high linear-probe accuracy, strong k-nearest-neighbor retrieval, and emergent segmentation, because the objective explicitly organizes the embedding space by image identity. MAE-style masked modeling produces features that are a superb <em>initialization</em> for fine-tuning but weaker under a frozen linear probe, because reconstruction does not directly cluster images by semantics. As a rule of thumb: if you will freeze the backbone and use its features directly (retrieval, clustering, few-shot, dense correspondence), prefer a DINO-family model; if you will fine-tune end to end on a labeled downstream task, MAE is an excellent starting point. The practical example below is a real version of this decision.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Frozen Features Versus Fine-Tuning in a Medical Pipeline</div>
+<p><strong>Who:</strong> a radiology AI team at a hospital network, 2023, building tools on a large archive of unlabeled chest images with only a few thousand expert-annotated cases per condition. <strong>Situation:</strong> they needed two things: a retrieval system that finds visually similar prior scans for a radiologist, and a set of fine-tuned classifiers for specific findings. <strong>Problem:</strong> they assumed one self-supervised backbone would serve both, and they started with an MAE-pretrained ViT because masked modeling was the most cited recipe that year. The fine-tuned classifiers were excellent, but the retrieval system, which used the frozen MAE features through cosine similarity, returned poorly matched scans. <strong>Decision:</strong> rather than force one backbone to do both, they pretrained a second backbone with DINO-style self-distillation on the same unlabeled archive and used its frozen features for retrieval, keeping the MAE backbone for the fine-tuned classifiers. <strong>Result:</strong> retrieval precision rose sharply because DINO's objective had organized the embedding space by image content, while the fine-tuned MAE classifiers stayed best-in-class for the labeled findings. <strong>Lesson:</strong> the choice of self-supervised objective is a choice about how you will use the features. Frozen-feature use cases want the clustering that self-distillation provides; fine-tuning use cases want the strong initialization that masked modeling provides. The modern answer, as <a href="section-25.6.html">Section 25.6</a> shows, is to combine both objectives in one model.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Reconstructing Features, Not Pixels</div>
+<p>MAE reconstructs raw pixels, which the Fun Fact above noted wastes capacity on imperceptible detail. The 2023 to 2024 JEPA line from Meta (I-JEPA for images, V-JEPA for video) argues the prediction should happen in <em>representation space</em>: predict the encoded features of the masked region, not its pixels, so the model is never penalized for failing to hallucinate exact texture. This removes the decoder's pull toward low-level detail and, the authors argue, learns more abstract, more semantic features at lower cost. iBOT and the data-curated DINOv2 (which fuses masked modeling with self-distillation) are the other strands of this convergence. Whether pixel reconstruction, feature prediction, or joint distillation wins is an open question of 2025 and 2026, and the JEPA direction connects directly to the predictive world models you will meet in <a href="../module-26-video-understanding/index.html">Chapter 26</a>; we return to all of this in <a href="section-25.6.html">Section 25.6</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.1: Why Both Centering and Sharpening <span class="exercise-type conceptual">Conceptual</span></div>
+<p>DINO uses both centering and sharpening on the teacher output. Describe the specific collapse that occurs if you remove centering (sharpening only), and the different collapse that occurs if you remove sharpening (centering only). Then explain, in terms of the two opposing forces, why applying both yields a stable non-collapsed solution. Why must these operations be applied to the teacher rather than the student?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.2: The Effect of Mask Ratio <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>random_masking</code> and <code>mae_loss</code> code with a small ViT encoder-decoder, pretrain MAE on an unlabeled image set at mask ratios of 0.25, 0.50, 0.75, and 0.90, then fine-tune each backbone on a labeled subset and report downstream accuracy. You should find a sweet spot near 0.75. Write one paragraph explaining why both very low and very high mask ratios hurt: what does the model learn when masking is too easy, and what is lost when too little visible context remains.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.3: Linear Probe Versus Fine-Tuning <span class="exercise-type analysis">Analysis</span></div>
+<p>The section claims DINO features win under a frozen linear probe while MAE features win under fine-tuning. Design an experiment using two pretrained backbones (one DINO, one MAE) from the library shortcut that would test this claim on a single downstream dataset. Specify exactly what you would measure for each backbone under each protocol (probe and fine-tune), what pattern of four numbers would confirm the claim, and what pattern would refute it. Then explain why the objective each method optimizes predicts the pattern you expect.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-25.2.html">&#8592; Section 25.2: Contrastive Learning: SimCLR &amp; MoCo</a>
+<a href="index.html">Chapter 25</a>
+<a class="next" href="section-25.4.html">Section 25.4: CLIP: Language as Supervision &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

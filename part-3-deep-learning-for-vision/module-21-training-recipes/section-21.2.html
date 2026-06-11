@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.2: Data Augmentation: From Flips to MixUp & CutMix. Geometric and photometric augmentation as regularization, why transforms must respect label semantics, the label-mixing methods MixUp and CutMix, and the automated policies RandAugment and TrivialAugment that replaced hand-tuning." name="description"/>
+<title>Section 21.2: Data Augmentation: From Flips to MixUp &amp; CutMix | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: Training Recipes: Data, Augmentation &amp; Transfer</a></div>
+<h1>Data Augmentation: From Flips to MixUp &amp; CutMix</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You showed me the same cat ten thousand times, but flipped, cropped, recolored, and once spliced halfway into a dog. I no longer trust that a cat lives in the left half of the image, and I am better for it."</p>
+<cite>A Classifier That Stopped Memorizing Backgrounds</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Data augmentation manufactures new training examples by applying label-preserving transformations, and it is the cheapest, highest-leverage regularizer in computer vision: the same model that overfits on raw data often generalizes well once augmentation forces it to ignore nuisance variation.</strong> This section climbs a ladder. At the bottom are the geometric and photometric transforms of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> repurposed to teach invariance. In the middle is the critical rule that an augmentation must not change what the label means. At the top are the modern label-mixing methods, MixUp and CutMix, which blend the targets as well as the pixels, and the automated policies that ended the era of hand-tuning every transform.</p>
+</div>
+
+<p>
+The previous section established that the dataset is fixed and finite. Augmentation is how we make a finite dataset behave like a much larger one. The intuition is simple: a horizontally flipped cat is still a cat, so showing the network both versions teaches it that "cat-ness" does not depend on left-right orientation. Each transform we add encodes a piece of knowledge about which variations are irrelevant to the label. Done well, this is the difference between a model that memorizes its training set and one that generalizes; done carelessly, it teaches the model something false. We build the ladder one rung at a time.
+</p>
+
+<h2>1. The Geometric and Photometric Rung <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The first family of augmentations reuses the warps and point operations you already know. The geometric transforms come straight from <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>: horizontal flip, random crop and resize, small rotations, and mild affine shears. Each tells the network that the object's identity survives that transformation. The photometric transforms come from the point operations of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>: brightness, contrast, saturation, and hue jitter, plus Gaussian blur and added noise. These teach invariance to lighting and camera variation. The standard ImageNet training augmentation is just two of these (a random-resized-crop and a horizontal flip), and that pair alone is worth several points of accuracy.
+</p>
+
+<pre><code class="language-python">from torchvision.transforms import v2
+import torch
+
+# The classic ImageNet training transform: random crop + flip, then normalize.
+train_tf = v2.Compose([
+    v2.RandomResizedCrop(224, scale=(0.08, 1.0)),   # zoom + reframe
+    v2.RandomHorizontalFlip(p=0.5),                 # left-right invariance
+    v2.ColorJitter(brightness=0.2, contrast=0.2,    # lighting invariance
+                   saturation=0.2, hue=0.05),
+    v2.ToDtype(torch.float32, scale=True),          # uint8 -> [0,1] float
+    v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# At validation time we DO NOT augment: deterministic resize + center crop.
+val_tf = v2.Compose([
+    v2.Resize(232), v2.CenterCrop(224),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])</code></pre>
+<div class="code-caption">Training and validation transforms differ on purpose: augmentation is applied only during training. The validation pipeline is deterministic so its metric measures the model, not the random crop.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Augment Train, Never Validation</div>
+<p>Augmentation belongs to training only. Its job is to make training harder and more varied so the model learns robust features; the validation and test sets must stay deterministic so their metrics measure generalization rather than augmentation luck. A validation transform with randomness in it gives you a noisy, irreproducible number. The one principled exception is test-time augmentation, where you deliberately average predictions over several augmented views at inference to squeeze out a little extra accuracy, but that is an inference-time ensembling trick, not a substitute for a clean validation metric.</p>
+</div>
+
+<h2>2. The Rule That Governs Everything: Respect the Label <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Every augmentation is a bet that the transformation does not change the correct answer, and the bet is task-dependent. A horizontal flip is safe for "is this a cat?" but catastrophic for "which way is this arrow pointing?" or for reading text, where left-right orientation is the label. A vertical flip is fine for satellite imagery but absurd for street scenes, where the sky belongs on top. Aggressive color jitter is harmless for object recognition but destroys a task that depends on color, like grading the ripeness of fruit or classifying a traffic light. The single most important habit in augmentation is to ask, for each transform, "does this preserve the label for my specific task?"
+</p>
+
+<p>
+The rule has a sharper edge for tasks with spatial labels. In detection and segmentation, a geometric transform applied to the image must be applied identically to the boxes or masks, or the supervision becomes wrong. Flip the image and the bounding boxes must flip too. This is why production augmentation libraries treat the image and its annotations as a single coupled object, a point the library shortcut at the end of this section makes concrete and which matters greatly for the detection pipelines of <a href="../module-23-object-detection/index.html">Chapter 23</a> and the segmentation masks of <a href="../module-24-segmentation/index.html">Chapter 24</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Flip That Broke a Defect Detector</div>
+<p><strong>Who:</strong> a manufacturing-vision team training a model to read tiny embossed orientation arrows on metal parts, 2025. <strong>Situation:</strong> they copied a standard ImageNet augmentation recipe, including <code>RandomHorizontalFlip</code>, into their pipeline. <strong>Problem:</strong> training accuracy was fine, but the model confused left-pointing and right-pointing arrows in production, the one distinction the whole system existed to make. <strong>Decision:</strong> reviewing the augmentation list, the lead realized the horizontal flip was turning left arrows into right arrows while keeping the original label, teaching the model that orientation was irrelevant, the exact opposite of the task. <strong>Result:</strong> removing the horizontal flip (and adding small rotations and brightness jitter, which are genuinely label-preserving here) fixed the confusion within one retraining cycle. <strong>Lesson:</strong> there is no universal augmentation recipe. A transform that is the bread and butter of object recognition can be poison for a task where that exact symmetry carries the label. Audit every transform against your task before you trust the recipe.</p>
+</div>
+
+<h2>3. Cutout, MixUp, and CutMix: Mixing the Labels <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The next rung of the ladder breaks the assumption that one training image carries one clean label. Three closely related methods, illustrated in Figure 21.2.1, push augmentation into the label space itself. <strong>Cutout</strong> masks a random rectangle of the image to zero, forcing the network to use the whole object rather than a single discriminative patch. <strong>MixUp</strong> takes two images and blends them pixel-wise, $\tilde{x} = \lambda x_i + (1 - \lambda) x_j$, and blends their one-hot labels identically, $\tilde{y} = \lambda y_i + (1 - \lambda) y_j$, with $\lambda$ drawn from a Beta distribution. <strong>CutMix</strong> combines the two ideas: it pastes a rectangular patch from image $j$ into image $i$, and sets the label mix proportional to the patch's area fraction.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of Cutout, MixUp, and CutMix augmentation strategies">
+<style>
+.h{font:13px sans-serif;fill:#1a1a1a;font-weight:bold;}
+.c{font:11px sans-serif;fill:#555;}
+.imgA{fill:#cfe4f7;stroke:#2c6fb5;stroke-width:1.5;}
+.imgB{fill:#ffe1cc;stroke:#d6802b;stroke-width:1.5;}
+.cut{fill:#444;}
+</style>
+<text class="h" x="120" y="30" text-anchor="middle">Cutout</text>
+<text class="h" x="360" y="30" text-anchor="middle">MixUp</text>
+<text class="h" x="600" y="30" text-anchor="middle">CutMix</text>
+<!-- Cutout -->
+<rect class="imgA" x="70" y="50" width="100" height="100"/>
+<rect class="cut" x="100" y="80" width="40" height="40"/>
+<text class="c" x="120" y="172" text-anchor="middle">label: cat (1.0)</text>
+<text class="c" x="120" y="190" text-anchor="middle">patch zeroed out</text>
+<!-- MixUp: half-opacity overlap shown as split -->
+<rect class="imgA" x="310" y="50" width="100" height="100" opacity="0.55"/>
+<rect class="imgB" x="310" y="50" width="100" height="100" opacity="0.45"/>
+<text class="c" x="360" y="172" text-anchor="middle">label: 0.6 cat + 0.4 dog</text>
+<text class="c" x="360" y="190" text-anchor="middle">whole image blended</text>
+<!-- CutMix -->
+<rect class="imgA" x="550" y="50" width="100" height="100"/>
+<rect class="imgB" x="600" y="100" width="50" height="50"/>
+<text class="c" x="600" y="172" text-anchor="middle">label: 0.75 cat + 0.25 dog</text>
+<text class="c" x="600" y="190" text-anchor="middle">patch pasted, label by area</text>
+<text class="c" x="360" y="228" text-anchor="middle">Blue = image A (cat), Orange = image B (dog). Each method changes the label, not just the pixels.</text>
+</svg>
+<figcaption><strong>Figure 21.2.1:</strong> Three label-aware augmentations. Cutout zeroes a patch and keeps the label. MixUp blends two whole images and their labels by a mixing weight $\lambda$. CutMix pastes a patch and sets the label mix to the patch's area fraction, combining Cutout's locality with MixUp's soft labels.</figcaption>
+</figure>
+
+<p>
+Why does blending labels help? Two reasons. First, it strongly regularizes: the network can no longer be fully confident on any single class, which discourages the overconfident, sharp decision boundaries that overfit. Second, it improves <strong>calibration</strong>, the agreement between a model's confidence and its actual accuracy, because soft targets teach the model to output soft probabilities. MixUp and CutMix are now standard in competitive image-classification recipes, including the ConvNeXt training procedure from <a href="../module-20-cnn-architectures/index.html">Chapter 20</a>. The implementation is remarkably short.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import torch
+
+def mixup(x, y, num_classes, alpha=0.2):
+    """MixUp: blend a batch with a shuffled copy of itself."""
+    lam = np.random.beta(alpha, alpha)             # mixing weight in [0,1]
+    idx = torch.randperm(x.size(0))                # random pairing within batch
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    y1 = torch.nn.functional.one_hot(y, num_classes).float()
+    mixed_y = lam * y1 + (1 - lam) * y1[idx]       # blend the labels too
+    return mixed_x, mixed_y
+
+# Train with a loss that accepts soft targets (KL or soft cross-entropy):
+# logits = model(mixed_x)
+# loss = -(mixed_y * logits.log_softmax(dim=1)).sum(dim=1).mean()</code></pre>
+<div class="code-caption">MixUp in eight lines. The same $\lambda$ that blends the pixels blends the one-hot labels, so the training target becomes a soft distribution, which is what regularizes the model and improves calibration.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>MixUp images look genuinely terrible to a human: a ghostly cat-dog superimposition that no photographer would ever shoot and no caption would ever describe. The MixUp authors freely admitted the inputs are "unnatural" and confessed mild surprise that training on these visual nonsense-blends works at all, let alone that it reliably beats training on clean images. It is a useful reminder that a network's idea of a helpful training example and a human's idea of a sensible photograph are two very different things.</p>
+</div>
+
+<h2>4. Automated Policies: RandAugment and TrivialAugment <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Once you have a dozen possible transforms, each with a magnitude knob, the search space of "which ones, how strong, in what order" is enormous. The first serious attempt, AutoAugment, used reinforcement learning to search for an optimal policy, but the search itself cost thousands of GPU hours. The field then discovered that almost all of that expense was unnecessary. <strong>RandAugment</strong> collapses the policy to two interpretable numbers: $N$, how many random transforms to apply per image, and $M$, a single global magnitude that scales all of them. <strong>TrivialAugment</strong> goes further and removes even those: it applies exactly one randomly chosen transform at a randomly chosen magnitude per image, with zero tuning, and matches or beats the heavily-searched policies.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Simpler Augmentation Often Wins</div>
+<p>The arc from AutoAugment to RandAugment to TrivialAugment is a microcosm of a broader lesson: expensive automated search frequently rediscovers what a tiny, well-chosen random policy already provides. TrivialAugment has no hyperparameters to tune and yet competes with policies that cost thousands of GPU hours to find. For a new project, the rational default is to start with TrivialAugment or RandAugment at a moderate magnitude, measure, and only invest in tuning if the data clearly demands it. Augmentation strength is itself a regularizer: increase it when overfitting, reduce it when underfitting.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Modern Augmentation Stack, Built In</div>
+<p>You almost never implement RandAugment, MixUp, or CutMix by hand in production. torchvision's v2 transforms ship all of them, and crucially they transform images, boxes, and masks together. The from-scratch versions above (and a hand-rolled RandAugment, which is roughly 80 lines) collapse to:</p>
+<pre><code class="language-python">from torchvision.transforms import v2
+import torch
+
+train_tf = v2.Compose([
+    v2.RandomResizedCrop(224, antialias=True),
+    v2.RandomHorizontalFlip(),
+    v2.RandAugment(num_ops=2, magnitude=9),         # the whole policy in one line
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# MixUp / CutMix operate on the batch (collated tensor + integer labels):
+cutmix_or_mixup = v2.RandomChoice([
+    v2.MixUp(num_classes=1000),
+    v2.CutMix(num_classes=1000),
+])
+# for images, labels in loader:  images, labels = cutmix_or_mixup(images, labels)</code></pre>
+<p>The library handles the magnitude scaling for every operation, the Beta sampling for the mixing weight, the soft-label bookkeeping, and (when you use the v2 API on detection or segmentation targets) the synchronized transformation of bounding boxes and masks. For pipelines that augment boxes and masks heavily, Albumentations is the production-standard alternative with the same coupling guarantee.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Augmentation Meets Generative Data</div>
+<p>The frontier of augmentation in 2024-2026 is increasingly generative. Rather than perturbing existing images, teams now synthesize new ones with the diffusion models of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> and text-to-image systems of <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>, generating rare classes, hard poses, or under-represented conditions on demand. Work on synthetic-data training (for example training classifiers on diffusion-generated images, and using generative models to balance long-tailed datasets) shows measurable gains when the synthetic distribution is anchored to the real one. This closes a loop that runs through the whole book: the geometric augmentation born in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a> becomes the generative data engine of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>, where models manufacture their own training data and the central question becomes how to keep that synthetic data faithful to reality.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.1: Build an Augmentation Audit <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the following tasks, list every transform from this section (horizontal flip, vertical flip, rotation, color jitter, MixUp) and mark it label-preserving or label-breaking, with a one-line justification: (a) classifying cat versus dog, (b) reading house numbers from photos, (c) classifying skin-lesion type from dermatology photos, (d) detecting which way a conveyor belt is moving from a single frame. There is no single right answer; the reasoning is the point.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.2: Measure What MixUp Buys <span class="exercise-type coding">Coding</span></div>
+<p>Train a small CNN on CIFAR-10 twice with an identical schedule: once with standard crop-and-flip augmentation, once additionally with the MixUp function from subsection 3. Report final test accuracy for both, and also report a calibration measure (for example the gap between average confidence and accuracy, or expected calibration error). You should observe MixUp improving calibration and usually accuracy. Write a short paragraph relating the calibration improvement to the soft-target argument in subsection 3.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.3: Find the Augmentation Sweet Spot <span class="exercise-type analysis">Analysis</span></div>
+<p>Using <code>RandAugment</code> from torchvision, train the same model at magnitudes $M \in \{0, 5, 9, 15, 20\}$ on a dataset of your choice and plot train and validation accuracy against $M$. Identify the magnitude where validation accuracy peaks, and explain the shape of the curve: why too little augmentation overfits and too much underfits. Relate the optimum to the dataset size, and predict how the sweet spot would shift if you had ten times more training data.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-21.1.html">&#8592; Section 21.1: Vision Datasets</a>
+<a href="index.html">Chapter 21</a>
+<a class="next" href="section-21.3.html">Section 21.3: Transfer Learning &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

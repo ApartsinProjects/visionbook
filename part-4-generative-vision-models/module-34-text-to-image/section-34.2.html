@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.2: Inside Stable Diffusion. The VAE that compresses to latents, the denoising U-Net and its diffusion-transformer successor, the cross-attention layers that inject text, and a full text-to-image generation traced end to end in code." name="description"/>
+<title>Section 34.2: Inside Stable Diffusion: VAE, U-Net, DiT &amp; Conditioning | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Text-to-Image Systems</a></div>
+<h1>Inside Stable Diffusion: VAE, U-Net, DiT &amp; Conditioning</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I am three machines in a trench coat. The first shrinks the world, the second hallucinates inside the shrunken world while a sentence whispers in its ear, and the third blows the result back up to scale. Marketing calls all three of us 'Stable Diffusion'."</p>
+<cite>A Latent Diffusion Stack Maintaining a United Front</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Stable Diffusion is three networks wired in series: an autoencoder that compresses pixels to a small latent, a denoiser (a U-Net or a diffusion transformer) that runs the diffusion process in that latent while cross-attending to text, and the same autoencoder's decoder that turns the finished latent back into pixels.</strong> Once you can name the three stations and the data tensor that flows between them, you can read any latent text-to-image system, debug it stage by stage, and understand exactly where the text gets to influence the image. This section dissects each station and then traces one full generation end to end in code.</p>
+</div>
+
+<p>
+In <a href="section-34.1.html">Section 34.1</a> we produced the conditioning sequence: a tensor of per-token text embeddings. This section is about the machine that consumes it. We assemble the three components of latent diffusion that <a href="../module-33-diffusion-models/index.html">Chapter 33</a> introduced separately, show how cross-attention threads the text through the denoiser, and run the assembled system so the abstract pipeline becomes a concrete sequence of tensor shapes.
+</p>
+
+<h2>1. Three Stations and the Tensor Between Them <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The architecture is a pipeline, and Figure 34.2.1 is the map. Text goes into the frozen encoder of <a href="section-34.1.html">Section 34.1</a> and comes out as a conditioning sequence. A random latent is denoised by the U-Net over many steps, with the conditioning injected at every step through cross-attention. The finished latent is decoded to pixels by the VAE decoder. The pixel-space image never touches the denoiser; all the expensive iteration happens in the small latent, which is the entire reason latent diffusion fits on a consumer GPU.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stable Diffusion pipeline: text encoder feeds cross-attention in a denoising U-Net that iterates in latent space, then a VAE decoder produces pixels">
+<style>
+.box{fill:#f4f5f7;stroke:#14385c;stroke-width:1.5;}
+.txt{font-family:Georgia,serif;font-size:12px;fill:#111418;}
+.cap{font-family:Georgia,serif;font-size:10.5px;fill:#5a626c;}
+.flow{stroke:#14385c;stroke-width:1.6;fill:none;marker-end:url(#a2);}
+.cond{stroke:#7a3b14;stroke-width:1.6;fill:none;marker-end:url(#a3);stroke-dasharray:5 3;}
+</style>
+<defs>
+<marker id="a2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#14385c"/></marker>
+<marker id="a3" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#7a3b14"/></marker>
+</defs>
+<rect class="box" x="20" y="30" width="120" height="44"/>
+<text class="txt" x="34" y="48">Text encoder</text>
+<text class="cap" x="34" y="64">CLIP / T5 (frozen)</text>
+<text class="cap" x="20" y="22">"a fox in snow"</text>
+
+<rect class="box" x="20" y="200" width="120" height="44"/>
+<text class="txt" x="38" y="218">random latent</text>
+<text class="cap" x="34" y="234">z&#8348; ~ N(0, I)</text>
+
+<rect class="box" x="270" y="160" width="170" height="120"/>
+<text class="txt" x="300" y="200">Denoising U-Net</text>
+<text class="cap" x="300" y="218">(or DiT)</text>
+<text class="cap" x="300" y="238">predicts noise &#949;&#952;</text>
+<text class="cap" x="300" y="256">cross-attn on text</text>
+
+<rect class="box" x="540" y="180" width="120" height="44"/>
+<text class="txt" x="556" y="198">VAE decoder</text>
+<text class="cap" x="556" y="214">latent &#8594; pixels</text>
+
+<path class="cond" d="M140,52 C210,70 230,150 268,190"/>
+<text class="cap" x="150" y="120">conditioning seq</text>
+<path class="flow" d="M140,222 L268,222"/>
+<path class="flow" d="M355,160 C355,120 355,300 355,295" />
+<path class="flow" d="M440,222 C490,222 500,202 538,202"/>
+<text class="cap" x="455" y="216">z&#8320;</text>
+<rect class="box" x="540" y="60" width="120" height="60"/>
+<text class="txt" x="566" y="86">output image</text>
+<text class="cap" x="556" y="104">512&#215;512 px</text>
+<path class="flow" d="M600,180 L600,122"/>
+<text class="cap" x="285" y="305">T denoising steps (loop)</text>
+</svg>
+<figcaption><strong>Figure 34.2.1:</strong> The Stable Diffusion pipeline. The frozen text encoder (Section 34.1) produces a conditioning sequence (brown dashed) that enters the U-Net through cross-attention. The denoiser iterates $T$ times in latent space, then the VAE decoder lifts the final latent $z_0$ to pixels. The pixel image is produced exactly once, at the end.</figcaption>
+</figure>
+
+<h2>2. The Autoencoder: Compress, Then Decode <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The first and last stations are the same network: the variational autoencoder you built in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>, here used as a fixed perceptual compressor. Stable Diffusion's VAE maps a $512 \times 512 \times 3$ image to a $64 \times 64 \times 4$ latent, an eightfold spatial downsampling per side and a $48\times$ reduction in element count. The latent is not a semantic code; it is a near-lossless perceptual compression, trained with a combination of reconstruction loss, a small KL penalty toward a standard normal, and an adversarial term (the GAN discriminator of <a href="../module-32-gans/index.html">Chapter 32</a>) that keeps decoded textures sharp. The diffusion process then runs entirely in this $64 \times 64 \times 4$ space.
+</p>
+
+<p>
+The compression ratio is the lever. A diffusion step on a $64 \times 64$ grid costs a fraction of a step on a $512 \times 512$ grid, so latent diffusion buys roughly an order-of-magnitude speedup over pixel diffusion at the same image resolution. There is a fixed scaling factor (0.18215 for the SD 1.x VAE) applied when moving between the VAE's natural output and the unit-variance scale the denoiser expects; forgetting it produces washed-out or over-saturated images, a classic first-day bug.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import AutoencoderKL
+from diffusers.utils import load_image
+import torchvision.transforms.functional as TF
+
+vae = AutoencoderKL.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="vae").eval()
+
+img = load_image("https://huggingface.co/datasets/huggingface/"
+                 "documentation-images/resolve/main/diffusers/cat.png")
+x = TF.to_tensor(img.resize((512, 512))).unsqueeze(0) * 2 - 1   # to [-1, 1]
+
+with torch.no_grad():
+    latent = vae.encode(x).latent_dist.sample() * vae.config.scaling_factor
+    recon = vae.decode(latent / vae.config.scaling_factor).sample
+
+print("pixel input:", tuple(x.shape))        # (1, 3, 512, 512)
+print("latent code:", tuple(latent.shape))   # (1, 4, 64, 64)
+print("compression (elements):",
+      x.numel() // latent.numel(), "x")</code></pre>
+<div class="code-caption">Encoding an image to a latent and decoding it back. The VAE compresses 786432 pixel values to 16384 latent values, the <code>48x</code> reduction reported by the last line. The <code>scaling_factor</code> rescales the latent to the variance the denoiser was trained on; the same factor is divided out before decoding.</div>
+
+<p>
+The print confirms the shapes promised in subsection 1: a $(1, 4, 64, 64)$ latent is what the denoiser actually sees. Everything in the next two subsections happens in this compact space.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The magic number <code>0.18215</code> is one of the most copy-pasted constants in modern machine learning, and almost nobody who pastes it knows where it comes from. It is simply the standard deviation the SD 1.x team measured on their VAE latents, baked in once so the latent arrives at roughly unit variance for the denoiser. There is nothing sacred about it: SDXL uses a different value, SD3's 16-channel VAE uses another, and every "why are my images washed out" forum thread since 2022 has a decent chance of tracing back to someone who forgot it. Treat it as the units conversion it is, not a spell.</p>
+</div>
+
+<h2>3. The Denoiser and Cross-Attention <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The denoiser is the only learned, time-dependent part of the loop and the place the text exerts its influence. In classic Stable Diffusion it is a U-Net: the convolutional encoder-decoder with skip connections whose convolution lineage runs back to <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. The U-Net takes the noisy latent $z_t$, a timestep embedding $t$, and the text conditioning, and predicts the noise $\epsilon_\theta(z_t, t, c)$ to remove. What makes it text-aware are the <strong>cross-attention</strong> blocks inserted at several resolutions.
+</p>
+
+<p>
+Cross-attention is the self-attention of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> with the keys and values coming from a different source than the queries. Here the queries come from the image latent (each spatial position asks a question) and the keys and values come from the text conditioning sequence (each word offers an answer):
+</p>
+
+<p>
+$$ \text{CrossAttn}(Q_{\text{image}}, K_{\text{text}}, V_{\text{text}}) = \text{softmax}\!\left(\frac{Q_{\text{image}} K_{\text{text}}^\top}{\sqrt{d}}\right) V_{\text{text}}. $$
+</p>
+
+<p>
+Each spatial location in the latent computes an attention distribution over the prompt's tokens and pulls in a weighted blend of their value vectors. This is precisely how the word "fox" can influence the latent positions that will become the fox and leave the background tokens to influence the snow. The attention maps are interpretable: visualizing the attention weight from the "fox" token to every spatial position produces a soft segmentation of where the model is placing the fox, which is the hook that later editing methods in <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a> grab onto.
+</p>
+
+<pre><code class="language-python">import torch, torch.nn.functional as F
+from torch import nn
+
+class CrossAttention(nn.Module):
+    """Image-latent queries attend to text keys/values (single head, for clarity)."""
+    def __init__(self, img_dim, txt_dim, d):
+        super().__init__()
+        self.to_q = nn.Linear(img_dim, d, bias=False)   # from image latent
+        self.to_k = nn.Linear(txt_dim, d, bias=False)   # from text conditioning
+        self.to_v = nn.Linear(txt_dim, d, bias=False)
+        self.scale = d ** -0.5
+
+    def forward(self, x, context):
+        # x: (B, HW, img_dim) spatial tokens;  context: (B, L, txt_dim) text tokens
+        q, k, v = self.to_q(x), self.to_k(context), self.to_v(context)
+        attn = (q @ k.transpose(-2, -1)) * self.scale     # (B, HW, L)
+        attn = attn.softmax(dim=-1)                       # each pixel over words
+        return attn @ v, attn                             # also return the maps
+
+ca = CrossAttention(img_dim=320, txt_dim=768, d=320)
+latent_tokens = torch.randn(1, 64 * 64, 320)              # flattened 64x64 latent
+text_ctx = torch.randn(1, 77, 768)                        # CLIP conditioning
+out, maps = ca(latent_tokens, text_ctx)
+print("output:", tuple(out.shape), "attention maps:", tuple(maps.shape))</code></pre>
+<div class="code-caption">A minimal cross-attention block. Queries come from the image latent and keys/values from the 77-token CLIP conditioning, so every one of the 4096 spatial positions attends over the prompt. The returned <code>maps</code> of shape <code>(1, 4096, 77)</code> are the per-word spatial attention that editing tools later manipulate. Expected output: <code>output: (1, 4096, 320) attention maps: (1, 4096, 77)</code>.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Self-Attention Mixes Pixels, Cross-Attention Injects Text</div>
+<p>
+A Stable Diffusion U-Net block contains both. Self-attention lets spatial positions talk to each other (global coherence: the two ears of the fox agree). Cross-attention lets every spatial position consult the prompt (semantic control: the ears belong to a fox, not a cat). Removing self-attention destroys global structure; removing cross-attention severs the text entirely and you get an unconditional generator. The text-to-image capability lives in exactly one place, the cross-attention keys and values, which is why the editing methods of the next chapter intervene there.
+</p>
+</div>
+
+<h3>3.1 From U-Net to Diffusion Transformer</h3>
+
+<p>
+The U-Net is not the only choice of denoiser. The diffusion transformer (DiT) of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> replaces the convolutional backbone with a pure transformer: the latent is split into patches, flattened into a token sequence, and processed by transformer blocks. DiT scales more predictably than the U-Net (its quality improves smoothly with compute, the same scaling behavior that drove the language-model era) and it folds text conditioning in naturally because it already speaks tokens. SD3 and FLUX use a DiT variant, MMDiT, in which image tokens and text tokens flow through the same attention blocks as a joint sequence rather than the image querying the text from a separate stream. The denoiser's job, predict the noise given the noisy latent, timestep, and text, is identical; only the internal wiring changes.
+</p>
+
+<h2>4. One Full Generation, Traced <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+We now assemble the three stations into a single manual generation, calling the components directly rather than the convenience pipeline, so every tensor that crosses a station boundary is visible. This is the code to read when a pipeline misbehaves and you need to inspect an intermediate.
+</p>
+
+<pre><code class="language-python">import torch
+from diffusers import (StableDiffusionPipeline, UNet2DConditionModel,
+                       AutoencoderKL, DDIMScheduler)
+from transformers import CLIPTokenizer, CLIPTextModel
+
+device, dtype = "cuda", torch.float16
+repo = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+tok = CLIPTokenizer.from_pretrained(repo, subfolder="tokenizer")
+enc = CLIPTextModel.from_pretrained(repo, subfolder="text_encoder").to(device, dtype)
+unet = UNet2DConditionModel.from_pretrained(repo, subfolder="unet").to(device, dtype)
+vae = AutoencoderKL.from_pretrained(repo, subfolder="vae").to(device, dtype)
+sched = DDIMScheduler.from_pretrained(repo, subfolder="scheduler")
+
+prompt = "a red fox sitting in fresh snow, sharp focus, soft daylight"
+guidance = 7.5
+
+# 1. Encode prompt and an empty string for classifier-free guidance.
+def embed(text):
+    ids = tok(text, padding="max_length", max_length=77,
+              truncation=True, return_tensors="pt").input_ids.to(device)
+    return enc(ids)[0]
+cond, uncond = embed(prompt), embed("")
+ctx = torch.cat([uncond, cond])                       # (2, 77, 768)
+
+# 2. Start from pure latent noise and set the denoising schedule.
+sched.set_timesteps(30, device=device)
+z = torch.randn(1, 4, 64, 64, device=device, dtype=dtype) * sched.init_noise_sigma
+
+# 3. The denoising loop.
+for t in sched.timesteps:
+    inp = sched.scale_model_input(torch.cat([z, z]), t)        # duplicate for CFG
+    with torch.no_grad():
+        eps_u, eps_c = unet(inp, t, encoder_hidden_states=ctx).sample.chunk(2)
+    eps = eps_u + guidance * (eps_c - eps_u)                   # classifier-free guidance
+    z = sched.step(eps, t, z).prev_sample
+
+# 4. Decode the final latent to pixels.
+with torch.no_grad():
+    img = vae.decode(z / vae.config.scaling_factor).sample
+print("final latent:", tuple(z.shape), "-> image:", tuple(img.shape))</code></pre>
+<div class="code-caption">A complete text-to-image generation with the three stations called explicitly. Step 1 embeds the prompt and an empty prompt; step 3 runs the denoising loop with classifier-free guidance (the conditional and unconditional noise predictions are blended); step 4 decodes once. Expected output: <code>final latent: (1, 4, 64, 64) -> image: (1, 3, 512, 512)</code>.</div>
+
+<p>
+That loop is the whole system. Every named product in <a href="section-34.3.html">Section 34.3</a> is a variation on it: a different encoder feeding <code>ctx</code>, a different denoiser computing <code>eps</code>, a different scheduler stepping <code>z</code>. The classifier-free guidance blend in step 3 is the prompt-strength control that <a href="section-34.5.html">Section 34.5</a> dissects.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Loop Is One Line</div>
+<p>
+The 40-line manual generation above is exactly what a pipeline call performs internally. Reach for the manual version only when you need an intermediate latent, a custom guidance schedule, or to inject something into cross-attention.
+</p>
+<pre><code class="language-python">from diffusers import StableDiffusionPipeline
+import torch
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+image = pipe("a red fox sitting in fresh snow, sharp focus",
+             num_inference_steps=30, guidance_scale=7.5).images[0]</code></pre>
+<div class="code-caption">The pipeline collapses encoder loading, the empty-prompt embedding, the CFG duplication, the full denoising loop, the scaling factor, and the VAE decode into one call. The manual version is for surgery; this is for everything else.</div>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Washed-Out Renders Nobody Could Explain</div>
+<p><strong>Who:</strong> A small studio building a custom Stable Diffusion serving stack instead of using the stock pipeline, for tighter latency control.</p>
+<p><strong>Situation:</strong> Their hand-written denoising loop produced images that were recognizably correct in content but consistently flat: low contrast, milky colors, as if shot through fog.</p>
+<p><strong>Problem:</strong> They had omitted the VAE scaling factor on decode. They divided by it on encode but multiplied (rather than divided) on decode, so the latent handed to the decoder was off by a factor of <code>0.18215^2</code>. The decoder still produced a plausible image because the VAE is robust, but the dynamic range was crushed.</p>
+<p><strong>Decision:</strong> They added a single assertion comparing their manual latents against the stock pipeline's latents on a fixed seed, which immediately localized the discrepancy to the decode step.</p>
+<p><strong>Result:</strong> One corrected line restored full contrast. The fixed-seed parity check against the reference pipeline became a permanent regression test for every future change to the custom loop.</p>
+<p><strong>Lesson:</strong> When building a generation loop by hand, validate each station against the reference implementation on a fixed seed. The scaling factor between VAE space and denoiser space is the single most common silent bug, and the symptom (plausible but degraded images) hides it.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Backbone Keeps Shifting</div>
+<p>
+The denoiser architecture is in active flux through 2024 to 2026. The MMDiT block of SD3 (Esser et al., 2024) and the FLUX transformer (Black Forest Labs, 2024) have largely displaced the U-Net at the frontier, because joint image-text attention scales better and follows prompts more faithfully than a U-Net querying a separate text stream. PixArt-alpha and PixArt-sigma (2023 to 2024) showed a DiT can reach competitive quality at a fraction of the training cost by reusing a strong T5 encoder and a cross-attention DiT. On the autoencoder side, work on higher-channel and higher-compression VAEs (the 16-channel autoencoders in SD3 and FLUX) recovered the fine detail the older four-channel VAE blurred, demonstrating that the perceptual compressor of subsection 2, long treated as fixed infrastructure, is itself a lever for image quality.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.1: Why Decode Only Once <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The pipeline runs the denoising loop in latent space and calls the VAE decoder exactly once, at the end. (a) Estimate the relative cost of decoding at every one of 30 steps versus decoding once, given the 48-fold element reduction of the latent. (b) Some tools show a live preview that decodes intermediate latents anyway; explain what that preview costs and why it is acceptable for a UI but not for the core loop. (c) Argue why running the diffusion process in pixel space would not just be slower but would also change what the denoiser must learn.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.2: Visualizing Cross-Attention <span class="exercise-type coding">Coding</span></div>
+<p>Register forward hooks on the cross-attention layers of a <code>diffusers</code> U-Net to capture the attention maps during a generation (the <code>maps</code> tensor of subsection 3, but from the real model). For the prompt "a cat wearing a tiny hat", extract the attention from the "cat" and "hat" tokens, average over heads and the highest-resolution block, and overlay each as a heatmap on the generated image. Do the maps localize where the model placed each object? Then swap to "a hat wearing a tiny cat" and report how the maps and the image change.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 34.2.3: U-Net Versus DiT Scaling <span class="exercise-type analysis">Analysis</span></div>
+<p>Using published FID-versus-compute numbers from the DiT paper and the SD3 paper, compare how U-Net and DiT denoisers scale with model size on the same latent diffusion task. (a) Plot quality against parameter count for both families. (b) Identify the crossover region where DiT overtakes the U-Net and relate it to the architectural argument in subsection 3.1. (c) Given a fixed training budget that is small (a few GPU-days), which backbone would you choose for a domain-specific generator, and what changes your answer as the budget grows?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-34.1.html">&#8592; Section 34.1: Connecting Text &amp; Pixels</a>
+<a href="index.html">Chapter 34</a>
+<a class="next" href="section-34.3.html">Section 34.3: The Model Landscape &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

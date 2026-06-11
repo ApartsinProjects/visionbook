@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.6: Capture-to-Render Pipelines in Practice. The end-to-end workflow a real capture flows through: shooting good images, recovering poses with COLMAP, training a radiance field or splat in Nerfstudio, and the failure modes no paper advertises." name="description"/>
+<title>Section 27.6: Capture-to-Render Pipelines in Practice | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Depth, 3D Vision &amp; Neural Scene Representations</a></div>
+<h1>Capture-to-Render Pipelines in Practice</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The paper showed a flawless rotating chair. My first capture showed a flawless rotating chair wrapped in glowing fog, sitting in a room that bent like a funhouse mirror. The difference, it turned out, was eleven photos taken while walking backward and one very shiny window."</p>
+<cite>A Pipeline That Has Met the Gap Between the Demo and the Driveway</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Turning real photographs into a usable 3D scene is a five-stage pipeline, and every stage downstream of a bad earlier stage inherits its errors, so the discipline is to verify each stage before trusting the next.</strong> The methods of this chapter, monocular depth, point clouds, NeRF, splatting, are the glamorous middle of a workflow whose success is mostly decided at the unglamorous ends: how you shoot the images, whether structure from motion recovers good poses, and how you clean the result. This section walks the full capture-to-render pipeline end to end, names the failure modes that no paper figure shows (bad poses, reflective surfaces, motion blur, floaters), and gives the practical checks that separate a crisp reconstruction from glowing fog. This is where the projective geometry of Part II and the deep learning of Part III stop being separate subjects and become one craft.</p>
+</div>
+
+<p>
+Across <a href="section-27.4.html">Section 27.4</a> and <a href="section-27.5.html">Section 27.5</a> we built two ways to synthesize novel views, and both quietly assumed the same inputs: a set of images with accurately known camera poses. That assumption is where most real projects succeed or fail. This closing section is deliberately practical. It treats NeRF and splatting not as models in isolation but as one stage of a pipeline, and it spends its time on the parts that the research papers, optimizing for a clean result on a curated dataset, leave out.
+</p>
+
+<h2>1. The Five Stages <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Every capture-to-render project, whatever the final representation, flows through the same five stages, shown in Figure 27.6.1. <strong>Capture</strong>: shoot photos or video of the scene from many viewpoints. <strong>Pose recovery</strong>: run structure from motion (COLMAP) to estimate each image's camera pose and a sparse point cloud, the geometry of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>. <strong>Train</strong>: fit a NeRF or Gaussian splat to the posed images. <strong>Clean</strong>: remove floaters and background artifacts, crop to the region of interest. <strong>Export</strong>: render a video, extract a mesh, or ship the splat to a viewer or engine. The arrows run one way, and an error introduced at any stage propagates to all the stages after it, which is why verification is built into the workflow rather than left to the end.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The five-stage capture-to-render pipeline: capture, pose recovery, train, clean, export, connected left to right">
+<style>
+.fl{font:12px sans-serif;fill:#1a1a1a;}
+.fs{font:9.5px sans-serif;fill:#555;}
+.fcap{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.fpose{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.ftrain{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.fclean{fill:#fff6e0;stroke:#d6a32b;stroke-width:1.5;}
+.fexp{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.far{stroke:#777;stroke-width:2;marker-end:url(#fah);fill:none;}
+</style>
+<defs><marker id="fah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<rect class="fcap" x="8" y="60" width="118" height="56"/>
+<text class="fl" x="67" y="84" text-anchor="middle">1. Capture</text>
+<text class="fs" x="67" y="102" text-anchor="middle">overlapping images</text>
+<line class="far" x1="126" y1="88" x2="148" y2="88"/>
+<rect class="fpose" x="150" y="60" width="118" height="56"/>
+<text class="fl" x="209" y="80" text-anchor="middle">2. Pose recovery</text>
+<text class="fs" x="209" y="98" text-anchor="middle">COLMAP / SfM</text>
+<line class="far" x1="268" y1="88" x2="290" y2="88"/>
+<rect class="ftrain" x="292" y="60" width="118" height="56"/>
+<text class="fl" x="351" y="80" text-anchor="middle">3. Train</text>
+<text class="fs" x="351" y="98" text-anchor="middle">NeRF / splat</text>
+<line class="far" x1="410" y1="88" x2="432" y2="88"/>
+<rect class="fclean" x="434" y="60" width="118" height="56"/>
+<text class="fl" x="493" y="80" text-anchor="middle">4. Clean</text>
+<text class="fs" x="493" y="98" text-anchor="middle">crop, kill floaters</text>
+<line class="far" x1="552" y1="88" x2="574" y2="88"/>
+<rect class="fexp" x="576" y="60" width="126" height="56"/>
+<text class="fl" x="639" y="80" text-anchor="middle">5. Export</text>
+<text class="fs" x="639" y="98" text-anchor="middle">video / mesh / viewer</text>
+<text class="fs" x="209" y="140" text-anchor="middle">bad poses here...</text>
+<text class="fs" x="430" y="140" text-anchor="middle">...ruin everything downstream</text>
+<line class="far" x1="240" y1="146" x2="380" y2="146"/>
+</svg>
+<figcaption><strong>Figure 27.6.1:</strong> The five-stage capture-to-render pipeline. Capture feeds pose recovery, which feeds training, cleaning, and export. The flow is one-directional, so an error at an early stage (most commonly bad poses from structure from motion) corrupts every stage after it. The practical discipline is to verify the output of each stage before proceeding.</figcaption>
+</figure>
+
+<h2>2. Capturing Well: The Decisions That Matter Most <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+More reconstructions are saved or ruined at capture time than anywhere else, because no amount of training fixes missing or contradictory information. The rules are few and they follow directly from how structure from motion and view synthesis work. <strong>Overlap</strong>: consecutive images must share substantial content (roughly 70 percent) so COLMAP can match features across them, exactly the feature-matching requirement from <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>. <strong>Coverage</strong>: orbit the subject and vary height, so every surface is seen from several angles; a surface seen once cannot be reconstructed in 3D. <strong>Sharpness</strong>: avoid motion blur (it poisons feature matching and bakes blur into the field), so move slowly or shoot stills. <strong>Constant exposure and focus</strong>: lock them, because auto-exposure changes a surface's apparent color between frames and confuses the photometric loss. <strong>Avoid the hard cases</strong>: textureless walls give COLMAP nothing to match, and reflective or transparent surfaces violate the view-synthesis assumption that a surface point has a consistent (if view-dependent) appearance.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Photometric Loss Trusts Your Photos Completely</div>
+<p>Both NeRF and splatting minimize the difference between rendered and observed pixels, which means they treat every photograph as ground truth about what the scene looks like from that pose. If two photos disagree about a surface's color (because auto-exposure shifted, or a reflection moved, or someone walked through the frame), the optimizer cannot satisfy both and resolves the contradiction by inventing semi-transparent "floater" geometry that happens to reproduce each view. Floaters are not a bug in the method; they are the method faithfully fitting inconsistent data. The cure is upstream: consistent captures, locked exposure, and removing transient objects, not more training iterations.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Floaters Are an Honest Answer to a Dishonest Question</div>
+<p>When two of your photos insist a surface is both beige and slightly-more-beige, the optimizer does not throw a tantrum or pick a side. It politely conjures a faint, semi-transparent ghost hanging in mid-air that, viewed from photo one, looks beige, and from photo two, looks slightly-more-beige. The floater is not the model failing; it is the model succeeding at an impossible request with the calm of a bureaucrat who has found a loophole. Blame the brief, not the contractor: fix the captures.</p>
+</div>
+
+<h2>3. Pose Recovery and the Verification Habit <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Stage two runs COLMAP to recover poses, and stage three cannot be trusted unless stage two is verified. The single most valuable habit in this entire pipeline is to <em>look at the sparse reconstruction before training anything</em>. COLMAP reports how many images it successfully registered and produces a sparse point cloud with the camera frustums; a healthy result registers nearly all images and shows a recognizable, undistorted sparse structure. The code below runs the pose-recovery stage through Nerfstudio (which wraps COLMAP) and then inspects the result, the check the museum team of <a href="section-27.4.html">Section 27.4</a> learned to do the hard way.
+</p>
+
+<pre><code class="language-python">import json, pathlib
+
+# After running: ns-process-data images --data ./photos --output-dir ./capture
+# Nerfstudio writes a transforms.json with one entry per successfully posed image.
+transforms = json.loads(pathlib.Path("./capture/transforms.json").read_text())
+n_posed = len(transforms["frames"])
+print(f"Camera model: {transforms.get('camera_model')}")
+print(f"Images successfully posed: {n_posed}")
+
+# A simple health check before committing GPU hours to training.
+import glob
+n_input = len(glob.glob("./photos/*.jpg"))
+ratio = n_posed / max(n_input, 1)
+print(f"Registration ratio: {ratio:.0%}")
+assert ratio > 0.8, "Too many images failed to register; re-shoot or check overlap/blur."</code></pre>
+<div class="code-caption">A pose-recovery health check. Reading <code>transforms.json</code> tells you how many images COLMAP successfully posed; a registration ratio below roughly 80 percent signals poor overlap, motion blur, or reflective surfaces, and means you should fix the capture before spending GPU time on training that is doomed to fail.</div>
+
+<p>
+If registration is poor, the fix is almost always at stages one and two: add images to bridge the gaps where matching failed, mask out reflective regions, or re-shoot the textureless areas with more angle variation. Training a NeRF or splat on bad poses produces the bent-room, double-image artifacts that look like a model problem but are a geometry problem.
+</p>
+
+<h2>4. Training, Cleaning, and Export <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With verified poses, stages three through five are largely the library-driven commands you saw in the previous two sections: <code>ns-train nerfacto</code> or <code>ns-train splatfacto</code> to fit the field, the live viewer to watch convergence, and <code>ns-export</code> to produce the deliverable. The judgment that remains is in <strong>cleaning</strong>. Almost every real capture produces some floaters (the inconsistent-data artifacts of subsection 2) and unwanted background. Nerfstudio's viewer lets you set a <em>crop box</em> to keep only the region of interest, which alone removes most distant floaters. For splats, you can additionally prune low-opacity Gaussians and those far from the scene center. The export choice depends on the use: a rendered camera-path video for a presentation, a mesh (via Poisson reconstruction for NeRF density, or SuGaR for splats) for a game engine, or the raw splat <code>.ply</code> for a web viewer.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Survey Firm Industrializes the Pipeline</div>
+<p><strong>Who:</strong> a civil-engineering survey firm, 2024, producing 3D reconstructions of construction sites from drone footage for progress monitoring. <strong>Situation:</strong> a junior engineer ran each site by hand, and roughly one capture in three came back with bent geometry or fog, costing a re-flight. <strong>Problem:</strong> the failures were discovered only after the multi-hour training finished, wasting both the flight and the compute. <strong>Decision:</strong> they inserted the verification habit of subsection 3 as an automated gate: every capture ran COLMAP first, and the pipeline refused to proceed to training unless the registration ratio cleared 85 percent and the sparse cloud passed a simple bounding-box sanity check; failures triggered an immediate re-flight while the drone was still on site. <strong>Result:</strong> wasted training runs dropped to nearly zero, and the average turnaround fell by half because failures were caught in minutes, not hours. <strong>Lesson:</strong> in a production 3D pipeline, the cheapest stage (pose recovery) is the right place to gate the most expensive stage (training); verify early, fail fast, and never spend GPU hours on a capture whose geometry you have not sanity-checked.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Whole Pipeline Is Three Nerfstudio Commands</div>
+<p>The five stages, minus the human judgment in capture and cleaning, are three commands. This is the entire production workflow that this section has been unpacking:</p>
+<pre><code class="language-python"># 1. Capture + pose recovery: extract frames from a video and run COLMAP.
+#    ns-process-data video --data site_flight.mp4 --output-dir ./capture
+# 2. Train (swap nerfacto for splatfacto to get a real-time Gaussian splat):
+#    ns-train splatfacto --data ./capture
+# 3. Export a fly-through video along a chosen camera path:
+#    ns-render camera-path --load-config ./outputs/.../config.yml \
+#        --camera-path-filename path.json --output-path render.mp4</code></pre>
+<p>Nerfstudio orchestrates COLMAP, the chosen field, the interactive crop-box cleaning in its viewer, and every export format, replacing what was, before 2023, a fragile chain of separate research codebases. It is the reference implementation of the entire chapter's pipeline, and the place to start any real capture-to-render project.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Collapsing the Pipeline Into One Forward Pass (2024-2026)</div>
+<p>The five-stage pipeline exists because pose recovery, geometry, and appearance were separate problems. The 2024-2026 frontier is dissolving the stages. <strong>DUSt3R</strong> (2024) and its successor <strong>MASt3R</strong> regress dense 3D point maps directly from uncalibrated image pairs, recovering geometry and relative pose together without COLMAP, and <strong>VGGT</strong> (CVPR 2025) extends this to a feed-forward transformer that predicts cameras, depth, and point tracks for a whole set of images in a single pass. Combined with the feed-forward splat predictors of <a href="section-27.5.html">Section 27.5</a>, these point toward a future where the entire capture-to-render pipeline of this section, pose recovery, training, and reconstruction, is one network evaluation taking seconds rather than a multi-stage workflow taking hours. The same feed-forward 3D-from-images capability is the reconstruction backbone behind the generative 3D and world models of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>, where the input images themselves are invented rather than captured.</p>
+</div>
+
+<p>
+This closes the chapter and, with it, the geometric strand of Part III. You can now recover depth from a single image, store and learn on explicit 3D structure, represent a whole scene as a neural radiance field or a Gaussian splat, and run the full pipeline that turns real photographs into a renderable 3D world. Every method here <em>reconstructs</em> reality. The next chapter, <a href="../module-28-efficient-vision-deployment/index.html">Chapter 28: Efficient Vision &amp; Edge Deployment</a>, asks how to make these and all the other heavy models of Part III run on the phones, cameras, and embedded devices where vision actually ships, and Part IV will turn the reconstruction machinery around to <em>generate</em> 3D worlds that were never photographed at all.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.6.1: Diagnose the Failure <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each symptom, state the most likely stage of the pipeline at fault and one concrete fix, using the failure modes of subsections 2 and 3: (a) the reconstructed room appears to bend, with walls that should be straight curving inward; (b) a glowing semi-transparent cloud floats in mid-air with nothing behind it; (c) the entire scene is uniformly blurry even after long training; (d) one wall is completely missing from the reconstruction. Explain why each is an upstream problem rather than a reason to change the NeRF or splat architecture.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.6.2: Build the Verification Gate <span class="exercise-type coding">Coding</span></div>
+<p>Capture a short video of an object (orbit it slowly, locked exposure) and run <code>ns-process-data</code> to recover poses. Extend the health check of subsection 3 into a script that (a) reports the registration ratio, (b) loads the sparse point cloud and prints its bounding-box dimensions, and (c) refuses to proceed if the ratio is below 0.85, exactly the gate the survey firm built. Run it on your good capture and on a deliberately bad one (shot fast, with motion blur, or of a shiny object), and report how the two differ. Submit the script and the two reports.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.6.3: NeRF or Splat for the Job <span class="exercise-type analysis">Analysis</span></div>
+<p>You run a reconstruction service and three clients arrive: (1) a museum wanting the highest-fidelity archival capture of a small artifact, rendered offline; (2) a real-estate firm needing real-time walkthroughs of houses on mid-range phones; (3) a film studio needing a clean mesh of a set piece to import into their existing graphics pipeline. For each, recommend NeRF or Gaussian splatting (and any export step), and justify the choice in two or three sentences using the speed, quality, deployment, and mesh-extraction trade-offs from <a href="section-27.4.html">Section 27.4</a> and <a href="section-27.5.html">Section 27.5</a>. Note for which client the 2024-2026 feed-forward methods of the research-frontier callouts would most change your answer.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.5.html">&#8592; Section 27.5: 3D Gaussian Splatting</a>
+<a href="index.html">Chapter 27</a>
+<a class="next" href="../module-28-efficient-vision-deployment/index.html">Chapter 28: Efficient Vision &amp; Edge Deployment &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.3: Video Transformers. Extend the Vision Transformer across time with spatiotemporal tubelet tokens, tame the quadratic token-count explosion with factorized space-time attention (TimeSformer, ViViT), and pretrain efficiently with VideoMAE tube masking." name="description"/>
+<title>Section 26.3: Video Transformers | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>Video Transformers</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me to let every patch talk to every other patch. Then they added time, and now every patch wants to talk to every other patch in every other moment. I have run the numbers. We are going to need a smaller guest list."</p>
+<cite>An Attention Matrix Contemplating Its Own Quadratic Growth</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A video transformer is the Vision Transformer with one more axis in its token sequence, and the entire engineering effort goes into surviving the quadratic cost that the extra axis creates.</strong> Cutting an image into patches gave a few hundred tokens; cutting a clip into spatiotemporal tubelets multiplies that by the number of frames, and the all-pairs attention of <a href="../module-22-vision-transformers/index.html">Chapter 22</a> grows with the square of the token count. This section extends patch embedding to tubelet embedding, shows why naive joint space-time attention is infeasible, and builds the factorized attention (TimeSformer's divided attention, ViViT's factorized encoder) that splits the cost into a tractable spatial part and temporal part. It closes with VideoMAE, which turns video's redundancy from <a href="section-26.1.html">Section 26.1</a> into a self-supervised pretraining advantage by masking ninety percent of the tubelets.</p>
+</div>
+
+<p>
+The previous section built action recognition out of convolutions; this one rebuilds it out of attention, exactly as <a href="../module-22-vision-transformers/index.html">Chapter 22</a> rebuilt image classification. You should hold that chapter's machinery in mind, because the video transformer reuses the transformer block, the class token, and the positional embedding almost unchanged. The genuinely new content is twofold: how to tokenize a clip, and how to make attention over the resulting sequence affordable. Both reduce to managing the time axis, the same theme that organized 3D convolutions and two-stream networks in <a href="section-26.2.html">Section 26.2</a>.
+</p>
+
+<h2>1. Tubelet Embedding: Tokens in Spacetime <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The Vision Transformer turned an image into tokens by cutting it into non-overlapping patches and linearly embedding each. A video transformer has two natural ways to do the same for a clip. The first, used by TimeSformer, embeds each frame into spatial patches independently, producing $T$ groups of $N_s$ patch tokens. The second, the <strong>tubelet embedding</strong> of ViViT, cuts the clip into 3D blocks (tubelets) of size $t \times p \times p$ that span several frames at once, so each token already fuses a little motion before any attention happens. Tubelet embedding is the exact 3D analogue of patch embedding, and just as the 2D patch embedding turned out to be a strided 2D convolution in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, the tubelet embedding is a strided 3D convolution, the same <code>Conv3d</code> primitive from <a href="section-26.2.html">Section 26.2</a>.
+</p>
+
+<p>
+The token count is what to watch. For a clip of $T$ frames at $H \times W$ resolution with patch size $p$ and temporal tubelet length $t$, the number of tokens is
+</p>
+
+<div class="math-block">
+$$N = \frac{T}{t} \cdot \frac{H}{p} \cdot \frac{W}{p}.$$
+</div>
+
+<p>
+For a typical $T = 32$, $H = W = 224$, $p = 16$, $t = 2$, that is $16 \times 14 \times 14 = 3136$ tokens, against the $196$ of a single ViT image. Since attention cost grows as $N^2$, the clip is roughly $(3136 / 196)^2 \approx 256$ times more expensive per attention layer than the image. Figure 26.3.1 shows the tubelet construction and the token-count growth.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A clip cut into spatiotemporal tubelets, each tubelet linearly embedded into one token">
+<style>
+.el{font:12px sans-serif;fill:#1a1a1a;}
+.es{font:10px sans-serif;fill:#555;}
+.eframe{fill:#eef4fb;stroke:#2c6fb5;stroke-width:1.2;}
+.etube{fill:#fdeee3;stroke:#d6802b;stroke-width:1.4;}
+.etok{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.3;}
+.ear{stroke:#777;stroke-width:1.5;marker-end:url(#eah);fill:none;}
+</style>
+<defs><marker id="eah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<text class="el" x="150" y="22" text-anchor="middle">clip cut into t x p x p tubelets</text>
+<rect class="eframe" x="60" y="70" width="150" height="150"/>
+<rect class="eframe" x="80" y="55" width="150" height="150"/>
+<rect class="eframe" x="100" y="40" width="150" height="150"/>
+<g class="etube">
+<rect x="120" y="60" width="40" height="40"/>
+<rect x="160" y="60" width="40" height="40"/>
+<rect x="120" y="100" width="40" height="40"/>
+<rect x="160" y="100" width="40" height="40"/>
+</g>
+<text class="es" x="150" y="240" text-anchor="middle">each tubelet spans t frames</text>
+<line class="ear" x1="255" y1="120" x2="320" y2="120"/>
+<text class="el" x="480" y="22" text-anchor="middle">sequence of N tokens + position</text>
+<g class="etok">
+<rect x="330" y="70" width="26" height="26"/>
+<rect x="362" y="70" width="26" height="26"/>
+<rect x="394" y="70" width="26" height="26"/>
+<rect x="426" y="70" width="26" height="26"/>
+<rect x="458" y="70" width="26" height="26"/>
+<rect x="490" y="70" width="26" height="26"/>
+<rect x="522" y="70" width="26" height="26"/>
+<rect x="554" y="70" width="26" height="26"/>
+</g>
+<text class="es" x="490" y="86" text-anchor="middle" fill="#2f9e5c"> </text>
+<text class="es" x="455" y="115" text-anchor="middle">... up to N = (T/t)(H/p)(W/p) tokens</text>
+<text class="el" x="455" y="150" text-anchor="middle">attention cost grows as N&#178;</text>
+<text class="es" x="455" y="172" text-anchor="middle">image ViT: N = 196</text>
+<text class="es" x="455" y="190" text-anchor="middle">video clip: N &#8776; 3000+</text>
+<text class="es" x="455" y="208" text-anchor="middle">joint attention &#8776; 256x more costly</text>
+</svg>
+<figcaption><strong>Figure 26.3.1:</strong> Tubelet embedding cuts a clip into 3D blocks of size $t \times p \times p$, linearly embedding each into one token (a strided 3D convolution). The resulting sequence is much longer than an image's, and because attention is quadratic in token count, joint space-time attention over a clip is hundreds of times costlier than over a single image. This is the problem factorized attention solves.</figcaption>
+</figure>
+
+<p>
+The code below implements tubelet embedding as a single <code>Conv3d</code> whose kernel and stride both equal the tubelet size, the cleanest way to express it, exactly mirroring the patch-embedding-as-convolution trick of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class TubeletEmbed(nn.Module):
+    """Cut a clip into t x p x p tubelets and embed each as one token."""
+    def __init__(self, dim=768, patch=16, tubelet=2, in_ch=3):
+        super().__init__()
+        # kernel == stride == tubelet size: non-overlapping 3D blocks
+        self.proj = nn.Conv3d(in_ch, dim,
+                              kernel_size=(tubelet, patch, patch),
+                              stride=(tubelet, patch, patch))
+
+    def forward(self, x):                       # x: (N, C, T, H, W)
+        z = self.proj(x)                        # (N, dim, T/t, H/p, W/p)
+        N, D, t, h, w = z.shape
+        tokens = z.flatten(2).transpose(1, 2)   # (N, t*h*w, dim)
+        return tokens, (t, h, w)
+
+embed = TubeletEmbed(dim=768, patch=16, tubelet=2)
+tokens, grid = embed(torch.randn(1, 3, 32, 224, 224))
+print("tokens:", tokens.shape, "grid (t,h,w):", grid)
+# tokens: torch.Size([1, 3136, 768]) grid (t,h,w): (16, 14, 14)</code></pre>
+<div class="code-caption">Tubelet embedding as one strided <code>Conv3d</code>. A 32-frame clip becomes 3136 tokens of dimension 768; the returned $(t, h, w)$ grid is what factorized attention needs to reshape tokens back into separate temporal and spatial groups.</div>
+
+<h2>2. The Quadratic Wall, Again <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+You met the quadratic cost of attention in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, where it bit a document-analysis team at high resolution. Video makes it worse along a new axis. <strong>Joint space-time attention</strong>, where every token attends to every other token across all positions and all frames, is the most expressive option and the most expensive: with $N$ tokens the attention matrix has $N^2$ entries, and at $N = 3136$ that is nearly ten million entries per head per layer, before any of the activations. For longer clips or higher resolution it is simply infeasible on commodity hardware.
+</p>
+
+<p>
+The remedy is to factorize attention along its axes, the same move that R(2+1)D made for convolution. Instead of one attention over all $N$ tokens, apply <strong>spatial attention</strong> within each frame (tokens attend only to other tokens in the same frame) and then <strong>temporal attention</strong> across frames (tokens at the same spatial location attend across time). The cost drops from $O(N^2)$ to roughly $O(N_s^2 \cdot T + T^2 \cdot N_s)$, where $N_s$ is the spatial token count per frame, a dramatic reduction. The table below makes the saving concrete.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 26.3.1:</strong> <em>Attention cost for a 32-frame clip with 196 spatial tokens per frame ($N_s = 196$, $T = 16$ temporal groups after tubelet length 2, total $N = 3136$).</em></div>
+<table>
+<thead>
+<tr><th scope="col">Scheme</th><th scope="col">Approx. attention pairs</th><th scope="col">Relative cost</th></tr>
+</thead>
+<tr><td>Joint space-time</td><td>$N^2 = 3136^2 \approx 9.8\text{M}$</td><td>1.0x</td></tr>
+<tr><td>Divided (spatial then temporal)</td><td>$N_s^2 T + T^2 N_s \approx 0.66\text{M}$</td><td>~0.07x</td></tr>
+<tr><td>Spatial-only (per-frame ViT)</td><td>$N_s^2 T \approx 0.61\text{M}$</td><td>~0.06x</td></tr>
+</table>
+</div>
+
+<p>
+Table 26.3.1 shows divided attention costing roughly one-fifteenth of joint attention while still letting every token influence every other through the two-step path. TimeSformer's ablation found this divided scheme to be the sweet spot: nearly the accuracy of joint attention at a fraction of the cost. The implementation in subsection 3 builds it.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Joint space-time attention is the model equivalent of inviting everyone you have ever met to the same party and insisting they each hold a personal conversation with everyone else. Add one more guest and the number of required conversations grows by the square; double the guest list and you have quadrupled the small talk. Divided attention is the polite host's compromise: first you only talk to people in your own room (spatial attention), then one delegate per room mingles down the hallway (temporal attention). Nobody meets everybody directly, but a rumor still reaches the whole party in two hops, which is exactly the accuracy-for-cost trade the table records.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Factorization Is the Recurring Answer to Quadratic Cost</div>
+<p>Notice that the same idea has now appeared three times. R(2+1)D factorized a 3D convolution into a 2D spatial convolution and a 1D temporal convolution (<a href="section-26.2.html">Section 26.2</a>). Divided space-time attention factorizes one joint attention into spatial and temporal attention. And the windowed attention of Swin (<a href="../module-22-vision-transformers/index.html">Chapter 22</a>) factorized global attention into local windows plus shifts. Whenever an operation's cost is quadratic in a quantity you can decompose, splitting the operation along that decomposition is the first move to try. The accuracy you give up is usually small because the factors recover global reach through composition; the compute you save is usually large.</p>
+</div>
+
+<h2>3. Divided Space-Time Attention <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A divided space-time block applies a temporal attention sub-layer and a spatial attention sub-layer in sequence, each wrapped in the residual-and-norm structure of the standard transformer block from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>. The trick is purely in the reshaping: before temporal attention, group tokens so that those sharing a spatial location across frames sit together; before spatial attention, group tokens so that those sharing a frame sit together. The multi-head attention itself is unchanged. The code reuses a standard attention module and only manipulates the token layout.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class DividedSpaceTimeBlock(nn.Module):
+    """TimeSformer-style block: temporal attention, then spatial attention."""
+    def __init__(self, dim=768, heads=12):
+        super().__init__()
+        self.norm_t = nn.LayerNorm(dim)
+        self.attn_t = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm_s = nn.LayerNorm(dim)
+        self.attn_s = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm_m = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def forward(self, x, t, h, w):              # x: (N, t*h*w, dim)
+        B, _, D = x.shape
+        # --- temporal attention: tokens at the same (h,w) attend across time ---
+        xt = x.view(B, t, h * w, D).permute(0, 2, 1, 3).reshape(B * h * w, t, D)
+        a, _ = self.attn_t(self.norm_t(xt), self.norm_t(xt), self.norm_t(xt))
+        xt = (xt + a).reshape(B, h * w, t, D).permute(0, 2, 1, 3).reshape(B, t * h * w, D)
+        # --- spatial attention: tokens in the same frame attend to each other ---
+        xs = xt.view(B, t, h * w, D).reshape(B * t, h * w, D)
+        a, _ = self.attn_s(self.norm_s(xs), self.norm_s(xs), self.norm_s(xs))
+        xs = (xs + a).reshape(B, t * h * w, D)
+        # --- shared MLP sub-layer ---
+        return xs + self.mlp(self.norm_m(xs))
+
+block = DividedSpaceTimeBlock(dim=768, heads=12)
+x = torch.randn(1, 16 * 14 * 14, 768)           # the 3136 tokens from subsection 1
+print("block out:", block(x, t=16, h=14, w=14).shape)  # block out: torch.Size([1, 3136, 768])</code></pre>
+<div class="code-caption">A divided space-time transformer block. Temporal attention reshapes tokens so each spatial location attends across all frames; spatial attention reshapes so each frame attends within itself. The attention modules are standard; only the token layout changes between the two sub-layers, which is what makes the factorization cheap to implement.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Pretrained Video Transformer From Hugging Face</div>
+<p>Implementing the block teaches the factorization; in production you load a pretrained model. Hugging Face Transformers ships TimeSformer and VideoMAE with their processors, so classifying a clip is a few lines, and the model already carries Kinetics-scale features:</p>
+<pre><code class="language-python">from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
+import torch
+
+proc = VideoMAEImageProcessor.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
+model = VideoMAEForVideoClassification.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
+
+# video: a list of 16 RGB frames as numpy arrays or PIL images
+inputs = proc(list(video_frames), return_tensors="pt")   # handles resize + normalize
+with torch.no_grad():
+    logits = model(**inputs).logits
+print(model.config.id2label[logits.argmax(-1).item()])    # e.g. "playing guitar"</code></pre>
+<p>The processor applies the exact frame count, resize, and normalization the model was trained with, and <code>id2label</code> maps the predicted index to a Kinetics class name. This replaces the tubelet embedding, the factorized blocks, the training loop, and the dataset with four lines and a download.</p>
+</div>
+
+<h2>4. VideoMAE: Redundancy as a Pretraining Advantage <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Video transformers are even hungrier for data than image ones, which collides with the fact that labeled video is scarce and expensive. The answer, as in <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, is self-supervised pretraining, and the masked autoencoder transfers to video beautifully. <strong>VideoMAE</strong> masks a large fraction of the tubelets, feeds only the visible ones to the encoder, and asks a lightweight decoder to reconstruct the missing pixels. The striking detail is the masking ratio: where the image MAE of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a> masked about 75 percent of patches, VideoMAE masks 90 percent or more, and it does so with <strong>tube masking</strong> (the same spatial locations are masked across all frames) to prevent the model from cheating by copying an unmasked neighboring frame.
+</p>
+
+<p>
+This extreme ratio is not an arbitrary tuning choice; it is the direct consequence of the temporal redundancy you measured in <a href="section-26.1.html">Section 26.1</a>. Because adjacent frames carry so little new information, the reconstruction task stays hard and informative even when ninety percent of the input is hidden, and the tiny visible fraction makes pretraining fast. The code below builds a tube mask and shows how few tokens the encoder actually processes.
+</p>
+
+<pre><code class="language-python">import torch
+
+def tube_mask(t, h, w, mask_ratio=0.9):
+    """Mask the same spatial positions across all t temporal groups."""
+    num_spatial = h * w
+    num_keep = int(num_spatial * (1 - mask_ratio))
+    keep_spatial = torch.randperm(num_spatial)[:num_keep]      # same for every frame
+    # build a (t*h*w,) boolean keep-mask by repeating the spatial pattern over time
+    keep = torch.zeros(t, num_spatial, dtype=torch.bool)
+    keep[:, keep_spatial] = True
+    return keep.flatten()                                       # (t*h*w,)
+
+t, h, w = 8, 14, 14
+keep = tube_mask(t, h, w, mask_ratio=0.9)
+print("total tubelet tokens:", keep.numel())   # total tubelet tokens: 1568
+print("tokens seen by encoder:", keep.sum().item())  # tokens seen by encoder: 152
+print("fraction processed: {:.0%}".format(keep.float().mean().item()))  # fraction processed: 10%</code></pre>
+<div class="code-caption">Tube masking for VideoMAE: the same spatial positions are dropped in every frame so the model cannot copy motion from an adjacent unmasked frame. At a 90 percent ratio the encoder sees only about 152 of 1568 tokens, making self-supervised video pretraining roughly ten times cheaper per clip while staying a hard reconstruction task.</div>
+
+<p>
+VideoMAE and its successors (VideoMAE V2, and the video branch of the joint image-video foundation models) are the modern recipe for pretraining a video transformer without a labeled Kinetics-scale dataset, and they connect directly to the self-supervision arc of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. The pretrained backbone is then fine-tuned for action recognition exactly as the R(2+1)D backbone was in <a href="section-26.2.html">Section 26.2</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Ninety Percent Masking Made the Budget Work</div>
+<p><strong>Who:</strong> a university lab studying surgical-skill assessment from operating-room video, 2024, with a modest four-GPU cluster. <strong>Situation:</strong> they had thousands of hours of unlabeled procedure footage but only a few hundred clips with expert skill ratings, far too few to train a video transformer from scratch. <strong>Problem:</strong> a TimeSformer fine-tuned on the labeled clips alone overfit badly, and they could not afford the compute to pretrain on a public dataset and then domain-adapt. <strong>Decision:</strong> they ran VideoMAE pretraining directly on their own unlabeled surgical footage, relying on the 90 percent tube-masking ratio to keep the per-clip cost low enough that the whole unlabeled corpus fit in their compute budget over a weekend. <strong>Result:</strong> the domain-pretrained backbone, fine-tuned on the few hundred rated clips, beat the from-scratch model and an ImageNet-video-pretrained baseline by a clear margin on skill-rating correlation. <strong>Lesson:</strong> the extreme masking ratio is what made pretraining on a small in-domain corpus affordable; video's redundancy, the same property that made it expensive in <a href="section-26.1.html">Section 26.1</a>, is exactly what makes masked pretraining cheap. When you have unlabeled video in your domain, self-supervised pretraining on it often beats borrowing features from a generic dataset.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Video Foundation Models and Long-Context Attention</div>
+<p>The 2023 to 2026 trajectory has been toward general video foundation models. InternVideo and VideoMAE V2 scale masked pretraining to billions of parameters and hundreds of millions of clips; the video-language models that pair a video encoder with a language model (the video branch of CLIP-style and the open VideoLLaMA-style systems) enable zero-shot action recognition and video question answering from text prompts, the temporal extension of the CLIP embeddings you will meet in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. A separate frontier attacks the remaining quadratic cost for long videos directly: memory-augmented and state-space video models (the video applications of the Mamba family noted in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>) aim for linear-cost temporal modeling so a model can attend over minutes rather than seconds. How to give a model genuine long-term temporal memory, rather than the few-second window every architecture in this chapter assumes, is one of the defining open problems of video understanding.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.1: Token Count and Cost <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For a clip of 64 frames at $224 \times 224$ with spatial patch size 16 and tubelet length 4, compute the number of tokens $N$ using the formula in subsection 1. Then compute the number of attention pairs for joint space-time attention and for divided attention (spatial within frame, temporal across frames), and state the ratio. In two sentences, explain why divided attention's saving grows as the clip gets longer, and connect this to the R(2+1)D factorization of <a href="section-26.2.html">Section 26.2</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.2: Implement Joint Attention and Compare <span class="exercise-type coding">Coding</span></div>
+<p>Write a <code>JointSpaceTimeBlock</code> that runs a single <code>nn.MultiheadAttention</code> over all $t \cdot h \cdot w$ tokens at once, and compare it to the <code>DividedSpaceTimeBlock</code> from subsection 3 on the same input. Measure the peak GPU memory and the wall-clock time of one forward pass for token grids of increasing size ($t = 4, 8, 16$ at $h = w = 14$). Plot both curves and confirm that the joint block's memory grows quadratically while the divided block's grows far more slowly, reproducing the trade in Table 26.3.1.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.3.3: Why Tube Masking, Not Random Masking <span class="exercise-type analysis">Analysis</span></div>
+<p>VideoMAE masks the same spatial positions across all frames (tube masking) rather than masking each frame's tokens independently. Using the temporal-redundancy measurement from <a href="section-26.1.html">Section 26.1</a>, write a one-page argument for why independent per-frame masking would make the reconstruction task too easy and produce weak features, while tube masking keeps it hard. Support your argument by modifying the <code>tube_mask</code> function to do independent per-frame masking, then describe what information an encoder could exploit under each scheme to reconstruct a masked tubelet.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-26.2.html">&#8592; Section 26.2: Action Recognition: 3D CNNs &amp; Two-Stream Networks</a>
+<a href="index.html">Chapter 26</a>
+<a class="next" href="section-26.4.html">Section 26.4: Deep Optical Flow: RAFT &amp; Beyond &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

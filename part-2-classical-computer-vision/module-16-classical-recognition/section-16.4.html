@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.4: Viola-Jones: Real-Time Face Detection. Haar-like features computed in constant time via the integral image, AdaBoost as feature selection, the attentional cascade that rejects background early, and the detector's long afterlife in embedded systems." name="description"/>
+<title>Section 16.4: Viola-Jones: Real-Time Face Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: Classical Recognition Pipelines</a></div>
+<h1>Viola-Jones: Real-Time Face Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I reject ninety-nine percent of the world in the first two questions, then take my time with whatever is left. It is not that I am fast; it is that I am magnificently lazy about the right things."</p>
+<cite>An Attentional Cascade With Excellent Priorities</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Viola and Jones made face detection run in real time on 2001 hardware by attacking speed from three directions at once, and each of the three ideas is worth knowing on its own.</strong> The integral image makes any rectangular brightness sum a constant-time lookup, so a feature costs the same whether the window is tiny or huge. AdaBoost both builds a strong classifier from thousands of weak ones and, crucially, selects the few hundred features that matter out of a pool of nearly two hundred thousand. The attentional cascade arranges those classifiers so that the easy background windows, the vast majority, are rejected after one or two cheap tests, and only face-like windows pay the full price. Where <a href="section-16.3.html">Section 16.3</a> optimized accuracy, this section optimizes throughput, and the contrast between the two philosophies is the lesson.</p>
+</div>
+
+<p>
+The HOG detector of the previous section was accurate but slow: every window paid for a full $3780$-dimensional descriptor and dense pyramid search. Viola and Jones asked a different question, not "how accurate can detection be?" but "how can detection run thirty times a second on a 2001 laptop?", and their answer reshaped what real-time vision could do. This section dissects their three inventions in turn. It builds directly on the brightness-summation and gradient ideas of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> and on the thresholding logic of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>.
+</p>
+
+<h2>1. Haar-Like Features and the Integral Image <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A <strong>Haar-like feature</strong> is a difference of summed pixel intensities over adjacent rectangular regions. A two-rectangle feature places a white box next to a black box and reports (sum under white) minus (sum under black); a face has many such patterns, the eye region is darker than the cheeks below it, the bridge of the nose is brighter than the eyes flanking it, and these brightness contrasts are robust to identity in a way raw pixels are not. The features are crude individually but there are an enormous number of them: at every position, every size, and several rectangle layouts, a $24 \times 24$ window admits roughly $160{,}000$ distinct Haar features.
+</p>
+<p>
+Evaluating one feature naively means summing all pixels in each rectangle, which is slow and gets slower as the window grows. The <strong>integral image</strong> (also called the summed-area table) removes the size dependence entirely. Define $II(x, y)$ as the sum of all pixels above and to the left of $(x, y)$ inclusive. Then the sum over any axis-aligned rectangle with corners $A$ (top-left), $B$ (top-right), $C$ (bottom-left), $D$ (bottom-right) is
+</p>
+<p>
+$$ \text{sum} \;=\; II(D) - II(B) - II(C) + II(A), $$
+</p>
+<p>
+four array lookups and three additions, independent of the rectangle's area. Build the integral image once per image in a single pass, and afterward every Haar feature, at any scale, costs the same constant handful of operations. This is the trick that decouples feature cost from window size, and it is why Viola-Jones can scan an image pyramid without the cost exploding. Figure 16.4.1 shows the four-corner lookup and three representative Haar feature layouts.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: the integral image four-corner rule, where a rectangle sum is computed from the integral image values at its four corners as D minus B minus C plus A. Right: three Haar-like feature layouts, a two-rectangle edge feature, a three-rectangle line feature, and a four-rectangle diagonal feature.">
+  <text x="190" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Integral image: rectangle sum in O(1)</text>
+  <rect x="60" y="46" width="260" height="200" fill="#f4f6f7" stroke="#aab7b8" stroke-width="1.2"/>
+  <rect x="140" y="106" width="120" height="100" fill="#aed6f1" opacity="0.55" stroke="#2980b9" stroke-width="1.6"/>
+  <circle cx="140" cy="106" r="5" fill="#c0392b"/><text x="132" y="100" font-family="sans-serif" font-size="13" fill="#c0392b" text-anchor="end">A</text>
+  <circle cx="260" cy="106" r="5" fill="#c0392b"/><text x="268" y="100" font-family="sans-serif" font-size="13" fill="#c0392b">B</text>
+  <circle cx="140" cy="206" r="5" fill="#c0392b"/><text x="132" y="224" font-family="sans-serif" font-size="13" fill="#c0392b" text-anchor="end">C</text>
+  <circle cx="260" cy="206" r="5" fill="#c0392b"/><text x="268" y="224" font-family="sans-serif" font-size="13" fill="#c0392b">D</text>
+  <text x="200" y="160" font-family="sans-serif" font-size="12" fill="#1f618d" text-anchor="middle">sum =</text>
+  <text x="190" y="276" font-family="monospace" font-size="13" fill="#2c3e50" text-anchor="middle">II(D) - II(B) - II(C) + II(A)</text>
+
+  <text x="585" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">Haar feature layouts</text>
+  <g>
+    <rect x="430" y="60" width="60" height="50" fill="#ffffff" stroke="#5a626c" stroke-width="1.2"/>
+    <rect x="490" y="60" width="60" height="50" fill="#2c3e50"/>
+    <text x="490" y="128" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">2-rect (edge)</text>
+  </g>
+  <g>
+    <rect x="600" y="60" width="40" height="50" fill="#ffffff" stroke="#5a626c" stroke-width="1.2"/>
+    <rect x="640" y="60" width="40" height="50" fill="#2c3e50"/>
+    <rect x="680" y="60" width="40" height="50" fill="#ffffff" stroke="#5a626c" stroke-width="1.2"/>
+    <text x="660" y="128" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">3-rect (line)</text>
+  </g>
+  <g>
+    <rect x="500" y="160" width="45" height="40" fill="#2c3e50"/>
+    <rect x="545" y="160" width="45" height="40" fill="#ffffff" stroke="#5a626c" stroke-width="1.2"/>
+    <rect x="500" y="200" width="45" height="40" fill="#ffffff" stroke="#5a626c" stroke-width="1.2"/>
+    <rect x="545" y="200" width="45" height="40" fill="#2c3e50"/>
+    <text x="545" y="258" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">4-rect (diagonal)</text>
+  </g>
+  <text x="585" y="290" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">feature value = white sum - black sum</text>
+</svg>
+<figcaption><strong>Figure 16.4.1</strong>: The integral image and Haar features. Left: once the integral image is built, the sum over any rectangle is four corner lookups, $II(D) - II(B) - II(C) + II(A)$, regardless of the rectangle's size. Right: three Haar feature layouts; each feature's value is the white-region sum minus the black-region sum, and a $24 \times 24$ window contains roughly $160{,}000$ of them.</figcaption>
+</figure>
+
+<p>
+The code below builds an integral image and reads off two rectangle sums in constant time, the operation every Haar feature reduces to.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+gray = cv2.imread("face_window.png", cv2.IMREAD_GRAYSCALE).astype(np.float64)
+
+# OpenCV returns an integral image padded by one row/col of zeros at the top-left.
+II = cv2.integral(gray)            # II.shape == (H+1, W+1)
+
+def rect_sum(II, x, y, w, h):
+    """Sum of pixels in the w x h rectangle at (x, y), in O(1)."""
+    A = II[y, x]; B = II[y, x + w]; C = II[y + h, x]; D = II[y + h, x + w]
+    return D - B - C + A
+
+# A two-rectangle "eyes darker than cheeks" Haar feature.
+eyes  = rect_sum(II, 4, 6, 16, 4)     # darker band across the eyes
+cheek = rect_sum(II, 4, 12, 16, 4)    # brighter band across the cheeks
+feature = cheek - eyes                 # positive when eyes are darker, as on a face
+print(f"Haar feature (cheek - eyes) = {feature:.0f}")
+# Haar feature (cheek - eyes) = 9821</code></pre>
+<div class="code-caption">Constant-time rectangle sums from an integral image: <code>rect_sum</code> uses the four-corner rule of Figure 16.4.1, and a single subtraction of two such sums implements a two-rectangle Haar feature, here one that fires on the eyes-darker-than-cheeks pattern.</div>
+
+<h2>2. AdaBoost: Building and Selecting <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Each Haar feature, on its own, is a terrible classifier: thresholding one feature value separates faces from non-faces only slightly better than a coin flip. Such a feeble rule is called a <strong>weak learner</strong>. <strong>AdaBoost</strong> (adaptive boosting) combines many weak learners into one strong classifier by training them in sequence, each new one focused on the examples its predecessors got wrong. The final decision is a weighted vote:
+</p>
+<p>
+$$ H(x) \;=\; \text{sign}\!\left( \sum_{t=1}^{T} \alpha_t\, h_t(x) \right), \qquad \alpha_t = \tfrac{1}{2}\ln\frac{1 - \epsilon_t}{\epsilon_t}, $$
+</p>
+<p>
+where each $h_t$ is a weak learner (here, one thresholded Haar feature), $\epsilon_t$ is its weighted error, and the weight $\alpha_t$ grows as the learner's error shrinks. After each round, the training examples that were misclassified get their weights increased, so the next round's weak learner is pulled toward the hard cases, exactly the same focus-on-mistakes principle as the hard negative mining of <a href="section-16.3.html">Section 16.3</a>, here built into the training loop itself.
+</p>
+<p>
+Viola and Jones's key realization was that AdaBoost is simultaneously a <strong>feature selector</strong>. At each round, the weak learner chosen is the single best Haar feature out of all $160{,}000$, so running AdaBoost for $T$ rounds automatically picks the $T$ most discriminative features and discards the rest. The first two features it selects are famous: an eyes-darker-than-upper-cheeks edge feature and a bridge-of-nose-brighter-than-eyes line feature. From a sea of candidates, boosting surfaces exactly the ones a human would point to.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Boosting Solves Two Problems With One Algorithm</div>
+<p>AdaBoost is doing classifier construction and feature selection at the same time, and that double duty is what made Viola-Jones practical. A linear SVM (Section 16.3) needs you to hand it a fixed feature vector; you choose the features, it finds the boundary. Boosting chooses the features and the boundary together, greedily, one feature at a time, by what most reduces the weighted error right now. This is why the detector evaluates a few hundred features instead of $160{,}000$: the other $159{,}700$ never earned a vote. Modern gradient-boosted trees (XGBoost, LightGBM) run the same construct-and-select loop on tabular data, and the "pick the most useful feature next" instinct reappears as feature attribution in deep networks.</p>
+</div>
+
+<h2>3. The Attentional Cascade <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Even a few hundred features per window is too slow when scanned over a full image pyramid, and Viola and Jones noticed an asymmetry to exploit: in any image, the overwhelming majority of windows are obviously not faces, blank wall, sky, floor. Spending the full classifier on each of them is wasteful. The <strong>attentional cascade</strong> arranges classifiers in stages of increasing complexity. The first stage is a tiny boosted classifier (the original used just two features) tuned to reject a large fraction of non-faces while passing essentially all faces. A window that fails any stage is rejected immediately; only a window that survives every stage is declared a face. Because the early stages are cheap and reject most windows, the average window costs almost nothing, while the rare face-like window pays for the deep later stages. Figure 16.4.2 shows the funnel.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The attentional cascade as a funnel. All windows enter stage 1, a 2-feature classifier; most are rejected. Survivors pass to stage 2, then stage 3, each with more features and rejecting more. Only windows surviving all stages are declared faces. Rejected windows exit downward at each stage.">
+  <text x="390" y="28" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">The attentional cascade: reject early, reject cheaply</text>
+  <text x="60" y="92" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">all</text>
+  <text x="60" y="108" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">windows</text>
+  <line x1="90" y1="100" x2="130" y2="100" stroke="#5a626c" stroke-width="2"/><polygon points="132,100 122,95 122,105" fill="#5a626c"/>
+
+  <rect x="135" y="74" width="100" height="52" rx="6" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.6"/>
+  <text x="185" y="96" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#1f618d" text-anchor="middle">Stage 1</text>
+  <text x="185" y="113" font-family="sans-serif" font-size="10.5" fill="#2471a3" text-anchor="middle">2 features</text>
+  <rect x="290" y="74" width="100" height="52" rx="6" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.6"/>
+  <text x="340" y="96" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#1f618d" text-anchor="middle">Stage 2</text>
+  <text x="340" y="113" font-family="sans-serif" font-size="10.5" fill="#2471a3" text-anchor="middle">10 features</text>
+  <rect x="445" y="74" width="100" height="52" rx="6" fill="#d6eaf8" stroke="#2980b9" stroke-width="1.6"/>
+  <text x="495" y="96" font-family="sans-serif" font-size="11.5" font-weight="bold" fill="#1f618d" text-anchor="middle">Stage 3..N</text>
+  <text x="495" y="113" font-family="sans-serif" font-size="10.5" fill="#2471a3" text-anchor="middle">25..200 features</text>
+
+  <line x1="235" y1="100" x2="288" y2="100" stroke="#1e8449" stroke-width="2"/><polygon points="290,100 280,95 280,105" fill="#1e8449"/>
+  <text x="262" y="92" font-family="sans-serif" font-size="9.5" fill="#196f3d" text-anchor="middle">pass</text>
+  <line x1="390" y1="100" x2="443" y2="100" stroke="#1e8449" stroke-width="2"/><polygon points="445,100 435,95 435,105" fill="#1e8449"/>
+  <text x="417" y="92" font-family="sans-serif" font-size="9.5" fill="#196f3d" text-anchor="middle">pass</text>
+
+  <rect x="600" y="74" width="120" height="52" rx="6" fill="#d5f5e3" stroke="#1e8449" stroke-width="2"/>
+  <text x="660" y="105" font-family="sans-serif" font-size="12" font-weight="bold" fill="#196f3d" text-anchor="middle">FACE</text>
+  <line x1="545" y1="100" x2="598" y2="100" stroke="#1e8449" stroke-width="2"/><polygon points="600,100 590,95 590,105" fill="#1e8449"/>
+
+  <g stroke="#c0392b" stroke-width="2">
+    <line x1="185" y1="126" x2="185" y2="190"/><line x1="340" y1="126" x2="340" y2="190"/><line x1="495" y1="126" x2="495" y2="190"/>
+  </g>
+  <polygon points="185,192 180,182 190,182" fill="#c0392b"/>
+  <polygon points="340,192 335,182 345,182" fill="#c0392b"/>
+  <polygon points="495,192 490,182 500,182" fill="#c0392b"/>
+  <text x="185" y="210" font-family="sans-serif" font-size="10.5" fill="#922b21" text-anchor="middle">reject ~50%</text>
+  <text x="340" y="210" font-family="sans-serif" font-size="10.5" fill="#922b21" text-anchor="middle">reject most rest</text>
+  <text x="495" y="210" font-family="sans-serif" font-size="10.5" fill="#922b21" text-anchor="middle">reject stragglers</text>
+  <text x="390" y="250" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">Each stage passes nearly all faces and rejects a large share of non-faces, so the average window exits early and cheaply.</text>
+</svg>
+<figcaption><strong>Figure 16.4.2</strong>: The attentional cascade. Every window enters stage $1$ (just two Haar features); most non-faces are rejected there at almost no cost. Only survivors advance to progressively larger boosted stages, and a window must clear every stage to be declared a face. Because each stage discards a large fraction, the expected number of features evaluated per window is tiny.</figcaption>
+</figure>
+
+<p>
+The design contract per stage is asymmetric on purpose: each stage is tuned for a very high detection rate (say $99.9$ percent, so almost no faces are lost) and a modest false-positive rate (say $50$ percent). Chaining many such stages multiplies the false-positive rates toward zero while the detection rate, a product of near-ones, stays high. Ten stages at $50$ percent false positive each give an overall false-positive rate of roughly $0.1$ percent, while ten stages at $99.9$ percent detection each retain about $99$ percent of faces. The cascade is how the detector achieves both speed and accuracy without compromising either, and the code below runs OpenCV's pretrained cascade, the direct descendant of the 2001 model.
+</p>
+
+<pre><code class="language-python">import cv2
+
+# OpenCV ships the trained Viola-Jones cascade as an XML file of stages.
+cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+gray = cv2.cvtColor(cv2.imread("group_photo.jpg"), cv2.COLOR_BGR2GRAY)
+faces = cascade.detectMultiScale(
+    gray,
+    scaleFactor=1.1,        # image-pyramid step between scales
+    minNeighbors=5,         # how many overlapping detections to confirm a face
+    minSize=(30, 30))       # ignore windows smaller than this
+
+print(f"detected {len(faces)} faces")
+for (x, y, w, h) in faces:
+    print(f"  face at ({x}, {y}) size {w}x{h}")
+# detected 4 faces
+#   face at (118, 86) size 92x92
+#   face at (305, 71) size 88x88
+#   ...</code></pre>
+<div class="code-caption">Running the pretrained Viola-Jones cascade: <code>detectMultiScale</code> walks the image pyramid and applies the staged cascade at every window, returning confirmed face rectangles; <code>minNeighbors</code> is a built-in grouping that plays the role of non-maximum suppression.</div>
+
+<h2>4. The Long Afterlife <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Viola-Jones is over two decades old and still ships. Its tiny memory footprint and integer arithmetic make it ideal for hardware where a neural network will not fit: it ran the green focus boxes in early digital cameras, it powers the wake-on-face logic in some always-on sensors, and it remains a sensible default for controlled frontal-face tasks on microcontrollers. It has real limitations, frontal faces only, brittle under rotation and occlusion, and the modern replacement for accuracy is a small CNN such as OpenCV's own <code>FaceDetectorYN</code> or a MediaPipe model. But on a power budget of milliwatts, the cascade's reject-early discipline is still hard to beat, which is why the embedded-vision discussion of <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> returns to exactly this trade-off.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Cascade Trained for a Week</div>
+<p>The original detector's final cascade had $38$ stages and $6{,}061$ features, selected by AdaBoost from a pool of about $180{,}000$. Training it in 2001 took weeks of CPU time, because each boosting round re-evaluated every candidate feature on every training example under the current weights. The detector then ran at about $15$ frames per second on a $700$ MHz Pentium III, which felt like magic in an era when face detection was a research demo measured in seconds per frame, not frames per second. The asymmetry, weeks to train, milliseconds to run, is the same bargain every learned vision system makes today, just at a different scale.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Doorbell Camera on a Coin-Cell Budget</div>
+<p><strong>Who &amp; situation:</strong> a smart-doorbell startup needed a battery-powered camera to wake its main processor only when a person approached, so the always-on detector had to run on a tiny microcontroller drawing microamps, with no room for a neural network. <strong>Problem:</strong> their first prototype used a lightweight CNN face detector that drained the battery in two days because the processor never truly slept. <strong>Decision:</strong> they moved the wake trigger to a Viola-Jones cascade running on the microcontroller's integer unit, tuned with a very aggressive first stage so that empty-porch frames were rejected in two feature evaluations, and only woke the main system on a confirmed face-like window. <strong>Result:</strong> battery life jumped from two days to over four months, because nearly every frame exited the cascade after the cheap first stage and the main processor stayed asleep. <strong>Lesson:</strong> the cascade's reject-early structure is not just a speed trick, it is a power trick; when the common case is "nothing here," a detector that decides "nothing here" in two operations beats a far more accurate one that always pays full price.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Early Exit, Rediscovered</div>
+<p>The cascade's deepest idea, spend computation in proportion to difficulty, came back as a central theme of efficient deep learning. Early-exit networks attach classifier heads to intermediate layers so easy inputs leave after a few layers and only hard inputs traverse the full depth, the cascade's reject-early logic made continuous and learnable. Cascade R-CNN stages detection heads at increasing IoU thresholds, an explicit homage. On the deployment side, the 2024-2026 push toward on-device vision (token pruning in vision transformers, dynamic-depth networks, the efficient operators of <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a>) is the same conservation principle Viola and Jones applied to Haar features, now applied to attention and convolution. For face detection specifically, lightweight learned models (BlazeFace, YuNet, the model behind <code>FaceDetectorYN</code>) have replaced the cascade for accuracy, but they inherit its obsession with running in real time on the smallest possible budget.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One XML File, One Method</div>
+<p>Implementing Haar features, AdaBoost training, and a cascade from scratch is hundreds of lines and weeks of training. OpenCV bundles the fully trained Viola-Jones model as a single XML file and exposes it through <code>CascadeClassifier.detectMultiScale</code>: integral-image construction, the staged evaluation, the pyramid, and detection grouping all happen inside one call. The same class loads cascades for eyes, full bodies, and license plates, and the modern <code>cv2.FaceDetectorYN</code> swaps in a small CNN behind a near-identical interface when accuracy matters more than the power budget.</p>
+<pre><code class="language-python">import cv2
+# Classical cascade: tiny, fast, integer-only, frontal faces.
+faces = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    ).detectMultiScale(gray, 1.1, 5)
+
+# Modern drop-in: a small CNN with the same "detect faces" job, higher accuracy.
+detector = cv2.FaceDetectorYN.create("face_detection_yunet.onnx", "", (320, 320))</code></pre>
+<div class="code-caption">The classical cascade and its learned successor side by side: <code>CascadeClassifier</code> runs the integer-only Viola-Jones model from one XML file, while <code>FaceDetectorYN</code> offers a CNN replacement when accuracy outweighs the power and memory budget.</div>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.1: Why the Cascade Is Fast on Average <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose a cascade has $20$ stages, each rejecting $50$ percent of the windows that reach it and using on average $20$ feature evaluations. For a stream of windows that are all non-faces, compute the expected number of feature evaluations per window and compare it to a monolithic classifier that always evaluates all $400$ features. Then explain in one sentence why the speedup depends on most windows being non-faces, and what happens to the average cost in an image that is mostly faces.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.2: Integral Image From Scratch <span class="exercise-type coding">Coding</span></div>
+<p>Implement the integral image with a single double cumulative sum (cumulative sum down rows, then across columns) and verify it against <code>cv2.integral</code> on a random image. Then write the four-corner <code>rect_sum</code> and time it against a naive <code>image[y:y+h, x:x+w].sum()</code> for rectangles ranging from $4 \times 4$ to $200 \times 200$. Plot the two timings against rectangle area and confirm empirically that the integral-image version is flat while the naive version grows linearly with area.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 16.4.3: Tuning the Cascade's Trade-Offs <span class="exercise-type analysis">Analysis</span></div>
+<p>Run the OpenCV frontal-face cascade on a set of group photos while sweeping <code>scaleFactor</code> over $\{1.05, 1.1, 1.3\}$ and <code>minNeighbors</code> over $\{2, 5, 10\}$. For each setting record the number of detected faces, the number of obvious false positives, and the wall-clock time. Build a small table and identify which parameter trades speed for recall and which trades false positives for missed faces. Relate <code>minNeighbors</code> explicitly to the non-maximum suppression of <a href="section-16.3.html">Section 16.3</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-16.3.html">&#8592; Section 16.3: HOG + SVM: The Pedestrian Detection Era</a>
+<a href="index.html">Chapter 16</a>
+<a class="next" href="section-16.5.html">Section 16.5: Deformable Part Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

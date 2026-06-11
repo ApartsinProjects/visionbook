@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.3: PyTorch Essentials: Tensors, Autograd &amp; nn.Module. The GPU-aware tensor, reverse-mode automatic differentiation, and the nn.Module container that organizes parameters and forward passes for every later chapter." name="description"/>
+<title>Section 18.3: PyTorch Essentials: Tensors, Autograd &amp; nn.Module | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: Neural Networks &amp; PyTorch for Vision</a></div>
+<h1>PyTorch Essentials: Tensors, Autograd &amp; nn.Module</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I am just an array who keeps a diary. Every operation you do to me, I write down. Ask me to look back, and I will hand you the gradient, no derivation required."</p>
+<cite>A Tensor With Excellent Record-Keeping Habits</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>PyTorch gives you three abstractions, and every model in Part III is built from exactly these three: the Tensor (a GPU-aware array), autograd (an engine that records your operations and replays them backward to produce gradients automatically), and nn.Module (a container that holds parameters and defines a forward pass).</strong> This section builds and exercises all three by hand, reproducing the from-scratch backward pass of <a href="section-18.2.html">Section 18.2</a> with a single <code>loss.backward()</code> call, so you understand what the framework automates before you depend on it.</p>
+</div>
+<p>
+The previous two sections were deliberately framework-free: the NumPy MLP and its hand-written backward pass would be true in any language. Now we adopt PyTorch, the framework this book uses throughout Part III and Part IV, because writing backward passes by hand does not scale to real networks. PyTorch's promise is that you write only the forward pass and it computes the backward pass for you, exactly the gradients you derived in Section 18.2, automatically and correctly, for any composition of operations. Understanding how it delivers on that promise is the difference between using PyTorch and debugging it.
+</p>
+<h2>1. The Tensor <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+A PyTorch <code>Tensor</code> is a multi-dimensional array, much like a NumPy <code>ndarray</code>, with two superpowers: it can live on a GPU, and it can track the operations performed on it for automatic differentiation. Its anatomy is a shape, a dtype (usually <code>float32</code> for training), and a device (<code>cpu</code> or <code>cuda</code>). Tensors interoperate with NumPy almost transparently, which is why the transition from the last two sections is gentle. The code shows the essentials: creation, shape inspection, and the broadcasting rules that let a small tensor combine with a large one without explicit loops.
+</p>
+<pre><code class="language-python">import torch
+
+x = torch.randn(4, 3)            # 4x3 tensor, float32 on CPU by default
+print(x.shape, x.dtype, x.device)   # torch.Size([4, 3]) torch.float32 cpu
+
+# broadcasting: a (3,) bias adds to every row of the (4,3) tensor
+bias = torch.tensor([1.0, 2.0, 3.0])
+y = x + bias                     # shapes (4,3) and (3,) align on the last axis
+print(y.shape)                   # torch.Size([4, 3])
+
+# reshape vs view: view shares storage, reshape may copy
+flat = x.reshape(-1)             # (12,) where the -1 size is inferred
+img = flat.view(2, 6)            # (2, 6) sharing the same memory as flat
+print(flat.shape, img.shape)     # torch.Size([12]) torch.Size([2, 6])
+
+# numpy bridge (shares memory on CPU)
+import numpy as np
+back = x.numpy(); again = torch.from_numpy(np.ones((2, 2), dtype=np.float32))
+print(type(back), again.shape)   # &lt;class 'numpy.ndarray'&gt; torch.Size([2, 2])</code></pre>
+<div class="code-caption">The tensor essentials: creation with a shape and dtype, broadcasting a bias across rows, the distinction between <code>view</code> (shares storage) and <code>reshape</code> (may copy), and the zero-copy NumPy bridge that makes porting earlier sections trivial.</div>
+<p>
+Two subtleties bite beginners. First, the difference between an in-place operation (a trailing underscore, like <code>x.add_(1)</code>, which modifies <code>x</code>) and its out-of-place sibling (<code>x.add(1)</code>, which returns a new tensor); in-place ops save memory but can corrupt the graph autograd needs. Second, <code>view</code> requires contiguous memory and shares storage, while <code>reshape</code> falls back to a copy when it must, a distinction that matters when you flatten the spatial dimensions of an image tensor before a linear layer, as <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> will do constantly.
+</p>
+<h2>2. Autograd: The Engine That Replays Backward <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Set <code>requires_grad=True</code> on a tensor and PyTorch begins recording every operation that touches it into a dynamic computation graph, the same graph drawn in <a href="section-18.2.html">Figure 18.2.1</a>, built on the fly as your Python runs (this is called <em>define-by-run</em>). Calling <code>.backward()</code> on a scalar loss walks that graph in reverse, applying the chain rule node by node, and deposits the gradient of the loss with respect to each leaf tensor into its <code>.grad</code> attribute. The snippet reproduces the exact MLP backward pass we wrote out by hand in Section 18.2, now with autograd doing the six lines of derivative work for us.
+</p>
+<pre><code class="language-python">import torch
+
+torch.manual_seed(3)
+batch, d, H, C = 16, 20, 32, 4
+X = torch.randn(batch, d)
+y = torch.randint(0, C, (batch,))
+
+# scale FIRST, then mark each tensor as a leaf that requires grad, so
+# .grad is populated directly (scaling a requires_grad tensor would make
+# it a non-leaf and .grad would stay None without retain_grad())
+W1 = (torch.randn(H, d) * (2.0 / d) ** 0.5).requires_grad_(True)
+b1 = torch.zeros(H, requires_grad=True)
+W2 = (torch.randn(C, H) * (2.0 / H) ** 0.5).requires_grad_(True)
+b2 = torch.zeros(C, requires_grad=True)
+
+# ---- forward only; no manual backward needed ----
+a1 = torch.relu(X @ W1.t() + b1)
+logits = a1 @ W2.t() + b2
+loss = torch.nn.functional.cross_entropy(logits, y)
+
+loss.backward()                  # autograd computes EVERY gradient here
+print(round(loss.item(), 4), W1.grad.shape, W2.grad.shape)  # e.g. 1.4872 [32, 20] [4, 32]
+print(logits.grad_fn)            # &lt;AddBackward0 ...&gt; the recorded backward op</code></pre>
+<div class="code-caption">Autograd reproducing Section 18.2's hand-written backward pass: one <code>loss.backward()</code> call fills <code>W1.grad</code>, <code>W2.grad</code>, and the rest, and the <code>grad_fn</code> attribute reveals the recorded operation that autograd will invert.</div>
+<p>
+The <code>grad_fn</code> printed at the end is the breadcrumb autograd leaves on every tensor produced by a tracked operation; following the chain of <code>grad_fn</code> pointers from the loss backward is exactly the reverse traversal. When a gradient comes out as <code>None</code> or a backward pass throws, inspecting <code>grad_fn</code> is the first debugging move. Two control mechanisms are essential in practice: <code>with torch.no_grad():</code> disables graph recording (use it during validation and inference to save memory, since you will not call backward), and <code>tensor.detach()</code> returns a copy cut out of the graph (use it when you want a value but not its gradient history, for example when logging a metric).
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Gradients Accumulate, So You Must Zero Them</div>
+<p>PyTorch <em>adds</em> each new backward pass's gradients into <code>.grad</code> rather than overwriting them. This is deliberate (it enables gradient accumulation across micro-batches) but it means that if you forget to reset gradients to zero before each training step, every step's gradient is polluted by all previous steps. The single most common silent training bug for beginners is a missing <code>optimizer.zero_grad()</code>. The correct ritual per step is: zero the gradients, forward, compute loss, backward, step. Get that order wrong and the network either fails to learn or learns something bizarre, with no error message to tell you why.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The tensor's "diary" habit is wonderful right up until you forget to tear out yesterday's page. A missing <code>optimizer.zero_grad()</code> is the most polite catastrophe in deep learning: no exception, no red text, no crash, just a model that quietly learns the sum of every gradient it has ever seen and produces nonsense with total confidence. Generations of beginners have lost an afternoon to it. <strong>Zero, forward, loss, backward, step</strong>, in that order, every batch, is the five-beat ritual that keeps the diary honest.</p>
+</div>
+<h2>3. nn.Module: Organizing Parameters and Forward Passes <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<p>
+Tracking loose <code>W1</code>, <code>b1</code>, <code>W2</code>, <code>b2</code> tensors does not scale. <code>nn.Module</code> is the container that solves this: you subclass it, declare your layers as attributes in <code>__init__</code>, and define the forward pass in <code>forward</code>. The module then automatically registers every parameter, so <code>model.parameters()</code> hands the whole list to your optimizer, <code>model.to(device)</code> moves them all to the GPU at once, and <code>model.state_dict()</code> serializes them for checkpointing (<a href="section-18.5.html">Section 18.5</a>). The code rebuilds the MLP as a proper module and confirms its parameter inventory.
+</p>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MLP(nn.Module):
+    def __init__(self, in_dim=784, hidden=128, n_classes=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),                 # (B, 1, 28, 28) -&gt; (B, 784)
+            nn.Linear(in_dim, hidden),    # He init applied automatically
+            nn.ReLU(),
+            nn.Linear(hidden, n_classes), # logits; no softmax here (CE does it)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = MLP()
+n_params = sum(p.numel() for p in model.parameters())
+print(model.net[1].weight.shape, "params:", n_params)   # [128, 784] params: 101770
+
+# a forward pass on a fake batch of one 28x28 grayscale image
+dummy = torch.randn(8, 1, 28, 28)
+out = model(dummy)
+print(out.shape)                                         # torch.Size([8, 10])</code></pre>
+<div class="code-caption">The MLP as an <code>nn.Module</code>: layers declared as attributes are auto-registered as parameters, <code>nn.Flatten</code> turns image tensors into vectors, and the final linear layer emits raw logits because the cross-entropy loss applies softmax internally.</div>
+<p>
+Two conventions in that code are non-negotiable house style. The final layer outputs raw <strong>logits</strong>, the learned-classifier descendant of the linear scorers that ended Part II's recognition pipelines in <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>, not probabilities, because <code>nn.CrossEntropyLoss</code> fuses the softmax and the log for numerical stability (applying softmax yourself and then cross-entropy is a classic double-softmax bug). And the model takes a 4D tensor <code>(batch, channels, height, width)</code>, the canonical PyTorch image layout, even though this MLP immediately flattens it; keeping that layout means the same data pipeline (<a href="section-18.4.html">Section 18.4</a>) feeds both this MLP and the CNNs of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> unchanged. Figure 18.3.1 maps how the three abstractions fit together in a single training step.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 780 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="How tensors, nn.Module, autograd, and the optimizer compose in one training step. Data tensor enters the module, produces logits, the loss is computed, backward fills gradients via autograd, and the optimizer updates the module's parameters.">
+  <g font-family="sans-serif" font-size="12.5">
+    <rect x="20" y="110" width="100" height="56" rx="6" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5"/>
+    <text x="70" y="134" text-anchor="middle" font-weight="bold" fill="#1b4f72">Tensor</text>
+    <text x="70" y="152" text-anchor="middle" fill="#1b4f72">batch x</text>
+
+    <rect x="160" y="100" width="130" height="76" rx="6" fill="#e8daef" stroke="#7d3c98" stroke-width="1.5"/>
+    <text x="225" y="128" text-anchor="middle" font-weight="bold" fill="#5b2c6f">nn.Module</text>
+    <text x="225" y="146" text-anchor="middle" fill="#5b2c6f">holds parameters,</text>
+    <text x="225" y="162" text-anchor="middle" fill="#5b2c6f">runs forward()</text>
+
+    <rect x="330" y="110" width="100" height="56" rx="6" fill="#fdf2e9" stroke="#e67e22" stroke-width="1.5"/>
+    <text x="380" y="134" text-anchor="middle" font-weight="bold" fill="#9c4a00">logits</text>
+    <text x="380" y="152" text-anchor="middle" fill="#9c4a00">+ CE loss</text>
+
+    <rect x="470" y="100" width="130" height="76" rx="6" fill="#fadbd8" stroke="#c0392b" stroke-width="1.5"/>
+    <text x="535" y="128" text-anchor="middle" font-weight="bold" fill="#922b21">autograd</text>
+    <text x="535" y="146" text-anchor="middle" fill="#922b21">.backward() fills</text>
+    <text x="535" y="162" text-anchor="middle" fill="#922b21">.grad on params</text>
+
+    <rect x="640" y="100" width="120" height="76" rx="6" fill="#eafaf1" stroke="#1e8449" stroke-width="2"/>
+    <text x="700" y="128" text-anchor="middle" font-weight="bold" fill="#145a32">optimizer</text>
+    <text x="700" y="146" text-anchor="middle" fill="#145a32">.step() updates</text>
+    <text x="700" y="162" text-anchor="middle" fill="#145a32">parameters</text>
+
+    <g stroke="#5a626c" stroke-width="2" fill="#5a626c">
+      <line x1="120" y1="138" x2="156" y2="138"/><polygon points="156,138 146,133 146,143"/>
+      <line x1="290" y1="138" x2="326" y2="138"/><polygon points="326,138 316,133 316,143"/>
+      <line x1="430" y1="138" x2="466" y2="138"/><polygon points="466,138 456,133 456,143"/>
+      <line x1="600" y1="138" x2="636" y2="138"/><polygon points="636,138 626,133 626,143"/>
+    </g>
+    <!-- feedback arrow from optimizer back to module params -->
+    <path d="M700,176 C700,235 225,235 225,180" fill="none" stroke="#1e8449" stroke-width="2" stroke-dasharray="5,4"/>
+    <polygon points="225,180 220,190 230,190" fill="#1e8449"/>
+    <text x="460" y="252" text-anchor="middle" fill="#1e8449">updated weights flow back into the module for the next step</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 18.3.1</strong> The three PyTorch abstractions in one training step. A data Tensor enters the nn.Module, which runs <code>forward</code> using its parameters to produce logits and a loss. Autograd's <code>.backward()</code> fills each parameter's <code>.grad</code>, and the optimizer's <code>.step()</code> updates the parameters in place (green dashed loop), ready for the next batch.</figcaption>
+</figure>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: nn.Module Erases the Bookkeeping</div>
+<p>Compare the autograd snippet of subsection 2, which juggled four loose tensors, manual initialization scaling, and explicit <code>requires_grad_</code> bookkeeping, with the <code>MLP</code> module of subsection 3. The module version is shorter, and it gives you <code>model.parameters()</code> for the optimizer, <code>model.to('cuda')</code> to move every weight to the GPU in one call, <code>model.train()</code> and <code>model.eval()</code> to toggle layers like dropout and batch norm, and <code>model.state_dict()</code> for checkpointing, none of which the loose-tensor version has. For a real network with dozens of layers, hand-tracking parameters is not merely tedious but error-prone; <code>nn.Module</code> is the abstraction that makes scaling to a hundred layers a non-event.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Phantom Overfit That Was a Forgotten eval()</div>
+<p><strong>Who:</strong> A computer-vision intern shipping a first PyTorch model for a retail shelf-monitoring product.</p>
+<p><strong>Situation:</strong> Validation accuracy bounced wildly between epochs, sometimes far below training accuracy, sometimes above it, with no pattern. The intern suspected a data leak and spent a day auditing the splits.</p>
+<p><strong>Problem:</strong> The validation loop never called <code>model.eval()</code>. Dropout layers stayed active during validation, randomly zeroing units, and batch-normalization layers kept updating their running statistics from validation batches, so the model being evaluated was effectively different (and noisier) each pass. The splits were fine; the mode was wrong.</p>
+<p><strong>Decision:</strong> Wrap validation in <code>model.eval()</code> and <code>torch.no_grad()</code>, and switch back to <code>model.train()</code> at the top of each training epoch. Two lines.</p>
+<p><strong>Result:</strong> Validation accuracy stabilized immediately and read consistently just below training accuracy, the expected healthy gap. The day of split-auditing found nothing because nothing was wrong with the splits.</p>
+<p><strong>Lesson:</strong> <code>train()</code> and <code>eval()</code> are not cosmetic; they change the behavior of dropout and normalization layers. Forgetting <code>eval()</code> at validation, or <code>train()</code> at the start of training, produces confusing metrics with no error, exactly the kind of bug the explicit loop of <a href="section-18.5.html">Section 18.5</a> is structured to prevent.</p>
+</div>
+<h2>4. Functional versus Object Layers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+PyTorch offers most operations in two forms: as stateful objects in <code>torch.nn</code> (like <code>nn.ReLU()</code>, <code>nn.Linear</code>) and as stateless functions in <code>torch.nn.functional</code> (like <code>F.relu</code>, <code>F.cross_entropy</code>). The rule of thumb: use the object form for anything with learnable parameters or mode-dependent behavior (linear layers, convolutions, dropout, batch norm) so the module registers and manages them; use the functional form for pure, parameter-free operations inside <code>forward</code> when it reads more cleanly. The cross-entropy in subsection 2 used the functional form; the ReLU inside the <code>Sequential</code> used the object form. Both are correct; mixing them thoughtlessly for parameterized layers is where bugs hide, because a functional-style dropout will not respond to <code>model.eval()</code>.
+</p>
+<h2>5. Reading and Debugging Shapes <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The overwhelming majority of PyTorch errors are shape mismatches, and the overwhelming majority of those are caught by printing <code>.shape</code> at each step. The canonical image batch is <code>(N, C, H, W)</code>: batch size, channels, height, width. A linear layer expects <code>(N, features)</code>, which is why <code>nn.Flatten</code> sits between them. Two operations deserve fluency because the rest of Part III leans on them: <code>permute</code> reorders axes (turning the <code>(N, C, H, W)</code> of a CNN into the <code>(N, H*W, C)</code> sequence a transformer wants in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>), and <code>unsqueeze</code>/<code>squeeze</code> add or remove a size-1 axis (often to make broadcasting line up). When a matrix multiply complains, read the two shapes it printed and ask which axis was supposed to be the contracted one; the answer is almost always a missing flatten, a transpose, or a stray batch dimension.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compiling the Eager Graph Away</div>
+<p>PyTorch's define-by-run model is wonderfully flexible for research but historically slower than statically compiled frameworks. The 2.x line closed that gap with <code>torch.compile</code> (Ansel et al., 2024), which traces your eager Python into an optimized graph using the TorchDynamo and TorchInductor stack, often delivering large speedups from a single wrapping call <code>model = torch.compile(model)</code> with no code change. Complementary 2024 to 2026 work, FlexAttention for custom attention patterns and the maturing torch.export path for deployment, keeps the same eager authoring experience while removing its runtime cost. The mental model in this section, tensors flowing through a recorded graph, is exactly what the compiler optimizes; understanding the eager semantics first is what lets you reason about when the compiler will help and when a data-dependent control-flow branch will force it to fall back.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.3.1: The Accumulating-Gradient Trap <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain precisely what goes wrong if a training loop computes <code>loss.backward()</code> and <code>optimizer.step()</code> on each batch but never calls <code>optimizer.zero_grad()</code>. Describe the trajectory of the effective gradient over the first three steps, why the loss might still appear to decrease for a while, and how you would diagnose the bug by inspecting <code>param.grad</code> magnitudes. Then state the one legitimate use case where deliberately not zeroing between sub-steps is correct.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.3.2: Verify Autograd Against Your Hand Backprop <span class="exercise-type coding">Coding</span></div>
+<p>Take the from-scratch NumPy backward pass from <a href="section-18.2.html">Section 18.2</a> and the autograd version in subsection 2 of this section, and feed both the <em>identical</em> arrays rather than two separately seeded RNG streams (NumPy and PyTorch generators do not match, so build <code>X</code>, <code>y</code>, and the weights once in NumPy and bring them into PyTorch with <code>torch.from_numpy</code>, making each weight a leaf with <code>requires_grad_(True)</code>). Confirm that <code>W1.grad</code> from autograd matches your NumPy <code>dW1</code> to floating-point tolerance for every entry. Then deliberately introduce an in-place operation that breaks the graph (for example <code>a1.relu_()</code> on a tensor that requires grad) and report the exact error PyTorch raises, explaining why in-place ops can be unsafe for autograd.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 18.3.3: Shape Surgery <span class="exercise-type analysis">Analysis</span></div>
+<p>Starting from a batch of RGB images shaped <code>(32, 3, 224, 224)</code>, write the sequence of tensor operations that produces each of the following, and state the resulting shape at each step: (a) the input to a linear classifier head; (b) a token sequence for a vision transformer treating each pixel as a token; (c) a per-channel mean over the spatial dimensions (global average pooling). For each, identify whether you used <code>flatten</code>, <code>permute</code>, <code>reshape</code>, or a reduction, and explain why that choice preserves or reorders the data correctly.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-18.2.html">&#8592; Section 18.2: Backpropagation &amp; Optimization in a Nutshell</a>
+<a href="index.html">Chapter 18</a>
+<a class="next" href="section-18.4.html">Section 18.4: Datasets, DataLoaders &amp; Input Pipelines &#8594;</a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

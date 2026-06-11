@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.7: Latent Diffusion. The trick that put diffusion on consumer hardware: train an autoencoder to compress images into a small perceptual latent, run the entire diffusion process there, and decode once at the end. The architecture of Stable Diffusion, plus the modern diffusion transformer (DiT) backbone." name="description"/>
+<title>Section 33.7: Latent Diffusion | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Diffusion Models</a></div>
+<h1>Latent Diffusion: Compress First, Then Diffuse</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Why repaint every blade of grass when a small map of the meadow will do? Compress the world, dream in the compressed world, and only render it back to pixels when someone insists on looking."</p>
+<cite>A Latent Vector That Saved Everyone a Fortune in GPU Hours</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Latent diffusion runs the entire diffusion process not on raw pixels but inside a small, learned latent space: an autoencoder first compresses a 512x512 image into a 64x64 latent grid, the diffusion U-Net or transformer denoises in that compact space, and the decoder turns the final latent back into pixels exactly once.</strong> Because the latent has roughly one forty-eighth the elements of the image, every step of diffusion is far cheaper, which is the single change that took diffusion from research-cluster scale to a model that runs on a consumer GPU. This is the architecture of Stable Diffusion, and with the U-Net swapped for a diffusion transformer (DiT) it is also the architecture of the 2024-onward frontier. This section assembles everything from the chapter into that complete system.</p>
+</div>
+
+<p>
+Every diffusion model in this chapter so far has operated on pixels: the noisy $x_t$ is a full-resolution image, and the U-Net processes it at that resolution at every one of the sampling steps. For a 512x512 RGB image that is roughly 786,000 numbers per step, and the compute of a convolution scales with that count. Pixel-space diffusion at high resolution is therefore enormously expensive, which is why the early models were trained by large labs on big clusters. Latent diffusion (Rombach et al., 2022), the model the world knows as Stable Diffusion, removes that wall with one idea borrowed from <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>: do the diffusion in a compressed <a href="../module-31-autoencoders-vaes/index.html">latent space</a> instead. This section builds the two-stage system, explains why splitting perception from generation works, and ends with the diffusion transformer backbone that now scales the idea to video and beyond.
+</p>
+
+<h2>1. Two Stages: Perceptual Compression, Then Generation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Latent diffusion factors the problem into two independently-trained stages. The first stage is an <strong>autoencoder</strong> (specifically a VAE-style encoder-decoder, often with a small adversarial and perceptual loss to keep decoded images sharp) that learns to compress an image into a much smaller latent tensor and reconstruct it. A typical Stable Diffusion autoencoder maps a 512x512x3 image to a 64x64x4 latent, an eightfold spatial downsampling and a roughly 48-fold reduction in element count. Crucially, this autoencoder is trained once and then frozen; it is a fixed perceptual codec. The second stage is the diffusion model from the rest of this chapter, but trained entirely on these latents: the forward process noises the latent, and the denoiser learns to predict the noise in latent space. At generation time you run diffusion in the latent, then decode the final latent to pixels once. Figure 33.7.1 shows the full pipeline with conditioning wired in.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Latent diffusion pipeline: encoder compresses image to latent, diffusion runs in latent space conditioned by text via cross-attention, decoder reconstructs the image">
+<style>
+.ll{font:12px sans-serif;fill:#1a1a1a;}
+.ls{font:10px sans-serif;fill:#555;}
+.enc{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.lat{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.diff{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.5;}
+.cond{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.5;}
+.lar{stroke:#777;stroke-width:1.6;marker-end:url(#lah);fill:none;}
+.lac{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#lahp);fill:none;stroke-dasharray:5 4;}
+</style>
+<defs>
+<marker id="lah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker>
+<marker id="lahp" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker>
+</defs>
+<rect class="enc" x="20" y="120" width="70" height="70"/>
+<text class="ll" x="55" y="110" text-anchor="middle">image</text>
+<text class="ls" x="55" y="205" text-anchor="middle">512x512x3</text>
+<line class="lar" x1="92" y1="155" x2="138" y2="155"/>
+<text class="ls" x="115" y="148" text-anchor="middle">E</text>
+<rect class="lat" x="140" y="135" width="44" height="44"/>
+<text class="ls" x="162" y="195" text-anchor="middle">64x64x4</text>
+<text class="ls" x="162" y="208" text-anchor="middle">latent</text>
+<line class="lar" x1="186" y1="157" x2="232" y2="157"/>
+<rect class="diff" x="234" y="110" width="180" height="95"/>
+<text class="ll" x="324" y="150" text-anchor="middle">diffusion denoiser</text>
+<text class="ls" x="324" y="168" text-anchor="middle">U-Net or DiT,</text>
+<text class="ls" x="324" y="182" text-anchor="middle">N steps in latent space</text>
+<rect class="cond" x="270" y="255" width="120" height="40"/>
+<text class="ll" x="330" y="272" text-anchor="middle">text encoder</text>
+<text class="ls" x="330" y="287" text-anchor="middle">CLIP / T5</text>
+<line class="lac" x1="330" y1="253" x2="330" y2="207"/>
+<text class="ls" x="392" y="232" text-anchor="middle" fill="#8e44ad">cross-attn</text>
+<line class="lar" x1="416" y1="157" x2="462" y2="157"/>
+<rect class="lat" x="464" y="135" width="44" height="44"/>
+<text class="ls" x="486" y="195" text-anchor="middle">clean latent</text>
+<line class="lar" x1="510" y1="157" x2="556" y2="157"/>
+<text class="ls" x="533" y="148" text-anchor="middle">D</text>
+<rect class="enc" x="558" y="120" width="70" height="70"/>
+<text class="ll" x="593" y="110" text-anchor="middle">image</text>
+<text class="ls" x="593" y="205" text-anchor="middle">512x512x3</text>
+</svg>
+<figcaption><strong>Figure 33.7.1:</strong> The latent diffusion pipeline. A frozen encoder $E$ compresses the image into a small latent; all diffusion (the green block, $N$ denoising steps) happens in that latent space, conditioned on text through cross-attention from a text encoder; the frozen decoder $D$ reconstructs pixels from the final clean latent, run only once. The compute savings come from the diffusion block operating on the 64x64x4 latent rather than the 512x512x3 image.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
+
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")   # frozen codec
+unet = UNet2DConditionModel.from_pretrained(                       # latent denoiser
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="unet")
+sched = DDPMScheduler(num_train_timesteps=1000)
+
+def latent_diffusion_train_step(image, text_emb):
+    """One training step: encode to latent, noise it, predict the noise."""
+    with torch.no_grad():
+        latent = vae.encode(image).latent_dist.sample() * 0.18215   # scale factor
+    noise = torch.randn_like(latent)
+    t = torch.randint(0, 1000, (latent.size(0),))
+    noisy = sched.add_noise(latent, noise, t)                       # closed-form corruption
+    pred = unet(noisy, t, encoder_hidden_states=text_emb).sample    # eps in latent space
+    return ((pred - noise) ** 2).mean()                             # same loss as ever</code></pre>
+<div class="code-caption">A latent diffusion training step. The only changes from the pixel-space step of Section 33.2 are the <code>vae.encode</code> at the start (and the <code>0.18215</code> scale factor that normalizes the latent variance) and that the U-Net is a conditional one consuming text embeddings. The diffusion loss itself is unchanged.</div>
+
+<h2>2. Why Splitting Perception From Generation Works <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The deep reason latent diffusion works so well is a division of labor. Most of the bits in a pixel image encode high-frequency perceptual detail, exact textures, sensor noise, sharp edges, that the human eye barely tracks and that contribute little to <em>what the image is of</em>. The autoencoder's job is to learn a code that throws away the imperceptible detail while keeping the perceptually meaningful structure, the same perceptual-compression idea behind JPEG, now learned. That leaves the hard, semantic part, deciding the content and layout, to the diffusion model, which now operates in a space where every dimension matters. Spending diffusion's expensive iterative compute on a space stripped of redundant detail is far more efficient than spending it on pixels, and because the decoder restores realistic texture at the end, the final images do not look compressed. This is also why latent diffusion is less prone to wasting capacity on noise than pixel diffusion: the autoencoder has already removed the noise the pixel model would otherwise have to model.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Latent Is Where the Whole Generative Part Lives</div>
+<p>
+Latent diffusion ties together every latent-space idea in this book. The latent is the same kind of compressed code as the <a href="../module-31-autoencoders-vaes/index.html">VAE latent of Chapter 31</a>, but used as a fixed substrate rather than the generator itself. The diffusion that runs in it is the entire machinery of Sections 33.1 through 33.6, unchanged except for the smaller tensor. The conditioning enters through the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">cross-attention of Chapter 22</a>. And inverting the autoencoder to edit a real image, the foundation of <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>, means encoding it into this same latent and manipulating it there. The latent space is the hub: compress into it once, and every generative and editing operation happens inside it.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The famous <code>0.18215</code> scale factor in the Stable Diffusion code, which everyone copies and almost nobody questions, exists because the trained autoencoder's latents had a standard deviation that did not match the unit-variance assumption the diffusion noise schedule expects. Multiplying by that constant rescales the latent to roughly unit variance so the schedule behaves. It is a single magic number that, if you forget it, produces washed-out or oversaturated images, and it has launched a thousand debugging sessions for people porting the model.</p>
+</div>
+
+<h2>3. From U-Net to Diffusion Transformer (DiT) <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The original latent diffusion used a convolutional U-Net as the denoiser. The 2023 diffusion transformer (DiT, Peebles and Xie) replaced it with a pure <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">transformer</a>: chop the latent into patches exactly as the Vision Transformer of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> chops an image, add positional embeddings, and process the patch sequence with transformer blocks, injecting the timestep and class or text condition through adaptive layer-norm. DiT matters for one reason: it scales cleanly. The U-Net's inductive biases helped at small scale but its design did not improve predictably with size, whereas the transformer's well-understood scaling (more layers, more width, more data, better samples) carried straight over from language and ViTs. That predictable scaling is why DiT is the backbone of the frontier: Sora's video model, Stable Diffusion 3, FLUX, and most 2024-onward systems are DiT-style latent diffusion (or latent flow-matching, combining this section with <a href="section-33.5.html">Section 33.5</a>). The pixel-space U-Net of <a href="section-33.2.html">Section 33.2</a> taught you the denoiser; the DiT-in-a-latent is where the field actually builds.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: The Full Pipeline in Five Lines</div>
+<p>Everything in this chapter, the autoencoder, the conditional denoiser, the scheduler, the classifier-free guidance of <a href="section-33.6.html">Section 33.6</a>, the text encoder, assembles into a single <code>diffusers</code> pipeline object. Loading and running a complete text-to-image latent diffusion model is: <code>pipe = StableDiffusionPipeline.from_pretrained("stable-diffusion-v1-5/stable-diffusion-v1-5"); image = pipe("a watercolor fox", guidance_scale=7.5, num_inference_steps=30).images[0]</code>. That is the entire chapter, the VAE encode/decode, the U-Net denoising loop, the DDIM scheduler, the CLIP text encoder, and CFG, behind two method calls, replacing what would be well over a thousand lines from scratch. Swap <code>StableDiffusion3Pipeline</code> or <code>FluxPipeline</code> to get the DiT-plus-flow-matching frontier models with the same interface. The library handles device placement, the latent scale factor, the safety checker, and the scheduler wiring. Build the pieces yourself to understand them; reach for the pipeline to ship.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Latent Diffusion Puts a Generator on a Designer's Laptop</div>
+<p><strong>Who:</strong> a small indie studio of four people with no GPU cluster, 2022 to 2023. <strong>Situation:</strong> they wanted in-house image generation for marketing assets but could not afford cloud generation at the volume they needed, nor the hardware for pixel-space diffusion. <strong>Problem:</strong> the high-quality pixel-space diffusion models of the time needed datacenter GPUs to run at usable resolution; on the studio's single consumer card, a 512x512 pixel-space sample would have been impractically slow and memory-hungry. <strong>Decision:</strong> they adopted Stable Diffusion, the open-weight latent diffusion model, which generated 512x512 images by denoising a 64x64 latent and decoding once. <strong>Result:</strong> the model ran in seconds on their 8 GB consumer GPU, the studio generated thousands of assets in-house at near-zero marginal cost, and the latent compression was the specific reason it fit in memory at all. <strong>Lesson:</strong> the latent-space trick was not a quality improvement so much as an accessibility revolution; by cutting the diffusion compute roughly fortyfold, it moved high-quality generation from the cluster to the laptop and is the direct reason open generative-image tooling exists. Architecture choices that change the compute scale, not just the metric, are the ones that change who gets to use the technology.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scaling the Latent and the Backbone</div>
+<p>Latent diffusion's two stages are both active frontiers. On the autoencoder side, 2024 to 2025 work pushed for higher compression (16x downsampling, more latent channels) without losing reconstruction quality, since a smaller latent means cheaper diffusion; the SD3 and FLUX autoencoders use 16-channel latents that hold more detail than SD1's 4-channel one. On the backbone side, DiT scaling (Peebles and Xie, 2023, arXiv:2212.09748) and its successors established that latent diffusion transformers follow clean scaling laws, and combining DiT with the rectified flow of <a href="section-33.5.html">Section 33.5</a> gave SD3 (Esser et al., 2024, arXiv:2403.03206) its quality. The same recipe, latent autoencoder plus DiT plus flow matching, now drives video generation (Sora, Movie Gen) and is being extended to 3D and multimodal generation in the chapters that follow. The state of the art in 2025 is essentially this section's architecture, scaled up and trained with the flow objective; understanding latent diffusion is understanding the skeleton of every frontier generative-vision system.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.7.1: Counting the Savings <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A 512x512x3 image has how many elements? The corresponding 64x64x4 latent has how many? Compute the ratio, and explain in two or three sentences why the per-step cost of the diffusion denoiser scales roughly with this element count, so that the latent-space model is roughly that many times cheaper per step. Then state why the autoencoder's encode and decode, run once each, do not erase this saving over a 30-step sampling run.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.7.2: Round-Trip the Autoencoder <span class="exercise-type coding">Coding</span></div>
+<p>Load the Stable Diffusion <code>AutoencoderKL</code> from <code>diffusers</code>. Encode a real photo to its latent, then decode it straight back to pixels (no diffusion in between). Display the original and the reconstruction side by side, and compute the <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">PSNR</a> from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> between them. Then visualize the four latent channels as grayscale images. Comment on what perceptual information survived the compression and what was discarded, connecting to the perception-versus-generation argument of subsection 2.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.7.3: U-Net vs DiT Trade-offs <span class="exercise-type analysis">Analysis</span></div>
+<p>Write a short comparison (one to two paragraphs) of the convolutional U-Net denoiser of <a href="section-33.2.html">Section 33.2</a> and the diffusion transformer of subsection 3 as backbones for latent diffusion. Address inductive bias, scaling behavior, compute at fixed parameter count, and why the field shifted to DiT for frontier models despite the U-Net's strong small-scale performance. Relate your answer to the CNN-versus-ViT discussion in <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>, and explain why operating in a compressed latent makes the transformer's quadratic attention cost manageable.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-33.6.html">&#8592; Section 33.6: Guidance</a>
+<a href="index.html">Chapter 33</a>
+<a class="next" href="../module-34-text-to-image/index.html">Chapter 34: Text-to-Image Systems &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

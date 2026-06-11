@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.1: The Detection Problem: Boxes, IoU and mAP. What detection outputs, the bounding box and its coordinate conventions, intersection-over-union as the overlap measure, precision-recall curves, average precision per class, and mean average precision across classes, built and verified from scratch in NumPy." name="description"/>
+<title>Section 23.1: The Detection Problem: Boxes, IoU &amp; mAP | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Object Detection</a></div>
+<h1>The Detection Problem: Boxes, IoU &amp; mAP</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They asked me how good my boxes were. I said most of them are pretty close. That, it turns out, is not a number. So they invented one, then another to average the first, then a third to average that. Now my report card is a single decimal and I lie awake worrying about the second digit."</p>
+<cite>A Detector Anxious About Its Average Precision</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Detection turns a fixed-output classifier into a variable-output set predictor, and the entire chapter is shaped by the metrics that score such a set: intersection-over-union to judge a single box, and mean average precision to summarize a whole detector across every confidence threshold at once.</strong> Before you can train a detector you must be able to say, precisely, whether a predicted box is right. That requires deciding when a box overlaps the truth enough to count (IoU), how to trade false positives against missed objects (precision and recall), how to collapse a precision-recall curve into one number per class (average precision), and how to average across classes (mean average precision). These are not afterthoughts; the IoU threshold appears in every loss function, and the mAP protocol decides which architectures the field declares winners. This section builds all of them from scratch in NumPy so that when later sections cite "37.4 mAP", you know exactly what was measured.</p>
+</div>
+
+<p>
+In the previous chapters a network mapped an image to one decision. A classifier sees a photo and returns "cat"; a Vision Transformer from <a href="../module-22-vision-transformers/index.html">Chapter 22</a> sees a photo and returns "cat" with a probability. Object detection asks for much more. Given the same photo, a detector must return a list: <em>a cat at pixels (x1, y1, x2, y2) with confidence 0.94, a sofa at (x3, y3, x4, y4) with confidence 0.81</em>, and so on, with the length of that list depending on what is actually in the image. The output is a set of localized, classified, scored predictions, and the number of elements is not known in advance. Everything difficult about detection flows from that one fact, and so does everything in this section, because before we can build a model that emits such a set we must agree on how to grade it.
+</p>
+
+<h2>1. What a Detector Outputs <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A single detection is a tuple: a class label, a confidence score in $[0, 1]$, and a bounding box. The box is the geometric heart of detection, so fix its conventions now to avoid the off-by-one and format confusions that cause more detector bugs than any algorithm. The two dominant formats are <strong>corner format</strong>, written $(x_{\min}, y_{\min}, x_{\max}, y_{\max})$, the pixel coordinates of the top-left and bottom-right corners, and <strong>center format</strong>, written $(c_x, c_y, w, h)$, the center coordinate plus width and height. torchvision and COCO use corner format; YOLO predicts and stores center format (often normalized to $[0, 1]$ by the image size). Converting between them is trivial but must be done consistently, and a great many "the model trained but predicts nonsense" reports trace to a silent format mismatch.
+</p>
+
+<p>
+Image coordinates put the origin at the top-left, $x$ increasing to the right and $y$ increasing downward, the same convention you have used since <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>. Figure 23.1.1 shows the two formats on one box and names the quantities we will use throughout the chapter.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A bounding box drawn on an image grid, labeled in both corner format and center format">
+<style>
+.bl{font:13px sans-serif;fill:#1a1a1a;}
+.bs{font:11px sans-serif;fill:#555;}
+.bbox{fill:none;stroke:#2c6fb5;stroke-width:2.5;}
+.bpt{fill:#d6802b;}
+.bdim{stroke:#2f9e5c;stroke-width:1.5;stroke-dasharray:4 3;}
+.bframe{fill:#f7f9fc;stroke:#ccc;stroke-width:1;}
+</style>
+<rect class="bframe" x="40" y="40" width="320" height="230"/>
+<text class="bs" x="44" y="34">image (0,0 top-left, y grows down)</text>
+<rect class="bbox" x="120" y="100" width="160" height="110"/>
+<circle class="bpt" cx="120" cy="100" r="4"/>
+<text class="bl" x="92" y="94">(x_min, y_min)</text>
+<circle class="bpt" cx="280" cy="210" r="4"/>
+<text class="bl" x="252" y="228">(x_max, y_max)</text>
+<circle class="bpt" cx="200" cy="155" r="4"/>
+<text class="bl" x="206" y="158">(c_x, c_y)</text>
+<line class="bdim" x1="120" y1="232" x2="280" y2="232"/>
+<text class="bs" x="200" y="248" text-anchor="middle">w</text>
+<line class="bdim" x1="298" y1="100" x2="298" y2="210"/>
+<text class="bs" x="306" y="158">h</text>
+<text class="bl" x="420" y="120">corner:  (x_min, y_min, x_max, y_max)</text>
+<text class="bl" x="420" y="150">center:  (c_x, c_y, w, h)</text>
+<text class="bs" x="420" y="180">c_x = (x_min + x_max) / 2</text>
+<text class="bs" x="420" y="200">c_y = (y_min + y_max) / 2</text>
+<text class="bs" x="420" y="220">w = x_max - x_min,  h = y_max - y_min</text>
+</svg>
+<figcaption><strong>Figure 23.1.1:</strong> One bounding box, two conventions. Corner format stores the two opposite corners; center format stores the center, width, and height. Detectors choose one internally (YOLO uses center, torchvision uses corner) and you must match it when you feed labels in or read predictions out.</figcaption>
+</figure>
+
+<p>
+The code below defines the conversions we will reuse. Run it against the figure: a box whose corners are $(120, 100)$ and $(280, 210)$ has center $(200, 155)$, width $160$, and height $110$.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def corner_to_center(box):
+    """(x_min, y_min, x_max, y_max) -> (cx, cy, w, h)."""
+    x1, y1, x2, y2 = box
+    return np.array([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1])
+
+def center_to_corner(box):
+    """(cx, cy, w, h) -> (x_min, y_min, x_max, y_max)."""
+    cx, cy, w, h = box
+    return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+
+b = np.array([120, 100, 280, 210])          # corner format
+print(corner_to_center(b))                  # [200. 155. 160. 110.]
+print(center_to_corner(corner_to_center(b)))# [120. 100. 280. 210.] round-trips
+</code></pre>
+<div class="code-caption">Bounding-box format conversions. The round-trip on the last line is the cheapest sanity check there is: convert and convert back, and you must recover the original box exactly.</div>
+
+<h2>2. Intersection over Union: Scoring One Box <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A predicted box almost never matches a ground-truth box exactly, so we need a continuous measure of how well they overlap. The standard is <strong>intersection over union</strong> (IoU), also called the Jaccard index: the area of the overlap of two boxes divided by the area of their union.
+</p>
+
+<div class="math-block">
+$$\text{IoU}(A, B) = \frac{|A \cap B|}{|A \cup B|} = \frac{|A \cap B|}{|A| + |B| - |A \cap B|}$$
+</div>
+
+<p>
+IoU is $0$ when the boxes are disjoint, $1$ when they coincide exactly, and somewhere in between otherwise. It is invariant to the overall scale of the image and it penalizes both a box that is too large (extra union) and one that is too small (missing intersection), which is exactly why it became the universal currency of detection. A detection is conventionally counted as correct when its IoU with a ground-truth box of the same class exceeds a threshold, classically $0.5$. Figure 23.1.2 shows the geometry: the intersection rectangle is found by taking the larger of the two left edges, the larger of the two top edges, the smaller of the two right edges, and the smaller of the two bottom edges.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two overlapping boxes with the intersection rectangle shaded, illustrating the intersection-over-union computation">
+<style>
+.il{font:13px sans-serif;fill:#1a1a1a;}
+.is{font:11px sans-serif;fill:#555;}
+.igt{fill:rgba(47,158,92,0.10);stroke:#2f9e5c;stroke-width:2.5;}
+.ipr{fill:rgba(44,111,181,0.10);stroke:#2c6fb5;stroke-width:2.5;}
+.iint{fill:rgba(214,128,43,0.35);stroke:#d6802b;stroke-width:1.5;}
+</style>
+<rect class="igt" x="60" y="60" width="200" height="150"/>
+<text class="il" x="64" y="52" fill="#2f9e5c">ground truth A</text>
+<rect class="ipr" x="170" y="110" width="200" height="150"/>
+<text class="il" x="234" y="276" fill="#2c6fb5">prediction B</text>
+<rect class="iint" x="170" y="110" width="90" height="100"/>
+<text class="is" x="215" y="165" text-anchor="middle">A &#8745; B</text>
+<text class="il" x="430" y="90">x1 = max(A.x_min, B.x_min)</text>
+<text class="il" x="430" y="115">y1 = max(A.y_min, B.y_min)</text>
+<text class="il" x="430" y="140">x2 = min(A.x_max, B.x_max)</text>
+<text class="il" x="430" y="165">y2 = min(A.y_max, B.y_max)</text>
+<text class="is" x="430" y="195">inter = max(0, x2 - x1) * max(0, y2 - y1)</text>
+<text class="is" x="430" y="218">IoU = inter / (areaA + areaB - inter)</text>
+</svg>
+<figcaption><strong>Figure 23.1.2:</strong> Computing IoU. The intersection rectangle's corners come from the inner edges of the two boxes; clamping each side to a minimum of zero handles the disjoint case (a negative width or height means no overlap). The union is the two areas minus the double-counted intersection.</figcaption>
+</figure>
+
+<p>
+The implementation follows the figure line for line, and it is worth getting exactly right because every matching decision and every loss in the chapter calls it. Notice the <code>max(0, ...)</code> clamp: when the boxes do not overlap, the naive intersection width or height goes negative, and without the clamp you would compute a spurious positive area.
+</p>
+
+<pre><code class="language-python">def iou(box_a, box_b):
+    """IoU of two corner-format boxes (x_min, y_min, x_max, y_max)."""
+    # Intersection rectangle: inner edges of the two boxes.
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)   # clamp handles no-overlap
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+A = [60, 60, 260, 210]      # ground truth
+B = [170, 110, 370, 260]    # prediction
+print(round(iou(A, B), 3))  # 0.157
+print(round(iou(A, A), 3))  # 1.0  (a box overlaps itself perfectly)
+</code></pre>
+<div class="code-caption">Intersection-over-union for a pair of boxes. The self-overlap test on the last line (a box against itself must score exactly 1.0) is the unit test you should write first; it catches sign and area errors immediately.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: IoU Is Where the Metric Meets the Loss</div>
+<p>IoU is not only an evaluation metric; modern detectors train against it directly. Plain L1 or L2 regression on box coordinates does not correlate well with IoU (a box can be close in coordinate error yet poor in overlap, or vice versa), so detectors increasingly minimize an IoU-based loss such as GIoU, DIoU, or CIoU. Those variants add penalty terms for the distance between box centers and the aspect-ratio mismatch, which gives a useful gradient even when two boxes do not yet overlap and ordinary IoU is flat at zero. Whenever you see "CIoU loss" in a detector's config, this is the quantity it is shaping.</p>
+</div>
+
+<h2>3. Precision, Recall, and the Matching Rule <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+With IoU in hand we can classify each prediction. For a single class and a single image, sort the predictions by confidence, then walk down that list assigning each prediction to the highest-IoU unassigned ground-truth box of the same class. A prediction is a <strong>true positive</strong> (TP) if its best match has IoU above the threshold and that ground-truth box has not already been claimed by a higher-confidence prediction; otherwise it is a <strong>false positive</strong> (FP). Any ground-truth box left unclaimed at the end is a <strong>false negative</strong> (FN), a missed object. The "already claimed" rule is what punishes duplicate boxes: if a detector fires three nearly identical boxes on one object, only the most confident one is a TP and the other two are FPs.
+</p>
+
+<p>
+From these counts come the two quantities you balance for the rest of your detection career. <strong>Precision</strong> is the fraction of predictions that were correct, $\text{TP} / (\text{TP} + \text{FP})$: how much you can trust a box the model emits. <strong>Recall</strong> is the fraction of ground-truth objects that were found, $\text{TP} / (\text{TP} + \text{FN})$: how little the model misses. They trade off against each other through the confidence threshold. Lower the threshold and you emit more boxes, finding more objects (higher recall) but admitting more junk (lower precision); raise it and the reverse happens. A single (precision, recall) pair therefore describes only one operating point, which is why no serious detector is summarized by one number at one threshold.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Confidence Threshold That Shipped the Wrong Product</div>
+<p><strong>Who:</strong> a three-person startup building a warehouse safety camera that detects whether workers near a forklift are wearing a hard hat, 2023. <strong>Situation:</strong> their detector reached a respectable mAP in the lab, and a demo at a default confidence threshold of 0.25 looked great. <strong>Problem:</strong> in the warehouse, the threshold that looked good in the demo flooded the operations team with false alarms on shadows and helmets-shaped boxes, and they muted the system within a week. <strong>Decision:</strong> the team realized they had been optimizing and demoing at one operating point while the customer needed a very different one. They plotted the full precision-recall curve, chose the threshold where precision hit 0.95 (alarms must be trustworthy or they get ignored), and accepted the lower recall that came with it, supplementing with a periodic full-frame review for the missed cases. <strong>Result:</strong> alarm volume dropped tenfold, the operations team re-enabled the system, and it stayed on. <strong>Lesson:</strong> mAP summarizes the whole curve, but a deployed detector lives at a single chosen threshold; pick it from the precision-recall curve against the customer's real cost of a false alarm versus a miss, not from whatever the demo defaulted to.</p>
+</div>
+
+<h2>4. Average Precision: Collapsing the Curve <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Sweep the confidence threshold from high to low and at each setting you get a (recall, precision) point; together they trace the <strong>precision-recall curve</strong>. A good detector stays high and to the right: high precision maintained even as recall grows. <strong>Average precision</strong> (AP) for a class is the area under that curve, a single number in $[0, 1]$ that summarizes performance across all thresholds at once. Equivalently, AP is the precision averaged over all recall levels.
+</p>
+
+<p>
+The mechanics are: rank every prediction for the class across the whole dataset by descending confidence, walk down the ranking accumulating TP and FP counts, and at each step record the running precision and recall. Because raw precision-recall curves are jagged (precision can briefly rise as recall increases), the COCO protocol applies a monotone envelope first, replacing precision at each recall with the maximum precision at that recall or any higher recall, and then integrates. The formula for the interpolated AP is
+</p>
+
+<div class="math-block">
+$$\text{AP} = \int_0^1 p_{\text{interp}}(r)\, dr, \qquad p_{\text{interp}}(r) = \max_{\tilde{r} \ge r} p(\tilde{r})$$
+</div>
+
+<p>
+where $p(r)$ is the measured precision at recall $r$. Figure 23.1.3 shows a jagged curve and the staircase envelope whose area is AP.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A jagged precision-recall curve and its monotone interpolated envelope, with the area under the envelope shaded as average precision">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10px sans-serif;fill:#555;}
+.paxis{stroke:#333;stroke-width:1.5;}
+.praw{fill:none;stroke:#bbb;stroke-width:1.5;}
+.penv{fill:rgba(44,111,181,0.12);stroke:#2c6fb5;stroke-width:2.5;}
+</style>
+<line class="paxis" x1="70" y1="40" x2="70" y2="250"/>
+<line class="paxis" x1="70" y1="250" x2="430" y2="250"/>
+<text class="pl" x="40" y="46">1.0</text>
+<text class="pl" x="55" y="254">0</text>
+<text class="pl" x="240" y="278" text-anchor="middle">recall</text>
+<text class="pl" x="30" y="150" transform="rotate(-90 30 150)" text-anchor="middle">precision</text>
+<polyline class="praw" points="70,55 130,60 130,95 200,80 200,130 280,120 280,175 360,165 360,225 430,220"/>
+<polyline class="penv" points="70,55 130,55 130,80 200,80 200,120 280,120 280,165 360,165 360,220 430,220 430,250 70,250"/>
+<text class="pl" x="540" y="120">AP = area under the</text>
+<text class="pl" x="540" y="142">interpolated (staircase)</text>
+<text class="pl" x="540" y="164">envelope.</text>
+<text class="ps" x="540" y="196">grey: raw measured curve</text>
+<text class="ps" x="540" y="214">blue: monotone envelope</text>
+</svg>
+<figcaption><strong>Figure 23.1.3:</strong> Average precision is the area under the precision-recall curve after the monotone interpolation that removes the small upward wiggles (grey to blue). A perfect detector traces the unit square and scores AP = 1; a random one hugs the bottom.</figcaption>
+</figure>
+
+<p>
+The function below computes AP for one class from a list of (confidence, is_true_positive) pairs and the total count of ground-truth objects. It implements the rank-accumulate-interpolate-integrate recipe directly so you can see every step.
+</p>
+
+<pre><code class="language-python">def average_precision(detections, n_ground_truth):
+    """detections: list of (confidence, is_tp) for one class, across the dataset.
+       n_ground_truth: total number of GT boxes of this class."""
+    if n_ground_truth == 0:
+        return 0.0
+    # 1. Rank by descending confidence.
+    detections = sorted(detections, key=lambda d: -d[0])
+    tp = fp = 0
+    precisions, recalls = [], []
+    for _, is_tp in detections:
+        tp += int(is_tp)
+        fp += int(not is_tp)
+        precisions.append(tp / (tp + fp))
+        recalls.append(tp / n_ground_truth)
+    # 2. Monotone envelope: precision is made non-increasing in recall (from the right).
+    for i in range(len(precisions) - 2, -1, -1):
+        precisions[i] = max(precisions[i], precisions[i + 1])
+    # 3. Integrate precision over recall (sum of rectangles between recall steps).
+    ap, prev_recall = 0.0, 0.0
+    for p, r in zip(precisions, recalls):
+        ap += p * (r - prev_recall)
+        prev_recall = r
+    return ap
+
+dets = [(0.95, 1), (0.91, 1), (0.88, 0), (0.80, 1), (0.74, 0), (0.65, 1)]
+print(round(average_precision(dets, n_ground_truth=4), 3))   # 1.0
+</code></pre>
+<div class="code-caption">Average precision for a single class from ranked detections. With 4 true positives among 6 detections and the high-confidence ones all correct, the interpolated envelope fills the unit square and AP reaches 1.0.</div>
+
+<h2>5. Mean Average Precision and the COCO Protocol <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+<strong>Mean average precision</strong> (mAP) is simply the AP averaged over all classes. That is the headline number every detector reports, but the details of how it is computed matter enormously when you compare papers, so pin them down. The older PASCAL VOC protocol (see the <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">classical recognition pipelines</a> of Chapter 16 for the lineage) computes AP at a single IoU threshold of $0.50$ and means over the 20 VOC classes. The modern COCO protocol is stricter and is the one you will see almost everywhere today: it computes AP at ten IoU thresholds from $0.50$ to $0.95$ in steps of $0.05$ and averages those too, then means over 80 classes. The COCO headline number written "mAP" or "AP" is this $\text{AP}@[0.50{:}0.95]$, and it punishes loose localization far more than VOC's single lenient threshold does.
+</p>
+
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 23.1.1:</strong> <em>The two dominant mAP protocols and what each reported number means.</em></div>
+<table>
+<thead>
+<tr>
+<th scope="col">Name</th>
+<th scope="col">IoU thresholds averaged</th>
+<th scope="col">Classes</th>
+<th scope="col">Notes</th>
+</tr>
+</thead>
+<tr>
+<td>VOC mAP</td>
+<td>single, 0.50</td>
+<td>20</td>
+<td>Lenient on localization; older papers.</td>
+</tr>
+<tr>
+<td>COCO AP (mAP)</td>
+<td>0.50 to 0.95 step 0.05 (ten values)</td>
+<td>80</td>
+<td>The default headline metric today.</td>
+</tr>
+<tr>
+<td>COCO AP50 / AP75</td>
+<td>single, 0.50 / single, 0.75</td>
+<td>80</td>
+<td>Reported alongside for detail.</td>
+</tr>
+<tr>
+<td>COCO APs / APm / APl</td>
+<td>0.50 to 0.95, by object size</td>
+<td>80</td>
+<td>Small / medium / large object breakdown.</td>
+</tr>
+</table>
+</div>
+
+<p>
+The size-stratified numbers (APs for small, APm for medium, APl for large objects) deserve a moment, because they reveal the single most consistent weakness of detectors: small objects score far lower than large ones, since a few-pixel box is hard to localize within $0.05$ IoU steps. When a vendor advertises a high overall mAP, asking for the APs is the fastest way to learn whether the model will work on the distant pedestrians or tiny defects you actually care about. Table 23.1.1 is the legend you should keep beside any detection benchmark.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Don't Hand-Roll mAP for Real Evaluation</div>
+<p>The from-scratch AP above is for understanding. For a real benchmark, use the reference implementation so your numbers are comparable to published ones. The <code>pycocotools</code> package computes the full COCO suite from your predictions in JSON:</p>
+<pre><code class="language-python">from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+coco_gt = COCO("instances_val.json")          # ground-truth annotations
+coco_dt = coco_gt.loadRes("predictions.json") # your detections, COCO JSON format
+ev = COCOeval(coco_gt, coco_dt, iouType="bbox")
+ev.evaluate(); ev.accumulate(); ev.summarize()  # prints AP, AP50, AP75, APs/m/l
+</code></pre>
+<p>Roughly 200 lines of careful matching, interpolation, per-size bucketing, and edge-case handling collapse into five lines. The library handles the cross-image ranking, the ten IoU thresholds, the 100-detection cap per image, and the crowd-annotation rules that the COCO leaderboard enforces, all of which a hand-rolled evaluator gets subtly wrong. The <code>torchmetrics.detection.MeanAveragePrecision</code> class wraps the same computation for use inside a PyTorch validation loop.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Is mAP Still the Right Yardstick?</div>
+<p>Even as detectors saturate COCO mAP (the best DINO-family and co-detection models pushed past 63 AP by 2023 to 2024), researchers increasingly argue the metric hides what matters for deployment. Localization-Recall-Precision (LRP) error and the Optimal Correction (oLRP) metric proposed by Oksuz et al. give a more interpretable decomposition into localization, false-positive, and false-negative components than a single AP. For safety-critical use, calibration of the confidence score (does a 0.9 box really succeed 90 percent of the time?) is now studied as seriously as ranking quality, since a detector can have excellent mAP yet wildly miscalibrated confidences. And the rise of open-vocabulary detectors such as Grounding DINO (2024) and YOLO-World forces new protocols entirely, because the class list is no longer fixed at evaluation time. Expect "mAP" to remain the headline through 2026, but to be reported alongside calibration and per-size error in any careful study.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The COCO dataset is named "Common Objects in Context", and the "in context" is not marketing. Its annotators were instructed to label objects in natural, cluttered scenes rather than the centered, iconic single-object photos that earlier datasets favored. That is precisely why COCO mAP is so much harder than ImageNet classification: the dataset deliberately contains the crowded, occluded, oddly-cropped objects that a real camera sees, including a famous abundance of people, chairs, and cups that anchor the small-object problem.</p>
+</div>
+
+<h2>6. Putting It Together: A Tiny End-to-End Evaluation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To make the matching rule concrete, the snippet below evaluates a handful of predictions against ground truth for one class on one image, labeling each prediction TP or FP, then feeds the result to our <code>average_precision</code> function. This is the inner loop that the COCO evaluator runs millions of times, written plainly.
+</p>
+
+<pre><code class="language-python">def match_predictions(preds, gts, iou_thresh=0.5):
+    """preds: list of (confidence, box). gts: list of box. Returns (conf, is_tp) list."""
+    preds = sorted(preds, key=lambda p: -p[0])   # highest confidence first
+    claimed = [False] * len(gts)
+    results = []
+    for conf, pbox in preds:
+        best_iou, best_j = 0.0, -1
+        for j, gbox in enumerate(gts):
+            ov = iou(pbox, gbox)
+            if ov > best_iou:
+                best_iou, best_j = ov, j
+        if best_iou >= iou_thresh and not claimed[best_j]:
+            claimed[best_j] = True          # this GT is now taken
+            results.append((conf, 1))       # true positive
+        else:
+            results.append((conf, 0))       # false positive (low IoU or duplicate)
+    return results
+
+gts = [[60, 60, 260, 210], [300, 300, 420, 420]]
+preds = [(0.92, [62, 64, 258, 205]),   # good overlap with GT 0 -> TP
+         (0.85, [70, 70, 250, 200]),   # duplicate of GT 0 -> FP (already claimed)
+         (0.60, [305, 305, 418, 418])] # good overlap with GT 1 -> TP
+matched = match_predictions(preds, gts)
+print(matched)                                   # [(0.92, 1), (0.85, 0), (0.60, 1)]
+print(round(average_precision(matched, len(gts)), 3))  # 1.0
+</code></pre>
+<div class="code-caption">End-to-end matching and scoring for one class. The middle prediction is a near-duplicate of the first; the "already claimed" rule correctly marks it a false positive, exactly the duplicate-suppression problem that non-maximum suppression and DETR's set loss exist to handle upstream.</div>
+
+<p>
+That duplicate false positive is a preview of the chapter's central engineering problem. Dense detectors emit many overlapping boxes per object, and the evaluation rule above punishes every extra one. The two-stage and one-stage families in the next sections solve it with a post-processing step called non-maximum suppression; DETR in <a href="section-23.5.html">Section 23.5</a> solves it by predicting a clean set in the first place. Either way, the metric you just built is the judge that forces the issue.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.1: Why Single-Threshold mAP Misleads <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Two detectors, X and Y, both score VOC mAP@0.50 of 0.80. On the COCO protocol, X scores AP@[0.50:0.95] of 0.55 and Y scores 0.40. In two or three sentences, explain what this difference tells you about how the two detectors localize, which one you would trust for a task requiring tight boxes (say, measuring an object's size from its box), and why the single VOC threshold hid the gap.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.2: A Vectorized IoU Matrix <span class="exercise-type coding">Coding</span></div>
+<p>The pairwise <code>iou</code> function loops over boxes one at a time, which is too slow for the thousands of boxes a detector produces. Write <code>iou_matrix(boxes_a, boxes_b)</code> that takes two arrays of shape <code>(M, 4)</code> and <code>(N, 4)</code> in corner format and returns an <code>(M, N)</code> matrix of all pairwise IoUs using NumPy broadcasting, with no Python loop over box pairs. Verify it against the scalar <code>iou</code> on a few pairs. This matrix is the workhorse inside non-maximum suppression and inside the matching loop of every evaluator.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 23.1.3: The Effect of a Confidence Floor on the PR Curve <span class="exercise-type analysis">Analysis</span></div>
+<p>Take the <code>average_precision</code> function and a fixed set of ranked detections for one class. Re-run it after discarding all detections below a confidence floor of 0.3, then 0.5, then 0.7. Plot AP and the maximum achievable recall as a function of the floor. Explain why a high floor can leave AP almost unchanged while sharply capping recall, and connect this to the warehouse-camera story in subsection 3: which quantity did that team actually need to control, and would raising the confidence floor have fixed their problem?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 23 Index</a>
+<a href="index.html">Chapter 23</a>
+<a class="next" href="section-23.2.html">Section 23.2: Two-Stage Detectors: The R-CNN Family &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

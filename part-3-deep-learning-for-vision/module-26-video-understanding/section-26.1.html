@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.1: From Frames to Clips. The structure of video tensors, temporal redundancy as both cost and opportunity, frame sampling strategies, and decoding clips into 5D tensors with current PyTorch tooling." name="description"/>
+<title>Section 26.1: From Frames to Clips: The Temporal Dimension | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Deep Learning for Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Video Understanding</a></div>
+<h1>From Frames to Clips: The Temporal Dimension</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Thirty frames a second, and twenty-nine of them are nearly identical to the one before. I used to find that insulting. Then I realized it was the only reason I could afford to watch at all."</p>
+<cite>A Video Decoder Making Peace With Redundancy</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A video adds one axis to the image tensor, and that single axis changes everything: it multiplies the data by a hundredfold, fills it with redundancy, and hides in its differences the only signal that distinguishes one action from another.</strong> Before we can build a single video network we have to decide how to turn a long, heavy, repetitive stream into a small tensor a GPU can hold, without discarding the temporal structure that is the whole point. This section establishes the data foundation for the chapter: what a video tensor looks like, why its redundancy is both a tax and a gift, the sampling strategies that turn three hundred frames into sixteen, and the decoding code that produces the 5D tensors every later section consumes.</p>
+</div>
+
+<p>
+In the previous chapter you finished assembling the Vision Transformer and, with it, the full toolkit of single-image deep vision: convolutions, attention, detection, segmentation, and self-supervised backbones. Every one of those models took a tensor of shape (channels, height, width) and produced a label, a box, or a mask. Now we add time. The change is conceptually small and practically enormous, and this section is about meeting the practical part head on before the architectures of <a href="section-26.2.html">Section 26.2</a> assume it is solved. We will look at the shape of video data, the redundancy that defines its economics, the sampling choices that every video system makes whether or not its authors admit to them, and the tooling that decodes a clip into the tensor a network expects.
+</p>
+
+<h2>1. The Shape of a Video Tensor <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+An image, as you have used it since <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, is a tensor of shape $(C, H, W)$: channels, height, width. A video is the same thing repeated over time, so it gains a temporal axis $T$ and becomes a 4D tensor $(C, T, H, W)$, or with a batch dimension the 5D tensor $(N, C, T, H, W)$ that PyTorch video models expect. The ordering is a convention worth committing to memory, because half the bugs in video code are an axis in the wrong place. TorchVision puts time after channels, $(N, C, T, H, W)$; some libraries and the raw output of decoders put it before, $(N, T, C, H, W)$, the frame-stack ordering. A single <code>permute</code> separates a working pipeline from a silent disaster.
+</p>
+
+<p>
+The numbers attached to those axes are what make video expensive. A modest clip of $T = 16$ frames at $224 \times 224$ resolution with $3$ colour channels is $16 \times 3 \times 224 \times 224 \approx 2.4$ million values, sixteen times a single image. A full ten-second clip at the source frame rate of 30 frames per second is 300 frames, and the storage and compute scale linearly with $T$. This is why video models almost never see the full stream; they see a sampled clip, and the sampling is a design decision we return to in subsection 3. Figure 26.1.1 lays out the tensor and its axes.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A video as a stack of image frames forming a 5D tensor with batch, channel, time, height and width axes">
+<style>
+.vl{font:12px sans-serif;fill:#1a1a1a;}
+.vs{font:10px sans-serif;fill:#555;}
+.vframe{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.3;}
+.vframe2{fill:#dce9f8;stroke:#2c6fb5;stroke-width:1.3;}
+.vax{stroke:#d6802b;stroke-width:1.5;marker-end:url(#vah);fill:none;}
+.vlt{font:11px sans-serif;fill:#d6802b;}
+</style>
+<defs><marker id="vah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#d6802b"/></marker></defs>
+<text class="vl" x="360" y="22" text-anchor="middle">One clip: a stack of T frames, each a (C, H, W) image</text>
+<rect class="vframe2" x="60" y="70" width="100" height="100"/>
+<rect class="vframe2" x="80" y="58" width="100" height="100"/>
+<rect class="vframe2" x="100" y="46" width="100" height="100"/>
+<rect class="vframe" x="120" y="34" width="100" height="100"/>
+<text class="vs" x="170" y="86" text-anchor="middle">frame t</text>
+<text class="vs" x="170" y="100" text-anchor="middle">H x W</text>
+<text class="vs" x="170" y="114" text-anchor="middle">3 channels</text>
+<line class="vax" x1="60" y1="200" x2="240" y2="120"/>
+<text class="vlt" x="250" y="118">time T</text>
+<line class="vax" x1="40" y1="180" x2="40" y2="46"/>
+<text class="vlt" x="14" y="120" transform="rotate(-90 14 120)">height H</text>
+<line class="vax" x1="120" y1="186" x2="230" y2="186"/>
+<text class="vlt" x="175" y="202" text-anchor="middle">width W</text>
+<rect x="420" y="60" width="250" height="150" fill="#f7f7f7" stroke="#ccc" stroke-width="1"/>
+<text class="vl" x="545" y="84" text-anchor="middle">PyTorch shape</text>
+<text class="vl" x="545" y="112" text-anchor="middle" style="font-family:monospace;">(N, C, T, H, W)</text>
+<text class="vs" x="545" y="138" text-anchor="middle">N = clips in batch</text>
+<text class="vs" x="545" y="156" text-anchor="middle">C = 3 (RGB)</text>
+<text class="vs" x="545" y="174" text-anchor="middle">T = frames per clip</text>
+<text class="vs" x="545" y="192" text-anchor="middle">H, W = spatial size</text>
+</svg>
+<figcaption><strong>Figure 26.1.1:</strong> A video clip is a stack of $T$ image frames, giving a 4D tensor $(C, T, H, W)$ per clip and a 5D tensor $(N, C, T, H, W)$ per batch. The temporal axis $T$ is the only structural difference from the single-image tensors of Part III, but it multiplies memory and compute by $T$ and is where all motion information lives.</figcaption>
+</figure>
+
+<p>
+The code below builds a synthetic clip tensor and demonstrates the two common axis orderings and the permute that converts between them. Run it and read the printed shapes against the figure to fix the convention in your mind.
+</p>
+
+<pre><code class="language-python">import torch
+
+# A batch of 2 clips, 16 frames each, RGB, 224x224.
+N, C, T, H, W = 2, 3, 16, 224, 224
+
+# Decoders usually hand you frame-stack order first: (N, T, C, H, W).
+clip_frame_stack = torch.rand(N, T, C, H, W)
+print("frame-stack order:", clip_frame_stack.shape)  # torch.Size([2, 16, 3, 224, 224])
+
+# TorchVision video models want channel-then-time: (N, C, T, H, W).
+clip_cttw = clip_frame_stack.permute(0, 2, 1, 3, 4).contiguous()
+print("model-ready order:", clip_cttw.shape)          # torch.Size([2, 3, 16, 224, 224])
+
+# How much memory does one clip occupy as float32?
+bytes_per_clip = C * T * H * W * 4
+print(f"one clip = {bytes_per_clip / 1e6:.1f} MB float32")  # one clip = 9.6 MB float32</code></pre>
+<div class="code-caption">The 5D video tensor and the permute between frame-stack order and TorchVision's channel-then-time order. The printed 9.6 MB is per clip; a batch of 32 such clips is over 300 MB before a single network activation, which is why clip length and batch size are always in tension.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Temporal Axis Is Where the Meaning Hides</div>
+<p>If you average a clip over time you get a single blurry image, and a surprising number of actions survive that destruction: you can still tell "playing guitar" from "swimming" because the appearance differs. But "opening a door" and "closing a door", "sitting down" and "standing up", "pushing" and "pulling" are indistinguishable in any single frame and in the time-average; only the ordered sequence of frames separates them. This is the entire reason video understanding is a distinct field rather than image classification applied frame by frame. A model that does not read the temporal axis is, for these actions, guessing.</p>
+</div>
+
+<h2>2. Redundancy: The Tax and the Gift <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The defining property of natural video is temporal redundancy. At 30 frames per second, consecutive frames are almost identical; the camera and the world both move slowly relative to the frame interval, so frame $t+1$ is mostly a small perturbation of frame $t$. This is why video compresses so well: the H.264 and H.265 codecs store a few full keyframes and encode everything in between as motion-compensated differences, which is also why decoding is not free, as we will see in subsection 4. The redundancy is a tax, because most of the frames you decode carry little new information, and it is simultaneously a gift, because it means you can throw most of them away and lose almost nothing.
+</p>
+
+<p>
+We can quantify the redundancy directly. The mean absolute difference between adjacent frames is small and the difference between distant frames is large; the signal grows roughly with temporal separation. The code below measures this on a synthetic moving pattern, but the same trend holds for any real clip and is the empirical justification for the sparse sampling of subsection 3.
+</p>
+
+<pre><code class="language-python">import torch
+
+# Synthesize a clip where a bright square drifts across a dark canvas:
+# slow drift means high redundancy between nearby frames.
+T, H, W = 64, 64, 64
+clip = torch.zeros(T, H, W)
+for t in range(T):
+    cx = 8 + t // 2          # square moves 1 pixel every 2 frames
+    clip[t, 20:36, cx:cx + 16] = 1.0
+
+# Mean absolute difference as a function of temporal gap.
+for gap in (1, 2, 8, 32):
+    diff = (clip[gap:] - clip[:-gap]).abs().mean().item()
+    print(f"gap={gap:2d} frames -> mean abs diff = {diff:.4f}")
+
+# gap= 1 frames -> mean abs diff = 0.0039
+# gap= 2 frames -> mean abs diff = 0.0078
+# gap= 8 frames -> mean abs diff = 0.0307
+# gap=32 frames -> mean abs diff = 0.1147</code></pre>
+<div class="code-caption">Frame-to-frame change grows with temporal gap. Adjacent frames differ by a fraction of a percent here, so sampling every frame wastes compute on near-duplicates; a wider gap carries more information per frame, which is exactly the trade sparse sampling exploits.</div>
+
+<p>
+This measurement explains a recurring theme: video is forgiving of frame loss in a way that audio or a single image is not. Drop every other frame and a human, or a network, still reads the action perfectly. That tolerance is what makes the aggressive sampling and the extreme masking ratios of <a href="section-26.3.html">Section 26.3</a> possible. It is also the reason the two-stream networks of <a href="section-26.2.html">Section 26.2</a> can afford to compute expensive optical flow on only a handful of frames: the motion field changes slowly enough that a sparse set of flow estimates captures most of the dynamics.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "wagon-wheel effect", where a spinning wheel in a film appears to rotate backward or stand still, is temporal aliasing: the wheel completes nearly a full spoke-rotation between frames, so the sampling rate is too low to capture the true motion and the brain reconstructs a slower or reversed one. It is the exact temporal analogue of the spatial aliasing you met with the sampling theorem in <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Video sampling has a Nyquist limit just as image sampling does, and a model that sees too few frames per second can be fooled in precisely the same way.</p>
+</div>
+
+<h2>3. Frame Sampling Strategies <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Given a long video and a fixed budget of $T$ frames, how do you choose which frames to keep? This is the sampling problem, and the three dominant answers each encode a different assumption about where the relevant motion lives. <strong>Dense sampling</strong> takes $T$ consecutive frames from a short window, capturing fine-grained motion but only a fraction of a second of context, which suits brief actions like a golf swing. <strong>Uniform sampling</strong> spreads $T$ frames evenly across the whole video, covering the full duration at the cost of temporal resolution, which suits long actions whose phases unfold over seconds. <strong>Segment-based sampling</strong>, introduced by the Temporal Segment Network, splits the video into $T$ equal segments and draws one random frame from each; this combines full coverage with the stochasticity that acts as data augmentation during training.
+</p>
+
+<p>
+The choice interacts with the architecture. A SlowFast network (<a href="section-26.2.html">Section 26.2</a>) deliberately samples one pathway densely and the other sparsely, so it needs both. A video transformer with a fixed token budget almost always samples uniformly. The implementation below produces all three index sets so you can see how few frames each keeps from a 300-frame clip.
+</p>
+
+<pre><code class="language-python">import torch
+
+def dense_indices(num_frames, clip_len, stride=1, start=0):
+    """T consecutive frames (with optional stride) from one window."""
+    idx = torch.arange(start, start + clip_len * stride, stride)
+    return idx.clamp(max=num_frames - 1)
+
+def uniform_indices(num_frames, clip_len):
+    """T frames spread evenly across the whole video."""
+    return torch.linspace(0, num_frames - 1, clip_len).round().long()
+
+def segment_indices(num_frames, clip_len, train=True):
+    """Temporal Segment Network: one frame per equal segment."""
+    bounds = torch.linspace(0, num_frames, clip_len + 1).long()
+    out = []
+    for i in range(clip_len):
+        lo, hi = bounds[i].item(), max(bounds[i + 1].item(), bounds[i].item() + 1)
+        # random frame within the segment during training, center at test time
+        pick = torch.randint(lo, hi, (1,)).item() if train else (lo + hi) // 2
+        out.append(pick)
+    return torch.tensor(out).clamp(max=num_frames - 1)
+
+NUM, CLIP = 300, 8
+print("dense  :", dense_indices(NUM, CLIP, stride=2).tolist())
+print("uniform:", uniform_indices(NUM, CLIP).tolist())
+print("segment:", segment_indices(NUM, CLIP, train=True).tolist())
+
+# dense  : [0, 2, 4, 6, 8, 10, 12, 14]
+# uniform: [0, 43, 86, 128, 171, 214, 257, 299]
+# segment: [22, 49, 99, 141, 169, 226, 251, 284]</code></pre>
+<div class="code-caption">Three frame-sampling strategies reducing a 300-frame video to 8 indices. Dense stays in one short window, uniform spans the whole clip at coarse resolution, and segment sampling adds per-segment randomness that doubles as augmentation. The architecture and action duration decide which is right.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When the Wrong Sampler Hid the Action</div>
+<p><strong>Who:</strong> a three-person team at a sports-analytics startup building a model to flag rule violations in recorded basketball games, 2024. <strong>Situation:</strong> they fine-tuned a pretrained action recognizer and reached strong accuracy on coarse labels like "dribbling" and "shooting". <strong>Problem:</strong> the model was nearly useless on the violations they actually cared about, like the "travelling" call, which hinges on a foot movement that takes barely a third of a second. Their pipeline used uniform sampling of 8 frames across each 5-second clip, so the two or three frames that contained the violation were almost never selected. <strong>Decision:</strong> they switched to a dense sampler centered on the moment the ball-handler stopped, detected with a cheap per-frame pose heuristic, and increased the clip length to 32 frames at the native frame rate. <strong>Result:</strong> recall on travelling violations rose from near chance to usable, with no change to the network at all. <strong>Lesson:</strong> sampling is not a preprocessing detail you can ignore; for fine-grained, brief actions the frames you choose to look at matter more than the architecture that looks at them. When a video model fails, suspect the sampler before you suspect the network.</p>
+</div>
+
+<h2>4. Decoding Clips Into Tensors <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The last practical hurdle is decoding: turning a compressed video file into the frame tensors the sampler indexes. Because codecs store most frames as differences from earlier ones, you cannot in general jump to an arbitrary frame without decoding from the nearest keyframe forward, which makes random frame access surprisingly expensive. TorchVision exposes two interfaces. The simple <code>read_video</code> reads an entire clip (or a time range) into memory at once; the streaming <code>VideoReader</code> seeks and yields frames one at a time, which is far more memory-efficient for long videos where you only want a handful of frames. The code below uses the streaming reader to apply uniform sampling without ever holding the whole video in memory.
+</p>
+
+<pre><code class="language-python">import torch
+from torchvision.io import VideoReader
+
+def load_clip(path, clip_len=16):
+    """Uniformly sample clip_len frames from a video into a (C, T, H, W) tensor."""
+    reader = VideoReader(path, "video")
+    meta = reader.get_metadata()["video"]
+    duration = meta["duration"][0]          # seconds
+    fps = meta["fps"][0]
+    num_frames = int(duration * fps)
+
+    # timestamps (in seconds) of the frames we want
+    targets = torch.linspace(0, duration * (1 - 1e-3), clip_len).tolist()
+
+    frames = []
+    for t in targets:
+        reader.seek(t)                      # jump to nearest decodable frame
+        frame = next(reader)["data"]        # uint8 tensor (C, H, W)
+        frames.append(frame)
+
+    clip = torch.stack(frames, dim=1)       # (C, T, H, W)
+    return clip.float() / 255.0             # scale to [0, 1]
+
+# clip = load_clip("game.mp4", clip_len=16)
+# print(clip.shape)  ->  torch.Size([3, 16, 224, 224])  (after a resize transform)</code></pre>
+<div class="code-caption">Memory-efficient clip loading with TorchVision's streaming <code>VideoReader</code>: seek to each target timestamp, decode a single frame, and stack into a $(C, T, H, W)$ tensor. The streaming reader avoids materializing the full video, the key difference from <code>read_video</code> on long files.</div>
+
+<p>
+In a real training loop you would wrap this in a <code>Dataset</code>, add a spatial resize and the per-channel normalization from <a href="../module-21-training-recipes/index.html">Chapter 21</a>, and let the <code>DataLoader</code> batch clips into the 5D tensor of subsection 1. The normalization statistics are the same idea you first met as the histogram-based intensity statistics of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, now computed once over a video dataset and applied per channel. The one new wrinkle is that augmentations must be applied consistently across all frames of a clip; a random crop or flip chosen per frame would destroy the temporal coherence the model is trying to learn.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Decoding, Sampling, and Transforms in a Few Lines</div>
+<p>The hand-rolled loader above exists so you understand seeking and stacking. PyTorchVideo packages the whole pipeline, decoding, clip sampling, and clip-consistent transforms, into a labeled-video dataset that produces ready-to-train batches in roughly a dozen lines instead of the hundred a from-scratch dataset would need:</p>
+<pre><code class="language-python">from pytorchvideo.data import labeled_video_dataset, make_clip_sampler
+from pytorchvideo.transforms import ApplyTransformToKey, UniformTemporalSubsample
+from torchvision.transforms import Compose, Lambda, Resize
+
+transform = ApplyTransformToKey(
+    key="video",
+    transform=Compose([
+        UniformTemporalSubsample(16),       # 16 frames per clip
+        Lambda(lambda x: x / 255.0),
+        Resize((224, 224)),
+    ]),
+)
+dataset = labeled_video_dataset(
+    data_path="kinetics/train.csv",
+    clip_sampler=make_clip_sampler("random", clip_duration=2.0),  # 2-second clips
+    transform=transform,
+    decode_audio=False,
+)
+# next(iter(dataset))["video"].shape  ->  (3, 16, 224, 224)</code></pre>
+<p>The library handles codec seeking, keyframe-aware decoding, clip sampling, clip-consistent transforms, and multiprocessing decode workers, all of which are easy to get subtly wrong by hand and all of which matter for throughput when you are decoding thousands of clips per epoch.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Decoding Is the Hidden Bottleneck</div>
+<p>As video models grew, the decode step, not the GPU, became the throughput bottleneck for many training runs, because CPU video decoding cannot keep a modern GPU fed. NVIDIA's DALI and the NVDEC hardware decoder move decoding onto the GPU itself, and the 2023 to 2025 <code>torchcodec</code> project (the successor to TorchVision's decoding stack) exposes a clean tensor API over hardware-accelerated FFmpeg decoding, with frame-exact seeking that the older readers approximate. A parallel line of work sidesteps decoding entirely by training directly on the compressed-domain motion vectors and residuals that the codec already stores (the CoViAR line of work and its 2024 successors), reusing the codec's motion estimate as a nearly-free optical-flow surrogate. Whether models learn to consume compressed video natively, rather than decoding to pixels first, is an open and very practical question for anyone training at scale.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.1: Why Time Comes After Channels <span class="exercise-type conceptual">Conceptual</span></div>
+<p>TorchVision uses $(N, C, T, H, W)$ while a raw frame stack from a decoder is naturally $(N, T, C, H, W)$. A 3D convolution slides a kernel over the last three axes. Explain in two or three sentences why placing $T$ alongside $H$ and $W$ (as the last three axes) is exactly what lets a single 3D convolution treat time as just another spatial-like dimension, and what would go wrong if you fed a network the frame-stack ordering without permuting. Connect your answer to the role of the channel axis in the 2D convolutions of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.2: Measure Real Redundancy <span class="exercise-type coding">Coding</span></div>
+<p>Take any short video file (or generate one with a slowly moving shape as in subsection 2). Decode all of its frames, then reproduce the mean-absolute-difference-versus-gap measurement for gaps of 1, 4, 16, and 64 frames. Plot the curve. Now repeat the experiment on a clip with a hard scene cut in the middle and explain how the cut appears in the difference signal. Use the result to argue, in one paragraph, for a sampling rate: at what gap does the per-frame information stop being negligible for your clip?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 26.1.3: Sampler Coverage Analysis <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the three sampler functions from subsection 3, compute for a 300-frame video the total temporal span covered (last index minus first) and the average gap between consecutive sampled frames for each strategy at $T = 8$ and $T = 32$. Tabulate the results. Then argue which sampler you would choose for (a) recognizing a 0.3-second hand gesture, (b) classifying a 20-second cooking activity, and (c) training with limited data where augmentation matters, justifying each choice from your coverage and gap numbers rather than intuition alone.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 26 Index</a>
+<a href="index.html">Chapter 26</a>
+<a class="next" href="section-26.2.html">Section 26.2: Action Recognition: 3D CNNs &amp; Two-Stream Networks &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.3: DCGAN to StyleGAN: The Architecture Lineage. DCGAN's stabilizing convolutional recipe, progressive growing for high resolution, and StyleGAN's style-based generator with its mapping network, adaptive instance normalization, per-layer noise, and disentangled W latent." name="description"/>
+<title>Section 32.3: DCGAN to StyleGAN | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Generative Adversarial Networks</a></div>
+<h1>Section 32.3: DCGAN to StyleGAN: The Architecture Lineage</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me a knob for every layer. One for the face shape, one for the hair, one for whether it is raining behind me. I did not ask for this much responsibility, but I will admit the portraits are spectacular."</p>
+<cite>A Style Vector With Too Many Dials</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The leap from grainy 64-pixel digits to indistinguishable megapixel faces was not one breakthrough but a lineage of architectural ideas, each fixing the bottleneck the previous one exposed.</strong> This section walks that lineage. DCGAN found the convolutional recipe that made GAN training reliable at all. Progressive growing solved the high-resolution instability by training coarse-to-fine. StyleGAN then rethought the generator itself, injecting a learned style vector at every layer through adaptive normalization, separating the random latent from the controllable style, and producing the disentangled W space that turned a generator into an editing instrument. Reading the lineage teaches you not just what works but why each piece was needed.</p>
+</div>
+
+<p>
+In <a href="section-32.1.html">Section 32.1</a> we built a GAN from fully-connected layers, and noted its samples were rough. In <a href="section-32.2.html">Section 32.2</a> we made training stable. This section is about capacity and control: how the generator's architecture evolved to produce high-resolution, high-fidelity images that you can also steer. The story spans roughly 2015 to 2020 and three landmark papers, and it is one of the clearest examples in deep learning of architecture, not just optimization, driving a capability jump.
+</p>
+
+<h2>1. DCGAN: The Recipe That Made GANs Trainable <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The Deep Convolutional GAN (Radford et al., 2016) was less a new idea than a hard-won set of architectural rules that turned the temperamental original GAN into something a practitioner could reliably train. Its recipe is worth memorizing because variants of it underlie almost every convolutional GAN since. The generator is an all-convolutional network that upsamples a latent vector to an image; the discriminator mirrors it, downsampling an image to a score. The DCGAN rules are:
+</p>
+
+<ul>
+<li>Replace pooling with <strong>strided convolutions</strong> in the discriminator and <strong>transposed (fractionally-strided) convolutions</strong> in the generator, so both up- and downsampling are learned. These are the same transposed convolutions you used to upsample in the VAE decoder of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>.</li>
+<li>Use <strong>batch normalization</strong> in both networks (except the generator's output layer and the discriminator's input layer), which keeps activations well-scaled and was essential for deep stacks at the time.</li>
+<li>Remove fully-connected hidden layers; the architecture is convolutional end to end.</li>
+<li>Use <strong>ReLU</strong> in the generator (with <code>Tanh</code> at the output) and <strong>LeakyReLU</strong> in the discriminator, so the discriminator never fully zeroes a gradient.</li>
+</ul>
+
+<p>
+Here is a compact DCGAN generator for $64 \times 64$ RGB images, exactly the structure used to produce the famous DCGAN bedroom and face samples.
+</p>
+
+<pre><code class="language-python">import torch.nn as nn
+
+class DCGANGenerator(nn.Module):
+    def __init__(self, latent_dim=100, ngf=64, channels=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            # project the latent vector to a 4x4 feature map, then upsample x2 four times
+            nn.ConvTranspose2d(latent_dim, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8), nn.ReLU(True),               # 4x4
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 4), nn.ReLU(True),               # 8x8
+            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf * 2), nn.ReLU(True),               # 16x16
+            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(ngf), nn.ReLU(True),                   # 32x32
+            nn.ConvTranspose2d(ngf, channels, 4, 2, 1, bias=False),
+            nn.Tanh(),                                            # 64x64, output in [-1, 1]
+        )
+
+    def forward(self, z):                  # z shape: (batch, latent_dim, 1, 1)
+        return self.net(z)</code></pre>
+<div class="code-caption">A DCGAN generator: a stack of transposed convolutions doubling the spatial size at each step, with batch norm and ReLU between them, ending in <code>Tanh</code>. The discriminator is its mirror image with strided convolutions and LeakyReLU.</div>
+
+<p>
+DCGAN also gave the field its first vivid demonstration that the latent space is structured. Averaging the latent codes of "man with glasses" minus "man without glasses" plus "woman without glasses" decodes to a woman with glasses, the latent-arithmetic result that proved the generator had learned semantically meaningful directions. We exploit exactly this structure for editing in <a href="section-32.5.html">Section 32.5</a>.
+</p>
+
+<h2>2. Progressive Growing: Coarse to Fine <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+DCGAN topped out around $64 \times 64$. Pushing to $1024 \times 1024$ directly was unstable: a high-resolution discriminator can tell real from fake too easily on fine detail, and the generator cannot learn global structure and fine texture simultaneously from scratch. Progressive Growing of GANs (Karras et al., 2018) solved this with a training schedule rather than a new loss. Training begins at $4 \times 4$ with a tiny generator and discriminator. Once that stabilizes, a new layer is <em>faded in</em> to double the resolution, on both networks at once, with the new layer's contribution blended in gradually so the existing weights are not shocked. The process repeats up to the target resolution.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Progressive growing schedule: training starts with a generator and discriminator operating at 4 by 4, then layers are faded in to reach 8 by 8, 16 by 16, and onward to 1024 by 1024, with resolution doubling at each stage">
+  <g font-family="sans-serif" font-size="12">
+    <defs><marker id="ah323" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker></defs>
+    <!-- stages -->
+    <g>
+      <rect x="20" y="90" width="70" height="50" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+      <text x="55" y="112" text-anchor="middle">4x4</text>
+      <text x="55" y="128" text-anchor="middle" font-size="10" fill="#555">stable first</text>
+    </g>
+    <g>
+      <rect x="150" y="82" width="78" height="66" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+      <text x="189" y="110" text-anchor="middle">8x8</text>
+      <text x="189" y="128" text-anchor="middle" font-size="10" fill="#555">fade in</text>
+    </g>
+    <g>
+      <rect x="290" y="72" width="92" height="86" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+      <text x="336" y="110" text-anchor="middle">16x16</text>
+    </g>
+    <g>
+      <rect x="442" y="58" width="110" height="114" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+      <text x="497" y="112" text-anchor="middle">...</text>
+    </g>
+    <g>
+      <rect x="610" y="36" width="150" height="160" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+      <text x="685" y="112" text-anchor="middle">1024x1024</text>
+      <text x="685" y="132" text-anchor="middle" font-size="10" fill="#555">final faces</text>
+    </g>
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah323)">
+      <path d="M90,115 L148,115"/>
+      <path d="M228,115 L288,115"/>
+      <path d="M382,115 L440,115"/>
+      <path d="M552,115 L608,115"/>
+    </g>
+    <text x="400" y="220" text-anchor="middle" font-size="11" fill="#555">add a layer, fade it in, double the resolution, repeat</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.3.1:</strong> Progressive growing. Training begins at $4 \times 4$ and adds a new layer pair to both networks each time resolution doubles, fading each new layer in smoothly. The generator masters global structure at low resolution before it ever has to render fine texture, which is what makes megapixel training stable.</figcaption>
+</figure>
+
+<p>
+Progressive growing also introduced two small tricks that survived into later models: <strong>minibatch standard deviation</strong>, an extra discriminator feature that reports the variation across a batch so the discriminator can directly punish the low diversity of mode collapse (the diagnostic we flagged in <a href="section-32.2.html">Section 32.2</a>), and <strong>equalized learning rate</strong>, which scales weights at runtime so every layer learns at a comparable pace. The result was the first GAN to produce $1024 \times 1024$ faces convincing enough to fool casual viewers.
+</p>
+
+<h2>3. StyleGAN: Style-Based Generation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+StyleGAN (Karras et al., 2019) kept progressive growing's training stability but redesigned the generator around a single question: can we control an image at multiple scales, coarse pose separately from fine texture? Its answer reshaped the field. Three architectural changes do the work.
+</p>
+
+<p>
+<strong>A mapping network and the W space.</strong> Instead of feeding the latent $\mathbf{z}$ directly into the generator, StyleGAN first passes it through an eight-layer MLP that maps $\mathbf{z} \in Z$ to an intermediate vector $\mathbf{w} \in W$. The motivation is disentanglement: the prior $p_z$ is forced to be a fixed Gaussian, whose round shape cannot match the irregular distribution of real factors of variation, so $Z$ is necessarily entangled. The learned mapping network is free to warp $Z$ into a $W$ space whose geometry better matches the data, and empirically $W$ is far more disentangled. This is the space we will invert into in <a href="section-32.5.html">Section 32.5</a>.
+</p>
+
+<p>
+<strong>Style injection via adaptive instance normalization.</strong> The generator no longer takes a latent as its input at all. It starts from a <em>learned constant</em> $4 \times 4$ tensor, and the style vector $\mathbf{w}$ controls the image by modulating the statistics of every layer's activations. At each layer, the feature map is instance-normalized (each channel set to zero mean and unit variance per image), then rescaled and shifted by a per-channel scale and bias predicted from $\mathbf{w}$:
+</p>
+
+<p>
+$$ \mathrm{AdaIN}(\mathbf{x}_i, \mathbf{w}) \;=\; \mathbf{y}_{s,i}(\mathbf{w}) \cdot \frac{\mathbf{x}_i - \mu(\mathbf{x}_i)}{\sigma(\mathbf{x}_i)} \;+\; \mathbf{y}_{b,i}(\mathbf{w}), $$
+</p>
+
+<p>
+where $\mathbf{y}_s$ and $\mathbf{y}_b$ are affine projections of $\mathbf{w}$. Because the same $\mathbf{w}$ feeds every layer, and because early (low-resolution) layers control coarse attributes while late (high-resolution) layers control fine ones, you can mix two images by using one $\mathbf{w}$ for the coarse layers and another for the fine layers, the celebrated <strong>style mixing</strong> that copies pose from one face and skin texture from another.
+</p>
+
+<p>
+<strong>Per-layer noise for stochastic detail.</strong> Details with no semantic content (the exact placement of individual hairs, freckles, pores) are injected as explicit per-pixel Gaussian noise added at each layer, scaled by a learned per-channel factor. This frees the style vector from having to encode irreducibly random detail and is why two images with the same $\mathbf{w}$ but different noise differ only in their fine stochastic texture. Figure 32.3.2 contrasts the traditional and style-based generators.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Side by side comparison of a traditional generator that feeds the latent z directly into the first layer, versus the StyleGAN generator where z passes through a mapping network to w, which is injected via adaptive instance normalization at every layer of a stack that starts from a learned constant, with per-layer noise added at each level">
+  <g font-family="sans-serif" font-size="12">
+    <defs><marker id="ah323b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#333"/></marker></defs>
+    <!-- traditional -->
+    <text x="150" y="28" text-anchor="middle" font-weight="bold">Traditional generator</text>
+    <rect x="100" y="40" width="100" height="34" rx="5" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="150" y="62" text-anchor="middle">latent z</text>
+    <rect x="100" y="96" width="100" height="34" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="150" y="118" text-anchor="middle">layer 1</text>
+    <rect x="100" y="152" width="100" height="34" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="150" y="174" text-anchor="middle">layer 2 ...</text>
+    <rect x="100" y="208" width="100" height="34" rx="5" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="150" y="230" text-anchor="middle">image</text>
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah323b)">
+      <path d="M150,74 L150,94"/><path d="M150,130 L150,150"/><path d="M150,186 L150,206"/>
+    </g>
+    <!-- divider -->
+    <line x1="410" y1="20" x2="410" y2="300" stroke="#ccc" stroke-dasharray="5,5"/>
+    <!-- stylegan -->
+    <text x="600" y="28" text-anchor="middle" font-weight="bold">StyleGAN generator</text>
+    <rect x="470" y="40" width="80" height="32" rx="5" fill="#eef3fb" stroke="#3b6cb7"/>
+    <text x="510" y="61" text-anchor="middle">latent z</text>
+    <rect x="470" y="92" width="80" height="32" rx="5" fill="#f6e7ef" stroke="#a0356f"/>
+    <text x="510" y="113" text-anchor="middle" font-size="11">mapping &#8594; w</text>
+    <!-- synthesis stack -->
+    <rect x="610" y="60" width="90" height="30" rx="5" fill="#f0eefb" stroke="#6a4ba0"/>
+    <text x="655" y="80" text-anchor="middle" font-size="11">const 4x4</text>
+    <rect x="610" y="108" width="90" height="30" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="655" y="128" text-anchor="middle" font-size="11">AdaIN layer</text>
+    <rect x="610" y="156" width="90" height="30" rx="5" fill="#e7f6ec" stroke="#2e8b57"/>
+    <text x="655" y="176" text-anchor="middle" font-size="11">AdaIN layer</text>
+    <rect x="610" y="208" width="90" height="30" rx="5" fill="#fbf3e7" stroke="#c8862a"/>
+    <text x="655" y="228" text-anchor="middle" font-size="11">image</text>
+    <g stroke="#333" stroke-width="1.5" fill="none" marker-end="url(#ah323b)">
+      <path d="M510,72 L510,90"/>
+      <path d="M655,90 L655,106"/><path d="M655,138 L655,154"/><path d="M655,186 L655,206"/>
+    </g>
+    <!-- w injected to each layer -->
+    <g stroke="#a0356f" stroke-width="1.4" fill="none" stroke-dasharray="4,3" marker-end="url(#ah323b)">
+      <path d="M550,108 L608,123"/>
+      <path d="M550,116 L608,171"/>
+    </g>
+    <text x="560" y="150" font-size="10" fill="#a0356f">w to every layer</text>
+    <!-- noise -->
+    <g stroke="#888" stroke-width="1.2" fill="none" stroke-dasharray="2,3" marker-end="url(#ah323b)">
+      <path d="M740,123 L702,123"/><path d="M740,171 L702,171"/>
+    </g>
+    <text x="755" y="150" font-size="10" fill="#888">+ noise</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 32.3.2:</strong> Traditional versus style-based generation. The traditional generator injects the latent only at the input. StyleGAN passes $\mathbf{z}$ through a mapping network to a disentangled $\mathbf{w}$, starts synthesis from a learned constant, and injects $\mathbf{w}$ (magenta) via adaptive instance normalization at every layer, adding stochastic noise (grey) for fine detail. This per-layer, per-scale control is what makes StyleGAN editable.</figcaption>
+</figure>
+
+<p>
+A minimal style block makes the AdaIN mechanism concrete. The full StyleGAN generator stacks many of these at increasing resolution, but the core is just normalize-then-modulate.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class StyleBlock(nn.Module):
+    """One StyleGAN-style layer: conv, add noise, then AdaIN modulation from w."""
+    def __init__(self, in_ch, out_ch, w_dim=512):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.noise_scale = nn.Parameter(torch.zeros(1, out_ch, 1, 1))   # learned per-channel
+        self.to_style = nn.Linear(w_dim, out_ch * 2)                    # w -> scale and bias
+
+    def forward(self, x, w):
+        x = self.conv(x)
+        x = x + self.noise_scale * torch.randn_like(x)                  # per-pixel stochastic detail
+        x = F.instance_norm(x)                                          # zero mean, unit var per channel
+        ys, yb = self.to_style(w).chunk(2, dim=1)                       # styles from the W vector
+        return ys.unsqueeze(-1).unsqueeze(-1) * x + yb.unsqueeze(-1).unsqueeze(-1)</code></pre>
+<div class="code-caption">A single style block. The convolution produces features, learned-scale Gaussian noise adds stochastic detail, instance normalization strips the per-channel statistics, and the style vector $\mathbf{w}$ writes new statistics back through a per-channel scale and bias. This is AdaIN in code.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Where You Inject the Latent Decides What You Can Control</div>
+<p>The single most transferable lesson of StyleGAN is that the <em>point of injection</em> of the latent determines the granularity of control. Inject it once at the input and you get a black box: change the code and the whole image changes unpredictably. Inject a disentangled style at every layer and you get scale-separated control, coarse layers move pose and identity, fine layers move texture and color. This same principle, condition at every layer rather than once, reappears as cross-attention conditioning in the text-to-image diffusion models of <a href="../module-34-text-to-image/index.html">Chapter 34</a>, where the text embedding is injected into every block of the U-Net.</p>
+</div>
+
+<p>
+StyleGAN2 (Karras et al., 2020) refined this by replacing AdaIN with <strong>weight demodulation</strong> (folding the style into the convolution weights to remove characteristic "water-droplet" artifacts), dropping progressive growing in favor of a fixed skip-connection architecture, and adding <strong>path-length regularization</strong> to keep the mapping from $W$ to image smooth. StyleGAN2 is the model most GAN-inversion and editing work of <a href="section-32.5.html">Section 32.5</a> still builds on. StyleGAN3 then made the generator translation- and rotation-equivariant, removing the "texture sticking" that betrayed earlier models in video.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The "water-droplet" artifacts that StyleGAN2's weight demodulation removed were, for a while, a reliable forensic giveaway: spotting the telltale blob became a parlor trick for telling a StyleGAN1 face from a real one. The arms race is recursive. Each generation of generator erases the tells of the last, and each generation of detector hunts for the new ones. The discriminator of <a href="section-32.1.html">Section 32.1</a> never really retires; it just changes employers and starts working for the fact-checkers.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>You will almost never train StyleGAN from scratch; it takes days on multiple high-end GPUs and a carefully tuned schedule. NVIDIA's <a href="https://github.com/NVlabs/stylegan3" target="_blank" rel="noopener">stylegan3</a> repository ships the full StyleGAN2 and StyleGAN3 implementations plus pretrained weights for faces (FFHQ), animals (AFHQ), and more, behind a tiny inference API: loading a pretrained generator and sampling a face is about five lines. Generating an image is <code>img = G(z, c)</code> where <code>z</code> is a latent and <code>c</code> an optional class label; the repository handles the mapping network, the synthesis stack, the noise inputs, and the truncation trick internally, replacing the several thousand lines of the from-scratch generator above.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Synthetic Faces for a Privacy-Safe Demo</div>
+<p>A startup building a retail analytics product in 2021 needed face imagery for its marketing site and investor deck, but using photographs of real customers raised obvious consent and privacy problems, and stock-photo licenses for the volume they wanted were expensive. The solution was a pretrained StyleGAN2 trained on FFHQ: every face on the site was sampled from the generator and belonged to no real person. The team used the truncation trick (sampling $\mathbf{w}$ vectors pulled toward the mean of $W$) to trade a little diversity for higher average quality, and style mixing to control demographics roughly so the gallery looked representative. The decision saved licensing cost and sidestepped consent entirely, and it taught the team a second lesson the hard way: a handful of early samples had subtle artifacts (asymmetric earrings, a melted background) that StyleGAN2's weight demodulation reduces but does not eliminate, so a human still had to curate the final set. Synthetic data removes one problem and adds a quality-control step; it does not remove the human from the loop.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier</div>
+<p>The StyleGAN lineage did not stop in 2020. <strong>StyleGAN-XL</strong> (Sauer et al., 2022) scaled the architecture to ImageNet-class diversity by projecting onto pretrained feature spaces, and the 2023 text-to-image GANs <strong>StyleGAN-T</strong> and <strong>GigaGAN</strong> (covered in <a href="section-32.6.html">Section 32.6</a>) carried the style-based design into billion-parameter, text-conditioned territory. Meanwhile the AdaIN and style-injection idea propagated outward: it is the conceptual ancestor of the adaptive-normalization conditioning (SPADE, AdaGN) used inside diffusion U-Nets, and the demonstration that a disentangled intermediate latent enables editing directly motivated the latent-manipulation methods that now operate on diffusion models in <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.3.1 <span class="exercise-type">Conceptual</span></div>
+<p>StyleGAN argues that the latent space $Z$ is necessarily entangled because the prior is a fixed Gaussian, and that the learned mapping network produces a more disentangled $W$. Explain in your own words why a fixed round Gaussian cannot match an arbitrary distribution of real factors of variation, and why a learned nonlinear map into $W$ can do better. What property of $W$ does the path-length regularization of StyleGAN2 try to preserve, and why does that property matter for editing?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.3.2 <span class="exercise-type">Coding</span></div>
+<p>Build a small StyleGAN-style generator by stacking three or four of the <code>StyleBlock</code> modules from this section, with bilinear upsampling between them, starting from a learned constant $4 \times 4$ tensor and a two-layer mapping network from $\mathbf{z}$ to $\mathbf{w}$. Train it on MNIST or FashionMNIST with the WGAN-GP setup from <a href="section-32.2.html">Section 32.2</a>. Then implement style mixing: generate an image using $\mathbf{w}_A$ for the first two blocks and $\mathbf{w}_B$ for the rest, and describe which visual attributes come from which source.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 32.3.3 <span class="exercise-type">Analysis</span></div>
+<p>Load a pretrained StyleGAN2 (FFHQ) from the official repository. Sample $\mathbf{w}$ vectors, compute their mean $\bar{\mathbf{w}}$, and implement the truncation trick $\mathbf{w}' = \bar{\mathbf{w}} + \psi (\mathbf{w} - \bar{\mathbf{w}})$ for several values of $\psi \in [0, 1]$. Generate a grid for each $\psi$ and describe the diversity-versus-quality tradeoff you observe. Relate this tradeoff to the mode-coverage discussion of <a href="section-32.2.html">Section 32.2</a>: what is truncation sacrificing, and why is that sometimes a good deal?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-32.2.html">&#8592; Section 32.2: Training Pathologies</a>
+<a href="index.html">Chapter 32</a>
+<a class="next" href="section-32.4.html">Section 32.4: Conditional GANs &amp; Image-to-Image Translation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.1: Measuring Image Quality. Why generative models need distribution metrics instead of reference metrics, the Frechet Inception Distance from the Gaussian formula up, the unbiased Kernel Inception Distance, the precision-recall decomposition of fidelity versus diversity, and CLIPScore for prompt alignment, each implemented from scratch and critiqued." name="description"/>
+<title>Section 37.1: Measuring Image Quality | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Generative Vision Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Evaluation, Safety &amp; Generative Data Engines</a></div>
+<h1>Measuring Image Quality: FID, KID, Precision-Recall &amp; CLIPScore</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My critic asked for a number. I do not have a number. I have a cloud of feature vectors and the strong opinion that it overlaps yours. Round that however you like."</p>
+<cite>An Inception Feature Extractor Refusing to Commit</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Because a generated image has no reference image to compare against, generative evaluation abandons per-image error and instead measures the distance between the distribution of generated images and the distribution of real images in a learned feature space.</strong> Frechet Inception Distance fits a Gaussian to each cloud of features and measures how far apart they are; Kernel Inception Distance does the same comparison without the Gaussian assumption and with an unbiased small-sample estimator; precision and recall split the single distance into how realistic the samples are versus how much of the real variety they cover; and CLIPScore steps outside this family to ask the orthogonal question of whether an image matches the text that requested it. None of the four is sufficient alone, and this section builds each one so you understand exactly what it rewards and how it can be fooled.</p>
+</div>
+
+<p>
+In <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> you measured restoration quality with PSNR and SSIM, and in <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> you measured detection with mAP. Both share a hidden assumption: there is a correct answer to compare against. A generator producing a face that has never existed breaks that assumption completely. There is no "true" image for the model to be close to, so per-image error is meaningless. What we can ask instead is a population question: does the set of images this model produces look, statistically, like the set of real images we trained on? That reframing, from per-sample error to distribution distance, is the conceptual leap of this section, and it is the place where the histogram and statistics thread from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a> grows up into a distance between entire image distributions.
+</p>
+
+<h2>1. From Pixels to Features: Why Inception <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Comparing distributions of raw pixels is hopeless: two images of the same dog differ in millions of pixel values, and a metric in pixel space would call them wildly dissimilar. The fix, established by the Inception Score and then FID, is to compare distributions not in pixel space but in the feature space of a pretrained classifier. Run every image through a network trained on ImageNet, take the activations from a late layer (the 2048-dimensional pooling layer of Inception-v3 is the historical standard), and you get a vector that encodes semantic content (object identity, texture, layout) while discarding the pixel-level noise that does not matter. Two photos of dogs land near each other in this space; a photo and a blob of static land far apart. Those learned features are the same kind of representation you studied in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>; here we borrow them as a measuring stick rather than a backbone to fine-tune.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Real and generated images each pass through a frozen Inception network to become feature clouds, which a distribution distance then compares">
+<style>
+.fl{font:12px sans-serif;fill:#1a1a1a;}
+.fs{font:10.5px sans-serif;fill:#555;}
+.freal{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.5;}
+.fgen{fill:#fdeee3;stroke:#d6802b;stroke-width:1.5;}
+.fnet{fill:#eef0f2;stroke:#555;stroke-width:1.3;}
+.farr{stroke:#555;stroke-width:1.6;marker-end:url(#fah);fill:none;}
+</style>
+<defs>
+<marker id="fah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#555"/></marker>
+</defs>
+<rect class="freal" x="20" y="40" width="90" height="45"/>
+<text class="fl" x="65" y="67" text-anchor="middle">real images</text>
+<rect class="fgen" x="20" y="180" width="90" height="45"/>
+<text class="fl" x="65" y="207" text-anchor="middle">generated</text>
+<rect class="fnet" x="200" y="95" width="110" height="75"/>
+<text class="fl" x="255" y="128" text-anchor="middle">frozen</text>
+<text class="fl" x="255" y="146" text-anchor="middle">Inception-v3</text>
+<line class="farr" x1="112" y1="62" x2="198" y2="115"/>
+<line class="farr" x1="112" y1="202" x2="198" y2="150"/>
+<circle cx="430" cy="62" r="3" fill="#2c6fb5"/><circle cx="450" cy="72" r="3" fill="#2c6fb5"/><circle cx="442" cy="50" r="3" fill="#2c6fb5"/><circle cx="465" cy="60" r="3" fill="#2c6fb5"/>
+<ellipse cx="448" cy="62" rx="38" ry="26" fill="none" stroke="#2c6fb5" stroke-dasharray="3 3"/>
+<text class="fs" x="448" y="20" text-anchor="middle" fill="#2c6fb5">real feature cloud</text>
+<circle cx="430" cy="200" r="3" fill="#d6802b"/><circle cx="455" cy="210" r="3" fill="#d6802b"/><circle cx="440" cy="190" r="3" fill="#d6802b"/><circle cx="468" cy="198" r="3" fill="#d6802b"/>
+<ellipse cx="448" cy="200" rx="40" ry="26" fill="none" stroke="#d6802b" stroke-dasharray="3 3"/>
+<text class="fs" x="448" y="248" text-anchor="middle" fill="#d6802b">generated feature cloud</text>
+<line class="farr" x1="312" y1="120" x2="408" y2="70"/>
+<line class="farr" x1="312" y1="145" x2="408" y2="195"/>
+<rect class="fnet" x="560" y="100" width="130" height="65"/>
+<text class="fl" x="625" y="128" text-anchor="middle">distribution</text>
+<text class="fl" x="625" y="146" text-anchor="middle">distance (FID/KID)</text>
+<line class="farr" x1="490" y1="80" x2="558" y2="120"/>
+<line class="farr" x1="492" y1="190" x2="558" y2="145"/>
+</svg>
+<figcaption><strong>Figure 37.1.1:</strong> The shared skeleton of FID, KID, and precision-recall. Real and generated images are pushed through the same frozen Inception-v3 network to produce two clouds of feature vectors. Every metric in this family is then a different way of measuring how far apart the two clouds are. CLIPScore (subsection 5) departs from this picture by comparing images to text instead.</figcaption>
+</figure>
+
+<p>
+The code below extracts pooled Inception-v3 features for a batch of images, the common preprocessing step underneath everything in this section. Figure 37.1.1 is exactly what this function feeds: the two feature clouds.
+</p>
+
+<pre><code class="language-python">import torch
+import torchvision.transforms as T
+from torchvision.models import inception_v3, Inception_V3_Weights
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load Inception-v3 and strip the classifier so forward() returns the
+# 2048-dim pooled feature vector used by FID/KID/precision-recall.
+weights = Inception_V3_Weights.IMAGENET1K_V1
+net = inception_v3(weights=weights, aux_logits=True).to(device).eval()
+net.fc = torch.nn.Identity()        # replace 1000-way head with a pass-through
+
+prep = T.Compose([
+    T.Resize(342), T.CenterCrop(299),          # Inception expects 299x299
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+@torch.no_grad()
+def inception_features(images):
+    """images: list of PIL.Image -> Tensor [N, 2048] of pooled features."""
+    batch = torch.stack([prep(im.convert("RGB")) for im in images]).to(device)
+    return net(batch).cpu()          # [N, 2048]
+</code></pre>
+<div class="code-caption">Extracting 2048-dimensional Inception-v3 pooled features, the shared front end for FID, KID, and the precision-recall manifolds.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Metric Inherits the Feature Extractor's Biases</div>
+<p>Every metric in this family is only as good as the network producing the features. Inception-v3 was trained to classify ImageNet objects, so it is exquisitely sensitive to object identity and nearly blind to things ImageNet does not care about, such as fine facial geometry or the difference between two artistic styles. This is why FID computed on faces can disagree sharply with what humans see, and why the 2023 to 2025 trend (subsection 6) is to recompute these metrics on self-supervised features like DINOv2 that encode a richer notion of similarity. The number is a shadow of the feature space that casts it.</p>
+</div>
+
+<h2>2. Frechet Inception Distance <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+FID makes one modeling assumption: approximate each feature cloud as a single multivariate Gaussian, summarized by its mean vector and covariance matrix. Let the real features have mean $\mu_r$ and covariance $\Sigma_r$, and the generated features have mean $\mu_g$ and covariance $\Sigma_g$. The Frechet distance (also called the 2-Wasserstein distance) between two Gaussians has a closed form:
+</p>
+
+<div class="math-block">
+$$\text{FID} = \lVert \mu_r - \mu_g \rVert_2^2 + \operatorname{tr}\!\left(\Sigma_r + \Sigma_g - 2\left(\Sigma_r \Sigma_g\right)^{1/2}\right)$$
+</div>
+
+<p>
+The first term penalizes a shift in the average feature (the generated images are, on average, a different kind of thing). The second term penalizes a mismatch in the spread and correlation structure (the generated images vary in the wrong ways). The matrix square root $(\Sigma_r \Sigma_g)^{1/2}$ is the only awkward piece; it is a real symmetric matrix square root, computed with an eigendecomposition or, in practice, the Schur-based <code>scipy.linalg.sqrtm</code>. Lower FID is better, and a perfect generator that exactly reproduces the real feature distribution scores zero. The implementation is a direct transcription of the formula.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy import linalg
+
+def frechet_distance(feat_real, feat_gen):
+    """feat_real, feat_gen: numpy arrays [N, D] of Inception features."""
+    mu_r, mu_g = feat_real.mean(0), feat_gen.mean(0)
+    # rowvar=False: each row is a sample, each column a feature dimension.
+    sig_r = np.cov(feat_real, rowvar=False)
+    sig_g = np.cov(feat_gen,  rowvar=False)
+
+    diff = mu_r - mu_g
+    covmean, _ = linalg.sqrtm(sig_r @ sig_g, disp=False)   # matrix square root
+    if np.iscomplexobj(covmean):        # tiny imaginary parts from numerics
+        covmean = covmean.real
+    return float(diff @ diff + np.trace(sig_r + sig_g - 2 * covmean))
+
+# Usage with the feature extractor from subsection 1:
+# fr = inception_features(real_images).numpy()
+# fg = inception_features(gen_images).numpy()
+# print(f"FID = {frechet_distance(fr, fg):.2f}")   # e.g. FID = 18.43
+</code></pre>
+<div class="code-caption">Frechet Inception Distance implemented directly from the closed-form Gaussian distance, including the matrix-square-root term and the numerical guard against tiny imaginary components.</div>
+
+<p>
+Two properties matter in practice and bite people who ignore them. First, FID is <em>biased</em>: the estimate decreases as you use more samples, so an FID computed on 5,000 images is not comparable to one computed on 50,000. The field standardized on 50,000 generated images against the full real set for exactly this reason. Second, FID is acutely sensitive to the image preprocessing pipeline. As the clean-fid paper (Parmar et al., 2022) demonstrated, using PIL bicubic resizing versus a different library's resizing can shift FID by several points, enough to flip the ranking of two models. Always report which pipeline you used, or use a standardized library.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FID in Four Lines</div>
+<p>The from-scratch versions in this section exist to show you the mechanics. In production you would never reimplement the matrix square root or the feature extraction. TorchMetrics handles the frozen Inception network, the running covariance accumulation, the bias-correction conventions, and device placement:</p>
+<pre><code class="language-python">from torchmetrics.image.fid import FrechetInceptionDistance
+
+fid = FrechetInceptionDistance(feature=2048, normalize=True)
+fid.update(real_batch, real=True)    # real_batch: [N,3,H,W] in [0,1]
+fid.update(fake_batch, real=False)
+print(fid.compute())                 # scalar tensor, e.g. tensor(18.43)
+</code></pre>
+<div class="code-caption">The TorchMetrics production FID call: a streaming Inception network and running covariance replace the hand-written feature extraction and matrix square root of subsection 2.</div>
+<p>This replaces roughly 40 lines of feature extraction and linear algebra with 4, and the library internally manages the streaming covariance so you never hold all features in memory at once. For cross-paper comparability, the <code>clean-fid</code> package additionally pins the exact resizing and JPEG handling.</p>
+</div>
+
+<h2>3. Kernel Inception Distance: Dropping the Gaussian <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+FID's Gaussian assumption is a convenience, not a truth; feature distributions are rarely Gaussian. Kernel Inception Distance (KID) replaces it with a squared maximum mean discrepancy (MMD) using a polynomial kernel, which compares all the moments of the two distributions implicitly without assuming any particular shape. For features $x$ from the real set and $y$ from the generated set, the kernel is $k(x, y) = \left(\tfrac{1}{d}\, x^\top y + 1\right)^3$, where $d$ is the feature dimension, and the squared MMD is:
+</p>
+
+<div class="math-block">
+$$\text{MMD}^2 = \mathbb{E}_{x, x'}\!\left[k(x, x')\right] + \mathbb{E}_{y, y'}\!\left[k(y, y')\right] - 2\,\mathbb{E}_{x, y}\!\left[k(x, y)\right]$$
+</div>
+
+<p>
+The decisive practical advantage over FID is that the standard estimator is <em>unbiased</em>: it does not systematically drift with sample count, so KID gives trustworthy numbers on a few thousand images where FID would still be moving. That makes KID the right choice when generating 50,000 samples is expensive, such as evaluating a slow video or 3D generator. The unbiased estimator drops the diagonal self-comparisons, which is the one subtlety in the code.
+</p>
+
+<pre><code class="language-python">def poly_kernel(a, b):
+    """Cubic polynomial kernel between feature sets a [m,D] and b [n,D]."""
+    d = a.shape[1]
+    return (a @ b.T / d + 1.0) ** 3         # [m, n] kernel matrix
+
+def kid(feat_real, feat_gen):
+    """Unbiased squared-MMD estimate (lower is better)."""
+    m, n = len(feat_real), len(feat_gen)
+    k_xx = poly_kernel(feat_real, feat_real)
+    k_yy = poly_kernel(feat_gen,  feat_gen)
+    k_xy = poly_kernel(feat_real, feat_gen)
+    # Unbiased term removes the diagonal (self-similarity) before averaging.
+    sum_xx = (k_xx.sum() - np.trace(k_xx)) / (m * (m - 1))
+    sum_yy = (k_yy.sum() - np.trace(k_yy)) / (n * (n - 1))
+    sum_xy = k_xy.sum() / (m * n)
+    return float(sum_xx + sum_yy - 2 * sum_xy)
+
+# Reported KID values are tiny; papers usually print KID x 1000.
+# print(f"KID = {kid(fr, fg) * 1000:.3f}")    # e.g. KID = 1.742
+</code></pre>
+<div class="code-caption">Unbiased Kernel Inception Distance via the cubic polynomial kernel, with the diagonal removed from the within-set terms so the estimator does not drift with sample count.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Video Team Switches FID for KID</div>
+<p><strong>Who:</strong> a four-person generative-video group at a media-tech startup, early 2025. <strong>Situation:</strong> they were comparing two text-to-video model checkpoints by computing per-frame FID against a real-video frame bank. <strong>Problem:</strong> sampling 50,000 frames from their diffusion video model took most of a day per checkpoint, so they had been computing FID on only 2,000 frames, and the rankings flipped run to run. They suspected randomness but could not tell signal from noise. <strong>Decision:</strong> they switched the headline metric to KID, whose unbiased estimator is stable at small sample sizes, and bootstrapped a confidence interval over feature subsets. <strong>Result:</strong> at 2,000 frames the KID gap between the two checkpoints was tight but its bootstrap interval excluded zero, giving them a defensible ranking that FID could not, at one-tenth the sampling cost. <strong>Lesson:</strong> when samples are expensive, the bias of FID is not a footnote; KID with a confidence interval is the honest choice, and reporting the interval matters as much as the point estimate.</p>
+</div>
+
+<h2>4. Precision and Recall: Splitting Fidelity From Diversity <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A single FID number hides a crucial ambiguity. A model can earn a mediocre FID two opposite ways: by producing a few flawless images that ignore most of the real distribution (high fidelity, low coverage, the classic GAN mode collapse from <a href="../module-32-gans/index.html">Chapter 32</a>), or by producing a broad but blurry mess (low fidelity, high coverage, the classic VAE failure from <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>). Improved precision and recall (Kynkaanniemi et al., 2019) disentangle these. The idea is geometric: estimate the real-data manifold as the union of small balls, one around each real feature, with radius equal to that point's distance to its $k$-th nearest real neighbor. Then:
+</p>
+
+<ul>
+<li><strong>Precision</strong> is the fraction of <em>generated</em> samples that fall inside the <em>real</em> manifold. It measures fidelity: are the generated images the kind of thing the real data contains?</li>
+<li><strong>Recall</strong> is the fraction of <em>real</em> samples that fall inside the <em>generated</em> manifold. It measures coverage: does the generator reach all the variety the real data has?</li>
+</ul>
+
+<p>
+Figure 37.1.2 makes the asymmetry visual: a mode-collapsed generator scores high precision and low recall, while an over-smoothed one does the reverse. The implementation builds the manifolds from k-nearest-neighbor radii and counts membership.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels: mode collapse with high precision and low recall, and over-smoothing with low precision and high recall">
+<style>
+.pl{font:12px sans-serif;fill:#1a1a1a;}
+.ps{font:10.5px sans-serif;fill:#555;}
+.pman{fill:#eaf2fb;stroke:#2c6fb5;stroke-width:1.4;opacity:0.55;}
+.pgen{fill:#d6802b;}
+</style>
+<text class="pl" x="180" y="24" text-anchor="middle">Mode collapse</text>
+<text class="ps" x="180" y="40" text-anchor="middle">high precision, low recall</text>
+<ellipse class="pman" cx="180" cy="135" rx="120" ry="70"/>
+<text class="ps" x="180" y="215" text-anchor="middle" fill="#2c6fb5">real manifold</text>
+<circle class="pgen" cx="160" cy="130" r="4"/><circle class="pgen" cx="172" cy="138" r="4"/><circle class="pgen" cx="166" cy="122" r="4"/><circle class="pgen" cx="178" cy="128" r="4"/>
+<text class="ps" x="220" y="130" fill="#d6802b">gen clustered</text>
+<line x1="360" y1="30" x2="360" y2="215" stroke="#ccc" stroke-width="1"/>
+<text class="pl" x="540" y="24" text-anchor="middle">Over-smoothing</text>
+<text class="ps" x="540" y="40" text-anchor="middle">low precision, high recall</text>
+<ellipse class="pman" cx="540" cy="135" rx="100" ry="58"/>
+<text class="ps" x="540" y="215" text-anchor="middle" fill="#2c6fb5">real manifold</text>
+<circle class="pgen" cx="450" cy="110" r="4"/><circle class="pgen" cx="630" cy="160" r="4"/><circle class="pgen" cx="540" cy="90" r="4"/><circle class="pgen" cx="500" cy="175" r="4"/><circle class="pgen" cx="600" cy="105" r="4"/><circle class="pgen" cx="540" cy="135" r="4"/>
+<text class="ps" x="540" y="200" text-anchor="middle" fill="#d6802b">gen spread, many outside</text>
+</svg>
+<figcaption><strong>Figure 37.1.2:</strong> Why one number is not enough. Left, a mode-collapsed generator places all its samples inside the real manifold but covers only a sliver of it, scoring high precision and low recall. Right, an over-smoothed generator spreads broadly, covering the manifold (high recall) but with many samples falling outside it (low precision). FID alone cannot tell these two failures apart; precision and recall can.</figcaption>
+</figure>
+
+<pre><code class="language-python">import torch
+
+def knn_radii(feats, k=3):
+    """Per-point radius = distance to its k-th nearest neighbor."""
+    d = torch.cdist(feats, feats)                 # pairwise distances
+    d.fill_diagonal_(float("inf"))                # ignore self
+    return d.topk(k, largest=False).values[:, -1] # k-th smallest per row
+
+def manifold_contains(manifold_feats, radii, query_feats):
+    """Fraction of query points inside any ball of the manifold."""
+    d = torch.cdist(query_feats, manifold_feats)  # [Q, M]
+    inside = (d &lt;= radii.unsqueeze(0)).any(dim=1) # within some real ball?
+    return inside.float().mean().item()
+
+def precision_recall(real, gen, k=3):
+    r_real, r_gen = knn_radii(real, k), knn_radii(gen, k)
+    precision = manifold_contains(real, r_real, gen)  # gen inside real
+    recall    = manifold_contains(gen,  r_gen,  real) # real inside gen
+    return precision, recall
+
+# p, r = precision_recall(torch.tensor(fr), torch.tensor(fg))
+# print(f"precision={p:.3f}  recall={r:.3f}")   # e.g. precision=0.78 recall=0.61
+</code></pre>
+<div class="code-caption">Improved precision and recall via k-nearest-neighbor manifold estimation, counting how many generated points fall inside the real manifold and vice versa.</div>
+
+<h2>5. CLIPScore: Did the Image Match the Prompt? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+FID, KID, and precision-recall all measure whether generated images look like real images <em>in general</em>. For a text-to-image system from <a href="../module-34-text-to-image/index.html">Chapter 34</a> that is only half the question; the other half is whether the image matches the specific prompt that asked for it. CLIPScore answers this by leaving the Inception family entirely and using the CLIP joint image-text embedding space you met in <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. Embed the image and the prompt with CLIP, and the cosine similarity between the two vectors, clamped at zero and scaled, is how well they agree:
+</p>
+
+<div class="math-block">
+$$\text{CLIPScore}(I, c) = w \cdot \max\!\left(0,\ \cos\!\big(E_{\text{img}}(I),\, E_{\text{txt}}(c)\big)\right), \qquad w = 2.5$$
+</div>
+
+<p>
+The scaling constant $w = 2.5$ is a convention from the original paper that spreads scores into a readable range; it does not change rankings. Higher means better prompt alignment. The code uses the <code>open_clip</code> library to embed both modalities.
+</p>
+
+<pre><code class="language-python">import torch, open_clip
+
+model, _, preprocess = open_clip.create_model_and_transforms(
+    "ViT-B-32", pretrained="laion2b_s34b_b79k")
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+model = model.eval()
+
+@torch.no_grad()
+def clip_score(image, prompt, w=2.5):
+    """image: PIL.Image, prompt: str -> CLIPScore (higher = better match)."""
+    img = preprocess(image).unsqueeze(0)
+    txt = tokenizer([prompt])
+    img_emb = model.encode_image(img)
+    txt_emb = model.encode_text(txt)
+    img_emb /= img_emb.norm(dim=-1, keepdim=True)   # L2-normalize for cosine
+    txt_emb /= txt_emb.norm(dim=-1, keepdim=True)
+    cos = (img_emb * txt_emb).sum(-1).clamp(min=0)
+    return float(w * cos)
+
+# clip_score(generated_image, "a red bicycle leaning on a brick wall")
+# -> e.g. 0.81   (well-aligned prompts typically land around 0.7 to 0.9)
+</code></pre>
+<div class="code-caption">CLIPScore as scaled, zero-clamped cosine similarity between CLIP image and text embeddings, the standard reference-free measure of prompt alignment.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>FID is the metric that gets cheaper the more you feed it: report it on 50,000 images and it looks great, report it on 5,000 and it looks even better, not because your model improved but because the bias quietly tightened its belt. It is the only number in this book that you can lower by working less, which is exactly why two papers quoting different sample counts are comparing nothing at all. Mnemonic for the whole section: <strong>FID assumes a bell, KID asks no questions, precision-recall files two separate reports, and CLIPScore reads the prompt.</strong></p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: CLIPScore and FID Measure Orthogonal Things</div>
+<p>A model can have excellent FID and poor CLIPScore (it produces beautiful, realistic images that ignore the prompt) or excellent CLIPScore and poor FID (it crams every requested object in but renders them crudely). Because the two metrics reward different and partly opposing behaviors, you report both and read them together. Optimizing one alone is how you get a model that games it: turning classifier-free guidance up hard usually raises CLIPScore while hurting FID and diversity, the exact tradeoff you tune in deployment.</p>
+</div>
+
+<h2>6. What These Metrics Miss <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Every metric here is a proxy, and proxies can be gamed. FID rewards matching ImageNet-flavored statistics, so a model can lower FID by producing slightly oversaturated, texture-rich images that Inception likes, regardless of whether humans prefer them. CLIPScore rewards literal object presence, so it scores a list-of-objects image higher than a more artful interpretation. None of them sees a sixth finger, a melted-together pair of faces, or text that reads as gibberish, because those failures barely move pooled-feature statistics. The decisive evidence that the metrics are imperfect is that they disagree with humans, which is why human evaluation in <a href="section-37.2.html">Section 37.2</a> remains the gold standard rather than a luxury.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Beyond Inception Features</div>
+<p>The 2023 to 2025 literature has been actively dismantling the Inception-feature assumption. Stein et al. (2023, arXiv:2306.04675) ran a large human study and showed that FID computed on Inception-v3 features misranks modern diffusion models relative to human preference, while FID on self-supervised <strong>DINOv2</strong> features (Chapter 25) aligns far better; "FD-DINOv2" is now a common companion metric. Other lines of work include the geometric coverage metric of Naeem et al. (Density and Coverage, 2020) that hardens precision-recall against outliers, and learned perceptual preference predictors such as <strong>ImageReward</strong> (Xu et al., 2023, arXiv:2304.05977) and <strong>PickScore</strong> (Kirstain et al., 2023, arXiv:2305.01569) that are trained directly on human preference data and now serve as both evaluation metrics and reward signals for preference-tuning generators. The trajectory is clear: as generators improve, evaluation moves from ImageNet statistics toward features and predictors that were themselves trained to track human judgment.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.1.1: Why Bias Breaks Comparability <span class="exercise-type conceptual">Conceptual</span></div>
+<p>FID decreases as you use more samples, while the unbiased KID estimator does not. In two or three sentences, explain why this makes it invalid to compare a paper's reported FID-on-10k against your own FID-on-50k, and describe a concrete situation in which an unwary reader would conclude the wrong model is better. Then state which single line of the FID code (subsection 2) would have to change if you wanted to add a bias correction, and why a clean fix is not trivial.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.1.2: Build a Mode-Collapse Detector <span class="exercise-type coding">Coding</span></div>
+<p>Take any dataset of real images and create two fake "generators": one that returns the same five real images repeated (severe mode collapse), and one that returns all real images with heavy Gaussian blur (over-smoothing). Using the <code>precision_recall</code> function from subsection 4 on Inception features, confirm that the first scores high precision and very low recall while the second scores the reverse. Then compute FID for both and verify that FID alone fails to distinguish the two failure modes clearly.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 37.1.3: Guidance Trades FID For CLIPScore <span class="exercise-type analysis">Analysis</span></div>
+<p>Using a diffusers text-to-image pipeline (or precomputed images at several guidance scales if you lack a GPU), generate images for a fixed set of 50 prompts at classifier-free guidance scales 1, 3, 7, and 15. Compute FID against a real reference set and the mean CLIPScore at each scale. Plot both curves against guidance scale, identify the crossover region where rising CLIPScore starts costing FID, and write one paragraph connecting this tradeoff to the diversity-versus-fidelity discussion in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 37 Index</a>
+<a href="index.html">Chapter 37</a>
+<a class="next" href="section-37.2.html">Section 37.2: Human Evaluation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
