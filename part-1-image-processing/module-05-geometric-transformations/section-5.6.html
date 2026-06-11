@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.6: Worked Example: A Document Scanner from Scratch. A complete pipeline: detect the page outline, order its corners, estimate the homography, warp to a flat rectangle, and binarize into a clean scan." name="description"/>
+<title>Section 5.6: Worked Example: A Document Scanner from Scratch | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a></div>
+<h1>Worked Example: A Document Scanner from Scratch</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"You photographed an A4 page as a trapezoid at a 40-degree angle, in restaurant lighting, with your thumb in frame. I will fix it. I always fix it. This is my whole personality now."</p>
+<cite>A Long-Suffering Document Scanner</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This section spends the whole chapter at once: a working document scanner is page detection (finding four corner correspondences), model selection (a flat page photographed with perspective means a homography), estimation (four points, eight equations, eight unknowns), and execution (inverse-mapped warp with bilinear interpolation), finished with a binarization pass.</strong> About a hundred lines of Python reproduce the core of every mobile scanning app, and each line is a concept you can now name.</p>
+</div>
+<p>
+The previous sections built the theory in the order textbooks like: models, coordinates, interpolation, execution, estimation. Real projects run in the opposite direction, starting from a goal: <em>the user photographs a paper at an angle; produce a clean, flat, high-contrast scan</em>. This section walks the full distance from one to the other, including the unglamorous parts (corner ordering, resolution bookkeeping) where real implementations actually break. Figure 5.6.1 shows the route.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Document scanner pipeline: photo, edge map, quadrilateral detection, perspective warp, binarized scan, connected left to right by arrows">
+<style>
+.stg { fill: #f0f6ff; stroke: #2563eb; stroke-width: 1.6; }
+.stg2 { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; }
+.tt { font-family: Verdana, Arial, sans-serif; font-size: 13px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.ss { font-family: Verdana, Arial, sans-serif; font-size: 10.5px; fill: #4b5563; text-anchor: middle; }
+.doc { fill: #ffffff; stroke: #6b7280; stroke-width: 1.4; }
+.docline { stroke: #9ca3af; stroke-width: 1.6; }
+.edge { stroke: #111827; stroke-width: 1.6; fill: none; }
+.quad { stroke: #ef4444; stroke-width: 2.2; fill: none; }
+.cdot { fill: #ef4444; }
+</style>
+<defs>
+<marker id="par" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+<path d="M0,0 L8,4.5 L0,9 z" fill="#2563eb"/>
+</marker>
+</defs>
+<!-- Stage 1: photo with skewed page -->
+<rect class="stg" x="20" y="30" width="150" height="130" rx="8"/>
+<polygon class="doc" points="55,60 135,72 122,140 42,126"/>
+<line class="docline" x1="62" y1="78" x2="120" y2="86"/>
+<line class="docline" x1="60" y1="92" x2="118" y2="100"/>
+<line class="docline" x1="58" y1="106" x2="115" y2="114"/>
+<text class="tt" x="95" y="185">1. Photo</text>
+<text class="ss" x="95" y="203">page is a trapezoid</text>
+<!-- arrow -->
+<line x1="176" y1="95" x2="200" y2="95" stroke="#2563eb" stroke-width="2.2" marker-end="url(#par)"/>
+<!-- Stage 2: edge map -->
+<rect class="stg" x="206" y="30" width="150" height="130" rx="8"/>
+<polygon class="edge" points="241,60 321,72 308,140 228,126"/>
+<text class="tt" x="281" y="185">2. Edges</text>
+<text class="ss" x="281" y="203">blur + Canny + dilate</text>
+<!-- arrow -->
+<line x1="362" y1="95" x2="386" y2="95" stroke="#2563eb" stroke-width="2.2" marker-end="url(#par)"/>
+<!-- Stage 3: quad + corners -->
+<rect class="stg" x="392" y="30" width="150" height="130" rx="8"/>
+<polygon class="quad" points="427,60 507,72 494,140 414,126"/>
+<circle class="cdot" cx="427" cy="60" r="5"/>
+<circle class="cdot" cx="507" cy="72" r="5"/>
+<circle class="cdot" cx="494" cy="140" r="5"/>
+<circle class="cdot" cx="414" cy="126" r="5"/>
+<text class="tt" x="467" y="185">3. Quad</text>
+<text class="ss" x="467" y="203">contour, 4 ordered corners</text>
+<!-- arrow -->
+<line x1="548" y1="95" x2="572" y2="95" stroke="#2563eb" stroke-width="2.2" marker-end="url(#par)"/>
+<!-- Stage 4: rectified -->
+<rect class="stg" x="578" y="30" width="150" height="130" rx="8"/>
+<rect class="doc" x="613" y="50" width="80" height="95"/>
+<line class="docline" x1="621" y1="66" x2="685" y2="66"/>
+<line class="docline" x1="621" y1="82" x2="685" y2="82"/>
+<line class="docline" x1="621" y1="98" x2="685" y2="98"/>
+<line class="docline" x1="621" y1="114" x2="673" y2="114"/>
+<text class="tt" x="653" y="185">4. Warp</text>
+<text class="ss" x="653" y="203">homography, full resolution</text>
+<!-- arrow -->
+<line x1="734" y1="95" x2="758" y2="95" stroke="#2563eb" stroke-width="2.2" marker-end="url(#par)"/>
+<!-- Stage 5: binarized -->
+<rect class="stg2" x="764" y="30" width="150" height="130" rx="8"/>
+<rect class="doc" x="799" y="50" width="80" height="95"/>
+<line stroke="#111827" stroke-width="2.2" x1="807" y1="66" x2="871" y2="66"/>
+<line stroke="#111827" stroke-width="2.2" x1="807" y1="82" x2="871" y2="82"/>
+<line stroke="#111827" stroke-width="2.2" x1="807" y1="98" x2="871" y2="98"/>
+<line stroke="#111827" stroke-width="2.2" x1="807" y1="114" x2="859" y2="114"/>
+<text class="tt" x="839" y="185">5. Binarize</text>
+<text class="ss" x="839" y="203">adaptive threshold</text>
+</svg>
+<figcaption><strong>Figure 5.6.1:</strong> The scanner pipeline. Stages 1 to 3 manufacture the four corner correspondences that Section 5.5 would have gotten from feature matching; stage 4 is the homography estimation and inverse warp of Sections 5.1 to 5.4; stage 5 is classic thresholding from Chapter 2. Each stage hands a strictly simpler object to the next: image, edge map, four points, rectangle, binary scan.</figcaption>
+</figure>
+<h2>1. Stage 1: Find the Page Outline <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Our scanner's "correspondence problem" is friendlier than Section 5.5's general matching: we know the object of interest is a quadrilateral that contrasts with the background. The classical detection recipe is blur, edge detection, and contour analysis. We downscale first, both for speed and because edge detectors behave more consistently at a standard working resolution; the crucial bookkeeping is to remember the scale factor, because the final warp must run on the <em>full-resolution</em> original. Detection can be lossy; rectification must not be.
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+PROC_HEIGHT = 600.0          # standard working height for detection
+
+def find_page_quad(image_bgr):
+    """Return the page's 4 corners in FULL-RES coords, or None."""
+    scale = PROC_HEIGHT / image_bgr.shape[0]
+    small = cv2.resize(image_bgr, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA)
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)        # tame paper texture
+    edges = cv2.Canny(gray, 75, 200)                # edge map
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8))  # bridge gaps
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    for c in contours:                              # biggest first
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            if cv2.contourArea(approx) &gt; 0.2 * small.size / 3:
+                return approx.reshape(4, 2).astype(np.float64) / scale
+    return None
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.1:</strong> Page detection: blur, Canny, dilate, then scan the largest contours for a big convex quadrilateral. The final division by <code>scale</code> converts the corners back to full-resolution coordinates, the single most forgotten line in homemade scanners.</div>
+<p>
+Each ingredient earns its place. The Gaussian blur (from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>) suppresses paper grain and carpet texture that would otherwise fill the edge map with confetti. Canny, which we use here as a black box and dissect properly in <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>, traces intensity discontinuities; the dilation closes one-pixel gaps in the page border so the contour is a single closed curve. <code>approxPolyDP</code> simplifies each candidate contour with the Douglas-Peucker algorithm at a tolerance of 2 percent of the perimeter: page outlines survive as exactly 4 vertices, while sleeves, mugs, and shadows rarely do. The convexity and minimum-area tests reject the rest.
+</p>
+<h2>2. Stage 2: Order the Corners <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The contour hands us four corners in an arbitrary cyclic order, but <code>getPerspectiveTransform</code> pairs source to destination points <em>by index</em>: if our first destination corner is "top-left", the first source corner had better actually be the page's top-left. Feed the points in a rotated or reflected order and you get a perfectly valid homography to an upside-down or mirror-imaged page. The classic ordering trick uses two scalar functions of each corner $(x, y)$: the sum $x + y$ is smallest at the top-left and largest at the bottom-right; the difference $y - x$ is smallest at the top-right and largest at the bottom-left.
+</p>
+<pre><code class="language-python">def order_corners(pts):
+    """pts: (4, 2) array in any order -&gt; [tl, tr, br, bl]."""
+    s = pts.sum(axis=1)            # x + y
+    d = np.diff(pts, axis=1)[:, 0] # y - x
+    return np.array([pts[np.argmin(s)],    # top-left
+                     pts[np.argmin(d)],    # top-right
+                     pts[np.argmax(s)],    # bottom-right
+                     pts[np.argmax(d)]],   # bottom-left
+                    dtype=np.float32)
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.2:</strong> Corner ordering by the sum/difference trick. It is reliable for the convex, roughly axis-aligned quadrilaterals a scanner sees; documents photographed at rotations near 45 degrees can fool it, which Exercise 5.6.1 explores.</div>
+<h2>3. Stage 3: Size the Output and Warp <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+What size should the flattened page be? We measure the quadrilateral's edges in the photo and take the maximum of opposite sides as the output width and height. This preserves as much resolution as the photo captured and gets the aspect ratio approximately right. Only approximately: perspective foreshortening means the photographed side lengths are not the true paper proportions. Recovering the <em>exact</em> aspect ratio of a rectangle from one perspective view is possible, but it requires the camera's focal length, which belongs to the calibration story of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. Production apps either do that or simply snap to known paper ratios (A4, Letter); we take the honest approximation.
+</p>
+<pre><code class="language-python">def rectify(image_bgr, quad):
+    """Warp the quadrilateral region into a flat, axis-aligned scan."""
+    tl, tr, br, bl = order_corners(quad)
+
+    W = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    H = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+
+    src = np.array([tl, tr, br, bl], dtype=np.float32)
+    dst = np.array([[0, 0], [W - 1, 0],
+                    [W - 1, H - 1], [0, H - 1]], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(src, dst)   # 4 pairs -&gt; 8 DoF, exact
+    return cv2.warpPerspective(image_bgr, M, (W, H),
+                               flags=cv2.INTER_LINEAR)
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.3:</strong> Rectification: measure the output size from the quad's sides, build the 4-point correspondence, solve the homography, and inverse-warp at full resolution. Every line of this function is a section of this chapter in miniature.</div>
+<p>
+Pause on <code>getPerspectiveTransform</code> for a moment, because it closes a loop opened in <a href="section-5.1.html">Section 5.1</a>: a homography has 8 degrees of freedom, each point pair supplies 2 equations, and 4 pairs make the system exactly determined, so the function solves a small linear system and returns <em>the</em> unique homography through our corners. No RANSAC is needed here, unlike <a href="section-5.5.html">Section 5.5</a>, because we have exactly four correspondences and trust all of them; the robustness lives upstream in the contour tests. The warp call then runs the inverse-mapping gather of <a href="section-5.4.html">Section 5.4</a> with the bilinear kernel of <a href="section-5.3.html">Section 5.3</a>.
+</p>
+<h2>4. Stage 4: Binarize Like a Scanner <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+A geometric rectangle of a photo still looks like a photo: gray paper, uneven lighting, a shadow from your hand. The "scanned document" look is a thresholding problem, and the right tool is the adaptive thresholding of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, which computes a local threshold per neighborhood and therefore shrugs off illumination gradients that destroy any single global threshold:
+</p>
+<pre><code class="language-python">def to_scan(image_bgr):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.adaptiveThreshold(gray, 255,
+                                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY,
+                                 blockSize=21, C=10)
+
+# The complete scanner, end to end:
+image = cv2.imread("receipt_photo.jpg")
+quad = find_page_quad(image)
+if quad is None:
+    raise SystemExit("No document found: check contrast with background")
+flat = rectify(image, quad)
+scan = to_scan(flat)
+cv2.imwrite("scan.png", scan)
+print(f"saved {scan.shape[1]}x{scan.shape[0]} scan")
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.4:</strong> Binarization and the six-line main program that chains all four stages. <code>blockSize</code> sets the neighborhood over which "local brightness" is judged; <code>C</code> biases the threshold to keep thin pen strokes.</div>
+<pre class="code-output">saved 1187x1684 scan
+</pre>
+<div class="code-caption"><strong>Output 5.6.4a:</strong> A representative run on a phone photo of an A4 page: the output dimensions land within about 1 percent of the true A4 ratio (1.414), the residual being the perspective aspect-ratio approximation discussed in stage 3.</div>
+<p>
+And that is the entire scanner: roughly one hundred lines including comments, no machine learning, latency dominated by the single full-resolution warp. The binarized output often shows speckle noise from paper texture and dust; cleaning that up with a morphological opening is literally the first worked example of the <a href="../module-06-morphology-binary-shape/index.html">next chapter</a>, which picks up this exact image.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Detect Cheap, Rectify Exact</div>
+<p>The pipeline splits into a perception half and a geometry half with different error economics. Detection (stages 1-2) can run on a downscaled image, fail occasionally, and be retried with different parameters, because its output is just four numbers that are easy to sanity-check. Rectification (stages 3-4) is exact mathematics that must run at full resolution exactly once. This "cheap proposal, exact execution" split recurs throughout vision systems, and getting the resolution bookkeeping right at the boundary (Code 5.6.1's final division by <code>scale</code>) is where a disproportionate share of real-world bugs live.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: imutils.four_point_transform</div>
+<p>Stages 2 and 3, corner ordering, output sizing, homography, and warp, are packaged in the <strong>imutils</strong> library as a single battle-tested call:</p>
+<pre><code class="language-python">from imutils.perspective import four_point_transform
+flat = four_point_transform(image, quad.reshape(4, 2))
+</code></pre>
+<div class="code-caption"><strong>Code 5.6.5:</strong> Corner ordering, output sizing, and the perspective warp delegated to imutils in a single call.</div>
+<p>That replaces our <code>order_corners</code> plus <code>rectify</code>, roughly 30 lines, with 1, handling degenerate quads and dtype conversions internally. Detection and binarization remain yours, which is the right division: those are the stages you tune per application.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Receipts Are Not Rectangles</div>
+<p><strong>Who:</strong> An ML engineer at an expense-management startup whose app extracts totals from photographed receipts.</p>
+<p><strong>Situation:</strong> The OCR vendor's accuracy was excellent on flatbed scans but poor on user photos. The team inserted a scanner pipeline nearly identical to this section's in front of OCR.</p>
+<p><strong>Problem:</strong> Accuracy improved overall but stayed bad for a stubborn 20 percent of receipts. Inspection of the failures showed thermal-paper receipts that had been crumpled and re-flattened, or were curling off the table: their edges were detected fine, but a homography assumes a <em>plane</em>, and these were cylinders and crumple surfaces. Text lines stayed bent after rectification, and the OCR's line segmentation broke.</p>
+<p><strong>Decision:</strong> Ship the homography scanner for the 80 percent it fixed (per-receipt OCR field accuracy rose from 71 to 89 percent in their evaluation), route low-confidence OCR outputs to manual review, and prototype a learned dewarping model for the curled cases rather than stretching the geometric model past its assumptions.</p>
+<p><strong>Result:</strong> Support tickets about wrong totals dropped sharply; the dewarping prototype (based on the document-restoration models in the callout below) later recovered half of the residual failures.</p>
+<p><strong>Lesson:</strong> Know your model's load-bearing assumption. The homography's is planarity; when the world bends, no four points will save you, and the fix is a richer deformation model, not more parameter tuning.</p>
+</div>
+<h2>5. Failure Modes and Hardening <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Turning this demo into a product is mostly about the inputs that break it. Four failure classes account for nearly everything, and each maps to a specific upgrade path:
+</p>
+<ul>
+<li><strong>Low edge contrast.</strong> White paper on a white desk gives Canny nothing. Mitigations: try multiple threshold pairs, run detection per color channel and on a saturation channel, or fall back to asking the user to tap the corners. The durable fix is replacing stage 1 with a segmentation model, the approach of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>, which is exactly what modern phone scanners do.</li>
+<li><strong>Distractor quadrilaterals.</strong> Laptops, monitors, and floor tiles are large convex quads. Mitigations: prefer the quad containing the image center, score candidates by text-like high-frequency content inside, or track stability across video frames.</li>
+<li><strong>Non-planar pages.</strong> Books near the spine, curled receipts. The homography is structurally wrong; see the practical example and research frontier.</li>
+<li><strong>Extreme angles.</strong> Beyond roughly 60 degrees of tilt, the far edge's effective resolution collapses; the warp magnifies a few hundred captured pixels into a thousand output pixels of mush. Detect by comparing opposite side lengths and prompt for a re-shoot; no interpolation from <a href="section-5.3.html">Section 5.3</a> can manufacture detail the sensor never sampled.</li>
+</ul>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Scanners That Learn</div>
+<p>The 2024-2026 generation of document capture replaces each classical stage with a learned one while keeping this section's architecture recognizable. Page localization is now typically a lightweight segmentation network rather than Canny plus contours. For non-planar geometry, dewarping models regress a dense backward map (a per-pixel <code>remap</code> field, exactly Section 5.4's lookup-table view) instead of an 8-parameter homography: <strong>DocTr++</strong> (Feng et al., 2023) and the grid-based <strong>UVDoc</strong> (Verhoeven et al., SIGGRAPH Asia 2023) flatten curled and folded pages, and <strong>DocRes</strong> (Zhang et al., CVPR 2024) unifies dewarping, deshadowing, deblurring, and appearance enhancement in one generalist model prompted per task. Benchmarks in this line still report the geometry through warped-distance metrics, and the models still emit warp fields executed by the very machinery you built in this chapter; what changed is who computes the field.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The sum/difference corner-ordering trick in Code 5.6.2 has been re-invented and re-blogged so many times that its origin is genuinely untraceable; it appears in graphics forums from the 1990s, OCR preprocessing papers, and at least one patent filing. It is the geometric equivalent of a folk song. The robust version (sort by angle around the centroid) is three lines longer and has an author on record, which tells you something about which solutions survive.</p>
+</div>
+<h2>6. What This Project Taught <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Walk back through the hundred lines and notice how the chapter's sections each carried a stage: the <em>hierarchy</em> (<a href="section-5.1.html">5.1</a>) told us a photographed plane needs exactly a homography, no more, no less; <em>homogeneous coordinates</em> (<a href="section-5.2.html">5.2</a>) are why <code>getPerspectiveTransform</code> returns a 3&times;3 matrix and why the warp divides by $W$; <em>interpolation</em> (<a href="section-5.3.html">5.3</a>) fills every output pixel from fractional source positions; <em>inverse mapping</em> (<a href="section-5.4.html">5.4</a>) is the reason the output has no holes; and the four corners are a tiny, trusted <em>correspondence set</em>, the same currency <a href="section-5.5.html">5.5</a> earned with feature matching and RANSAC. One pipeline, five ideas, each load-bearing.
+</p>
+<p>
+The scanner also hands the book its next problem. Its output is a binary image, and binary images have their own algebra: erosion to strip speckle, dilation to heal broken strokes, connected components to find characters, shape descriptors to classify them. That algebra is <a href="../module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a>, and it begins exactly where <code>scan.png</code> ends.
+</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.1: Break the Corner Ordering <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Construct (on paper) a convex quadrilateral for which the sum/difference trick of Code 5.6.2 assigns two corners the same role, or the wrong roles. At what rotation angles of a long, thin receipt does this happen? Then describe the centroid-angle alternative (sort corners by <code>atan2</code> around their mean) and explain why it cannot produce duplicate assignments, but still needs a rule to decide which sorted corner is "top-left".</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.2: Scanner, Hardened <span class="exercise-type coding">Coding</span></div>
+<p>Extend the scanner with two production features. (a) A fallback detection pass: if <code>find_page_quad</code> returns <code>None</code>, retry with Otsu-thresholded saturation and value channels (Chapter 2 tools) before giving up. (b) A quality gate: reject the detected quad if the ratio of its longest to shortest side exceeds 12 (receipt sanity), if any interior angle is below 35 degrees, or if opposite sides differ by more than 3x (extreme-tilt detector from this section's failure-mode list). Demonstrate both features on five of your own photos, including at least one deliberate failure case.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.6.3: How Wrong Corners Hurt <span class="exercise-type analysis">Analysis</span></div>
+<p>Perturb each of the four detected corners independently by Gaussian noise of $\sigma \in \{1, 2, 5, 10\}$ pixels before rectification, 50 trials each, and measure the damage to the output: (a) SSIM between the perturbed and unperturbed scans, and (b) if you have an OCR engine available (e.g. <code>pytesseract</code>), character error rate on a printed test page. Plot both against $\sigma$. Which corner perturbations hurt most, and why does the answer depend on the camera angle? Relate the shape of the curve to the homography's sensitivity as the quad degenerates.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-5.5.html"><span class="nav-label">Section 5.5: Image Registration &amp; Alignment</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span></a>
+<a class="next" href="../module-06-morphology-binary-shape/index.html"><span class="nav-label">Chapter 6: Morphology, Binary Images &amp; Shape</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

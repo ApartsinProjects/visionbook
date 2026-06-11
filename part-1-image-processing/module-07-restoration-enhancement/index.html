@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 7: Image Restoration &amp; Enhancement. Noise models and degradation pipelines, classical denoising up to non-local means, Wiener and Richardson-Lucy deconvolution, inpainting, classical super-resolution, and HDR imaging with tone mapping." name="description"/>
+<title>Chapter 7: Image Restoration &amp; Enhancement | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Image Restoration &amp; Enhancement</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"They handed me a blurry, noisy, half-missing photograph and asked for the truth. I gave them the most probable truth, which is the only kind I stock."</p>
+<cite>A Bayesian Restoration Filter</cite>
+</blockquote>
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Every photograph you have ever taken was damaged before you saw it. Photons arrived at the sensor randomly, so every pixel carries shot noise. The lens spread each point of light into a small smear, and if your hand moved, the smear grew a tail. The scene's brightness range exceeded what the sensor could record, so the highlights clipped or the shadows drowned. And somewhere between sensor and screen, compression quietly threw information away. Image restoration is the discipline of undoing this damage, and image enhancement is its pragmatic cousin: making the picture look better even when "the original" is not strictly recoverable.
+</p>
+<p>
+What makes restoration intellectually special is that it is the book's first true <em>inverse problem</em>. Everything in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> through <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a> ran forward: take an image, apply an operation, get a result. Restoration runs the movie backward. We observe a degraded image $g$, we model how it was produced from an ideal image $f$ (typically blur plus noise, $g = h \ast f + n$), and we try to invert the model. The catch, and the recurring theme of this chapter, is that the inversion is ill-posed: many different clean images explain the same dirty one, and naive inversion amplifies noise catastrophically. Every method here resolves the ambiguity the same way, by adding a <em>prior</em>: an assumption about what natural images look like. Smoothness, self-similarity, sparse gradients, each classical algorithm is a hand-written belief about images.
+</p>
+<p>
+The journey runs from damage to remedy. <a href="section-7.1.html">Section 7.1</a> builds the vocabulary of degradation itself: where noise comes from physically, why its statistics are Poisson at heart, and how realistic degradation pipelines are assembled. <a href="section-7.2.html">Section 7.2</a> attacks noise, climbing from the Gaussian blur of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> to the patch-based elegance of non-local means and BM3D. <a href="section-7.3.html">Section 7.3</a> takes on blur with frequency-domain deconvolution, where the Fourier machinery of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> earns its keep: the Wiener filter and Richardson-Lucy iteration, including the algorithm that rescued the Hubble Space Telescope. <a href="section-7.4.html">Section 7.4</a> fills holes: inpainting by smoothness, by fast marching, and by copying texture. <a href="section-7.5.html">Section 7.5</a> asks how much resolution can honestly be recovered, from multi-frame fusion to the eve of deep super-resolution. <a href="section-7.6.html">Section 7.6</a> closes with dynamic range: merging bracketed exposures into high dynamic range radiance and tone mapping the result back onto an eight-bit screen.
+</p>
+<p>
+This chapter is also a load-bearing wall for the rest of the book. The noise models of Section 7.1 return as the noise schedules of diffusion models in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>; denoising itself becomes the training objective of denoising autoencoders in <a href="../../part-4-generative-vision-models/module-31-autoencoders-vaes/index.html">Chapter 31</a> and, astonishingly, the generative engine of diffusion. Inpainting reappears as generative editing in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>, and super-resolution returns both at the edge in <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a> and inside text-to-image upscalers in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. When deep models eventually beat every method in this chapter, they did it by learning the priors we are about to write by hand. Knowing the hand-written versions is what lets you understand, debug, and distrust the learned ones.
+</p>
+</div>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Restoration is inference, not filtering: you model how the damage happened, you state what clean images look like, and the algorithm follows from those two commitments.</strong> Every method in this chapter, from the Wiener filter to exemplar inpainting, is the same Bayesian sentence with different nouns: find the image that best explains the observation while remaining plausible. Deep restoration networks did not change the sentence; they replaced the hand-written plausibility term with a learned one.</p>
+</div>
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Write down the degradation model $g = h \ast f + n$, identify the physical source of each term, and synthesize realistic noise (Gaussian, Poisson, salt-and-pepper, speckle) and full degradation pipelines in code.</li>
+<li>Denoise images with Gaussian, median, bilateral, non-local means, and BM3D filtering, and explain the prior each method encodes and where it fails.</li>
+<li>Deblur images by inverse filtering, the Wiener filter, and Richardson-Lucy iteration, and explain why regularization is unavoidable.</li>
+<li>Fill missing regions with PDE-based, fast-marching, and exemplar-based inpainting, and choose the right method from hole geometry.</li>
+<li>Reconstruct higher-resolution images from multiple aliased frames and explain why single-image interpolation cannot add information.</li>
+<li>Merge bracketed exposures into HDR radiance maps, tone map them for display, and decide when exposure fusion should replace the radiometric pipeline entirely.</li>
+</ul>
+</div>
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter leans on most of Part I. From <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1: Digital Image Fundamentals</a> you need the sensor pipeline (where photons become numbers) and the PSNR and SSIM quality metrics, which we use to score every restoration. <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a> supplies convolution itself, plus the Gaussian, median, and bilateral filters that Section 7.2 builds upon. <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a> is essential for Section 7.3 (deconvolution lives in the Fourier domain) and useful for Sections 7.5 and 7.6 (aliasing and pyramid blending). <a href="../module-05-geometric-transformations/index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a> provides interpolation and registration, which multi-frame super-resolution and HDR alignment both require. <a href="../module-02-point-operations-histograms/index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a> helps with tone mapping, and <a href="../module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a> with preparing inpainting masks. If your environment needs setting up, start at <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>.
+</p>
+</div>
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num"><a href="section-7.1.html">7.1</a></span>
+<span class="section-title"><a href="section-7.1.html">Noise Models &amp; Degradation Pipelines</a></span>
+<span class="section-desc">Where damage comes from: shot noise, read noise, blur, and compression, and how to model, synthesize, and measure each one before attempting any cure.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-7.2.html">7.2</a></span>
+<span class="section-title"><a href="section-7.2.html">Classical Denoising: From Gaussian to Non-Local Means</a></span>
+<span class="section-desc">Denoising as the art of choosing what to average: local filters, edge-aware filters, patch self-similarity, and BM3D, the decade-long classical champion.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-7.3.html">7.3</a></span>
+<span class="section-title"><a href="section-7.3.html">Deblurring &amp; Deconvolution: Wiener &amp; Richardson-Lucy</a></span>
+<span class="section-desc">Undoing convolution in the Fourier domain: why naive inversion explodes, how Wiener regularizes it, and the iterative method that fixed Hubble's eyesight.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-7.4.html">7.4</a></span>
+<span class="section-title"><a href="section-7.4.html">Inpainting: Filling the Holes</a></span>
+<span class="section-desc">Reconstructing missing pixels by continuing structure, marching from the boundary, or copying texture, and knowing which trick the hole demands.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-7.5.html">7.5</a></span>
+<span class="section-title"><a href="section-7.5.html">Classical Super-Resolution</a></span>
+<span class="section-desc">Why bicubic upscaling is not super-resolution, how sub-pixel shifts across frames buy genuine detail, and the back-projection loop that fuses them.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-7.6.html">7.6</a></span>
+<span class="section-title"><a href="section-7.6.html">HDR Imaging &amp; Tone Mapping</a></span>
+<span class="section-desc">Capturing more light range than the sensor allows and squeezing it onto a display: radiance recovery, tone-mapping operators, and exposure fusion.</span>
+</li>
+</ul>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most famous deblurring job in history was performed on a telescope, not by one. When the Hubble Space Telescope launched in 1990 with a mirror ground 2.2 micrometers too flat, astronomers spent three years deconvolving its images with the Richardson-Lucy algorithm (Section 7.3) while waiting for the repair mission. The algorithm dates from 1972, the telescope from 1990, and the combination produced publishable science from a broken billion-dollar instrument. Software patience beat hardware perfection.</p>
+</div>
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+This chapter completes the conceptual core of Part I: you can now describe, filter, transform, measure, and repair an image. <a href="../module-08-tools-of-the-trade/index.html">Chapter 8: Tools of the Trade: The Image Processing Stack</a> steps back from algorithms to engineering: how OpenCV, scikit-image, Pillow, and friends divide the territory, how to choose among them, and how to assemble the techniques of Chapters 0 through 7 into pipelines that survive production. Every restoration method you just learned has a battle-tested library implementation; Chapter 8 shows you where each one lives and what it costs.
+</p>
+</div>
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Buades, A., Coll, B., and Morel, J.-M. "A Non-Local Algorithm for Image Denoising." CVPR (2005). <a href="https://ieeexplore.ieee.org/document/1467423" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">The paper that redefined a pixel's "neighborhood" as every similar patch in the image. Section 7.2's centerpiece, and the conceptual ancestor of attention mechanisms.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Dabov, K., Foi, A., Katkovnik, V., and Egiazarian, K. "Image Denoising by Sparse 3-D Transform-Domain Collaborative Filtering." IEEE TIP (2007). <a href="https://ieeexplore.ieee.org/document/4271520" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">BM3D: group similar patches, denoise them jointly in a transform domain. The classical state of the art for a full decade and still the baseline deep denoisers must beat.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Richardson, W. H. "Bayesian-Based Iterative Method of Image Restoration." Journal of the Optical Society of America 62(1) (1972). <a href="https://opg.optica.org/josa/abstract.cfm?uri=josa-62-1-55" target="_blank" rel="noopener">Optica Publishing</a></div>
+<p class="bib-annotation">One half of the Richardson-Lucy deconvolution algorithm of Section 7.3: a multiplicative update that respects the Poisson statistics of photon counting.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lucy, L. B. "An Iterative Technique for the Rectification of Observed Distributions." The Astronomical Journal 79, 745 (1974). <a href="https://ui.adsabs.harvard.edu/abs/1974AJ.....79..745L/abstract" target="_blank" rel="noopener">NASA ADS</a></div>
+<p class="bib-annotation">The astronomy half of Richardson-Lucy, derived independently for stellar photometry. Astronomers still run it nightly, half a century later.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Bertalmio, M., Sapiro, G., Caselles, V., and Ballester, C. "Image Inpainting." SIGGRAPH (2000). <a href="https://dl.acm.org/doi/10.1145/344779.344972" target="_blank" rel="noopener">ACM Digital Library</a></div>
+<p class="bib-annotation">Brought the word "inpainting" from art conservation into vision, framing hole filling as a PDE that continues isophotes into the missing region (Section 7.4).</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Telea, A. "An Image Inpainting Technique Based on the Fast Marching Method." Journal of Graphics Tools 9(1) (2004). <a href="https://www.tandfonline.com/doi/abs/10.1080/10867651.2004.10487596" target="_blank" rel="noopener">Taylor &amp; Francis</a></div>
+<p class="bib-annotation">The fast, simple inpainting algorithm behind OpenCV's <code>cv2.INPAINT_TELEA</code> flag: fill the hole inward from the boundary, in the order fast marching dictates.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Criminisi, A., P&eacute;rez, P., and Toyama, K. "Region Filling and Object Removal by Exemplar-Based Image Inpainting." IEEE TIP (2004). <a href="https://ieeexplore.ieee.org/document/1323101" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">Inpainting by copying patches, with a priority rule that lets structure propagate before texture fills in. The classical method that handles large holes credibly.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Debevec, P. and Malik, J. "Recovering High Dynamic Range Radiance Maps from Photographs." SIGGRAPH (1997). <a href="https://dl.acm.org/doi/10.1145/258734.258884" target="_blank" rel="noopener">ACM Digital Library</a></div>
+<p class="bib-annotation">How to recover a camera's response curve and true scene radiance from a handful of bracketed exposures. The founding paper of Section 7.6's HDR pipeline.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Mertens, T., Kautz, J., and Van Reeth, F. "Exposure Fusion." Pacific Graphics (2007). <a href="https://ieeexplore.ieee.org/document/4392748" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">Skip radiance recovery entirely: blend the best-exposed pixels from each bracket with a Laplacian pyramid. The pragmatic algorithm inside most phone "HDR" modes.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Dong, C., Loy, C. C., He, K., and Tang, X. "Image Super-Resolution Using Deep Convolutional Networks." (2015). <a href="https://arxiv.org/abs/1501.00092" target="_blank" rel="noopener">arXiv:1501.00092</a></div>
+<p class="bib-annotation">SRCNN: the three-layer network that ended the classical era of Section 7.5 and opened the deep one. Reads as a direct translation of sparse-coding super-resolution into convolutions.</p>
+</div>
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Gonzalez, R. and Woods, R. "Digital Image Processing," 4th ed. Pearson (2018). <a href="https://www.imageprocessingplace.com/" target="_blank" rel="noopener">Book website</a></div>
+<p class="bib-annotation">Chapter 5 ("Image Restoration and Reconstruction") is the canonical textbook treatment of noise models, inverse filtering, and Wiener theory, with worked frequency-domain examples.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. "Computer Vision: Algorithms and Applications," 2nd ed. Springer (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">Free online edition</a></div>
+<p class="bib-annotation">Sections on image processing, computational photography, and HDR cover this chapter's territory with modern references; free PDF from the author.</p>
+</div>
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV: Computational Photography module (<code>photo</code>). <a href="https://docs.opencv.org/4.x/d1/d0d/group__photo.html" target="_blank" rel="noopener">Official API reference</a></div>
+<p class="bib-annotation">Home of <code>fastNlMeansDenoising</code>, <code>inpaint</code>, the HDR calibration and merge classes, and every tone-mapping operator used in this chapter.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">scikit-image: <code>skimage.restoration</code> API. <a href="https://scikit-image.org/docs/stable/api/skimage.restoration.html" target="_blank" rel="noopener">Official documentation</a></div>
+<p class="bib-annotation">Clean NumPy implementations of Wiener and Richardson-Lucy deconvolution, non-local means, biharmonic inpainting, and noise estimation, ideal for studying the algorithms.</p>
+</div>
+<h3>Recent Research (2024-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Yu, F. et al. "Scaling Up to Excellence: Practicing Model Scaling for Photo-Realistic Image Restoration In the Wild" (SUPIR). CVPR (2024). <a href="https://arxiv.org/abs/2401.13627" target="_blank" rel="noopener">arXiv:2401.13627</a></div>
+<p class="bib-annotation">Restoration in the diffusion era: a generative prior so strong it reinvents missing content. The direct descendant of every prior in this chapter, with the same hallucination risks scaled up.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, X. et al. "Real-ESRGAN: Training Real-World Blind Super-Resolution with Pure Synthetic Data." ICCV Workshops (2021). <a href="https://github.com/xinntao/Real-ESRGAN" target="_blank" rel="noopener">GitHub repository</a></div>
+<p class="bib-annotation">The degradation-pipeline insight of Section 7.1 weaponized: train a restorer entirely on synthetically damaged images, and it generalizes to real damage. Actively maintained and widely deployed.</p>
+</div>
+</section>
+<nav class="chapter-nav">
+<a class="prev" href="../module-06-morphology-binary-shape/index.html"><span class="nav-label">Chapter 6: Morphology, Binary Images &amp; Shape</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part I: Image Processing</span></a>
+<a class="next" href="section-7.1.html"><span class="nav-label">Section 7.1: Noise Models &amp; Degradation Pipelines</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

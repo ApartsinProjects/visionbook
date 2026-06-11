@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.4: Thresholding: Global, Otsu &amp; Adaptive. Binarizing images with global thresholds, deriving Otsu's optimal threshold from the histogram, and adaptive and Sauvola methods for uneven illumination." name="description"/>
+<title>Section 2.4: Thresholding: Global, Otsu &amp; Adaptive | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a></div>
+<h1>Thresholding: Global, Otsu &amp; Adaptive</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"There are exactly two kinds of pixels in this world. I decided that. You're welcome."</p>
+<cite>An Uncompromisingly Binary Threshold Operator</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Thresholding is the moment image processing first makes a decision: every pixel is declared foreground or background, and a grayscale measurement becomes a binary claim about the world.</strong> The entire question is where to put the cut. Otsu's 1979 answer, pick the threshold that best separates the histogram into two tight clusters, is one of the most-used algorithms in vision history, and the deeper pattern (continuous scores in, threshold, binary decision out) never goes away: it is exactly how segmentation networks produce masks from logits today.</p>
+</div>
+
+<p>
+The previous sections remapped intensities while keeping them continuous: <a href="section-2.1.html">Section 2.1</a> bent the tone curve and <a href="section-2.3.html">Section 2.3</a> let the histogram choose it. Now we collapse the scale entirely. Thresholding replaces every pixel with a yes or a no, which sounds destructive (and is) but is precisely the point: counting cells under a microscope, reading a barcode, locating solder joints, and OCRing a receipt all require deciding which pixels belong to the thing. This section covers choosing that decision boundary: by hand, optimally from the histogram, and locally when one global answer cannot exist.
+</p>
+
+<h2>1. Binarization: The Simplest Classifier <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+Global thresholding is a one-parameter point operation:
+</p>
+<p>
+$$g(x, y) = \begin{cases} 255 &amp; \text{if } f(x, y) > T \\ 0 &amp; \text{otherwise} \end{cases}$$
+</p>
+<p>
+It is worth pausing on what this really is: a classifier with a single feature (intensity) and a single learned parameter ($T$). When does such a crude classifier work? Exactly when the histogram from <a href="section-2.2.html">Section 2.2</a> is bimodal: two well-separated humps, one for background and one for object, with a quiet valley between them. Then any $T$ in the valley yields a clean mask. Figure 2.4.1 shows this ideal case, along with the quantity Otsu's method will optimize. When the humps overlap (and the sensor noise we traced in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> broadens both of them), no global $T$ can be clean, and we will need either better lighting, the local methods of this section's second half, or the learned segmentation of Part III.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A bimodal histogram with background and foreground modes and the Otsu threshold in the valley between them">
+<rect x="0" y="0" width="760" height="380" fill="#ffffff"/>
+<rect x="80" y="40" width="600" height="280" fill="#fafbfc" stroke="#cccccc"/>
+<!-- bimodal density -->
+<path d="M90,318 C150,315 170,100 230,100 C290,100 310,315 370,318 C420,316 450,180 520,180 C590,180 610,316 660,318 L660,320 L90,320 Z"
+      fill="#9ec7e8" fill-opacity="0.55" stroke="#2980b9" stroke-width="2.5"/>
+<!-- class labels -->
+<text x="230" y="86" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#14385c">class 0 (background)</text>
+<text x="230" y="130" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#14385c">weight &#969;&#8320;, mean &#956;&#8320;</text>
+<text x="520" y="166" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#14385c">class 1 (object)</text>
+<text x="520" y="210" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#14385c">weight &#969;&#8321;, mean &#956;&#8321;</text>
+<!-- threshold -->
+<line x1="440" y1="50" x2="440" y2="320" stroke="#c0392b" stroke-width="2.5" stroke-dasharray="8,5"/>
+<text x="440" y="36" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#c0392b">t* (Otsu)</text>
+<!-- mu0, mu1 markers -->
+<line x1="230" y1="320" x2="230" y2="328" stroke="#14385c" stroke-width="2"/>
+<line x1="520" y1="320" x2="520" y2="328" stroke="#14385c" stroke-width="2"/>
+<path d="M230,332 L520,332" stroke="#14385c" stroke-width="1.5" marker-start="url(#tick24a)" marker-end="url(#tick24b)"/>
+<text x="375" y="350" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#14385c">t* maximizes &#963;&#178;B(t) = &#969;&#8320;&#969;&#8321;(&#956;&#8320; &#8722; &#956;&#8321;)&#178;</text>
+<text x="380" y="372" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333">intensity</text>
+<defs>
+<marker id="tick24a" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+<circle cx="4" cy="4" r="2.6" fill="#14385c"/>
+</marker>
+<marker id="tick24b" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+<circle cx="4" cy="4" r="2.6" fill="#14385c"/>
+</marker>
+</defs>
+</svg>
+<figcaption><strong>Figure 2.4.1</strong> The thresholding ideal: a bimodal histogram whose two modes correspond to background and object. Any threshold in the valley separates them; Otsu's method finds the cut $t^*$ that maximizes the between-class variance $\sigma_B^2(t) = \omega_0 \omega_1 (\mu_0 - \mu_1)^2$, pushing the two class means as far apart as their populations allow.</figcaption>
+</figure>
+
+<p>
+In OpenCV, global thresholding is <code>cv2.threshold</code>, which returns both the threshold used and the binarized image, and supports inverse and truncation variants through its flag argument. The interesting question is not the call but the number: who chooses $T$?
+</p>
+
+<h2>2. Otsu's Method: The Histogram Chooses the Cut <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Nobuyuki Otsu's 1979 insight reframed threshold selection as a clustering problem on the histogram. A candidate threshold $t$ splits the normalized histogram $p(k)$ into class 0 ($k \le t$) and class 1 ($k > t$), with class weights and means
+</p>
+<p>
+$$\omega_0(t) = \sum_{k=0}^{t} p(k), \quad \omega_1(t) = 1 - \omega_0(t), \quad \mu_0(t) = \frac{\sum_{k=0}^{t} k\,p(k)}{\omega_0(t)}, \quad \mu_1(t) = \frac{\sum_{k=t+1}^{255} k\,p(k)}{\omega_1(t)}$$
+</p>
+<p>
+A good threshold should produce two tight, well-separated classes: small variance within each class, large distance between their means. Otsu showed these are the same objective, because total variance decomposes as $\sigma^2 = \sigma_W^2(t) + \sigma_B^2(t)$: within-class plus between-class. Since $\sigma^2$ is fixed, minimizing the within-class spread equals maximizing the between-class variance
+</p>
+<p>
+$$\sigma_B^2(t) = \omega_0(t)\, \omega_1(t)\, \big(\mu_0(t) - \mu_1(t)\big)^2$$
+</p>
+<p>
+and the optimal threshold is $t^* = \arg\max_t \sigma_B^2(t)$. With only 256 candidates, brute force is instant, and cumulative sums make the whole search a few vectorized lines:
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def otsu_threshold(gray):
+    """Otsu's method from scratch: maximize between-class variance."""
+    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    p = hist / hist.sum()
+    k = np.arange(256)
+
+    w0 = np.cumsum(p)                      # class-0 weight for every t
+    m  = np.cumsum(k * p)                  # cumulative first moment
+    mG = m[-1]                             # global mean
+
+    w1 = 1.0 - w0
+    valid = (w0 > 0) &amp; (w1 > 0)            # both classes must be non-empty
+    mu0 = np.where(valid, m / np.maximum(w0, 1e-12), 0)
+    mu1 = np.where(valid, (mG - m) / np.maximum(w1, 1e-12), 0)
+
+    sigma_b2 = np.where(valid, w0 * w1 * (mu0 - mu1) ** 2, 0)
+    return int(np.argmax(sigma_b2))
+
+# Synthetic sanity check: dark background N(70, 12), bright blobs N(180, 12)
+rng = np.random.default_rng(0)
+img = rng.normal(70, 12, (400, 400))
+img[100:300, 100:300] = rng.normal(180, 12, (200, 200))
+img = np.clip(img, 0, 255).astype(np.uint8)
+
+t_scratch = otsu_threshold(img)
+t_cv, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+print(t_scratch, t_cv)   # 124 124.0  (the valley between 70 and 180)</code></pre>
+<div class="code-caption">Otsu's method in vectorized NumPy: cumulative sums give every candidate threshold's class weights and means at once, and <code>argmax</code> of the between-class variance picks the cut. On the synthetic two-mode image, both the from-scratch version and OpenCV land on the same valley threshold of 124.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Flag, Not Fifteen Lines</div>
+<p>The entire from-scratch function above is one flag added to <code>cv2.threshold</code>:</p>
+<pre><code class="language-python">t, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)</code></pre>
+<div class="code-caption">Otsu's entire optimization, reduced to one flag on the threshold call; the chosen threshold comes back as the first return value.</div>
+<p>A 15-to-1 reduction. The library computes the histogram, runs the variance maximization, and applies the binarization in a single optimized pass, and the same flag composes with other modes (<code>THRESH_BINARY_INV + THRESH_OTSU</code> for dark objects on light backgrounds, common in document images). scikit-image offers <code>skimage.filters.threshold_otsu</code> when you want the number without the binarized image.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Otsu Is k-Means in One Dimension</div>
+<p>Minimizing within-class variance over a one-dimensional split is exactly the k-means objective with $k = 2$, solved exhaustively rather than iteratively. This framing tells you precisely when Otsu fails: when the two clusters have wildly unequal populations (a tiny defect on a vast background barely dents $\sigma_B^2$), when there are not actually two modes, or when the modes overlap heavily. The histogram diagnostics of <a href="section-2.2.html">Section 2.2</a> are therefore the pre-flight check for Otsu: look at the distribution before trusting an automatic cut. The same "inspect your score distribution before thresholding it" discipline applies verbatim to the network logits of Part III.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Four Pages, Half a Century</div>
+<p>Otsu's paper is four pages long, contains one figure, and was published in 1979 in a systems-and-cybernetics journal rather than a vision venue. It has accumulated on the order of a hundred thousand citations and ships today inside OpenCV, scikit-image, MATLAB, ImageJ, Halcon, and effectively every microscope and document scanner on Earth. Per page, it may be the most deployed algorithm description in the history of imaging.</p>
+</div>
+
+<h2>3. When One Threshold Cannot Work: Adaptive Methods <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Otsu optimizes a global cut, and some images simply do not have one. The canonical case is a document photographed under side lighting: the paper at the bright corner is lighter than the ink at the dark corner, so any single $T$ misclassifies one end of the page. Figure 2.4.2 shows the failure and the cure. The cure is to let the threshold vary across the image: classify each pixel against a statistic of its own neighborhood rather than against one global number.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of global versus adaptive thresholding on a document with an illumination gradient">
+<rect x="0" y="0" width="800" height="330" fill="#ffffff"/>
+<defs>
+<linearGradient id="illum24" x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stop-color="#f2f2f2"/>
+<stop offset="100%" stop-color="#5a5a5a"/>
+</linearGradient>
+</defs>
+<!-- input -->
+<text x="135" y="34" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#333">input: uneven light</text>
+<rect x="35" y="50" width="200" height="220" fill="url(#illum24)" stroke="#999"/>
+<g fill="#222222" fill-opacity="0.75">
+<rect x="55" y="75"  width="160" height="9"/>
+<rect x="55" y="100" width="140" height="9"/>
+<rect x="55" y="125" width="155" height="9"/>
+<rect x="55" y="150" width="130" height="9"/>
+<rect x="55" y="175" width="150" height="9"/>
+<rect x="55" y="200" width="120" height="9"/>
+<rect x="55" y="225" width="145" height="9"/>
+</g>
+<!-- arrow 1 -->
+<path d="M250,160 L300,160" stroke="#555" stroke-width="2.5" marker-end="url(#arr24)"/>
+<!-- global result -->
+<text x="410" y="34" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#333">global T = 127</text>
+<rect x="310" y="50" width="200" height="220" fill="#ffffff" stroke="#999"/>
+<!-- dark corner swallowed: black wedge -->
+<path d="M510,110 L510,270 L350,270 Z" fill="#111111"/>
+<g fill="#111111">
+<rect x="330" y="75"  width="160" height="9"/>
+<rect x="330" y="100" width="140" height="9"/>
+<rect x="330" y="125" width="120" height="9"/>
+<rect x="330" y="150" width="80"  height="9"/>
+<rect x="330" y="175" width="55"  height="9"/>
+</g>
+<text x="410" y="296" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#c0392b">dark corner crushed to ink</text>
+<!-- arrow 2 -->
+<path d="M525,160 L575,160" stroke="#555" stroke-width="2.5" marker-end="url(#arr24)"/>
+<!-- adaptive result -->
+<text x="685" y="34" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#333">adaptive (31&#215;31)</text>
+<rect x="585" y="50" width="200" height="220" fill="#ffffff" stroke="#999"/>
+<g fill="#111111">
+<rect x="605" y="75"  width="160" height="9"/>
+<rect x="605" y="100" width="140" height="9"/>
+<rect x="605" y="125" width="155" height="9"/>
+<rect x="605" y="150" width="130" height="9"/>
+<rect x="605" y="175" width="150" height="9"/>
+<rect x="605" y="200" width="120" height="9"/>
+<rect x="605" y="225" width="145" height="9"/>
+</g>
+<text x="685" y="296" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#27ae60">every line recovered</text>
+<defs>
+<marker id="arr24" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+<path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+</marker>
+</defs>
+</svg>
+<figcaption><strong>Figure 2.4.2</strong> Why adaptive thresholding exists. Left: a document under an illumination gradient; the paper in the dark corner is darker than the ink in the bright corner. Center: any global threshold misclassifies one end, here crushing the dark corner to solid ink. Right: comparing each pixel to its own local neighborhood mean recovers every text line, because the gradient varies slowly while ink edges vary fast.</figcaption>
+</figure>
+
+<p>
+OpenCV's <code>cv2.adaptiveThreshold</code> computes, for each pixel, the mean (or Gaussian-weighted mean) of a <code>blockSize</code> x <code>blockSize</code> neighborhood and thresholds the pixel at that local mean minus a constant <code>C</code>. For harder material (stained documents, low contrast film scans), Sauvola's method additionally scales the offset by the local standard deviation, so the threshold tightens in busy regions and relaxes in flat ones:
+</p>
+
+<pre><code class="language-python">import cv2
+from skimage.filters import threshold_sauvola
+
+gray = cv2.imread("receipt_photo.jpg", cv2.IMREAD_GRAYSCALE)
+
+# Local Gaussian-weighted mean, minus offset C. blockSize must be odd
+# and larger than the stroke width of the text.
+adaptive = cv2.adaptiveThreshold(gray, 255,
+                                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY,
+                                 blockSize=31, C=10)
+
+# Sauvola: threshold = mean * (1 + k * (std/R - 1)), per pixel
+t_sauvola = threshold_sauvola(gray, window_size=31, k=0.2)
+sauvola = (gray > t_sauvola).astype("uint8") * 255</code></pre>
+<div class="code-caption">Two local thresholding methods on a photographed receipt: OpenCV's Gaussian-weighted adaptive mean with an offset, and scikit-image's Sauvola method, which modulates the threshold by local standard deviation and dominates document-binarization benchmarks among classical methods.</div>
+
+<p>
+Two parameter rules of thumb save hours of fiddling. First, <code>blockSize</code> (or <code>window_size</code>) must be larger than the features you are extracting: if the window fits inside a pen stroke, the stroke's interior sees only itself as context and dissolves. Second, <code>C</code> (or Sauvola's <code>k</code>) sets how decisively a pixel must differ from its surroundings to count as foreground; raising it suppresses noise speckle at the cost of thin strokes. Speckle that survives is not a thresholding failure but a job for the smoothing filters of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, and for the morphological cleanup of <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a>, which consumes exactly the binary maps this section produces.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Expiry-Date Reader That Died at 3 PM</div>
+<p><strong>Who:</strong> A vision engineer at a food-packaging plant, responsible for verifying inkjet-printed expiry dates on foil lids.</p>
+<p><strong>Situation:</strong> The verification system binarized each lid image with Otsu's threshold, then matched characters. It ran at 99.7 percent read rate for months.</p>
+<p><strong>Problem:</strong> Read rate collapsed to around 80 percent, but only on sunny afternoons. A skylight above the line cast a soft gradient across the foil from roughly 2 to 5 PM, and the glare made one global threshold impossible: either the bright half blew out or the dim half went black. The histogram, previously bimodal, smeared into one broad ridge, exactly the failure condition for Otsu.</p>
+<p><strong>Decision:</strong> The engineer swapped global Otsu for <code>cv2.adaptiveThreshold</code> (Gaussian, blockSize 41, C 8), sized so the window comfortably exceeded the character stroke width, and added a histogram-bimodality check to the telemetry so the system could flag lighting regressions itself.</p>
+<p><strong>Result:</strong> Afternoon read rate returned above 99.5 percent with no hardware change; the skylight got a diffuser film a month later anyway.</p>
+<p><strong>Lesson:</strong> A threshold is an assumption about the histogram. When a thresholding system degrades on a schedule (time of day, season), suspect illumination first, and reach for local methods before re-engineering the optics.</p>
+</div>
+
+<h2>4. Beyond a Single Cut <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Three refinements round out the thresholding toolbox. Multi-level thresholding generalizes Otsu to two or more cuts (three classes or more); scikit-image ships it as <code>threshold_multiotsu</code>, useful for images with distinct material phases, like soil-pore-water micrographs. The triangle method (<code>cv2.THRESH_TRIANGLE</code>) handles strongly unimodal histograms with a small foreground tail, the regime where Otsu's equal-cluster assumption breaks, by dropping a perpendicular from the histogram peak's chord; it is a favorite in fluorescence microscopy. And hysteresis thresholding uses two thresholds: pixels above the high cut are definitely foreground, pixels between the cuts are accepted only if connected to definite ones. That last idea, tolerance for weak evidence when it is attached to strong evidence, is the heart of the Canny edge detector you will meet in <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>.
+</p>
+
+<p>
+Step back and notice the shape of everything this section did: produce a per-pixel score, then apply a cut to make a per-pixel decision. That shape survives the deep learning revolution completely intact. A semantic segmentation network in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> ends in exactly this operation: per-pixel logits, a sigmoid, and a threshold (usually 0.5, and choosing it better is a tuning lever practitioners use). The score map got smarter; the final operation is still this section.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Thresholds Inside Modern Segmenters</div>
+<p>The threshold did not retire; it moved inside the model. SAM and SAM 2 (Meta, 2023 and 2024) generate segmentation masks by thresholding predicted mask logits at zero, and expose a <code>stability_score</code> that measures how much a mask changes when that threshold shifts, literally a threshold-sensitivity analysis from this section run as a quality filter. In cell microscopy, Cellpose's 2024-2025 generation (Cellpose3 and the "Cellpose-SAM" line) still finalizes instance masks by thresholding predicted flow and probability fields, with the cut exposed as a user parameter. And in document AI, the DIBCO binarization benchmarks continue to be contested by hybrid methods where a U-Net predicts a per-pixel threshold surface, a direct learned descendant of Sauvola's formula. The research question is no longer "where is the cut?" but "how do we make the scores so good that the cut is easy?"</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.1: Break Otsu on Purpose <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Describe three concrete images on which Otsu's method chooses a badly wrong threshold, one for each failure cause: (a) extremely unequal class populations, (b) more than two modes, (c) heavy mode overlap. For each, predict roughly where Otsu's cut lands and why, using the $\sigma_B^2(t) = \omega_0 \omega_1 (\mu_0 - \mu_1)^2$ formula to justify your prediction.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.2: Coin Counter <span class="exercise-type coding">Coding</span></div>
+<p>Photograph several coins on a plain dark surface (or synthesize bright discs on a dark noisy background). Build a pipeline: grayscale, Otsu threshold, then count the resulting connected components with <code>cv2.connectedComponents</code>. Then re-shoot (or re-synthesize) with a strong lighting gradient and show that the Otsu version miscounts while a version using <code>cv2.adaptiveThreshold</code> recovers the correct count. Report both counts at both lighting conditions.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.4.3: The Valley Sensitivity Curve <span class="exercise-type analysis">Analysis</span></div>
+<p>For the synthetic two-mode image from this section's Otsu code, sweep the threshold $t$ from 0 to 255 and plot the pixel-level classification error against the known ground truth (the blob rectangle) as a function of $t$. Mark Otsu's choice on the curve. Then narrow the gap between the two modes (means 70 and 180, then 90 and 160, then 110 and 140) and repeat. Write a short analysis of how the error valley's width changes and what that implies about thresholding robustness as class separability shrinks.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.3.html">&#8592; Section 2.3: Histogram Equalization &amp; CLAHE</a>
+<a href="index.html">Chapter 2</a>
+<a class="next" href="section-2.5.html">Section 2.5: Image Arithmetic, Blending &amp; Compositing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

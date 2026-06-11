@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 10: Keypoints, Descriptors &amp; Matching. Corner detection with Harris, Shi-Tomasi and FAST, scale space, SIFT, binary descriptors, the ratio test, and RANSAC: the complete classical correspondence pipeline." name="description"/>
+<title>Chapter 10: Keypoints, Descriptors &amp; Matching | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a></div>
+<h1>Keypoints, Descriptors &amp; Matching</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I have spent my whole career looking for the same point in two photographs. The trick is to be memorable enough that the second photograph recognizes you."</p>
+<cite>A Quietly Distinctive Keypoint</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This chapter solves the correspondence problem: find the same physical point in two different photographs, and most of geometric vision follows as a consequence.</strong> Panorama stitching, camera calibration, stereo depth, structure from motion, visual SLAM, and image retrieval all begin with the same four-stage pipeline built here: detect repeatable points, describe their neighborhoods as vectors, match the vectors between images, and verify the matches with a geometric model. The pipeline is classical, but it is no museum piece: it runs today inside <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s COLMAP reconstructions that feed the neural radiance fields of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>, and its design choices echo through the learned representations of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+<a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> extracted structure from single images: edges, lines, and curves. This chapter asks a question that involves two images at once. Given a photograph of a building taken from the street and another taken a few steps to the left, can a program point at a window corner in the first image and find the very same window corner in the second? A human does this instantly. For a machine, it is a genuinely hard problem: the second image differs in viewpoint, scale, rotation, lighting, and sensor noise, and the search space is every pixel. Solving it unlocks an astonishing amount of geometry, because two views of the same point constrain where the cameras were, which is the seed of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>'s stereo and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s structure from motion.
+</p>
+<p>
+The classical answer decomposes the problem into stages, and the chapter walks through them in order. Section 10.1 asks which points are worth finding at all and answers with corners: locations where the image gradient varies in two directions, detected by the Harris and Shi-Tomasi operators and, at production speed, by FAST. Section 10.2 confronts the fact that a corner detector tuned to one zoom level fails at another, and builds the scale-space machinery (Gaussian pyramids, the Difference of Gaussians, canonical orientation) that makes detection survive zoom and rotation. Section 10.3 assembles these parts into SIFT, the 128-dimensional gradient-histogram descriptor that dominated computer vision for a decade and still ships inside reconstruction pipelines today.
+</p>
+<p>
+The second half of the chapter is about engineering and trust. Section 10.4 trades SIFT's floating-point precision for binary descriptors (BRIEF, ORB, AKAZE) that match hundreds of times faster and fit real-time budgets on phones and robots. Section 10.5 turns piles of descriptors into actual correspondences, introducing brute-force and approximate nearest-neighbor search and the deceptively simple ratio test that rejects most false matches before they cause damage. Section 10.6 deals with the false matches that survive anyway: RANSAC, the hypothesize-and-verify algorithm that fits geometric models to contaminated data and, in doing so, separates inliers from outliers. RANSAC is so generally useful that it long ago escaped this chapter's topic and became a standard tool across all of engineering.
+</p>
+<p>
+One theme deserves flagging before you begin. Every design decision in this chapter is a trade between <em>invariance</em> (ignoring changes you do not care about) and <em>distinctiveness</em> (preserving differences you do). A descriptor invariant to everything describes nothing; a descriptor sensitive to everything matches nothing. SIFT's gradient histograms, BRIEF's intensity comparisons, and the ratio test's relative threshold are all answers to this one tension. The same tension returns, with weights learned from data instead of designed by hand, when <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a> trains networks to produce embeddings, and when <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>'s CLIP vectors act as universal descriptors for entire images. Hand-crafted features lost the recognition war to deep learning, but the vocabulary they established (detect, describe, match, verify) remains the grammar of geometric vision.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter leans directly on image gradients and the Sobel operator from <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a>, and on Gaussian pyramids and the Difference of Gaussians from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a>. Section 10.6 fits homographies, so the geometric transformations of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a> should be fresh. The discussion of robust fitting continues a thread started in <a href="../module-09-edges-lines-curves/index.html">Chapter 9: Edges, Lines &amp; Curves</a>, whose least-squares and Hough machinery is the contrast against which RANSAC makes sense. Comfort with NumPy arrays and basic linear algebra (eigenvalues of a 2x2 matrix) is assumed throughout.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">10.1</span>
+<a href="section-10.1.html"><span class="section-title">Corner Detection: Harris, Shi-Tomasi &amp; FAST</span></a>
+<span class="section-desc">Why corners are the findable points: the structure tensor, eigenvalue analysis, the Harris response, Shi-Tomasi's refinement, and the FAST segment test that runs at video rate.</span>
+</li>
+<li>
+<span class="section-num">10.2</span>
+<a href="section-10.2.html"><span class="section-title">Scale &amp; Rotation Invariance: Scale Space</span></a>
+<span class="section-desc">Making detection survive zoom and rotation: Gaussian scale space, octaves, Difference-of-Gaussians extrema, sub-pixel refinement, and canonical orientation assignment.</span>
+</li>
+<li>
+<span class="section-num">10.3</span>
+<a href="section-10.3.html"><span class="section-title">SIFT: The Descriptor That Defined a Decade</span></a>
+<span class="section-desc">The 128-dimensional gradient-histogram descriptor: its 4x4x8 anatomy, the normalization tricks behind its illumination robustness, RootSIFT, and its legacy.</span>
+</li>
+<li>
+<span class="section-num">10.4</span>
+<a href="section-10.4.html"><span class="section-title">Fast Binary Alternatives: BRIEF, ORB &amp; AKAZE</span></a>
+<span class="section-desc">Descriptors as bit strings: BRIEF's intensity comparisons, Hamming distance at hardware speed, ORB's oriented and de-correlated upgrade, and AKAZE's nonlinear scale space.</span>
+</li>
+<li>
+<span class="section-num">10.5</span>
+<a href="section-10.5.html"><span class="section-title">Descriptor Matching &amp; the Ratio Test</span></a>
+<span class="section-desc">From descriptor piles to correspondences: brute-force and FLANN nearest-neighbor search, cross-checking, and Lowe's ratio test that compares best to second-best.</span>
+</li>
+<li>
+<span class="section-num">10.6</span>
+<a href="section-10.6.html"><span class="section-title">RANSAC &amp; Robust Model Fitting</span></a>
+<span class="section-desc">Trusting matches by geometric consensus: why least squares breaks, the hypothesize-and-verify loop, fitting homographies to contaminated matches, and modern MAGSAC++ variants.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+Keypoints answer "where is the same point?" but stay silent about regions: which pixels belong together as one object or surface? <a href="../module-11-classical-segmentation/index.html">Chapter 11: Classical Segmentation &amp; Grouping</a> takes up that question with clustering, region growing, watersheds, graph cuts, and superpixels: the classical toolkit for carving an image into meaningful pieces. The two chapters are complementary halves of classical scene understanding: this one finds sparse, precise anchors for geometry, the next finds dense, coherent groupings for content. Both threads converge later, when <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> begins the geometric arc that consumes this chapter's correspondences.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Harris, C. and Stephens, M. "A Combined Corner and Edge Detector." Alvey Vision Conference (1988). <a href="https://www.bmva.org/bmvc/1988/avc-88-023.pdf" target="_blank" rel="noopener">bmva.org (PDF)</a></div>
+<div class="bib-annotation">The four-page paper behind Section 10.1: the structure tensor, the eigenvalue picture of flat/edge/corner, and the famous response formula with its mysterious constant k.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lowe, D. "Distinctive Image Features from Scale-Invariant Keypoints." IJCV (2004). <a href="https://doi.org/10.1023/B:VISI.0000029664.99615.94" target="_blank" rel="noopener">doi:10.1023/B:VISI.0000029664.99615.94</a></div>
+<div class="bib-annotation">The SIFT paper: scale-space detection, orientation assignment, the 128-dimensional descriptor, and the ratio test, all in one document. Sections 10.2, 10.3, and 10.5 are essentially a guided tour of it.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lindeberg, T. "Feature Detection with Automatic Scale Selection." IJCV (1998). <a href="https://doi.org/10.1023/A:1008045108935" target="_blank" rel="noopener">doi:10.1023/A:1008045108935</a></div>
+<div class="bib-annotation">The theoretical foundation of Section 10.2: scale-normalized derivatives and the principle that extrema over scale select an object's intrinsic scale.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Rosten, E. and Drummond, T. "Machine Learning for High-Speed Corner Detection." ECCV (2006). <a href="https://doi.org/10.1007/11744023_34" target="_blank" rel="noopener">doi:10.1007/11744023_34</a></div>
+<div class="bib-annotation">FAST: the segment test, and the decision-tree compilation that made corner detection nearly free. The reason Section 10.1's third detector runs at video rate on a microcontroller.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Calonder, M., Lepetit, V., Strecha, C., and Fua, P. "BRIEF: Binary Robust Independent Elementary Features." ECCV (2010). <a href="https://doi.org/10.1007/978-3-642-15561-1_56" target="_blank" rel="noopener">doi:10.1007/978-3-642-15561-1_56</a></div>
+<div class="bib-annotation">The paper that replaced 128 floats with 256 bits and made Section 10.4 possible; remarkably readable, including the empirical comparison of sampling strategies.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Rublee, E., Rabaud, V., Konolige, K., and Bradski, G. "ORB: An Efficient Alternative to SIFT or SURF." ICCV (2011). <a href="https://doi.org/10.1109/ICCV.2011.6126544" target="_blank" rel="noopener">doi:10.1109/ICCV.2011.6126544</a></div>
+<div class="bib-annotation">Oriented FAST plus rotated, de-correlated BRIEF: the descriptor that powers ORB-SLAM and most real-time matching a decade later. Section 10.4's centerpiece.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Fischler, M. and Bolles, R. "Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography." Communications of the ACM (1981). <a href="https://doi.org/10.1145/358669.358692" target="_blank" rel="noopener">doi:10.1145/358669.358692</a></div>
+<div class="bib-annotation">RANSAC's birth certificate, written for camera pose estimation in cartography. Section 10.6 follows its hypothesize-and-verify logic almost line by line.</div>
+</div>
+
+<h3>Recent Research (2023-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Lindenberger, P., Sarlin, P.-E., and Pollefeys, M. "LightGlue: Local Feature Matching at Light Speed." ICCV (2023). <a href="https://arxiv.org/abs/2306.13643" target="_blank" rel="noopener">arXiv:2306.13643</a></div>
+<div class="bib-annotation">The learned matcher that replaced Section 10.5's nearest-neighbor search in many modern pipelines: adaptive depth and width make it fast enough for real-time use.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Jiang, H. et al. "OmniGlue: Generalizable Feature Matching with Foundation Model Guidance." CVPR (2024). <a href="https://arxiv.org/abs/2405.12979" target="_blank" rel="noopener">arXiv:2405.12979</a></div>
+<div class="bib-annotation">Feature matching guided by a vision foundation model, aimed at generalizing across image domains that break classical and learned matchers alike.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Potje, G. et al. "XFeat: Accelerated Features for Lightweight Image Matching." CVPR (2024). <a href="https://arxiv.org/abs/2404.19174" target="_blank" rel="noopener">arXiv:2404.19174</a></div>
+<div class="bib-annotation">A learned detector-descriptor designed for the same CPU-and-embedded niche ORB occupies, showing the efficiency race of Section 10.4 continues in the deep era.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Leroy, V., Cabon, Y., and Revaud, J. "Grounding Image Matching in 3D with MASt3R." ECCV (2024). <a href="https://arxiv.org/abs/2406.09756" target="_blank" rel="noopener">arXiv:2406.09756</a></div>
+<div class="bib-annotation">Recasts two-view matching as direct 3D reconstruction with a transformer, challenging the detect-describe-match-verify decomposition this whole chapter teaches.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 7 covers feature detection, description, and matching with full mathematical depth and exhaustive references; free online.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Feature Detection and Description" tutorial series. <a href="https://docs.opencv.org/4.x/db/d27/tutorial_py_table_of_contents_feature2d.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The official OpenCV 4.x walkthroughs of Harris, Shi-Tomasi, FAST, SIFT, ORB, matching, and homography estimation used throughout this chapter's code.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kornia. <code>kornia.feature</code> documentation. <a href="https://kornia.readthedocs.io/en/latest/feature.html" target="_blank" rel="noopener">kornia.readthedocs.io</a></div>
+<div class="bib-annotation">Differentiable PyTorch implementations of Harris, DoG, SIFT, and modern learned features (DISK, LoFTR adapters), bridging this chapter to Part III.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Sch&#246;nberger, J. L. COLMAP: Structure-from-Motion and Multi-View Stereo. <a href="https://colmap.github.io/" target="_blank" rel="noopener">colmap.github.io</a></div>
+<div class="bib-annotation">The reference reconstruction pipeline: SIFT keypoints, ratio-test matching, and RANSAC geometric verification at industrial scale. Where this chapter's pipeline lives in production.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-09-edges-lines-curves/index.html">&#8592; Chapter 9: Edges, Lines &amp; Curves</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="../module-11-classical-segmentation/index.html">Chapter 11: Classical Segmentation &amp; Grouping &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

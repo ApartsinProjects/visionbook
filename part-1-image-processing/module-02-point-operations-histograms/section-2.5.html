@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.5: Image Arithmetic, Blending &amp; Compositing. Combining images pixel by pixel: the uint8 overflow trap, weighted blending, difference imaging for change detection, and Porter-Duff alpha compositing with masks." name="description"/>
+<title>Section 2.5: Image Arithmetic, Blending &amp; Compositing | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a></div>
+<h1>Image Arithmetic, Blending &amp; Compositing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I am 30 percent mountain, 70 percent weather graphics, and 100 percent committed to this relationship."</p>
+<cite>A Partially Transparent Alpha Channel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Everything in this chapter so far transformed one image; this section combines several, still strictly pixel by pixel, and that one extension unlocks change detection, crossfades, watermarking, and the alpha-compositing algebra behind every screen you own.</strong> The mathematics is elementary (add, subtract, weighted average), so the section's real lessons are the traps and the algebra: uint8 arithmetic that silently wraps around, and the Porter-Duff "over" operator that turned layering images into a closed, composable system.</p>
+</div>
+
+<p>
+With <a href="section-2.1.html">Section 2.1</a> through <a href="section-2.4.html">Section 2.4</a> behind us, we can curve, equalize, and binarize a single image. The natural next step is arithmetic between images: given two aligned frames $f_1$ and $f_2$, compute $f_1 + f_2$, $f_1 - f_2$, or $\alpha f_1 + (1-\alpha) f_2$ at every pixel. These operations stay within the point-operation family (each output pixel depends only on the input pixels at the same location), but the inputs now come from multiple images, which is where the first trap lies waiting.
+</p>
+
+<h2>1. The Arithmetic Trap: uint8 Overflow <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+As established in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>, images arrive as uint8 arrays, and uint8 arithmetic in NumPy is modular: it wraps around at 256 rather than stopping at 255. Adding two bright pixels yields a dark one; subtracting a larger value from a smaller one yields a bright one. OpenCV's arithmetic functions instead saturate, clamping results into $[0, 255]$. The two-line demonstration below is worth running once in your life, because the bug it represents is endemic:
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+a = np.array([[200]], dtype=np.uint8)
+b = np.array([[100]], dtype=np.uint8)
+
+print(a + b)            # [[44]]   NumPy wraps: (200 + 100) % 256 = 44
+print(cv2.add(a, b))    # [[255]]  OpenCV saturates: min(300, 255)
+
+print(b - a)                 # [[156]]  NumPy wraps: (100 - 200) % 256
+print(cv2.subtract(b, a))    # [[0]]    OpenCV saturates: max(-100, 0)
+print(cv2.absdiff(a, b))     # [[100]]  |200 - 100|, always safe</code></pre>
+<div class="code-caption">The uint8 wraparound demonstration: identical inputs, opposite answers. NumPy's modular arithmetic turns 200 plus 100 into 44, while OpenCV's saturating arithmetic clamps to 255. For differences, <code>cv2.absdiff</code> sidesteps the sign problem entirely.</div>
+
+<p>
+The symptoms of wraparound in real pipelines are unforgettable: brightened skies turn black in blotches, difference images light up like neon. The rules that prevent it: use <code>cv2.add</code>, <code>cv2.subtract</code>, <code>cv2.absdiff</code>, and <code>cv2.addWeighted</code> for uint8 work; or convert to a wider type first (<code>astype(np.float32)</code> or <code>np.int16</code>), compute, then clip and convert back, exactly the float-clip-convert discipline from <a href="section-2.1.html">Section 2.1</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Saturation Is a Modeling Choice, Not Just a Bug Fix</div>
+<p>Saturating arithmetic is not merely "the safe option"; it models physical reality. Light adds: doubling exposure cannot make a sensor read negative, and a sensor well that is full stays full. Modular arithmetic models nothing visual at all; it is a hardware accident of binary counters. When you choose a dtype and an arithmetic mode, you are choosing the physics of your pixel algebra, which is why serious compositing pipelines work in float and clamp exactly once, at the end.</p>
+</div>
+
+<h2>2. Blending: The Weighted Average <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The most useful two-image operation is the convex combination
+</p>
+<p>
+$$g = \alpha f_1 + (1 - \alpha) f_2, \qquad \alpha \in [0, 1]$$
+</p>
+<p>
+which crossfades between the images: $\alpha = 1$ shows pure $f_1$, $\alpha = 0$ pure $f_2$, and anything between is a dissolve. One call does it with saturation handled:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+day   = cv2.imread("street_day.jpg")
+night = cv2.imread("street_night.jpg")     # same size and dtype
+
+# A 60-frame crossfade from day to night:
+frames = []
+for i in range(60):
+    alpha = 1.0 - i / 59.0                  # 1.0 -&gt; 0.0
+    mix = cv2.addWeighted(day, alpha, night, 1.0 - alpha, 0.0)
+    frames.append(mix)
+
+# Watermarking is the same operation with a high alpha:
+logo_bg = cv2.addWeighted(day, 0.92, np.full_like(day, 255), 0.08, 0.0)</code></pre>
+<div class="code-caption">Crossfading with <code>cv2.addWeighted</code>: a convex combination per frame produces a dissolve, and the same call with a lopsided weight implements translucent watermarking. The final argument is a scalar bias added after the weighted sum.</div>
+
+<p>
+Blending has a second life far from video editing: averaging $N$ aligned noisy frames divides the noise standard deviation by $\sqrt{N}$, the cheapest denoiser ever invented and a staple of astrophotography and microscopy (a theme developed properly in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>). And in deep learning, the mixup augmentation blends pairs of training images (and their labels) with a random $\alpha$, exactly this section's formula deployed as a regularizer, which we will meet among the training recipes of <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
+</p>
+
+<h2>3. Difference Images: Seeing Change <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Subtracting two aligned images of the same scene isolates what changed between them. With a clean reference frame (an empty corridor, a bare conveyor belt), <code>cv2.absdiff</code> against the live frame highlights everything new, and a threshold from <a href="section-2.4.html">Section 2.4</a> turns the difference into a binary change mask. This three-line pattern is the ancestral form of motion detection and still runs in countless deployed systems:
+</p>
+
+<pre><code class="language-python">import cv2
+
+background = cv2.imread("empty_corridor.png", cv2.IMREAD_GRAYSCALE)
+frame      = cv2.imread("corridor_now.png",  cv2.IMREAD_GRAYSCALE)
+
+diff = cv2.absdiff(frame, background)              # |frame - background|
+_, motion_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+
+changed_fraction = motion_mask.mean() / 255.0
+if changed_fraction > 0.02:                        # &gt;2% of pixels changed
+    print(f"motion: {changed_fraction:.1%} of frame")   # e.g. motion: 7.3%</code></pre>
+<div class="code-caption">Frame differencing in three operative lines: absolute difference against a reference frame, a binary threshold on the change magnitude, and a changed-area trigger. The threshold of 25 absorbs sensor noise; the 2 percent area rule absorbs flicker and compression artifacts.</div>
+
+<p>
+The static-reference assumption is, predictably, the weak point: lighting drifts, trees sway, and the "empty" scene never stays empty. Production systems therefore maintain a running statistical model of the background per pixel (OpenCV ships <code>cv2.createBackgroundSubtractorMOG2</code>, a per-pixel Gaussian mixture), and the full story of motion, including optical flow that estimates where each pixel went rather than just whether it changed, belongs to <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
+</p>
+
+<h2>4. Alpha Compositing: The Over Operator <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Blending with one global $\alpha$ dissolves whole images into each other. Compositing generalizes $\alpha$ into a per-pixel coverage map: a fourth channel, the alpha channel, where 1 means fully opaque, 0 fully transparent, and fractions mean partial coverage (the soft edge of hair, the translucency of glass, the antialiased boundary of a rendered logo). Porter and Duff's 1984 paper defined an algebra of twelve ways to combine two such images; the one that conquered the world is <em>over</em>. Placing foreground $F$ (color $C_f$, alpha $\alpha_f$) over background $B$ (color $C_b$, alpha $\alpha_b$):
+</p>
+<p>
+$$\alpha_o = \alpha_f + \alpha_b (1 - \alpha_f), \qquad
+C_o = \frac{\alpha_f C_f + \alpha_b C_b (1 - \alpha_f)}{\alpha_o}$$
+</p>
+<p>
+The structure is exactly what physical intuition demands: the foreground contributes in proportion to its coverage $\alpha_f$, and the background shows through only the remaining $(1 - \alpha_f)$. With an opaque background ($\alpha_b = 1$), the color formula collapses to the familiar $C_o = \alpha_f C_f + (1 - \alpha_f) C_b$. Figure 2.5.1 traces the operator's data flow.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Alpha compositing data flow: a foreground layer with an alpha channel is combined with a background layer through the over operator to produce the composite">
+<rect x="0" y="0" width="800" height="320" fill="#ffffff"/>
+<!-- foreground layer -->
+<rect x="40" y="40" width="170" height="110" rx="8" fill="#fde9d9" stroke="#e67e22" stroke-width="2"/>
+<text x="125" y="78" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#7f4a12">foreground F</text>
+<text x="125" y="102" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#7f4a12">color Cf</text>
+<text x="125" y="124" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#7f4a12">alpha &#945;f (coverage)</text>
+<!-- background layer -->
+<rect x="40" y="180" width="170" height="110" rx="8" fill="#d9e8f7" stroke="#2980b9" stroke-width="2"/>
+<text x="125" y="218" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#14385c">background B</text>
+<text x="125" y="242" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#14385c">color Cb</text>
+<text x="125" y="264" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#14385c">alpha &#945;b</text>
+<!-- arrows to operator -->
+<path d="M212,95 C290,95 300,140 340,152" fill="none" stroke="#e67e22" stroke-width="2.5" marker-end="url(#arrF25)"/>
+<path d="M212,235 C290,235 300,190 340,176" fill="none" stroke="#2980b9" stroke-width="2.5" marker-end="url(#arrB25)"/>
+<!-- weights on arrows -->
+<text x="268" y="110" font-family="sans-serif" font-size="13" fill="#e67e22">weight &#945;f</text>
+<text x="252" y="226" font-family="sans-serif" font-size="13" fill="#2980b9">weight (1 &#8722; &#945;f)&#183;&#945;b</text>
+<!-- over operator -->
+<circle cx="385" cy="164" r="38" fill="#f4f5f7" stroke="#14385c" stroke-width="2.5"/>
+<text x="385" y="171" text-anchor="middle" font-family="sans-serif" font-size="17" font-weight="bold" fill="#14385c">over</text>
+<!-- arrow to output -->
+<path d="M427,164 L520,164" stroke="#555" stroke-width="2.5" marker-end="url(#arrO25)"/>
+<!-- output -->
+<rect x="528" y="106" width="220" height="116" rx="8" fill="#e8f6ee" stroke="#27ae60" stroke-width="2"/>
+<text x="638" y="142" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#1d6b40">composite F over B</text>
+<text x="638" y="172" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1d6b40">&#945;o = &#945;f + &#945;b(1 &#8722; &#945;f)</text>
+<text x="638" y="198" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1d6b40">&#945;oCo = &#945;fCf + (1 &#8722; &#945;f)&#945;bCb</text>
+<!-- note -->
+<text x="385" y="262" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#666">associative: (A over B) over C = A over (B over C),</text>
+<text x="385" y="282" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#666">so deep layer stacks compose two at a time, in any grouping</text>
+<defs>
+<marker id="arrF25" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+<path d="M0,0 L10,5 L0,10 z" fill="#e67e22"/>
+</marker>
+<marker id="arrB25" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+<path d="M0,0 L10,5 L0,10 z" fill="#2980b9"/>
+</marker>
+<marker id="arrO25" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+<path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+</marker>
+</defs>
+</svg>
+<figcaption><strong>Figure 2.5.1</strong> The Porter-Duff over operator as a data flow. The foreground contributes its color weighted by its coverage $\alpha_f$; the background contributes through the remaining $(1 - \alpha_f)$, scaled by its own alpha. Because over is associative, an arbitrarily deep stack of layers (a UI, a film composite, a game HUD) can be collapsed pairwise in any grouping.</figcaption>
+</figure>
+
+<p>
+The implementation below covers the overwhelmingly common case of an opaque background, where the division by $\alpha_o$ disappears. Watch the imread flag: OpenCV's default loader silently drops the alpha channel that the whole computation depends on.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def composite_over(fg_bgra, bg_bgr):
+    """Porter-Duff 'over' for a BGRA foreground on an opaque BGR background."""
+    fg = fg_bgra[..., :3].astype(np.float32)
+    alpha = (fg_bgra[..., 3:4].astype(np.float32)) / 255.0   # (H, W, 1)
+    bg = bg_bgr.astype(np.float32)
+    out = alpha * fg + (1.0 - alpha) * bg       # broadcast over channels
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+overlay = cv2.imread("score_banner.png", cv2.IMREAD_UNCHANGED)  # keeps alpha!
+frame   = cv2.imread("match_frame.jpg")
+print(overlay.shape)        # (H, W, 4): the 4th channel is alpha
+shown = composite_over(overlay, frame)</code></pre>
+<div class="code-caption">A from-scratch over composite for an opaque background: float arithmetic, per-pixel alpha broadcast across the color channels, one clip at the end. Note <code>cv2.IMREAD_UNCHANGED</code>: the default imread flag silently discards the alpha channel that this entire computation depends on.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Pillow's alpha_composite</div>
+<p>For general foreground-over-background work, including a semi-transparent background, Pillow implements the full Porter-Duff formula in one line:</p>
+<pre><code class="language-python">from PIL import Image
+out = Image.alpha_composite(bg_rgba, fg_rgba)    # both in RGBA mode</code></pre>
+<div class="code-caption">The full Porter-Duff over, including output-alpha handling, as one Pillow call on two RGBA images.</div>
+<p>That one call replaces roughly ten lines of careful float math (the general case must also compute the output alpha and divide by it, with a guard against $\alpha_o = 0$). Internally Pillow handles the un-premultiplied algebra, integer rounding, and full-transparency edge cases that hand-rolled versions reliably get wrong on their first deployment.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Alpha Channel Came From Lucasfilm</div>
+<p>The alpha channel was conceived by Alvy Ray Smith and Ed Catmull in the late 1970s, and the compositing algebra was formalized at Lucasfilm's graphics group by Thomas Porter and Tom Duff in 1984, where the immediate use case was layering rendered spaceships over live-action plates without re-rendering everything per frame. The group later spun out as Pixar. Every PNG with transparency you have ever shipped carries a little movie-studio DNA.</p>
+</div>
+
+<h2>5. Masks and Bitwise Operations <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+When transparency is all-or-nothing, the binary masks produced by the thresholding of <a href="section-2.4.html">Section 2.4</a> take the place of a fractional alpha channel, and compositing reduces to bitwise logic: AND to keep pixels where the mask is set, AND with the inverted mask to punch a hole, OR to merge the pieces. OpenCV's <code>bitwise_*</code> family accepts an 8-bit mask argument that gates the operation per pixel, giving the classic hard-edged logo overlay:
+</p>
+
+<pre><code class="language-python">import cv2
+
+frame = cv2.imread("match_frame.jpg")
+logo  = cv2.imread("club_logo.png")            # opaque BGR logo on white
+
+# Build a binary mask of the logo's own pixels (Otsu, inverted: logo is dark)
+logo_gray = cv2.cvtColor(logo, cv2.COLOR_BGR2GRAY)
+_, mask = cv2.threshold(logo_gray, 0, 255,
+                        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+mask_inv = cv2.bitwise_not(mask)
+
+roi = frame[20:20 + logo.shape[0], 20:20 + logo.shape[1]]
+hole  = cv2.bitwise_and(roi, roi, mask=mask_inv)   # background minus logo area
+inked = cv2.bitwise_and(logo, logo, mask=mask)     # logo pixels only
+frame[20:20 + logo.shape[0], 20:20 + logo.shape[1]] = cv2.add(hole, inked)</code></pre>
+<div class="code-caption">Hard-mask compositing with bitwise operations: Otsu builds the logo's mask, one AND empties the logo-shaped region of the frame, another AND extracts the logo's pixels, and a saturating add welds the two together. This idiom predates the alpha channel and still runs in embedded systems with no float unit.</div>
+
+<p>
+This bitwise idiom is the workhorse of region-of-interest processing throughout the rest of the book: masks select which pixels an operation may touch, whether that operation is a histogram (the mask argument of <code>cv2.calcHist</code> in <a href="section-2.2.html">Section 2.2</a>), a color correction, or a generative edit. The masks themselves will get vastly smarter, produced by morphology in <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a> and by segmentation networks later, but the compositing algebra they plug into is the one on this page. Two previews of where this leads: blending with a soft mask across a seam is done far better at multiple scales with the pyramids of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and the modern generative version of "put this object into that photo" appears in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Broadcast Overlay That Flickered</div>
+<p><strong>Who:</strong> A graphics engineer at a regional sports broadcaster, building a live score-bug renderer for lower-league football streams.</p>
+<p><strong>Situation:</strong> The score bug (a semi-transparent panel with club crests and the clock) was composited onto each 1080p frame in Python before encoding. The first implementation added the panel with plain NumPy uint8 arithmetic.</p>
+<p><strong>Problem:</strong> On bright pitches the panel region flickered with dark garbage pixels. The uint8 sums were wrapping past 255 wherever sunlit grass met the panel's light pixels: the exact overflow trap from this section, shipping live to a few thousand viewers.</p>
+<p><strong>Decision:</strong> The engineer rewrote the composite as a proper premultiplied-alpha over in float32, built the panel's alpha once per design change, and (after profiling the float conversion at 1080p60) cached the panel as premultiplied float so the per-frame cost was one multiply-add per pixel.</p>
+<p><strong>Result:</strong> The flicker vanished, per-frame compositing time dropped below 2 milliseconds, and the renderer survived three seasons unchanged.</p>
+<p><strong>Lesson:</strong> Compositing bugs are arithmetic bugs in disguise. Decide the dtype and the alpha convention (straight versus premultiplied) once, document them, and convert at the boundaries only.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Compositing Goes Generative</div>
+<p>Classical compositing pastes pixels; the open research problem is making the paste physically plausible: matching illumination, casting shadows, adding reflections. ObjectStitch (CVPR 2023) reframed object compositing as conditional diffusion generation, and IMPRINT (CVPR 2024) improved identity preservation so the inserted object stays recognizably itself while adapting pose and lighting. ObjectDrop (2024) trained on counterfactual photo pairs (a scene photographed with and without an object) to learn the object's effects on the scene, shadows and reflections included, and Magic Insert (2024) extended drag-and-drop insertion across style domains. All of them still respect this section's contract (a foreground, a background, a region to fill), but replace the over operator's weighted average with a generative model conditioned on both layers, the subject of <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.1: Alpha Algebra <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the over formulas, compute the composite color and alpha when a 50 percent opaque red layer ($C_f = (255, 0, 0)$, $\alpha_f = 0.5$) is placed over a 50 percent opaque blue layer ($C_b = (0, 0, 255)$, $\alpha_b = 0.5$). Then compute blue over red and compare. Is over commutative? Is it associative? Explain in one paragraph why one of these properties matters far more than the other for a layered renderer.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.2: Soft-Edge Logo Overlay <span class="exercise-type coding">Coding</span></div>
+<p>Extend this section's bitwise logo overlay to use a feathered alpha instead of a hard mask: blur the Otsu mask with <code>cv2.GaussianBlur</code> (kernel size 15), normalize it to $[0, 1]$, and composite with the from-scratch <code>composite_over</code> routine. Produce a side-by-side of the hard-mask and soft-mask results at 4x zoom on the logo boundary and describe the difference. Then animate the overlay fading in over 30 frames by scaling the alpha map.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.5.3: Frame-Averaging Denoiser <span class="exercise-type analysis">Analysis</span></div>
+<p>Capture or synthesize 32 noisy versions of the same image (add Gaussian noise, $\sigma = 20$, to a clean photo). Average the first $N$ frames for $N \in \{1, 2, 4, 8, 16, 32\}$ in float32, and for each average compute the PSNR against the clean image using the metric from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>. Plot PSNR against $N$ on a log axis, verify the $\sqrt{N}$ noise reduction (about 3 dB per doubling), and explain where the curve would stop improving for real handheld photos rather than perfectly aligned synthetic frames.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.4.html">&#8592; Section 2.4: Thresholding: Global, Otsu &amp; Adaptive</a>
+<a href="index.html">Chapter 2</a>
+<a class="next" href="../module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

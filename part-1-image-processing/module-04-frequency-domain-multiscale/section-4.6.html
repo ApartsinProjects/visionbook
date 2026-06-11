@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.6: Wavelets &amp; Time-Frequency Trade-offs. Why Fourier forgets location, the uncertainty principle, Haar wavelets from scratch, multi-level DWT with PyWavelets, denoising by thresholding, and JPEG 2000." name="description"/>
+<title>Section 4.6: Wavelets &amp; Time-Frequency Trade-offs | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>Wavelets &amp; Time-Frequency Trade-offs</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The Fourier transform knows every note in the symphony but refuses to say when any of them was played. I know the what and the where, within limits my lawyer describes as 'Heisenberg-compliant'."</p>
+<cite>A Well-Localized Wavelet</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Fourier analysis buys perfect frequency knowledge at the price of total positional amnesia; wavelets renegotiate the deal, describing an image by what frequencies occur where, and an uncertainty principle sets the exact limit of how good that deal can get.</strong> The result is the representation behind JPEG 2000, the cleanest classical denoising algorithms, and the FBI's fingerprint archive: a multi-scale transform like the pyramids of <a href="section-4.5.html">Section 4.5</a>, but with zero redundancy and an orthogonal basis. This section builds it from the simplest possible wavelet, two pixels at a time.</p>
+</div>
+
+<p>The pyramids of the previous section decomposed images by scale, but they are slightly wasteful (a Laplacian pyramid carries about a third more numbers than the image it encodes) and their levels are not independent. Wavelets fix both at once, and they answer a complaint you may have been nursing since <a href="section-4.1.html">Section 4.1</a>: a spectrum tells you a strong diagonal texture exists <em>somewhere</em> in the image, but not <em>where</em>. For inspection, compression, and denoising, where matters. This section explains why no transform can answer both questions perfectly, then builds the family that comes closest.</p>
+
+<h2>1. What Fourier Forgets, and the Price of Remembering <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Each Fourier basis wave spans the entire image: a single coefficient $F(u,v)$ mixes contributions from every pixel. That is why one bright dead pixel perturbs the whole spectrum, and why the spectrum of "stripes on the left half" and "stripes on the right half" can look nearly identical. The pixel basis sits at the opposite extreme: perfect location, zero frequency knowledge. The obvious compromise is to window the analysis, chopping the image into patches and transforming each, the short-time Fourier transform (STFT), whose 2D incarnation with Gaussian windows gives the Gabor filters that reappear as texture features later in this book and, remarkably, as good models of the receptive fields in your own primary visual cortex.</p>
+
+<p>But windowing has a built-in flaw: one window size must serve all frequencies. A window wide enough to estimate low frequencies precisely smears the location of fine details; a window narrow enough to localize an edge cannot tell a 30-cycle wave from a 32-cycle one. The constraint is fundamental, not an engineering failure. For any analysis function with spatial spread $\sigma_x$ and frequency spread $\sigma_u$,</p>
+
+<p>$$\sigma_x \, \sigma_u \;\ge\; \frac{1}{4\pi}$$</p>
+
+<p>the Gabor uncertainty principle, mathematically the same inequality as Heisenberg's. You cannot know both precisely; you can only choose how to spend your uncertainty budget. The wavelet insight is that the right spending plan is <em>frequency-dependent</em>: analyze low frequencies with wide windows (good frequency resolution, who cares exactly where the sky gradient sits) and high frequencies with narrow windows (good localization, which is the whole point of an edge). Figure 4.6.1 compares the four budgets.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four time-frequency tiling diagrams: pixel basis, Fourier basis, STFT, and wavelet dyadic tiling">
+<text x="440" y="24" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Four ways to spend one uncertainty budget (each cell = one basis function)</text>
+<!-- Panel 1: pixel basis (vertical slats) -->
+<g>
+<rect x="40" y="50" width="170" height="170" fill="#fafbfd" stroke="#5a6b85" stroke-width="1.5"/>
+<line x1="61" y1="50" x2="61" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="82" y1="50" x2="82" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="103" y1="50" x2="103" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="124" y1="50" x2="124" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="145" y1="50" x2="145" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="166" y1="50" x2="166" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<line x1="187" y1="50" x2="187" y2="220" stroke="#1f77b4" stroke-width="1"/>
+<text x="125" y="242" font-family="sans-serif" font-size="13" fill="#444" text-anchor="middle">Pixels</text>
+<text x="125" y="260" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">where: exact, what: unknown</text>
+</g>
+<!-- Panel 2: Fourier (horizontal slats) -->
+<g>
+<rect x="260" y="50" width="170" height="170" fill="#fafbfd" stroke="#5a6b85" stroke-width="1.5"/>
+<line x1="260" y1="71" x2="430" y2="71" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="92" x2="430" y2="92" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="113" x2="430" y2="113" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="134" x2="430" y2="134" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="155" x2="430" y2="155" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="176" x2="430" y2="176" stroke="#d62728" stroke-width="1"/>
+<line x1="260" y1="197" x2="430" y2="197" stroke="#d62728" stroke-width="1"/>
+<text x="345" y="242" font-family="sans-serif" font-size="13" fill="#444" text-anchor="middle">Fourier</text>
+<text x="345" y="260" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">what: exact, where: unknown</text>
+</g>
+<!-- Panel 3: STFT uniform grid -->
+<g>
+<rect x="480" y="50" width="170" height="170" fill="#fafbfd" stroke="#5a6b85" stroke-width="1.5"/>
+<line x1="522" y1="50" x2="522" y2="220" stroke="#2ca02c" stroke-width="1"/>
+<line x1="565" y1="50" x2="565" y2="220" stroke="#2ca02c" stroke-width="1"/>
+<line x1="607" y1="50" x2="607" y2="220" stroke="#2ca02c" stroke-width="1"/>
+<line x1="480" y1="92" x2="650" y2="92" stroke="#2ca02c" stroke-width="1"/>
+<line x1="480" y1="135" x2="650" y2="135" stroke="#2ca02c" stroke-width="1"/>
+<line x1="480" y1="177" x2="650" y2="177" stroke="#2ca02c" stroke-width="1"/>
+<text x="565" y="242" font-family="sans-serif" font-size="13" fill="#444" text-anchor="middle">Windowed Fourier (STFT)</text>
+<text x="565" y="260" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">one window size for all frequencies</text>
+</g>
+<!-- Panel 4: wavelet dyadic tiling; frequency increases upward -->
+<g>
+<rect x="700" y="50" width="170" height="170" fill="#fafbfd" stroke="#5a6b85" stroke-width="1.5"/>
+<!-- bottom band: low freq, 1 wide cell, height 21 -->
+<line x1="700" y1="199" x2="870" y2="199" stroke="#9467bd" stroke-width="1"/>
+<!-- next band height 21, one division -->
+<line x1="700" y1="178" x2="870" y2="178" stroke="#9467bd" stroke-width="1"/>
+<line x1="785" y1="178" x2="785" y2="199" stroke="#9467bd" stroke-width="1"/>
+<!-- band height 43, cells of width 42.5 -->
+<line x1="700" y1="135" x2="870" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="742" y1="135" x2="742" y2="178" stroke="#9467bd" stroke-width="1"/>
+<line x1="785" y1="135" x2="785" y2="178" stroke="#9467bd" stroke-width="1"/>
+<line x1="827" y1="135" x2="827" y2="178" stroke="#9467bd" stroke-width="1"/>
+<!-- top band height 85, cells of width 21.25 -->
+<line x1="721" y1="50" x2="721" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="742" y1="50" x2="742" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="763" y1="50" x2="763" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="785" y1="50" x2="785" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="806" y1="50" x2="806" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="827" y1="50" x2="827" y2="135" stroke="#9467bd" stroke-width="1"/>
+<line x1="848" y1="50" x2="848" y2="135" stroke="#9467bd" stroke-width="1"/>
+<text x="785" y="242" font-family="sans-serif" font-size="13" fill="#444" text-anchor="middle">Wavelets</text>
+<text x="785" y="260" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">wide cells for low freq, narrow for high</text>
+</g>
+<text x="20" y="135" font-family="sans-serif" font-size="11" fill="#888" transform="rotate(-90 20 135)" text-anchor="middle">frequency &#8593;</text>
+<text x="440" y="290" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">position &#8594;&#160;&#160;&#160;(every cell has the same area: the uncertainty principle's floor)</text>
+</svg>
+<figcaption><strong>Figure 4.6.1:</strong> Time-frequency tilings. Pixels localize position perfectly but say nothing about frequency; Fourier is the mirror image; the STFT compromises with one fixed window; wavelets tile adaptively, giving low frequencies fine frequency resolution and high frequencies fine spatial resolution. The uncertainty principle fixes each cell's minimum area; the freedom is only in its shape.</figcaption>
+</figure>
+
+<h2>2. The Haar Wavelet From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>The simplest wavelet transform, due to Alfr&#233;d Haar in 1910, predates the word "wavelet" by seven decades and needs only addition and subtraction. Take a row of pixels two at a time and record, for each pair, its scaled average $a = (p_1 + p_2)/\sqrt{2}$ and its scaled difference $d = (p_1 - p_2)/\sqrt{2}$. Averages summarize; differences remember what summarizing lost. (The $\sqrt{2}$ keeps total energy unchanged, making the transform orthogonal.) In 2D, apply the pairing first along rows, then along columns of both results, yielding four quarter-size <strong>subbands</strong>:</p>
+
+<pre><code class="language-python">import numpy as np
+from skimage import data
+
+img = data.camera().astype(np.float64)            # 512 x 512
+
+def haar2d_level(a):
+    """One level of the 2D Haar transform: returns LL, (LH, HL, HH)."""
+    lo = (a[:, 0::2] + a[:, 1::2]) / np.sqrt(2)   # pair averages along x
+    hi = (a[:, 0::2] - a[:, 1::2]) / np.sqrt(2)   # pair differences along x
+    LL = (lo[0::2, :] + lo[1::2, :]) / np.sqrt(2) # then the same along y
+    LH = (lo[0::2, :] - lo[1::2, :]) / np.sqrt(2)
+    HL = (hi[0::2, :] + hi[1::2, :]) / np.sqrt(2)
+    HH = (hi[0::2, :] - hi[1::2, :]) / np.sqrt(2)
+    return LL, (LH, HL, HH)
+
+LL, (LH, HL, HH) = haar2d_level(img)
+print(LL.shape)    # (256, 256): four quarter-size bands, zero redundancy
+# LL is a clean half-resolution image; LH lights up on horizontal edges,
+# HL on vertical edges, HH on diagonals and fine texture.</code></pre>
+<div class="code-caption"><strong>Code 4.6.1:</strong> One level of the 2D Haar transform in eight lines of NumPy. The four subbands together have exactly as many numbers as the input, unlike the Laplacian pyramid's one-third overhead, and the transform inverts exactly by reversing the sums and differences.</div>
+
+<p>Display the four bands and you will recognize old friends: LL is a properly anti-aliased half-size image (it <em>is</em> a Gaussian-pyramid level, by humbler means), while LH, HL, and HH split the lost detail by orientation, the same band that a Laplacian level stores all mixed together. The multi-level transform now writes itself: the LL band is just a smaller image, so transform it again, and again, until the approximation is a handful of pixels. The result, the <strong>discrete wavelet transform (DWT)</strong>, is the critically sampled cousin of <a href="section-4.5.html">Section 4.5</a>'s pyramid, with the nested layout shown in Figure 4.6.2.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Nested subband layout of a two-level discrete wavelet transform">
+<rect x="300" y="30" width="280" height="280" fill="#fafbfd" stroke="#5a6b85" stroke-width="2"/>
+<!-- level 1 quadrants -->
+<line x1="440" y1="30" x2="440" y2="310" stroke="#5a6b85" stroke-width="1.5"/>
+<line x1="300" y1="170" x2="580" y2="170" stroke="#5a6b85" stroke-width="1.5"/>
+<text x="510" y="95" font-family="sans-serif" font-size="14" fill="#445" text-anchor="middle">HL&#8321;</text>
+<text x="510" y="113" font-family="sans-serif" font-size="10" fill="#888" text-anchor="middle">vertical edges, fine</text>
+<text x="370" y="235" font-family="sans-serif" font-size="14" fill="#445" text-anchor="middle">LH&#8321;</text>
+<text x="370" y="253" font-family="sans-serif" font-size="10" fill="#888" text-anchor="middle">horizontal edges, fine</text>
+<text x="510" y="235" font-family="sans-serif" font-size="14" fill="#445" text-anchor="middle">HH&#8321;</text>
+<text x="510" y="253" font-family="sans-serif" font-size="10" fill="#888" text-anchor="middle">diagonals, fine</text>
+<!-- level 2 inside top-left quadrant -->
+<line x1="370" y1="30" x2="370" y2="170" stroke="#5a6b85" stroke-width="1.2"/>
+<line x1="300" y1="100" x2="440" y2="100" stroke="#5a6b85" stroke-width="1.2"/>
+<rect x="300" y="30" width="70" height="70" fill="#cfe0f2" stroke="#1f77b4" stroke-width="1.5"/>
+<text x="335" y="60" font-family="sans-serif" font-size="13" fill="#1f4e79" text-anchor="middle">LL&#8322;</text>
+<text x="335" y="78" font-family="sans-serif" font-size="9" fill="#1f4e79" text-anchor="middle">tiny image</text>
+<text x="405" y="62" font-family="sans-serif" font-size="13" fill="#445" text-anchor="middle">HL&#8322;</text>
+<text x="335" y="140" font-family="sans-serif" font-size="13" fill="#445" text-anchor="middle">LH&#8322;</text>
+<text x="405" y="140" font-family="sans-serif" font-size="13" fill="#445" text-anchor="middle">HH&#8322;</text>
+<!-- annotations -->
+<text x="150" y="70" font-family="sans-serif" font-size="12" fill="#1f5e8a" text-anchor="middle">recursion lives here:</text>
+<text x="150" y="88" font-family="sans-serif" font-size="12" fill="#1f5e8a" text-anchor="middle">LL is re-transformed,</text>
+<text x="150" y="106" font-family="sans-serif" font-size="12" fill="#1f5e8a" text-anchor="middle">level after level</text>
+<line x1="225" y1="85" x2="296" y2="62" stroke="#bbb" stroke-width="1"/>
+<text x="722" y="150" font-family="sans-serif" font-size="12" fill="#445" text-anchor="middle">total coefficient count =</text>
+<text x="722" y="168" font-family="sans-serif" font-size="12" fill="#445" text-anchor="middle">original pixel count, exactly</text>
+<text x="722" y="196" font-family="sans-serif" font-size="12" fill="#888" text-anchor="middle">(critically sampled, orthogonal:</text>
+<text x="722" y="214" font-family="sans-serif" font-size="12" fill="#888" text-anchor="middle">no band overlaps another)</text>
+</svg>
+<figcaption><strong>Figure 4.6.2:</strong> The nested subband layout of a two-level DWT. Three oriented detail bands are peeled off at each scale, and the recursion continues inside the shrinking approximation band at top left. JPEG 2000 stores images in exactly this arrangement.</figcaption>
+</figure>
+
+<h2>3. Multi-Level DWT with PyWavelets <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>Haar is the clearest wavelet but not the best for photographs: its blocky basis leaves staircase artifacts under heavy compression. Practical systems use smoother families, Daubechies (db2, db4), symlets, biorthogonal pairs (JPEG 2000 uses the bior-family CDF 9/7 and 5/3 wavelets), all available through PyWavelets:</p>
+
+<pre><code class="language-python">import pywt
+
+coeffs = pywt.wavedec2(img, wavelet="db2", level=3)
+print(coeffs[0].shape)                        # (66, 66) coarse approximation
+print([lvl[0].shape for lvl in coeffs[1:]])   # [(66, 66), (130, 130), (257, 257)]
+
+arr, slices = pywt.coeffs_to_array(coeffs)    # pack into one Figure-4.6.2 mosaic
+
+# Energy compaction: what fraction of total energy do the largest 1% hold?
+flat = np.sort(np.abs(arr).ravel())[::-1]
+k = int(0.01 * flat.size)
+print((flat[:k] ** 2).sum() / (flat ** 2).sum())
+# Prints a number close to 1.0 (typically 0.95 to 0.99 for natural photos):
+# a few coefficients carry almost everything.</code></pre>
+<div class="code-caption"><strong>Code 4.6.2:</strong> A three-level db2 decomposition with PyWavelets. The shape printout shows the bookkeeping for non-dyadic sizes, and the energy check quantifies why wavelets compress so well: nearly all the energy concentrates into a tiny fraction of coefficients.</div>
+
+<p>That last printed number is the economic engine of everything wavelets are used for. An orthogonal transform cannot create or destroy energy, only reorganize it, and the DWT reorganizes a photograph's energy into very few large coefficients (edges, structures) and a vast desert of near-zeros (smooth regions, at every scale). Compression keeps the few and cheaply encodes the desert; denoising exploits the same sparsity from the opposite direction.</p>
+
+<h2>4. Wavelet Shrinkage: Denoising by Thresholding <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>White noise is the one signal that refuses to compact: orthogonal transforms spread it evenly, so every wavelet coefficient receives the same small noise contribution. Real image content, by contrast, concentrates into few large coefficients. The two populations barely overlap, and that gap is an algorithm: transform, shrink every coefficient toward zero by a threshold calibrated to the noise level, reconstruct. Donoho and Johnstone's classic recipe estimates the noise from the finest diagonal band (which is almost pure noise in most photos) and applies the "universal" threshold:</p>
+
+<pre><code class="language-python">rng = np.random.default_rng(0)
+noisy = img + 20 * rng.standard_normal(img.shape)     # sigma = 20 noise
+
+c = pywt.wavedec2(noisy, "db2", level=4)
+sigma = np.median(np.abs(c[-1][-1])) / 0.6745         # noise std from finest HH
+thresh = sigma * np.sqrt(2 * np.log(noisy.size))      # universal threshold
+
+c_den = [c[0]] + [
+    tuple(pywt.threshold(band, thresh, mode="soft") for band in level)
+    for level in c[1:]
+]
+restored = pywt.waverec2(c_den, "db2")[: img.shape[0], : img.shape[1]]
+print(round(sigma, 1))      # close to 20.0: the estimate found the noise</code></pre>
+<div class="code-caption"><strong>Code 4.6.3:</strong> VisuShrink-style wavelet denoising in ten lines: estimate the noise from the finest diagonal subband via the robust median rule, soft-threshold every detail coefficient, reconstruct. Edges survive because their coefficients tower far above the threshold.</div>
+
+<p>Compare this with the Gaussian smoothing of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>: blurring suppresses noise and edges alike, because in pixel space they occupy the same neighborhoods. In wavelet space they occupy different <em>amplitudes</em>, so the threshold can kill one and spare the other. This idea, denoise where the signal is sparse, is the seed of the entire restoration toolbox of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>, and its philosophical descendants reach all the way to the learned denoisers at the heart of modern generative models.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sparsity Is the Superpower</div>
+<p>Every wavelet application in this section is one trick wearing three costumes. The DWT makes natural images <em>sparse</em>: few large coefficients, many near-zeros. Compression spends bits only on the few (JPEG 2000). Denoising deletes everything small, which is mostly noise (shrinkage). Analysis reads structure off the few large coefficients' positions and scales. When you meet a new representation anywhere in vision, your first question should be the one wavelets teach: what does it make sparse?</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.restoration.denoise_wavelet</div>
+<p>Our ten-line VisuShrink is instructive but conservative (the universal threshold over-smooths). scikit-image ships the refined version as one line:</p>
+<pre><code class="language-python">from skimage.restoration import denoise_wavelet
+clean = denoise_wavelet(noisy / 255.0, method="BayesShrink",
+                        mode="soft", wavelet="db2", rescale_sigma=True)</code></pre>
+<div class="code-caption"><strong>Code 4.6.4:</strong> Production wavelet denoising in one scikit-image call, with adaptive per-subband BayesShrink thresholds replacing our single global one.</div>
+<p>A 10-to-1 line reduction, and the library adds what production needs: BayesShrink's per-subband adaptive thresholds (markedly better detail preservation than one global threshold), automatic noise estimation, color handling in a decorrelated luminance-chrominance space, and correct intensity rescaling. The from-scratch version's value is that you now know exactly which dials these arguments turn.</p>
+</div>
+
+<h2>5. Wavelets at Work: JPEG 2000 and the Compression Lineage <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>The JPEG format you met in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> transforms fixed 8x8 blocks with the discrete cosine transform, a Fourier relative, and at strong compression its block boundaries surface as the familiar mosaic of artifacts. JPEG 2000 replaced the blocks with a whole-image DWT in exactly Figure 4.6.2's layout, and the change buys three structural advantages: no block boundaries (artifacts degrade into soft blur instead of mosaics), an embedded progressive bitstream (truncate the file anywhere and you still have the best possible image at that byte budget), and free multi-resolution access (the LL bands <em>are</em> ready-made zoom levels, so a viewer can fetch a thumbnail or a region at reduced scale without decoding the full image). Those properties made it the standard in digital cinema distribution, medical imaging archives, and map servers, even though baseline JPEG kept the consumer web on simplicity and decoder ubiquity.</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>One of the first large-scale wavelet deployments was the FBI's fingerprint archive in the 1990s. Digitizing tens of millions of ink-on-card prints at 500 dpi was hopeless uncompressed, and JPEG's 8x8 blocking artifacts corrupted exactly the ridge bifurcations that examiners testify about in court. The bureau commissioned a wavelet-based standard, WSQ (Wavelet Scalar Quantization), achieving roughly 15-to-1 compression that preserved ridge detail. Your fingertips may well be wavelet coefficients in a federal database right now.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Streaming Pathology Slides Without the Blocks</div>
+<p><strong>Who:</strong> The infrastructure lead at a digital-pathology company scanning biopsy slides for remote diagnosis.</p>
+<p><strong>Situation:</strong> A whole-slide scan is enormous (commonly on the order of 100,000 pixels per side, tens of gigabytes uncompressed), and pathologists navigate it like a map: mostly low zoom, with sudden deep zooms into suspicious regions, often over hospital networks of modest bandwidth.</p>
+<p><strong>Problem:</strong> The original pipeline stored JPEG tile pyramids. At the compression needed for affordable storage, pathologists reported blocky shimmer over chromatin texture, precisely the fine structure used to grade nuclei, and the company faced both clinical pushback and a doubled storage bill from backing off the quality setting.</p>
+<p><strong>Decision:</strong> They migrated the archive to JPEG 2000 (a DICOM-supported encoding for whole-slide images), serving each viewer request directly from the wavelet bitstream: resolution levels from the nested LL bands, regions from the spatially localized coefficients, and extra quality layers streamed only on deep zoom.</p>
+<p><strong>Result:</strong> At equal storage cost the blocking artifacts vanished (wavelet degradation reads as gentle softening, which pathologists tolerated far better), and initial slide-open latency dropped because thumbnails decoded from the coarse bands alone, no separate pyramid files needed.</p>
+<p><strong>Lesson:</strong> When users consume one image at many scales and regions, a multi-resolution transform is not just a codec, it is the serving architecture. The DWT's nested structure did the systems engineering for free.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Wavelets Meet Generative Models and Learned Codecs</div>
+<p>Wavelets are enjoying a vigorous second act. Wavelet Diffusion Models (CVPR 2023) run the <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion process of Chapter 33</a> on DWT subbands instead of pixels, cutting sampling cost several-fold since most bands are sparse and easy. WaLa (2024) scaled the idea to 3D, training billion-parameter generators on wavelet-tree representations of shapes, where the compaction you measured in Code 4.6.2 is what makes billion-scale training tractable. And the compression lineage has gone neural: the JPEG AI standard, finalized in the mid-2020s, replaces hand-designed transforms with a learned analysis-synthesis pair, while research codecs learn lifting steps (the building blocks of fast wavelet implementations) end to end. The design question this section taught, what basis makes images sparse, is now answered with gradient descent, but it is still the same question.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.6.1: Choose the Right Tool <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each task, say whether you would reach for the Fourier transform, the STFT/Gabor bank, or the DWT, and justify in one sentence each: (a) removing a uniform 50 Hz electrical interference pattern from a scanned document; (b) locating every position in a fabric image where the weave pattern breaks; (c) compressing a satellite image so that coastlines stay sharp at 40-to-1; (d) measuring the dominant orientation of brush strokes across a painting.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.6.2: The Compression Knee <span class="exercise-type coding">Coding</span></div>
+<p>Using Code 4.6.2's machinery, implement keep-top-k compression: zero all but the largest k percent of DWT coefficients (try k = 0.5, 1, 2, 5, 10), reconstruct with waverec2, and plot PSNR against k for the camera image and for a pure-noise image of the same size. Explain the dramatic difference between the two curves using the sparsity argument, and find the k where the photo's quality curve has its knee.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.6.3: Shrinkage Against the Field <span class="exercise-type analysis">Analysis</span></div>
+<p>Benchmark four denoisers on the same noisy image (Gaussian noise, sigma = 15, 25, 40): Gaussian blur tuned by grid search, median filtering, your Code 4.6.3 VisuShrink, and skimage's BayesShrink. Report PSNR and, more importantly, crop and compare an edge region and a flat region for each method. Which method wins where, and at which noise level does the ranking change? Connect each behavior to the spectral story this chapter told about the method.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.5.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.5</span><span class="nav-title">Image Pyramids: Gaussian &amp; Laplacian</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="../module-05-geometric-transformations/index.html"><span class="nav-label">Next</span><span class="nav-num">Chapter 5</span><span class="nav-title">Geometric Transformations &amp; Image Warping</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

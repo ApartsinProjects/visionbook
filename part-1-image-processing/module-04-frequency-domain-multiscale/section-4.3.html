@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.3: Frequency-Domain Filtering: Low-Pass, High-Pass &amp; Notch. Designing ideal, Butterworth, and Gaussian transfer functions, predicting ringing, sharpening by high-frequency emphasis, and removing periodic noise with notch filters." name="description"/>
+<title>Section 4.3: Frequency-Domain Filtering: Low-Pass, High-Pass &amp; Notch | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>Frequency-Domain Filtering: Low-Pass, High-Pass &amp; Notch</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I deleted every frequency above the cutoff, exactly as designed. The image rang like a struck bell. Nobody warned me that being decisive has side effects."</p>
+<cite>A Heavy-Handed Ideal Low-Pass Filter</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Filtering in the frequency domain is nothing more than multiplying the spectrum, element by element, by a designed mask called a transfer function, and the entire craft is choosing a mask whose shape does not create artifacts of its own.</strong> Every spatial kernel from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> secretly is such a mask, by the convolution theorem. Working with the mask directly buys you three things: filters too large to be practical as kernels, exact control over which frequencies live and die, and operations like periodic-noise removal that no small spatial kernel can express cleanly.</p>
+</div>
+
+<p><a href="section-4.2.html">Section 4.2</a> built the transform machinery; this section uses it as a workbench. The recipe never changes: transform the image, multiply by a transfer function $H(u, v)$, transform back. What changes is the shape of $H$, and the section's running lesson is that the <em>shape of the cut</em> matters as much as <em>where</em> you cut. We will watch the most intuitive design (a hard cutoff) produce the worst artifacts, understand exactly why through the Gibbs phenomenon from <a href="section-4.1.html">Section 4.1</a>, and end with the one filter family that spatial convolution genuinely cannot replace: the notch.</p>
+
+<h2>1. Filtering as Spectrum Sculpting <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>The full pipeline, with the shift conventions made explicit, is:</p>
+
+<p>$$g(x, y) = \mathcal{F}^{-1}\Big[\, H(u, v) \cdot \mathcal{F}\big[f(x, y)\big] \,\Big]$$</p>
+
+<p>where $H$ is built in centered coordinates (so it must multiply a shifted spectrum, per Figure 4.2.1). Since most useful filters care only about how far a frequency is from the center, not its direction, we first compute a radial distance grid and then express every filter as a function of it:</p>
+
+<pre><code class="language-python">import numpy as np
+from skimage import data
+
+img = data.camera().astype(np.float64)
+
+def radial_distance(shape):
+    """Distance of each (centered) frequency bin from the spectrum center."""
+    h, w = shape
+    yy, xx = np.ogrid[:h, :w]
+    return np.sqrt((yy - h / 2) ** 2 + (xx - w / 2) ** 2)
+
+def apply_filter(image, H):
+    """Transform, multiply by the centered transfer function H, invert."""
+    F = np.fft.fftshift(np.fft.fft2(image))
+    return np.real(np.fft.ifft2(np.fft.ifftshift(F * H)))
+
+D = radial_distance(img.shape)        # same shape as img, zero at center</code></pre>
+<div class="code-caption"><strong>Code 4.3.1:</strong> The reusable filtering scaffold: a radial distance grid D and an apply_filter helper that handles both shifts and returns the real part. Every filter in this section is one expression in D away.</div>
+
+<p>Before designing new masks, note what this view says about old friends. The Gaussian blur of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> has a transfer function that is itself a Gaussian (wide kernel, narrow $H$, and vice versa); the box filter's $H$ is a sinc function that dips <em>negative</em>, which is the frequency-domain explanation of the box filter's odd artifacts on fine patterns. A filter's spatial and spectral faces are two views of one object, and you can design on whichever side is clearer, then translate.</p>
+
+<h2>2. Three Low-Pass Designs: Ideal, Butterworth, Gaussian <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>A low-pass filter keeps frequencies near the center (smooth content) and attenuates the rest (detail, edges, noise). The three classical designs differ only in how abruptly they say no:</p>
+
+<p>$$H_{\text{ideal}}(u,v) = \begin{cases} 1 &amp; D(u,v) \le D_0 \\ 0 &amp; D(u,v) &gt; D_0 \end{cases} \qquad
+H_{\text{btw}}(u,v) = \frac{1}{1 + \big[D(u,v)/D_0\big]^{2n}} \qquad
+H_{\text{gauss}}(u,v) = e^{-D^2(u,v) / 2 D_0^2}$$</p>
+
+<p>Here $D_0$ is the cutoff radius and $n$ the Butterworth order, which dials its steepness anywhere between Gaussian-gentle ($n = 1$) and ideal-brutal ($n \to \infty$). Figure 4.3.1 plots the three profiles; the only visual difference is the sharpness of the shoulder, and that shoulder is the whole story.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Radial cross-sections of ideal, Butterworth, and Gaussian low-pass transfer functions">
+<!-- axes -->
+<line x1="80" y1="260" x2="780" y2="260" stroke="#5a6b85" stroke-width="2"/>
+<line x1="80" y1="260" x2="80" y2="30" stroke="#5a6b85" stroke-width="2"/>
+<text x="785" y="276" font-family="sans-serif" font-size="13" fill="#666">D (distance from spectrum center)</text>
+<text x="40" y="40" font-family="sans-serif" font-size="13" fill="#666">H(D)</text>
+<text x="62" y="45" font-family="sans-serif" font-size="12" fill="#888">1</text>
+<text x="62" y="264" font-family="sans-serif" font-size="12" fill="#888">0</text>
+<!-- D0 marker -->
+<line x1="300" y1="40" x2="300" y2="260" stroke="#aab3c2" stroke-width="1.5" stroke-dasharray="5,5"/>
+<text x="300" y="285" font-family="sans-serif" font-size="13" fill="#666" text-anchor="middle">D&#8320; (cutoff)</text>
+<!-- ideal: blue step -->
+<path d="M 80 40 L 300 40 L 300 260 L 780 260" fill="none" stroke="#1f77b4" stroke-width="3"/>
+<!-- butterworth n=2: red smooth S -->
+<path d="M 80 42 C 180 42, 245 60, 300 150 C 355 238, 470 257, 780 258" fill="none" stroke="#d62728" stroke-width="3"/>
+<!-- gaussian: green -->
+<path d="M 80 40 C 150 43, 225 75, 300 126 C 375 178, 460 228, 545 248 C 630 257, 710 259, 780 259" fill="none" stroke="#2ca02c" stroke-width="3"/>
+<!-- annotation of the cliff -->
+<line x1="318" y1="120" x2="395" y2="78" stroke="#888" stroke-width="1.5"/>
+<text x="400" y="72" font-family="sans-serif" font-size="12" fill="#555">vertical cliff here &#8594; ringing in the image</text>
+<!-- legend -->
+<rect x="565" y="38" width="210" height="78" fill="#fafbfd" stroke="#d5dae3" stroke-width="1"/>
+<line x1="578" y1="58" x2="612" y2="58" stroke="#1f77b4" stroke-width="3"/>
+<text x="620" y="62" font-family="sans-serif" font-size="12" fill="#444">Ideal (step)</text>
+<line x1="578" y1="82" x2="612" y2="82" stroke="#d62728" stroke-width="3"/>
+<text x="620" y="86" font-family="sans-serif" font-size="12" fill="#444">Butterworth, n = 2</text>
+<line x1="578" y1="106" x2="612" y2="106" stroke="#2ca02c" stroke-width="3"/>
+<text x="620" y="110" font-family="sans-serif" font-size="12" fill="#444">Gaussian</text>
+</svg>
+<figcaption><strong>Figure 4.3.1:</strong> Radial profiles of the three classical low-pass transfer functions at the same cutoff. The ideal filter's vertical cliff produces spatial ringing; the Butterworth order n trades steepness against ringing; the Gaussian declines smoothly and rings not at all.</figcaption>
+</figure>
+
+<pre><code class="language-python">D0 = 30.0                                       # cutoff radius, in frequency bins
+H_ideal  = (D &lt;= D0).astype(np.float64)
+H_butter = 1.0 / (1.0 + (D / D0) ** (2 * 2))    # Butterworth, order n = 2
+H_gauss  = np.exp(-(D ** 2) / (2 * D0 ** 2))
+
+lp_ideal  = apply_filter(img, H_ideal)    # blur + ripples hugging every edge
+lp_butter = apply_filter(img, H_butter)   # blur, only a whisper of ringing
+lp_gauss  = apply_filter(img, H_gauss)    # pure blur, zero ringing</code></pre>
+<div class="code-caption"><strong>Code 4.3.2:</strong> Three low-pass filters at identical cutoff D0 = 30. Display the three results side by side: the ideal output shows ghostly contours rippling outward from every strong edge, the Butterworth shows almost none, the Gaussian none at all.</div>
+
+<p>Run the code and look closely at the ideal-filtered image: every strong edge has ripples radiating from it, like a pond after a stone. This is the <strong>ringing</strong> artifact, and it is the Gibbs phenomenon of <a href="section-4.1.html">Section 4.1</a> in its adult form. The hard spectral cutoff is itself an edge, and an edge in one domain is an oscillation in the other: the ideal filter's spatial form is a 2D sinc whose decaying lobes stamp themselves around every feature they convolve with.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sharp in One Domain, Ringing in the Other</div>
+<p>The spatial and frequency domains are bound by a duality: a discontinuity in either domain forces slowly decaying oscillations in the other. A hard frequency cutoff rings in space (ideal LPF); a hard spatial edge demands frequencies out to infinity (the square wave of Section 4.1). Every practical filter design is a negotiated settlement with this duality, and the Gaussian, which is smooth in both domains at once, is the negotiation's most famous diplomat. When you see ripples around edges in any processed image, suspect that something, somewhere, applied a too-sharp spectral cut.</p>
+</div>
+
+<h2>3. High-Pass Filtering and Sharpening <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Every low-pass design yields a high-pass twin for free: $H_{\text{HP}} = 1 - H_{\text{LP}}$. A pure high-pass result keeps only edges and texture floating on a mid-gray void (the DC term is gone, so the mean is zero), which is useful for inspection but rarely the goal. The practical sharpening tool is <strong>high-frequency emphasis</strong>: keep the whole image and add back an extra helping of its high frequencies,</p>
+
+<p>$$H_{\text{hfe}}(u, v) = a + b \cdot H_{\text{HP}}(u, v)$$</p>
+
+<p>with $a \approx 1$ preserving the original and $b$ controlling the boost. This is precisely the unsharp masking of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> wearing frequency-domain clothes: there you computed "image plus $b$ times (image minus blur)", and expanding that expression gives exactly $1 + b(1 - H_{\text{blur}})$ as a spectral multiplier.</p>
+
+<pre><code class="language-python">H_hp  = 1.0 - H_gauss                  # Gaussian high-pass: smooth, no ringing
+H_hfe = 1.0 + 1.2 * H_hp               # a = 1 keeps the image, b = 1.2 boosts detail
+
+sharp = np.clip(apply_filter(img, H_hfe), 0, 255)
+# Edges and fine texture visibly crisper; flat regions untouched, because
+# H_hfe equals 1.0 exactly at the spectrum center where smooth content lives.</code></pre>
+<div class="code-caption"><strong>Code 4.3.3:</strong> Sharpening by high-frequency emphasis built on the ringing-free Gaussian high-pass. The parameter b is the strength dial; values beyond about 2 start amplifying noise faster than detail, a trade-off explored properly in Chapter 7.</div>
+
+<div class="callout note">
+<div class="callout-title">Note: Homomorphic Filtering, the Classic Variant</div>
+<p>A venerable cousin worth recognizing on sight: take the log of the image first, then high-pass filter, then exponentiate. Because illumination (smooth, low-frequency) and surface reflectance (detailed, high-frequency) combine multiplicatively, the log turns their product into a sum the filter can separate, evening out lighting while boosting detail. It is a frequency-domain answer to the uneven-illumination problem that <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> attacked with adaptive histogram methods, and a preview of the illumination-reflectance reasoning that returns in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>.</p>
+</div>
+
+<h2>4. Notch Filters: Surgical Removal of Periodic Noise <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>Now for the filter family that justifies the whole frequency-domain detour. Periodic interference, scanner banding, electrical hum coupled into a sensor, halftone dots from printed sources, screen-door moir&#233;, is spread across <em>every pixel</em> in the spatial domain, hopelessly entangled with the signal. But in the frequency domain, a periodic pattern is a <em>point</em>: one conjugate pair of bright spikes at its frequency (visible in Figure 4.3.2). A <strong>notch filter</strong> zeroes a small disk around each spike and leaves everything else untouched. No spatial kernel of reasonable size can do this; the notch's spatial equivalent is an oscillating pattern as large as the image itself.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A centered spectrum with two interference spikes on the vertical axis surrounded by dashed notch circles">
+<rect x="270" y="20" width="260" height="260" fill="#fafbfd" stroke="#b9c2d0" stroke-width="1.5"/>
+<line x1="270" y1="150" x2="530" y2="150" stroke="#c9d0db" stroke-width="1"/>
+<line x1="400" y1="20" x2="400" y2="280" stroke="#c9d0db" stroke-width="1"/>
+<!-- natural image energy: center blob -->
+<circle cx="400" cy="150" r="28" fill="#5a6b85" opacity="0.55"/>
+<circle cx="400" cy="150" r="52" fill="#5a6b85" opacity="0.22"/>
+<circle cx="400" cy="150" r="80" fill="#5a6b85" opacity="0.08"/>
+<!-- interference spikes on the v axis -->
+<circle cx="400" cy="70" r="7" fill="#e94560"/>
+<circle cx="400" cy="230" r="7" fill="#e94560"/>
+<!-- notch circles -->
+<circle cx="400" cy="70" r="18" fill="none" stroke="#1f77b4" stroke-width="2.5" stroke-dasharray="5,4"/>
+<circle cx="400" cy="230" r="18" fill="none" stroke="#1f77b4" stroke-width="2.5" stroke-dasharray="5,4"/>
+<!-- labels -->
+<text x="555" y="72" font-family="sans-serif" font-size="13" fill="#9b1c31">interference spike (+60 cycles)</text>
+<line x1="425" y1="70" x2="548" y2="70" stroke="#bbb" stroke-width="1"/>
+<text x="555" y="234" font-family="sans-serif" font-size="13" fill="#9b1c31">conjugate twin (always zero both)</text>
+<line x1="425" y1="230" x2="548" y2="230" stroke="#bbb" stroke-width="1"/>
+<text x="120" y="100" font-family="sans-serif" font-size="13" fill="#1f5e8a" text-anchor="middle">notch: H = 0 inside,</text>
+<text x="120" y="118" font-family="sans-serif" font-size="13" fill="#1f5e8a" text-anchor="middle">H = 1 everywhere else</text>
+<line x1="200" y1="105" x2="380" y2="73" stroke="#bbb" stroke-width="1"/>
+<text x="120" y="200" font-family="sans-serif" font-size="13" fill="#445" text-anchor="middle">image energy stays</text>
+<line x1="195" y1="195" x2="350" y2="160" stroke="#bbb" stroke-width="1"/>
+<text x="400" y="296" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">horizontal banding at 60 cycles &#8594; spike pair on the vertical frequency axis</text>
+</svg>
+<figcaption><strong>Figure 4.3.2:</strong> Anatomy of a notch filtering job. Periodic banding concentrates into one conjugate pair of spectral spikes (red); the notch mask zeroes small disks around both (dashed blue) while the natural image energy near the center passes untouched.</figcaption>
+</figure>
+
+<pre><code class="language-python">h, w = img.shape
+yy, xx = np.mgrid[0:h, 0:w]
+noisy = img + 25 * np.sin(2 * np.pi * 60 * yy / h)   # 60-cycle horizontal banding
+
+def notch_mask(shape, centers, radius=6):
+    """All-ones mask with zeroed disks at given (row, col) offsets from center."""
+    hh, ww = shape
+    Y, X = np.ogrid[:hh, :ww]
+    mask = np.ones(shape, dtype=np.float64)
+    for dv, du in centers:
+        cy, cx = hh / 2 + dv, ww / 2 + du
+        mask[(Y - cy) ** 2 + (X - cx) ** 2 &lt;= radius ** 2] = 0.0
+    return mask
+
+# The banding lives at (v, u) = (+60, 0) and its conjugate (-60, 0)
+H_notch = notch_mask(img.shape, centers=[(60, 0), (-60, 0)])
+clean = apply_filter(noisy, H_notch)
+# The banding vanishes completely; the tiny residual difference from the
+# original is the sliver of true image energy that shared those two bins.</code></pre>
+<div class="code-caption"><strong>Code 4.3.4:</strong> Synthetic 60-cycle banding removed by zeroing two 6-pixel disks out of 262,144 spectrum bins. The same recipe with detected spike locations handles scanner hum, halftone patterns, and screen moir&#233;.</div>
+
+<p>In production you rarely hard-code spike positions: detect them as local maxima of the log-magnitude spectrum beyond some radius (excluding the natural center blob and axis streaks), then notch each detection and its conjugate. Soft-edged notches (a small inverted Gaussian rather than a hard zero disk) avoid introducing miniature ringing of their own, the same lesson as Figure 4.3.1 at a smaller scale.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Century of Newsprint, Minus the Halftone</div>
+<p><strong>Who:</strong> The imaging lead of a national library's newspaper digitization program, scanning roughly 1.2 million pages spanning 1880 to 1990.</p>
+<p><strong>Situation:</strong> Old newspapers print photographs as halftone dot screens. Scanned at archival resolution, the dot lattice survives, and it both degrades OCR on adjacent text and produces severe moir&#233; when pages are rendered at reading sizes on the archive's website.</p>
+<p><strong>Problem:</strong> Gaussian blurring strong enough to erase the dots also erased small type. Median filtering helped the text but left blotchy artifacts in the photographs. Every spatial filter faced the same impossible trade, because the halftone occupies the same spatial neighborhoods as the content.</p>
+<p><strong>Decision:</strong> The team added an automated notch stage: detect the halftone's spectral peaks per scan (the dot screen's frequency varied by decade and printer), zero each peak pair with a soft Gaussian notch, and only then apply a mild low-pass tuned for the rendering size.</p>
+<p><strong>Result:</strong> OCR character error rate on photo-adjacent text fell from 8.9 to 3.6 percent across the validation sample, moir&#233; complaints from the web archive's readers effectively stopped, and the stage added only milliseconds per page since it rode on FFTs already computed for quality checks.</p>
+<p><strong>Lesson:</strong> Interference that is periodic is a point defect in frequency space. Find the points, remove the points, and the spatial domain heals around them.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.filters.butterworth</div>
+<p>Our scaffold plus filter construction comes to roughly 30 lines once you add padding and color handling. scikit-image ships the whole pipeline as one call:</p>
+<pre><code class="language-python">from skimage.filters import butterworth
+
+low  = butterworth(img, cutoff_frequency_ratio=0.06, high_pass=False, order=2)
+high = butterworth(img, cutoff_frequency_ratio=0.06, high_pass=True,  order=2)</code></pre>
+<div class="code-caption"><strong>Code 4.3.5:</strong> Butterworth low-pass and high-pass filtering through scikit-image's one-call API; the cutoff is specified as a fraction of the maximum representable frequency.</div>
+<p>A 30-to-1 reduction for the standard cases. Internally it builds the squared Butterworth response, performs the forward and inverse FFTs, supports optional edge padding (<code>npad</code>) to suppress boundary artifacts from the DFT's implicit tiling, and handles color images via <code>channel_axis</code>. Notch filtering, being inherently bespoke, is the one design you will still assemble by hand from Code 4.3.4's parts.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned and Scheduled Spectral Filters</div>
+<p>Hand-designed transfer functions have learned descendants. Global Filter Networks (GFNet, NeurIPS 2021) make $H(u,v)$ a trainable parameter tensor: the network literally learns a bank of frequency-domain masks as its token mixer, and the learned masks turn out smooth and low-pass-heavy, echoing this section's designs. Fourier Domain Adaptation (FDA, CVPR 2020) filters between domains, transplanting low-frequency amplitude from real photos onto synthetic renders. And the idea of <em>scheduling</em> a low-pass cutoff over time now regulates 3D reconstruction: FreGS (CVPR 2024) anneals frequency content from coarse to fine while optimizing 3D Gaussian splats, preventing early overfitting to high frequencies, conceptually the same coarse-to-fine discipline that drives the pyramids of <a href="section-4.5.html">Section 4.5</a> and, one part later, the noise schedules of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion models</a>, which destroy high frequencies first and regenerate them last.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.1: Filter Forensics <span class="exercise-type conceptual">Conceptual</span></div>
+<p>You receive three blurred versions of the same photograph, produced by an ideal, a Butterworth (n = 2), and a Gaussian low-pass filter at the same cutoff, but the filenames are scrambled. Describe the visual evidence you would use to assign each image to its filter, and explain why examining regions near strong edges is more diagnostic than examining smooth regions.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.2: Automatic Notch Detection <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.3.4 into an automatic pipeline: corrupt an image with two superimposed sinusoids of unknown (to your code) frequency and orientation, find the interference spikes as local maxima of the log-magnitude spectrum at radius greater than 20 bins from the center, place a soft Gaussian notch over each spike and its conjugate, and report the PSNR (Chapter 1's metric) of the restoration against the original. Compare against the PSNR achievable by the best Gaussian low-pass you can tune.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.3.3: The Ringing-Steepness Trade-off <span class="exercise-type analysis">Analysis</span></div>
+<p>For Butterworth orders n = 1, 2, 4, 8, 16 at fixed D0, filter a test image containing one strong vertical edge. For each n, measure (a) the amplitude of the largest ripple within 20 pixels of the edge and (b) the residual energy above the cutoff frequency. Plot (a) against (b) and identify the order you would choose for a medical-imaging viewer where false ripple structure is unacceptable. Justify with your plot.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.2</span><span class="nav-title">The 2D DFT &amp; FFT in Practice</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="section-4.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.4</span><span class="nav-title">The Sampling Theorem, Aliasing &amp; Anti-Aliasing</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

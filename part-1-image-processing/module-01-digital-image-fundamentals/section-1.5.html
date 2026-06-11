@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 1.5: Image Formats &amp; Compression: PNG, JPEG &amp; WebP. Lossless versus lossy storage, the JPEG pipeline end to end, measuring damage with PSNR and SSIM, and choosing formats for vision datasets." name="description"/>
+<title>Section 1.5: Image Formats &amp; Compression: PNG, JPEG &amp; WebP | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 1: Digital Image Fundamentals</a></div>
+<h1>Image Formats &amp; Compression: PNG, JPEG &amp; WebP</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"I divided the image into 8 by 8 blocks and threw away what nobody would miss. Apparently somebody missed it."</p>
+<cite>A Remorseful JPEG Quantizer</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A file format is a contract about acceptable loss: lossless formats promise your array back bit for bit, lossy formats promise only that a human will not mind the difference, and vision systems are not humans.</strong> JPEG's artifacts were tuned against human eyes in 1991; your segmentation labels, your measurement pipelines, and to a measurable degree your neural networks all care about exactly the information JPEG throws away. This section opens the formats you use daily, shows how to measure what compression costs, and gives you defensible rules for choosing.</p>
+</div>
+<p>This section is where the whole chapter cashes in. <a href="section-1.4.html">Section 1.4</a> gave us YCbCr and chroma subsampling; <a href="section-1.2.html">Section 1.2</a> gave us quantization; <a href="section-1.3.html">Section 1.3</a> gave us bit depth; and the frequency-domain view that completes the picture is coming in <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. JPEG is precisely these ideas composed into one pipeline, which is why we can now read it end to end. But first, the cleaner half of the world: formats that throw nothing away.</p>
+
+<h2>1. Lossless Storage: PNG <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>A lossless format guarantees that decode(encode(image)) equals the original array exactly. PNG, the workhorse, achieves compression in two stages: first a per-row prediction filter (each scanline is rewritten as differences from already-decoded neighbors, using one of five predictors chosen per row), then the generic DEFLATE compressor over the residuals. Prediction is what makes it work on images: natural rows resemble their neighbors, so residuals are small and highly compressible. PNG supports 8-bit and 16-bit channels, grayscale, RGB, indexed palettes, and an alpha channel, which makes it the default answer for anything synthetic or anything that is secretly data: charts, UI screenshots, depth maps, and above all annotation masks.</p>
+<p>Code 1.5.1 demonstrates the single most important format rule in this book with a 12-line experiment: round-trip a segmentation label mask through JPEG and through PNG, and count how many labels change.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# A binary segmentation label: class 1 inside a square, class 0 outside.
+mask = np.zeros((128, 128), np.uint8)
+mask[32:96, 32:96] = 1
+
+# Round trip through JPEG (stored scaled to 0/255, as masks often are).
+ok, buf = cv2.imencode(".jpg", mask * 255, [cv2.IMWRITE_JPEG_QUALITY, 90])
+back = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+relabeled = (back > 127).astype(np.uint8)
+print("JPEG round trip: labels changed at",
+      int((relabeled != mask).sum()), "pixels")
+
+# Round trip through PNG.
+ok, buf = cv2.imencode(".png", mask)
+back_png = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+print("PNG  round trip: labels changed at",
+      int((back_png != mask).sum()), "pixels")
+</code></pre>
+<div class="code-caption"><strong>Code 1.5.1:</strong> The label-corruption experiment. JPEG's ringing around the square's edges flips pixel labels along the entire boundary even at quality 90, silently corrupting ground truth; PNG returns every label untouched.</div>
+<pre><code class="language-text">JPEG round trip: labels changed at 96 pixels
+PNG  round trip: labels changed at 0 pixels
+</code></pre>
+<div class="code-caption"><strong>Output 1.5.1:</strong> Representative run. Nearly a hundred boundary labels flipped on a single small mask: multiply by a dataset and the evaluation noise becomes structural.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Anything That Is Secretly Data Must Be Lossless</div>
+<p>Photographs degrade gracefully under lossy compression; label maps, masks, depth images, flow fields, and medical measurements do not, because their values are categorical or metric, not perceptual. The rule: if a pixel's exact value will ever be compared, counted, indexed, or trained against (as segmentation labels are in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>), store it losslessly. A surprising number of public datasets violated this rule early on, and their boundary-pixel label noise is now permanent.</p>
+</div>
+
+<h2>2. JPEG: This Chapter, Composed Into a Codec <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>JPEG earns its 10:1 to 20:1 compression by spending the chapter's entire toolkit against human perception. Figure 1.5.1 traces the encoder; every stage should now look familiar.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Block diagram of the JPEG encoder: RGB to YCbCr, chroma subsampling, 8 by 8 block splitting, DCT, quantization with the quality knob, zigzag and Huffman coding, output file">
+<defs>
+<marker id="arr151" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#14385c"/></marker>
+<marker id="arr151b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.b151 { fill:#f4f7fb; stroke:#14385c; stroke-width:1.6; }
+.t151 { font:600 13.5px sans-serif; fill:#14385c; text-anchor:middle; }
+.s151 { font:11px sans-serif; fill:#5a626c; text-anchor:middle; }
+.l151 { fill:none; stroke:#14385c; stroke-width:1.8; marker-end:url(#arr151); }
+</style>
+<!-- Row 1 -->
+<rect class="b151" x="20" y="50" width="140" height="64" rx="8"/>
+<text class="t151" x="90" y="76">RGB image</text>
+<text class="s151" x="90" y="96">8 bit, gamma sRGB</text>
+<rect class="b151" x="210" y="50" width="150" height="64" rx="8"/>
+<text class="t151" x="285" y="76">to YCbCr</text>
+<text class="s151" x="285" y="96">Section 1.4</text>
+<rect class="b151" x="410" y="50" width="170" height="64" rx="8"/>
+<text class="t151" x="495" y="76">4:2:0 subsample</text>
+<text class="s151" x="495" y="96">half the chroma, both axes</text>
+<rect class="b151" x="630" y="50" width="200" height="64" rx="8"/>
+<text class="t151" x="730" y="76">split into 8&#215;8 blocks</text>
+<text class="s151" x="730" y="96">per channel</text>
+<line class="l151" x1="160" y1="82" x2="206" y2="82"/>
+<line class="l151" x1="360" y1="82" x2="406" y2="82"/>
+<line class="l151" x1="580" y1="82" x2="626" y2="82"/>
+<!-- connector to row 2 -->
+<path class="l151" d="M 730 114 L 730 150 L 95 150 L 95 186"/>
+<!-- Row 2 -->
+<rect class="b151" x="20" y="190" width="150" height="64" rx="8"/>
+<text class="t151" x="95" y="216">DCT per block</text>
+<text class="s151" x="95" y="236">Chapter 4's transform</text>
+<rect class="b151" x="220" y="190" width="190" height="64" rx="8"/>
+<text class="t151" x="315" y="216">quantize coefficients</text>
+<text class="s151" x="315" y="236">divide by Q table, round</text>
+<rect class="b151" x="460" y="190" width="190" height="64" rx="8"/>
+<text class="t151" x="555" y="216">zigzag + Huffman</text>
+<text class="s151" x="555" y="236">entropy coding, lossless</text>
+<rect class="b151" x="700" y="190" width="130" height="64" rx="8"/>
+<text class="t151" x="765" y="216">.jpg file</text>
+<text class="s151" x="765" y="236">10x to 20x smaller</text>
+<line class="l151" x1="170" y1="222" x2="216" y2="222"/>
+<line class="l151" x1="410" y1="222" x2="456" y2="222"/>
+<line class="l151" x1="650" y1="222" x2="696" y2="222"/>
+<!-- quality knob -->
+<rect x="240" y="296" width="150" height="40" rx="8" fill="#fdf3e7" stroke="#b8431f" stroke-width="1.6"/>
+<text class="t151" x="315" y="320" fill="#b8431f">quality knob (1 to 100)</text>
+<line x1="315" y1="296" x2="315" y2="258" stroke="#b8431f" stroke-width="1.8" marker-end="url(#arr151b)"/>
+<text class="s151" x="478" y="320">quality scales the Q table: the ONLY lossy dial, and the rounding is the ONLY loss</text>
+</svg>
+<figcaption><strong>Figure 1.5.1:</strong> The JPEG encoder as a composition of this chapter. Color space change and chroma subsampling come from Section 1.4, quantization from Section 1.2; the DCT converts each 8&#215;8 block into frequency coefficients (Chapter 4's subject), and the quality knob scales the quantization table that decides how coarsely each frequency is rounded.</figcaption>
+</figure>
+<p>Reading Figure 1.5.1 stage by stage: the encoder first converts to YCbCr and discards three quarters of the chroma samples (Code 1.4.4 showed how little that costs). Each channel is then tiled into 8&#215;8 blocks, and each block passes through the discrete cosine transform, rewriting 64 pixel values as 64 frequency coefficients: one average (DC) plus progressively finer patterns. Perceptual knowledge enters at the quantization step: each coefficient is divided by an entry from a quantization table and rounded to an integer. The table's entries are large for high frequencies (which the eye barely sees, so they round to zero in droves) and small for low frequencies. The quality parameter simply scales this table. Everything after rounding (zigzag ordering, run-length and Huffman coding) is lossless bookkeeping that exploits all those zeros. The artifacts follow directly: blocking, because each 8&#215;8 tile is quantized independently and neighbors disagree at the seam; ringing near sharp edges, because an edge needs high frequencies that got rounded away; and color bleeding, from the subsampled chroma.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The standard JPEG quantization tables, the ones scaled by the quality knob in most encoders to this day, were published in the standard's Annex K as "example" tables from psychovisual experiments around 1991, on CRT monitors, at viewing distances nobody uses anymore. Three decades of images have been compressed against the eyesight of a 1991 lab volunteer. And no, quality 100 is not lossless: chroma subsampling and DCT rounding still apply in most encoders.</p>
+</div>
+
+<h2>3. Measuring the Damage: PSNR and SSIM <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Format debates end when you measure. The bluntest instrument is mean squared error dressed in decibels, the peak signal-to-noise ratio:</p>
+$$\mathrm{PSNR} = 10 \log_{10} \frac{(2^b - 1)^2}{\mathrm{MSE}},$$
+<p>with $b = 8$ for ordinary images. PSNR is three lines of NumPy, monotone in MSE, and correlates only loosely with what humans see: it penalizes a brightness shift heavily while shrugging at smeared texture. The structural similarity index (SSIM) was designed to do better by comparing local luminance, contrast, and structure between windows of the two images:</p>
+$$\mathrm{SSIM}(x, y) = \frac{(2\mu_x \mu_y + C_1)(2\sigma_{xy} + C_2)}{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)},$$
+<p>where $\mu$, $\sigma^2$, and $\sigma_{xy}$ are windowed means, variances, and covariance, and $C_1, C_2$ stabilize the ratios. SSIM lives in $[-1, 1]$ with 1 meaning identical. These two metrics open an arc that runs the length of this book: from judging pixels here, to judging detections with IoU and mAP in <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>, to judging entire generated distributions with FID in <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>. Code 1.5.2 sweeps JPEG quality and measures both.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+# Self-contained test image: smooth waves + hard edges + fine texture,
+# the three content types compression treats most differently.
+rng = np.random.default_rng(11)
+h, w = 384, 512
+yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+img = np.dstack([
+    120 + 90 * np.sin(xx / 40) * np.cos(yy / 60),        # smooth waves
+    np.where((xx // 64 + yy // 64) % 2 == 0, 200, 60),   # checker edges
+    rng.normal(128, 30, (h, w)),                         # noise texture
+]).clip(0, 255).astype(np.uint8)
+
+print(" qual    bytes  PSNR(dB)   SSIM")
+for q in [95, 75, 50, 25, 10]:
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
+    dec = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    p = peak_signal_noise_ratio(img, dec)
+    s = structural_similarity(img, dec, channel_axis=2)
+    print(f"  q{q:&lt;3} {len(buf):&gt;8}    {p:5.2f}  {s:.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 1.5.2:</strong> The quality-distortion sweep every team should run once on its own data. In-memory encoding via <code>imencode</code> avoids littering the disk, and the synthetic image deliberately mixes the smooth, edged, and textured content that JPEG handles best, worst, and most expensively.</div>
+<pre><code class="language-text"> qual    bytes  PSNR(dB)   SSIM
+  q95   227004    38.74  0.9821
+  q75   105177    33.62  0.9384
+  q50    72436    31.49  0.9046
+  q25    48327    29.32  0.8531
+  q10    26358    26.05  0.7402
+</code></pre>
+<div class="code-caption"><strong>Output 1.5.2:</strong> Representative run. Bytes fall almost 9&#215; between q95 and q10 while PSNR drops 13 dB; note how SSIM falls gently at first and then accelerates, mirroring when artifacts become visible.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.metrics Replaces a 40-Line SSIM</div>
+<p>PSNR from scratch is genuinely three lines (<code>mse = np.mean((a - b) ** 2)</code> and a log). SSIM from scratch is a different story: Gaussian-windowed local means, variances, and covariances, two stabilizing constants, edge handling, and a per-channel average, around 40 careful lines with several published-implementation discrepancies to choose among. <code>skimage.metrics.structural_similarity(a, b, channel_axis=2)</code> is one line that matches the reference implementation, and its sibling <code>peak_signal_noise_ratio</code> keeps your PSNR consistent with the literature's conventions too.</p>
+</div>
+
+<h2>4. WebP and the Modern Format Landscape <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>WebP, derived from the VP8 video codec's intra-frame coder, improves on JPEG by predicting each block from its decoded neighbors before transforming the residual, typically saving 25 to 35% of bytes at matched quality; it also offers a genuinely lossless mode (a different algorithm entirely) and alpha support in both modes. Its successors push further: AVIF applies the AV1 codec's intra tools and shines at low bitrates; JPEG XL targets both worlds with high-quality lossy compression, fast lossless mode, and the party trick of losslessly re-encoding legacy JPEGs about 20% smaller. Code 1.5.3 compares the three formats OpenCV writes natively.</p>
+<pre><code class="language-python">for ext, params in [(".png",  []),
+                    (".jpg",  [cv2.IMWRITE_JPEG_QUALITY, 90]),
+                    (".webp", [cv2.IMWRITE_WEBP_QUALITY, 90])]:
+    ok, buf = cv2.imencode(ext, img, params)
+    print(f"{ext:&gt;6}: {len(buf):&gt;8} bytes")
+</code></pre>
+<div class="code-caption"><strong>Code 1.5.3:</strong> Same image, three contracts. On photographic content WebP at quality 90 typically lands 25 to 35% under JPEG; PNG, being lossless, can be many times larger on noisy photos while beating both on flat synthetic graphics. In OpenCV, a <code>IMWRITE_WEBP_QUALITY</code> above 100 switches WebP to its lossless mode.</div>
+<p>For vision work, the format decision tree is short. Ground truth and anything measured: lossless (PNG, or 16-bit TIFF for depth and scientific data), per the key insight above. Training photographs: whatever they already are; recompressing helps storage but compounds generation loss, and JPEG quality below about 75 measurably dents downstream accuracy, which is why JPEG-artifact augmentation appears in the robustness recipes of <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>. Serving and archives: WebP or AVIF at high quality. And whenever throughput matters, remember from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> that decode time differs across formats as much as size does; PNG's DEFLATE is often the training-loader bottleneck that JPEG's hardware-accelerated decoders are not.</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Thumbnails That Poisoned the Embeddings</div>
+<p><strong>Who:</strong> An ML engineer on the visual-search team of an e-commerce marketplace.</p>
+<p><strong>Situation:</strong> Product images were embedded with a vision model; nearest-neighbor search powered "find similar items" and duplicate detection.</p>
+<p><strong>Problem:</strong> Duplicate-detection recall degraded slowly over months. Investigation found the CDN had begun re-encoding seller images to JPEG quality 60 thumbnails, and the indexing job had silently switched to embedding those thumbnails. Identical products no longer matched: blocking and ringing artifacts shifted embeddings enough to break the neighborhood structure.</p>
+<p><strong>Decision:</strong> Embeddings were recomputed from the archived originals, and a contract test was added: every indexed image must carry PSNR above 38 dB against its stored original, or the original is fetched instead.</p>
+<p><strong>Result:</strong> Duplicate recall returned to baseline, and the regression became impossible to reintroduce silently.</p>
+<p><strong>Lesson:</strong> Compression is a domain shift. Models meet it exactly like any other distribution change, and your data pipeline can introduce it without anyone committing a line of model code.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Codecs That Learned to See (2024 to 2026)</div>
+<p>Compression is becoming a learned task end to end. JPEG AI, standardized as ISO/IEC 6048 with its core parts finalized in 2024 and 2025, is the first international image-coding standard built on a neural autoencoder: an analysis network maps the image to a compact latent, a synthesis network decodes it, and the standard explicitly targets machine-vision consumption alongside human viewing, with latents designed to feed downstream tasks without full decoding. In parallel, MPEG's Video Coding for Machines effort optimizes rate against detection and segmentation accuracy rather than human opinion scores. At the aggressive end, generative codecs such as PerCo (Careil et al., ICLR 2024) use diffusion decoders to reconstruct convincing images at bitrates near 0.003 bits per pixel; the reconstructions are photorealistic but increasingly hallucinated, reopening this section's contract question in sharper form: when the decoder is generative, "looks right" and "is right" part ways, a tension that returns at full scale with the generative models of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.</p>
+</div>
+<p>This closes the chapter's arc: photons to charge, charge to samples, samples to levels, levels to color coordinates, and coordinates to bytes on disk. You now know what an image file really contains and what it has already lost. The next chapter starts changing images on purpose: per-pixel transformations, histograms, and thresholds, the simplest and most-used tools in the kit.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.5.1: The Format Decision Tree <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Choose a storage format (PNG, JPEG, WebP lossy, WebP lossless, or 16-bit TIFF) for each asset and justify each choice in one sentence: (a) depth maps from a stereo rig, in millimeters; (b) ten million crawled product photos arriving as JPEG; (c) the per-pixel class labels your annotation team produces; (d) screenshots in your product documentation; (e) a medical imaging archive with regulatory integrity requirements.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.5.2: Find the Blocks <span class="exercise-type coding">Coding</span></div>
+<p>Compress a photograph at JPEG quality 15, decode it, and compute the absolute difference image against the original. Average the difference over all complete 8&#215;8 tiles to produce one mean 8&#215;8 error block, and display it upscaled. Where within the block does the error concentrate, and how does the pattern change at quality 50 and 90? Relate what you see to the quantization-table structure described in Figure 1.5.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.5.3: Generation Loss <span class="exercise-type analysis">Analysis</span></div>
+<p>Simulate a meme's life: re-encode the same image through JPEG quality 80 twenty times in a row (decode, re-encode, repeat), recording PSNR and SSIM against the pristine original after each generation. Plot both curves. Does quality decay linearly, level off, or accelerate? Explain the shape using the quantize-and-round mechanics of Figure 1.5.1, and predict (then verify) what changes if every other generation also resizes the image by 99%.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-1.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 1.4</span><span class="nav-title">Color Science &amp; Color Spaces: RGB, HSV, Lab &amp; YCbCr</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 1</span><span class="nav-num">Contents</span><span class="nav-title">Digital Image Fundamentals</span></a>
+<a class="next" href="../module-02-point-operations-histograms/index.html"><span class="nav-label">Next Chapter</span><span class="nav-num">Chapter 2</span><span class="nav-title">Point Operations, Histograms &amp; Thresholding</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.4: Warping, Remapping &amp; Inverse Mapping. Why warps iterate over the output and pull from the input, building warpAffine from scratch, lens undistortion with cv2.remap, border policy, and differentiable grid_sample." name="description"/>
+<title>Section 5.4: Warping, Remapping &amp; Inverse Mapping | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a></div>
+<h1>Warping, Remapping &amp; Inverse Mapping</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"I never ask where a pixel is going. I stand at the destination and ask where it came from. People call it pessimism; I call it complete coverage."</p>
+<cite>A Contrarian Inverse Mapper</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every production warp runs backwards: it iterates over the pixels of the output image and uses the inverse transform to ask where each one came from in the input.</strong> This single design decision eliminates the holes and pile-ups that plague the intuitive forward approach, and it generalizes beautifully: once the "where did I come from" question is answered by an arbitrary per-pixel lookup table instead of a matrix, the same machinery performs lens undistortion, fisheye correction, artistic distortions, and the differentiable warps inside neural networks.</p>
+</div>
+<p>
+We now hold both halves of the puzzle: <a href="section-5.2.html">Section 5.2</a> gave us matrices that map coordinates, and <a href="section-5.3.html">Section 5.3</a> gave us interpolation to read values at the fractional positions those matrices produce. This section assembles them into the actual algorithm that executes a warp, and the assembly contains the chapter's most important engineering idea. It is not obvious, most newcomers implement the wrong version first, and the right version is one line of insight: <em>loop over the output, not the input</em>.
+</p>
+<h2>1. Forward Mapping and Why It Fails <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The intuitive algorithm reads: for each input pixel $(x, y)$, compute its destination $(x', y') = M(x, y)$, round to the nearest grid position, and copy the value there. This is <strong>forward mapping</strong> (also called <em>splatting</em>), and it has two failure modes that are not edge cases but guarantees. First, <strong>holes</strong>: under any transform that locally magnifies, neighboring input pixels land more than one pixel apart in the output, leaving destination pixels that no input pixel ever claims. Rotate by 15 degrees and the output is peppered with unwritten black dots. Second, <strong>collisions</strong>: under local minification, several input pixels round to the same destination and overwrite one another arbitrarily, last-writer-wins, which is both lossy and nondeterministic with parallel execution.
+</p>
+<p>
+<strong>Inverse mapping</strong> flips the iteration. For each <em>output</em> pixel $(x', y')$, compute the <em>source</em> location via the inverse transform, $(x, y) = M^{-1}(x', y')$, and interpolate the input there:
+</p>
+$$
+I_{\text{out}}(x', y') \;=\; \mathrm{interp}\!\left(I_{\text{in}},\; M^{-1}(x', y')\right)
+$$
+<p>
+Every output pixel is visited exactly once, so there are no holes and no collisions by construction. The fractional source position is exactly what the bilinear sampler from <a href="section-5.3.html">Section 5.3</a> was built for. The only requirement is an invertible transform, which every family in <a href="section-5.1.html">Section 5.1</a>'s hierarchy satisfies. Figure 5.4.1 contrasts the two strategies; it is the diagram to redraw from memory if you remember only one from this chapter.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Forward mapping scatters input pixels to the output leaving holes; inverse mapping pulls each output pixel from an interpolated source location">
+<style>
+.grid { stroke: #d0d7de; stroke-width: 1; fill: none; }
+.cellsrc { fill: #dbeafe; stroke: #93b4f0; stroke-width: 0.8; }
+.cellhole { fill: #fee2e2; stroke: #f3a8a8; stroke-width: 0.8; }
+.celldst { fill: #d1fae5; stroke: #86d3b1; stroke-width: 0.8; }
+.t1 { font-family: Verdana, Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.t2 { font-family: Verdana, Arial, sans-serif; font-size: 11.5px; fill: #4b5563; text-anchor: middle; }
+.thole { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #dc2626; text-anchor: middle; font-weight: bold; }
+.farrow { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+.barrow { stroke: #059669; stroke-width: 2.2; fill: none; }
+.qmark { fill: #059669; }
+</style>
+<defs>
+<marker id="mfwd" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto">
+<path d="M0,0 L7,4 L0,8 z" fill="#2563eb"/>
+</marker>
+<marker id="mbck" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto">
+<path d="M0,0 L7,4 L0,8 z" fill="#059669"/>
+</marker>
+</defs>
+<!-- ===== Forward mapping (top) ===== -->
+<text class="t1" x="460" y="24">Forward mapping: push input pixels, holes appear</text>
+<!-- source grid -->
+<g>
+<rect class="cellsrc" x="60" y="50" width="30" height="30"/>
+<rect class="cellsrc" x="90" y="50" width="30" height="30"/>
+<rect class="cellsrc" x="60" y="80" width="30" height="30"/>
+<rect class="cellsrc" x="90" y="80" width="30" height="30"/>
+<rect class="grid" x="30" y="40" width="120" height="90"/>
+<text class="t2" x="90" y="148">input (each pixel pushed)</text>
+</g>
+<!-- destination grid with holes -->
+<g>
+<rect class="celldst" x="640" y="44" width="30" height="30"/>
+<rect class="cellhole" x="670" y="50" width="30" height="30"/>
+<rect class="celldst" x="700" y="56" width="30" height="30"/>
+<rect class="celldst" x="652" y="80" width="30" height="30"/>
+<rect class="cellhole" x="694" y="88" width="30" height="30"/>
+<rect class="grid" x="610" y="36" width="150" height="96"/>
+<text class="thole" x="685" y="69">?</text>
+<text class="thole" x="709" y="107">?</text>
+<text class="t2" x="685" y="150">output (red cells never written)</text>
+</g>
+<!-- forward arrows, diverging -->
+<line class="farrow" x1="122" y1="62" x2="636" y2="56" marker-end="url(#mfwd)"/>
+<line class="farrow" x1="122" y1="76" x2="700" y2="68" marker-end="url(#mfwd)"/>
+<line class="farrow" x1="122" y1="96" x2="650" y2="92" marker-end="url(#mfwd)"/>
+<!-- ===== Inverse mapping (bottom) ===== -->
+<text class="t1" x="460" y="196">Inverse mapping: each output pixel pulls from the source</text>
+<!-- source grid with sample point -->
+<g>
+<rect class="cellsrc" x="60" y="218" width="30" height="30"/>
+<rect class="cellsrc" x="90" y="218" width="30" height="30"/>
+<rect class="cellsrc" x="60" y="248" width="30" height="30"/>
+<rect class="cellsrc" x="90" y="248" width="30" height="30"/>
+<rect class="grid" x="30" y="208" width="120" height="90"/>
+<circle cx="86" cy="244" r="4.5" fill="#059669"/>
+<text class="t2" x="90" y="316">input (sampled between pixels)</text>
+</g>
+<!-- destination full grid -->
+<g>
+<rect class="celldst" x="610" y="212" width="30" height="30"/>
+<rect class="celldst" x="640" y="212" width="30" height="30"/>
+<rect class="celldst" x="670" y="212" width="30" height="30"/>
+<rect class="celldst" x="610" y="242" width="30" height="30"/>
+<rect class="celldst" x="640" y="242" width="30" height="30"/>
+<rect class="celldst" x="670" y="242" width="30" height="30"/>
+<rect class="grid" x="610" y="212" width="90" height="60"/>
+<text class="t2" x="660" y="316">output (every cell visited once,</text>
+<text class="t2" x="660" y="330">no holes possible)</text>
+</g>
+<!-- backward arrow: from output cell back to source sample -->
+<line class="barrow" x1="640" y1="256" x2="96" y2="246" marker-end="url(#mbck)"/>
+<text class="t2" x="372" y="238">M&#8315;&#185;(x&#8242;, y&#8242;) = fractional source location, bilinear read</text>
+</svg>
+<figcaption><strong>Figure 5.4.1:</strong> Forward versus inverse mapping. Top: pushing input pixels forward leaves unwritten holes (red) wherever the transform locally stretches, and causes overwrites where it compresses. Bottom: iterating over output pixels and pulling each value from the inverse-mapped source location (green arrow, read right to left) covers every output pixel exactly once; the fractional source position is handled by the interpolation of Section 5.3.</figcaption>
+</figure>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Think Backwards by Default</div>
+<p>"Iterate over what you must fill, pull from what you have" is a pattern far bigger than warping: ray tracers cast rays from the screen into the scene, texture mapping samples the texture per screen pixel, and <code>grid_sample</code> in deep learning warps feature maps by exactly this gather operation. Forward "scatter" approaches do exist (additive splatting with normalization solves the collision problem and appears in point-cloud rendering and frame interpolation), but they are the specialist tool. When you sit down to write any resampling code, your first question should be: what is my output grid, and what do I pull onto it?</p>
+</div>
+<h2>2. Building warpAffine From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Inverse mapping plus the vectorized <code>bilinear_sample</code> from <a href="section-5.3.html">Section 5.3</a> yields a complete affine warper in under 20 lines. The only new machinery is generating all output coordinates at once with <code>np.mgrid</code> and pushing them through the inverted matrix in a single einsum:
+</p>
+<pre><code class="language-python">import numpy as np
+
+def warp_affine_scratch(img, M2x3, out_shape):
+    """Inverse-mapping affine warp of a grayscale image.
+
+    M2x3 maps INPUT coords to OUTPUT coords (like cv2.warpAffine).
+    """
+    H_out, W_out = out_shape
+    M3 = np.vstack([M2x3, [0.0, 0.0, 1.0]])     # lift to 3x3
+    Minv = np.linalg.inv(M3)                    # output -> input
+
+    ys, xs = np.mgrid[0:H_out, 0:W_out].astype(np.float64)
+    ones = np.ones_like(xs)
+    dst = np.stack([xs, ys, ones])              # 3 x H x W homogeneous grid
+
+    src = np.einsum('ij,jhw->ihw', Minv, dst)   # apply Minv to every pixel
+    src_x, src_y = src[0], src[1]               # affine: w stays 1, no divide
+
+    out = bilinear_sample(img, src_x, src_y)    # Section 5.3's sampler
+
+    # Mask coordinates that fell outside the source image (constant border).
+    inside = ((src_x &gt;= 0) &amp; (src_x &lt;= img.shape[1] - 1) &amp;
+              (src_y &gt;= 0) &amp; (src_y &lt;= img.shape[0] - 1))
+    return np.where(inside, out, 0.0)
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.1:</strong> A complete from-scratch affine warper: invert the matrix, build the output coordinate grid, map it backwards, sample bilinearly, and zero out-of-bounds pixels. For a homography, the only change is dividing by the third coordinate after the einsum.</div>
+<p>
+Three details in Code 5.4.1 deserve attention. First, the matrix we invert is the input-to-output transform, matching OpenCV's convention; the algorithm itself consumes the output-to-input direction, and APIs differ on which one they want (OpenCV's <code>warpAffine</code> accepts <code>flags=cv2.WARP_INVERSE_MAP</code> to skip the inversion). Second, the einsum applies a single $3 \times 3$ matrix to millions of coordinates with no Python loop; this is the vectorization habit from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> doing real work. Third, the <code>inside</code> mask implements the simplest <strong>border policy</strong>: pixels whose source falls outside the input become black. These are the same border questions you met when convolution kernels hung off the image edge in <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, and OpenCV reuses the identical flags: <code>BORDER_CONSTANT</code>, <code>BORDER_REPLICATE</code>, <code>BORDER_REFLECT_101</code>, and for tiling warps, <code>BORDER_WRAP</code>.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.warpAffine and cv2.warpPerspective</div>
+<p>Our 20-line warper, extended to color, multiple interpolation kernels, all border modes, and SIMD speed, is what these two calls deliver in one line each:</p>
+<pre><code class="language-python">out = cv2.warpAffine(img, M2x3, (W_out, H_out),
+                     flags=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REPLICATE)
+out = cv2.warpPerspective(img, H3x3, (W_out, H_out))   # homography version
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.4:</strong> The production equivalents of Code 5.4.1: one call for affine warps, one for homographies, with interpolation and border policy as flags.</div>
+<p>Roughly 20 lines (or 60 with bicubic and border modes) become 1. Internally OpenCV tiles the output, computes source coordinates in fixed-point arithmetic, dispatches SIMD-vectorized interpolation per tile, and multithreads across tiles, typically 10-50&times; faster than our NumPy version. Note the size argument is <code>(width, height)</code>, opposite to NumPy's <code>shape</code> order; this asymmetry causes a measurable fraction of all OpenCV bugs.</p>
+</div>
+<h2>3. Beyond Matrices: remap and the Lookup-Table View <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Here is the conceptual jump that makes inverse mapping truly powerful: nothing in the algorithm requires the source coordinates to come from a matrix. Any pair of arrays <code>map_x[y, x]</code> and <code>map_y[y, x]</code>, declaring for each output pixel where in the input to look, defines a valid warp. OpenCV exposes exactly this as <code>cv2.remap</code>, and it is the escape hatch for every transform that is not projective: lens distortion, fisheye unwrapping, swirl filters, scanline jitter, and the per-pixel flow fields we will meet in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
+</p>
+<p>
+The canonical real-world example is <strong>radial lens distortion</strong>. Real lenses bow straight lines outward (barrel distortion, wide-angle lenses) or inward (pincushion, telephoto). The standard model perturbs each point's distance from the image center: with normalized radius $r$,
+</p>
+$$
+r_{\text{distorted}} \;=\; r\,(1 + k_1 r^2 + k_2 r^4)
+$$
+<p>
+where $k_1, k_2$ are lens-specific coefficients (where they come from is the calibration story of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>). To <em>undistort</em>, we build maps that send each output (clean) pixel to its distorted source position and let <code>remap</code> do the rest:
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("wide_angle.jpg")
+h, w = img.shape[:2]
+cx, cy = w / 2.0, h / 2.0
+k1, k2 = 0.28, 0.06          # barrel distortion strengths (illustrative)
+
+# For each OUTPUT pixel, where in the distorted input is its color?
+ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+xn = (xs - cx) / cx          # normalize to roughly [-1, 1]
+yn = (ys - cy) / cy
+r2 = xn**2 + yn**2
+factor = 1 + k1 * r2 + k2 * r2**2
+
+map_x = (xn * factor * cx + cx).astype(np.float32)
+map_y = (yn * factor * cy + cy).astype(np.float32)
+
+undistorted = cv2.remap(img, map_x, map_y,
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT)
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.2:</strong> Undistorting barrel distortion with <code>cv2.remap</code>: two float32 lookup tables tell every output pixel where to shop for its value. No matrix could express this warp; the radius factor varies per pixel.</div>
+<p>
+Two performance notes turn this from demo into production. The maps depend only on the lens, not the image, so compute them <em>once</em> and reuse them for every frame of a video stream. And <code>cv2.convertMaps</code> converts the float maps into a fixed-point representation (<code>CV_16SC2</code>) that <code>remap</code> executes significantly faster with identical visual results, a standard trick on embedded hardware.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Sixty Undistortions per Second on a Car Computer</div>
+<p><strong>Who:</strong> A perception engineer at an automotive supplier building a surround-view parking system.</p>
+<p><strong>Situation:</strong> Four fisheye cameras stream 30 frames per second each; every frame must be undistorted and warped into a common top-down view before stitching, on a power-constrained automotive SoC.</p>
+<p><strong>Problem:</strong> The prototype called the full undistortion math per frame, recomputing trigonometric per-pixel maps 120 times a second. The SoC ran at 90 percent CPU before any detection code ran.</p>
+<p><strong>Decision:</strong> The engineer split the work by what changes: lens geometry never changes, so the maps were precomputed once at startup with <code>cv2.initUndistortRectifyMap</code> (the calibrated-camera version of Code 5.4.2), converted to fixed point with <code>cv2.convertMaps</code>, and the per-frame work reduced to four <code>cv2.remap</code> calls.</p>
+<p><strong>Result:</strong> Per-frame warp cost dropped by roughly 4&times;, freeing the budget for the actual parking-spot detection. The visual output was pixel-identical.</p>
+<p><strong>Lesson:</strong> A warp is a lookup table plus interpolation. If the geometry is static, build the table once; the per-frame cost is then pure memory traffic, which is exactly what embedded silicon is good at.</p>
+</div>
+<h2>4. Differentiable Warping: grid_sample <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+The same gather-and-interpolate operation lives inside PyTorch as <code>torch.nn.functional.grid_sample</code>, with one crucial addition: it is differentiable. Bilinear interpolation is a little weighted sum, so gradients flow through the weights to the sampling <em>coordinates</em> themselves, which means a network can <em>learn where to look</em>. This was the breakthrough of Spatial Transformer Networks (Jaderberg et al., 2015), and it is now plumbing inside registration networks, optical-flow training, and the view-synthesis methods of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.
+</p>
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+img_t = torch.rand(1, 3, 240, 320)            # (N, C, H, W)
+
+# grid holds, for each output pixel, the source location in
+# NORMALIZED coordinates: x and y each in [-1, 1] over the input.
+theta = torch.tensor([[[0.966, -0.259, 0.0],   # 15-degree rotation,
+                       [0.259,  0.966, 0.0]]]) # expressed for normalized coords
+grid = F.affine_grid(theta, size=img_t.shape, align_corners=False)
+warped = F.grid_sample(img_t, grid, mode='bilinear',
+                       padding_mode='zeros', align_corners=False)
+print(warped.shape)        # torch.Size([1, 3, 240, 320])
+</code></pre>
+<div class="code-caption"><strong>Code 5.4.3:</strong> The PyTorch warp pair: <code>affine_grid</code> builds the inverse-mapping coordinate grid from a matrix, <code>grid_sample</code> performs the differentiable gather. Both the image and the grid can carry gradients.</div>
+<p>
+The API holds two traps for OpenCV-trained hands. Coordinates are <em>normalized</em>: $(-1, -1)$ is the input's top-left and $(1, 1)$ its bottom-right, so pixel-space maps must be rescaled before use. And the <code>align_corners</code> flag changes what $-1$ and $1$ mean (corner pixel <em>centers</em> versus corner pixel <em>edges</em>); mixing conventions between a model's training code and its deployment code shifts every sample by up to half a pixel, an error small enough to survive code review and large enough to degrade a super-resolution model. Pick <code>align_corners=False</code> (the modern default) and use it everywhere.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The texture-mapping hardware that makes <code>grid_sample</code> fast on GPUs was designed in the 1990s so that video games could wrap brick patterns onto walls. The operation deep learning calls "differentiable image sampling" is, in silicon terms, the same circuit that textured every wall in Quake. Few transistors have had such a distinguished second career.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Warping as a Layer, Everywhere</div>
+<p>Differentiable warping has become a load-bearing component across 2024-2026 research. Optical-flow models such as <strong>SEA-RAFT</strong> (Wang et al., ECCV 2024) are trained by backward-warping one frame toward another through <code>grid_sample</code> and penalizing the photometric residual, making the warp itself the loss function. Video frame interpolation runs the opposite primitive, differentiable <em>forward</em> splatting (softmax splatting, Niklaus and Liu, CVPR 2020), inside modern interpolation and video-generation stacks where occlusions must be resolved by depth-like weights rather than overwritten. And the view-synthesis lineage, from NeRF's ray sampling to <strong>3D Gaussian Splatting</strong> (Kerbl et al., SIGGRAPH 2023) and its fast 2024-2025 successors, can be read as the warping question asked in 3D: instead of a 2D lookup table, a learned scene representation answers "where does this output pixel's content come from?" The inverse-versus-forward mapping distinction you learned in this section is precisely the gather-versus-splat distinction these papers negotiate.</p>
+</div>
+<h2>5. A Checklist for Production Warps <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Warping code is short but dense with conventions, and most bugs come from the same five questions being answered inconsistently. Before shipping any warp, walk this list:
+</p>
+<ol>
+<li><strong>Direction:</strong> does your API want the forward matrix or the inverse? (<code>cv2.warp*</code> wants forward and inverts internally; <code>remap</code> and <code>grid_sample</code> consume the inverse-mapped coordinates directly.)</li>
+<li><strong>Coordinate convention:</strong> pixel coordinates or normalized? $(x, y)$ or (row, col)? Size as (width, height) or shape as (height, width)?</li>
+<li><strong>Interpolation:</strong> bilinear for images, nearest for masks and label maps (the phantom-class trap from <a href="section-5.3.html">Section 5.3</a>), and an anti-aliased path if the warp locally minifies.</li>
+<li><strong>Border policy:</strong> what value do out-of-source pixels take, and will downstream code mistake it for content? (A black border feeding a histogram skews it; recall the border discussions of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>.)</li>
+<li><strong>Reuse:</strong> if the geometry is fixed, are the maps precomputed and fixed-point converted?</li>
+</ol>
+<p>
+With execution machinery in hand, one question remains open, and it is the big one: where do the transforms come from when no one hands you a matrix? Estimating them from the images themselves is image registration, the subject of <a href="section-5.5.html">Section 5.5</a>.
+</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.1: Holes, Counted <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An image is forward-mapped through a similarity transform with scale $s = 2$ (each axis). Assuming rounding to nearest integer and ignoring borders, what fraction of output pixels receive no value? What if $s = 3$? Now answer for minification at $s = 0.5$: what is the average number of input pixels colliding on each output pixel, and why does "last writer wins" produce aliasing by the argument of Section 5.3's downscaling discussion?</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.2: The Swirl Filter <span class="exercise-type coding">Coding</span></div>
+<p>Using the structure of Code 5.4.2, implement a swirl effect: each output pixel samples from the input position obtained by rotating its offset from the image center by an angle $\theta(r) = \theta_{\max}\,(1 - r/R)$ that decays from the center to radius $R$. Apply it to a portrait with <code>cv2.remap</code> at three values of $\theta_{\max}$. Then implement the same warp by forward mapping (round and copy) and display the two results side by side; describe the artifacts you observe and connect each to Figure 5.4.1.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.4.3: Benchmarking the Map Pipeline <span class="exercise-type analysis">Analysis</span></div>
+<p>For a 1920&times;1080 three-channel frame, benchmark four undistortion strategies over 300 iterations: (a) recomputing float maps each frame then <code>remap</code>; (b) precomputed float32 maps; (c) precomputed maps converted with <code>cv2.convertMaps</code> to <code>CV_16SC2</code>; (d) our from-scratch NumPy warper from Code 5.4.1 adapted to use the maps. Report milliseconds per frame and speedup ratios, and profile where strategy (a) spends its time. At what frame rate does each strategy stop being real-time?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-5.3.html"><span class="nav-label">Section 5.3: Interpolation: Nearest, Bilinear, Bicubic &amp; Lanczos</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span></a>
+<a class="next" href="section-5.5.html"><span class="nav-label">Section 5.5: Image Registration &amp; Alignment</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

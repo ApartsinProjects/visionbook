@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 9: Edges, Lines &amp; Curves. From gradient maps to geometric structure: the Canny edge detector, the Hough transform for lines and circles, robust curve fitting with RANSAC, and a complete lane-marking detection pipeline." name="description"/>
+<title>Chapter 9: Edges, Lines &amp; Curves | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Edges, Lines &amp; Curves</a></div>
+<h1>Edges, Lines &amp; Curves</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My job is to look at two million pixels and report back with a handful of lines. Compression is easy; the hard part is deciding which 1,999,500 pixels were beside the point."</p>
+<cite>A Ruthlessly Selective Edge Detector</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This chapter is where the book stops processing images and starts understanding them: it turns arrays of pixel intensities into geometric structure, the edges, lines, and curves that describe what a scene contains rather than what its pixels measure.</strong> The derivative filters of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> gave us gradient maps; here the Canny detector distills them into clean one-pixel-wide contours, the Hough transform groups those contours into lines and circles by letting pixels vote, and robust fitting sharpens the votes into precise parametric curves that survive outliers. The chapter ends by assembling every piece into a working lane-marking detector, the same architecture that shipped in early driver-assistance systems and still runs as a fallback in some of them.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Part I treated an image as a signal to be improved: denoised in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>, sharpened and filtered in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, warped in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>. Whatever we did, the output was always another image. This chapter changes the type signature. The output of an edge detector is not an image in any useful sense; it is a claim about the world: "here, the scene changes." The output of a line detector is more abstract still: four numbers that summarize ten thousand pixels. This progression, from dense arrays toward compact symbolic descriptions, is the central project of classical computer vision, and edges are its first step because nearly every meaningful boundary in a scene (an object's silhouette, a road marking, the corner of a building) announces itself as a rapid change in intensity.
+</p>
+<p>
+The chapter follows a deliberate arc from evidence to structure. Section 9.1 revisits the image gradient with new eyes: not as a filter output but as a measuring instrument, and confronts the gap between a gradient map (a number at every pixel) and an edge map (a decision at every pixel). Section 9.2 closes that gap with the Canny detector, a four-stage pipeline from 1986 that remains the most-used edge detector on the planet; we build every stage from scratch, then compress the whole thing into one OpenCV call. Section 9.3 asks what to do with edge pixels once we have them, and answers with one of the field's most elegant ideas: the Hough transform, which detects lines and circles by letting every edge pixel vote for every shape that could pass through it. Section 9.4 trades the Hough transform's robustness for precision, fitting parametric curves by least squares, then rescuing least squares from its fatal sensitivity to outliers with M-estimators and RANSAC, an algorithm so durable that it will reappear in <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.
+</p>
+<p>
+Section 9.5 is the payoff: a complete, working lane-marking detection pipeline that thresholds gradients and colors, warps the road into a bird's-eye view using the homography machinery of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, gathers lane pixels with a sliding-window search, fits robust polynomials, and reports lane curvature in meters. It is a genuinely deployed architecture, and it is also a teaching instrument: every stage exercises a section of this chapter, and every failure mode (shadows, worn paint, rain) illustrates exactly why the deep learning methods of Part III were invented.
+</p>
+<p>
+One more reason to take this chapter seriously, even in 2026: edges refuse to retire. The first convolutional layer of virtually every trained CNN rediscovers oriented edge detectors on its own, as we will see in <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>. And at the far end of the book, Canny edge maps return as one of the most popular conditioning signals for controllable image generation: ControlNet and its successors steer diffusion models with precisely the one-pixel-wide contours this chapter teaches you to compute, a story told in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>. The gradient-to-geometry pipeline you learn here is not a historical exhibit; it is a load-bearing wall of the modern stack.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+This chapter leans directly on the derivative filters (Sobel, Scharr, Laplacian) of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a>, especially Section 3.4; if gradient magnitude and orientation feel hazy, reread that section first. Thresholding and histogram reasoning from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a> appear in every section. The lane-detection capstone in Section 9.5 uses the perspective transform from <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a> and benefits from the binary-image cleanup operations of <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a>. As always, fluency with NumPy arrays from <a href="../../part-1-image-processing/module-00-python-imaging-stack/index.html">Chapter 0</a> is assumed, and the noise models of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a> explain why every detector in this chapter begins by smoothing.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">9.1</span>
+<a href="section-9.1.html"><span class="section-title">What Is an Edge? Gradients Revisited</span></a>
+<span class="section-desc">Edges as rapid intensity change: edge profiles and their physical causes, gradient magnitude and orientation as measurements, why differentiation amplifies noise, and why a gradient map is not yet an edge map.</span>
+</li>
+<li>
+<span class="section-num">9.2</span>
+<a href="section-9.2.html"><span class="section-title">The Canny Edge Detector, Step by Step</span></a>
+<span class="section-desc">The 1986 detector that refuses to die: optimality criteria, non-maximum suppression, double thresholding with hysteresis, a from-scratch implementation, and the one-line OpenCV equivalent with its tuning knobs.</span>
+</li>
+<li>
+<span class="section-num">9.3</span>
+<a href="section-9.3.html"><span class="section-title">The Hough Transform: Lines &amp; Circles</span></a>
+<span class="section-desc">Detection as voting: the polar line parameterization, accumulator arrays, peak finding, the probabilistic variant that returns segments, and the gradient trick that makes circle detection tractable.</span>
+</li>
+<li>
+<span class="section-num">9.4</span>
+<a href="section-9.4.html"><span class="section-title">Fitting Curves: Least Squares &amp; Robust Alternatives</span></a>
+<span class="section-desc">From detection to measurement: total least squares for lines, why one outlier ruins everything, M-estimators and iteratively reweighted fitting, RANSAC and its iteration budget, and direct ellipse fitting.</span>
+</li>
+<li>
+<span class="section-num">9.5</span>
+<a href="section-9.5.html"><span class="section-title">Worked Example: Lane-Marking Detection</span></a>
+<span class="section-desc">The whole chapter assembled: gradient and color thresholding, bird's-eye perspective warp, sliding-window lane pixel search, robust polynomial fits, curvature in meters, and a sober comparison with 2024-2026 learned lane detectors.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+Edges describe where the image changes, but they are anonymous: one stretch of contour looks much like another, which is why this chapter could group them only with strong geometric priors (lines, circles, polynomials). <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a> takes the complementary path: instead of long anonymous curves, it finds compact distinctive points (corners and blobs) and equips each with a fingerprint descriptor so it can be recognized again in a different photograph. That single capability, finding the same point in two images, unlocks panorama stitching, camera calibration, stereo depth, and ultimately the 3D reconstruction pipelines of Chapters 12 through 14. The RANSAC estimator you meet in Section 9.4 travels there with you; it is the standard tool for separating correct matches from false ones.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Canny, J. "A Computational Approach to Edge Detection." IEEE TPAMI (1986). <a href="https://doi.org/10.1109/TPAMI.1986.4767851" target="_blank" rel="noopener">doi:10.1109/TPAMI.1986.4767851</a></div>
+<div class="bib-annotation">The paper behind Section 9.2: edge detection posed as an optimization over detection, localization, and single response, solved with the pipeline that still bears Canny's name forty years later.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Duda, R. and Hart, P. "Use of the Hough Transformation to Detect Lines and Curves in Pictures." Communications of the ACM (1972). <a href="https://doi.org/10.1145/361237.361242" target="_blank" rel="noopener">doi:10.1145/361237.361242</a></div>
+<div class="bib-annotation">Introduced the polar (rho, theta) line parameterization taught in Section 9.3, turning Hough's bubble-chamber patent into the algorithm every vision library implements.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Fischler, M. and Bolles, R. "Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography." Communications of the ACM (1981). <a href="https://doi.org/10.1145/358669.358692" target="_blank" rel="noopener">doi:10.1145/358669.358692</a></div>
+<div class="bib-annotation">RANSAC, the robust estimator of Section 9.4 and arguably the most reused algorithm in geometric vision; the original paper is short and worth reading in full.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Matas, J., Galambos, C., and Kittler, J. "Robust Detection of Lines Using the Progressive Probabilistic Hough Transform." Computer Vision and Image Understanding (2000). <a href="https://doi.org/10.1006/cviu.1999.0831" target="_blank" rel="noopener">doi:10.1006/cviu.1999.0831</a></div>
+<div class="bib-annotation">The algorithm inside OpenCV's <code>HoughLinesP</code>: random sampling plus on-the-fly segment extraction, the practical variant recommended throughout Sections 9.3 and 9.5.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ballard, D. H. "Generalizing the Hough Transform to Detect Arbitrary Shapes." Pattern Recognition (1981). <a href="https://doi.org/10.1016/0031-3203(81)90009-1" target="_blank" rel="noopener">doi:10.1016/0031-3203(81)90009-1</a></div>
+<div class="bib-annotation">Voting extended from lines and circles to any template shape, mentioned in Section 9.3; the conceptual ancestor of implicit-shape-model detection.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Fitzgibbon, A., Pilu, M., and Fisher, R. "Direct Least Square Fitting of Ellipses." IEEE TPAMI (1999). <a href="https://doi.org/10.1109/34.765658" target="_blank" rel="noopener">doi:10.1109/34.765658</a></div>
+<div class="bib-annotation">The closed-form ellipse fit behind OpenCV's <code>fitEllipse</code>, used in Section 9.4; a model of how a clever constraint turns a hard problem into an eigenvalue problem.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">von Gioi, R. G., Jakubowicz, J., Morel, J.-M., and Randall, G. "LSD: a Line Segment Detector." Image Processing On Line (2012). <a href="https://www.ipol.im/pub/art/2012/gjmr-lsd/" target="_blank" rel="noopener">ipol.im/pub/art/2012/gjmr-lsd</a></div>
+<div class="bib-annotation">The strongest classical alternative to Hough line detection: region-growing on gradient orientations with a false-detection control, with reference code and an online demo.</div>
+</div>
+
+<h3>Recent Research (2023-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Ye, Y. et al. "DiffusionEdge: Diffusion Probabilistic Model for Crisp Edge Detection." AAAI (2024). <a href="https://arxiv.org/abs/2401.02032" target="_blank" rel="noopener">arXiv:2401.02032</a></div>
+<div class="bib-annotation">A diffusion model that generates single-pixel-wide edge maps directly, sidestepping the thick-edge problem that Sections 9.1 and 9.2 solve with non-maximum suppression.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Cetinkaya, B., Kalkan, S., and Akbas, E. "RankED: Addressing Imbalance and Uncertainty in Edge Detection Using Ranking-based Losses." CVPR (2024). <a href="https://arxiv.org/abs/2403.01795" target="_blank" rel="noopener">arXiv:2403.01795</a></div>
+<div class="bib-annotation">Modern learned edge detection that confronts the same two demons Canny named in 1986: most pixels are not edges, and annotators disagree about the rest.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Pautrat, R., Barath, D., Larsson, V., Oswald, M., and Pollefeys, M. "DeepLSD: Line Segment Detection and Refinement with Deep Image Gradients." CVPR (2023). <a href="https://arxiv.org/abs/2212.07766" target="_blank" rel="noopener">arXiv:2212.07766</a></div>
+<div class="bib-annotation">A hybrid that learns a gradient-like field with a CNN and then runs classical line extraction on top of it: the clearest evidence that the classical machinery of Section 9.3 still earns its keep.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kluger, F. and Rosenhahn, B. "PARSAC: Accelerating Robust Multi-Model Fitting with Parallel Sample Consensus." AAAI (2024). <a href="https://arxiv.org/abs/2401.14919" target="_blank" rel="noopener">arXiv:2401.14919</a></div>
+<div class="bib-annotation">RANSAC modernized: a network proposes which points belong together so that many models (several lines, several planes) can be fit in parallel; context for Section 9.4's frontier discussion.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Honda, H. and Uchida, Y. "CLRerNet: Improving Confidence of Lane Detection with LaneIoU." WACV (2024). <a href="https://arxiv.org/abs/2305.08366" target="_blank" rel="noopener">arXiv:2305.08366</a></div>
+<div class="bib-annotation">A strong 2024 learned lane detector and the natural benchmark contrast for Section 9.5's classical pipeline; note how much of its evaluation vocabulary (curvature, lateral offset) the classical pipeline defined.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, L., Rao, A., and Agrawala, M. "Adding Conditional Control to Text-to-Image Diffusion Models." ICCV (2023). <a href="https://arxiv.org/abs/2302.05543" target="_blank" rel="noopener">arXiv:2302.05543</a></div>
+<div class="bib-annotation">ControlNet: the paper that made Canny edge maps a conditioning signal for image generation and gave this chapter's output a second career, previewed in Section 9.2 and developed in Chapter 35.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 7 of Szeliski covers edges, lines, and fitting with full mathematical depth and excellent historical notes; free online and the standard reference.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Canny Edge Detection" tutorial. <a href="https://docs.opencv.org/4.x/da/d22/tutorial_py_canny.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The official OpenCV 4.x walkthrough of <code>cv2.Canny</code>, including the aperture and L2-gradient flags tuned in Section 9.2.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. "Hough Line Transform" tutorial. <a href="https://docs.opencv.org/4.x/d6/d10/tutorial_py_houghlines.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">Documentation for <code>HoughLines</code> and <code>HoughLinesP</code> as used in Sections 9.3 and 9.5, with the accumulator semantics spelled out.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">scikit-image. "Straight line Hough transform" example gallery. <a href="https://scikit-image.org/docs/stable/auto_examples/edges/plot_line_hough_transform.html" target="_blank" rel="noopener">scikit-image.org</a></div>
+<div class="bib-annotation">A readable pure-Python Hough implementation with accumulator visualizations that complement Figure 9.3.1; also covers the probabilistic variant.</div>
+</div>
+
+<h3>Datasets &amp; Benchmarks</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Berkeley Segmentation Dataset and Benchmark (BSDS500). <a href="https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/resources.html" target="_blank" rel="noopener">eecs.berkeley.edu</a></div>
+<div class="bib-annotation">The standard benchmark for boundary detection: 500 images with multiple human annotations, the dataset on which every learned edge detector in the Recent Research list reports results.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">CULane: a large-scale lane detection benchmark. <a href="https://xingangpan.github.io/projects/CULane.html" target="_blank" rel="noopener">xingangpan.github.io/projects/CULane</a></div>
+<div class="bib-annotation">133,000 frames of urban and highway driving with lane annotations, including the shadow, glare, and no-line categories that stress-test Section 9.5's pipeline.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../../part-1-image-processing/module-08-tools-of-the-trade/index.html">&#8592; Chapter 8: Tools of the Trade: The Image Processing Stack</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

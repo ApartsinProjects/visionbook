@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.4: The Sampling Theorem, Aliasing &amp; Anti-Aliasing. Nyquist-Shannon explained through spectrum replication, why naive downsampling creates moir&#233;, the prefilter-then-sample recipe, and aliasing inside neural networks." name="description"/>
+<title>Section 4.4: The Sampling Theorem, Aliasing &amp; Anti-Aliasing | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>The Sampling Theorem, Aliasing &amp; Anti-Aliasing</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They photographed me at two pixels per plank and now the internet thinks I'm a rainbow. I am a fence. I have always been a fence."</p>
+<cite>An Undersampled Picket Fence</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A signal can be sampled and perfectly reconstructed only if it is sampled at more than twice its highest frequency; violate that bound and the excess frequencies do not vanish but reappear disguised as lower ones, permanently corrupting the data.</strong> That single sentence, the Nyquist-Shannon sampling theorem, governs every camera sensor, every call to resize, every strided convolution in a CNN, and every video frame rate. This section derives it with one picture, shows the damage with one test image, and gives the universal fix: remove what you cannot represent <em>before</em> you sample, never after.</p>
+</div>
+
+<p><a href="section-4.3.html">Section 4.3</a> sculpted spectra deliberately. This section is about the spectral surgery you perform <em>by accident</em> every time you shrink an image. Resizing feels like an innocent operation, yet it is the most common way real pipelines corrupt their data, and the corruption has a special property that makes it dangerous: it is invisible in code review, intermittent in testing (it depends on image content), and irreversible once it happens. The frequency view from this chapter makes the mechanism, and therefore the cure, completely transparent.</p>
+
+<h2>1. Sampling Through the Frequency Lens <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Mathematically, sampling a continuous signal means multiplying it by a train of impulses spaced $1/f_s$ apart, where $f_s$ is the sampling rate. The frequency-domain consequence is the key to everything: multiplication by an impulse train in space equals convolution with an impulse train in frequency, so <em>the sampled signal's spectrum is the original spectrum copied over and over</em>, with replicas centered at every multiple of $f_s$:</p>
+
+<p>$$F_s(u) \;=\; f_s \sum_{k=-\infty}^{\infty} F(u - k f_s)$$</p>
+
+<p>Reconstruction means isolating the central copy with a low-pass filter. That works precisely when the copies do not touch, and the copies do not touch precisely when the original spectrum ends before the next replica begins: $f_s &gt; 2 f_{\max}$, the <strong>Nyquist criterion</strong>. Figure 4.4.1 tells the whole story in two rows. When the criterion fails, neighboring replicas overlap, their tails add irreversibly, and a frequency $f$ above the limit masquerades as the lower frequency $|f - k f_s|$ folded back into range. That impostor is an <strong>alias</strong>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Spectrum replication after sampling: separated replicas when the Nyquist criterion holds, overlapping corrupted replicas when it fails">
+<text x="430" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Sampling replicates the spectrum at every multiple of f&#8347;</text>
+<!-- top row: no overlap -->
+<text x="60" y="62" font-family="sans-serif" font-size="13" fill="#1b5e20">f&#8347; &gt; 2f&#8344;&#8336;&#8347;: replicas separated, original recoverable</text>
+<line x1="60" y1="170" x2="800" y2="170" stroke="#5a6b85" stroke-width="2"/>
+<!-- replicas: triangles centered at 200, 430, 660 (spacing 230 > 2*half-width 90) -->
+<path d="M 110 170 L 200 85 L 290 170 Z" fill="#1f77b4" opacity="0.55"/>
+<path d="M 340 170 L 430 85 L 520 170 Z" fill="#1f77b4" opacity="0.85"/>
+<path d="M 570 170 L 660 85 L 750 170 Z" fill="#1f77b4" opacity="0.55"/>
+<text x="430" y="190" font-family="sans-serif" font-size="12" fill="#555" text-anchor="middle">0</text>
+<text x="200" y="190" font-family="sans-serif" font-size="12" fill="#555" text-anchor="middle">-f&#8347;</text>
+<text x="660" y="190" font-family="sans-serif" font-size="12" fill="#555" text-anchor="middle">+f&#8347;</text>
+<!-- recovery low-pass -->
+<path d="M 330 170 L 330 78 L 530 78 L 530 170" fill="none" stroke="#2ca02c" stroke-width="2.5" stroke-dasharray="6,4"/>
+<text x="430" y="70" font-family="sans-serif" font-size="12" fill="#1b7a1b" text-anchor="middle">reconstruction low-pass recovers the original</text>
+<!-- bottom row: overlap -->
+<text x="60" y="252" font-family="sans-serif" font-size="13" fill="#9b1c31">f&#8347; &lt; 2f&#8344;&#8336;&#8347;: replicas overlap, tails add, content corrupted</text>
+<line x1="60" y1="380" x2="800" y2="380" stroke="#5a6b85" stroke-width="2"/>
+<!-- replicas: triangles centered at 280, 430, 580 (spacing 150 < 2*half-width 110) -->
+<path d="M 170 380 L 280 285 L 390 380 Z" fill="#d62728" opacity="0.45"/>
+<path d="M 320 380 L 430 285 L 540 380 Z" fill="#d62728" opacity="0.75"/>
+<path d="M 470 380 L 580 285 L 690 380 Z" fill="#d62728" opacity="0.45"/>
+<!-- overlap shading -->
+<path d="M 320 380 L 355 350 L 390 380 Z" fill="#7a0c1c"/>
+<path d="M 470 380 L 505 350 L 540 380 Z" fill="#7a0c1c"/>
+<text x="355" y="402" font-family="sans-serif" font-size="12" fill="#7a0c1c" text-anchor="middle">aliased</text>
+<text x="505" y="402" font-family="sans-serif" font-size="12" fill="#7a0c1c" text-anchor="middle">aliased</text>
+<text x="430" y="270" font-family="sans-serif" font-size="12" fill="#9b1c31" text-anchor="middle">no filter can separate the overlapped regions afterward</text>
+</svg>
+<figcaption><strong>Figure 4.4.1:</strong> The sampling theorem in one picture. Top: sampling above twice the maximum frequency leaves the spectral replicas separated, and a low-pass filter recovers the original exactly. Bottom: undersampling makes the replicas overlap (dark regions); high frequencies fold back as low-frequency impostors, and the damage cannot be undone.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Aliasing Is Irreversible, So the Cure Is Preventive</div>
+<p>After aliasing, an impostor frequency is bit-for-bit indistinguishable from genuine content at that frequency: the fold has already happened and the spectrum's overlapped regions have summed. No deblurring, sharpening, or clever restoration in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> can separate them. The only correct treatment is prevention: low-pass filter the signal <em>before</em> sampling so that nothing above the new Nyquist limit exists at the moment of sampling. Blur-then-decimate is not a quality trade-off; it is the difference between losing detail and fabricating false detail.</p>
+</div>
+
+<h2>2. Seeing Aliasing: The Zone Plate Torture Test <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>The standard instrument for catching resamplers misbehaving is the <strong>zone plate</strong>: concentric rings whose frequency grows linearly with radius, sweeping from zero at the center to the Nyquist limit at the edge. Any aliasing shows up as ghostly secondary ring families blooming where no rings should be. The test costs five lines:</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+N = 512
+yy, xx = np.mgrid[0:N, 0:N].astype(np.float64)
+r2 = (xx - N / 2) ** 2 + (yy - N / 2) ** 2
+zone = np.cos(np.pi * r2 / N)         # radial frequency grows linearly with radius
+
+factor = 4
+naive = zone[::factor, ::factor]      # decimation, no prefilter: aliasing factory
+area  = cv2.resize(zone, (N // factor, N // factor),
+                   interpolation=cv2.INTER_AREA)          # box prefilter built in
+sigma = 0.5 * factor                  # blur matched to the reduction factor
+prefiltered = cv2.GaussianBlur(zone, (0, 0), sigmaX=sigma)[::factor, ::factor]
+
+# naive: loud families of false rings swirl across the whole image.
+# area and prefiltered: the true central rings, fading smoothly to flat
+# gray where frequencies above the new Nyquist limit were removed.</code></pre>
+<div class="code-caption"><strong>Code 4.4.1:</strong> The zone-plate stress test at 4x reduction. Bare decimation folds every above-Nyquist ring back into a visible ghost pattern; INTER_AREA and an explicit Gaussian prefilter both remove the unrepresentable frequencies first and produce clean results.</div>
+
+<p>Display the three results and the lesson is unforgettable: the naive decimation does not merely lose the fine outer rings, it <em>invents coarse rings that were never there</em>. This is exactly the moir&#233; you have seen photographing a window screen, a fine-knit sweater, or a distant roof of tiles, and it is also why the rotating wagon wheels of old westerns spin backward: film at 24 frames per second is temporal sampling, and a wheel spoke passing faster than 12 cycles per second folds back into apparent slow or reverse rotation.</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Helicopter rotors filmed at a shutter and frame rate that exactly divide the rotor's rotation appear perfectly frozen mid-air, one of the internet's favorite "broken reality" videos. The physical sensor in your own camera dodges the same fate with an optical anti-aliasing layer that slightly blurs the scene <em>before</em> the pixel grid samples it, as described in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>. Manufacturers literally install blur on purpose, because the alternative to a little softness is colorful lies.</p>
+</div>
+
+<h2>3. Anti-Aliasing Done Right <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>The universal recipe is <strong>prefilter, then sample</strong>: reduce the image's bandwidth to fit the new sampling rate, then decimate. For a reduction by factor $s$, the new Nyquist limit is $1/s$ of the old one, so the prefilter must suppress everything above it; for the Gaussian prefilter of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, $\sigma \approx 0.5 s$ is a serviceable rule of thumb (scikit-image's resize uses the close cousin $\sigma = (s - 1)/2$ when its anti-aliasing is enabled). What trips teams up is that common APIs distribute this responsibility unevenly. In OpenCV, <code>INTER_AREA</code> averages over the source footprint and is the correct flag for shrinking, while <code>INTER_LINEAR</code> and <code>INTER_NEAREST</code> sample only a tiny neighborhood and alias badly at large reductions (they are interpolators, designed for <em>enlarging</em>, where the considerations are different and which <a href="../module-05-geometric-transformations/index.html">Chapter 5</a> treats in depth). In PyTorch, <code>F.interpolate</code> aliases by default and antialiasing is opt-in:</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+t = torch.from_numpy(zone)[None, None]                  # (1, 1, 512, 512)
+no_aa = F.interpolate(t, scale_factor=0.25, mode="bilinear")
+aa    = F.interpolate(t, scale_factor=0.25, mode="bilinear", antialias=True)
+
+# no_aa reproduces the naive ghost rings on the GPU; aa widens the
+# bilinear kernel to cover the full source footprint and matches the
+# clean result of Code 4.4.1.</code></pre>
+<div class="code-caption"><strong>Code 4.4.2:</strong> The same experiment inside PyTorch 2.x. The antialias=True flag is the entire difference between a resize that fabricates patterns and one that does signal processing correctly; it exists on F.interpolate for bilinear and bicubic modes.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: torchvision.transforms.v2.Resize</div>
+<p>A correct hand-rolled shrink (choose the prefilter, match its bandwidth to the factor, blur, decimate, handle borders and dtypes) is about 10 lines that must be re-tuned for every scale factor. The library form is one line:</p>
+<pre><code class="language-python">from torchvision.transforms import v2
+small = v2.Resize(128, antialias=True)(t)    # antialias defaults to True in v2</code></pre>
+<div class="code-caption"><strong>Code 4.4.3:</strong> A correct, antialiased shrink in one torchvision v2 call; the kernel support scales with the reduction factor automatically.</div>
+<p>A 10-to-1 reduction, and more importantly a guarantee: torchvision's v2 transforms enable antialiasing by default (the v1 generation did not, a frequent source of train-versus-deploy quality gaps), automatically widen the resampling kernel in proportion to the scale factor, and behave consistently on tensors and PIL images. Pillow's own <code>Image.resize</code> has performed proper supersampled filtering since version 2.7, which is one reason datasets preprocessed with PIL and models served with raw <code>F.interpolate</code> can disagree.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Rainbow Sweaters of a Fashion Marketplace</div>
+<p><strong>Who:</strong> A platform engineer on the image-pipeline team of a large fashion e-commerce marketplace.</p>
+<p><strong>Situation:</strong> Sellers upload product photos at 3000 to 6000 pixels; the pipeline generates 240-pixel thumbnails for listing grids. A GPU rewrite of the pipeline had quietly replaced PIL resizing with a plain bilinear <code>F.interpolate</code>.</p>
+<p><strong>Problem:</strong> Support tickets began arriving with the subject "my photo is corrupted": fine-knit sweaters, tweed jackets, and pleated skirts rendered with garish swirling color bands in thumbnails while looking perfect at full size. An A/B dashboard showed measurably lower click-through on affected categories. Nothing was "broken" in the code, and most product photos (smooth fabrics, plain backgrounds) looked fine, so the bug had passed review and canary alike.</p>
+<p><strong>Decision:</strong> The team diagnosed moir&#233; from unfiltered 12-to-25x downsampling, switched the resize to antialiased bicubic, and added a zone-plate image (Code 4.4.1) to the pipeline's CI suite with an assertion on ghost-ring energy after every resize backend change.</p>
+<p><strong>Result:</strong> The artifacts disappeared, click-through on textured categories recovered to baseline within two weeks, and six months later the CI zone plate caught an identical regression when a new "fast preview" path shipped with nearest-neighbor sampling.</p>
+<p><strong>Lesson:</strong> Resizing is sampling, and sampling is a signal-processing operation with a correctness criterion, not a cosmetic choice among interpolation flags. Encode the criterion in a test, because this bug class is content-dependent and will sneak past human review again.</p>
+</div>
+
+<h2>4. Aliasing Inside Neural Networks <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>The sampling theorem does not stop applying when the pixels enter a network. Every stride-2 convolution and every pooling layer in the <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">CNNs of Chapter 19</a> is a downsampling step, and most classic architectures perform it with no adequate prefilter, max pooling is particularly lawless, since taking a maximum is not even linear, let alone bandlimited. The measurable symptom is broken shift invariance: shift the input image by a single pixel and a classifier's confidence can swing dramatically, because aliased feature maps fold the shift into spurious low-frequency changes. Richard Zhang's BlurPool (ICML 2019) applied this chapter's recipe verbatim, insert a small fixed blur before each stride, and improved both shift stability and plain accuracy across architectures. StyleGAN3 (NeurIPS 2021) pushed the discipline through an entire generator, treating every feature map as a continuous bandlimited signal with carefully matched filters at each resampling, which cured the eerie "texture sticking" of earlier GANs where hair and skin detail stayed glued to screen coordinates while faces moved. Alias-Free Convnets (CVPR 2023) extended the program to full fractional-shift equivariance in classifiers, taming the nonlinearities that reintroduce high frequencies.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Alias-Free Program, 2023-2026</div>
+<p>Anti-aliasing has become an architectural design principle rather than a preprocessing detail. The torchvision v2 transforms (2023 onward) made antialiased resizing the framework default, closing a long-standing train-versus-serve mismatch. Alias-Free Convnets (CVPR 2023) showed certified shift-equivariant classification is achievable with polynomial activations and proper resampling. In generative video, the 2024-2025 wave of systems in the Sora lineage made temporal sampling artifacts a first-class evaluation concern: wagon-wheel rotation, flickering fine textures, and frame-rate-dependent motion are temporal aliasing by another name, and the same prefilter-before-sample reasoning, applied along the time axis, guides both their critique and their fixes. The through-line from a 1949 theorem to 2025 video models is unusually direct: any system that samples, in space or in time, owes Nyquist its due.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.1: Fold It by Hand <span class="exercise-type conceptual">Conceptual</span></div>
+<p>An image contains a fabric texture at 0.7 cycles per pixel... except it cannot, since 0.5 cycles per pixel is the maximum a pixel grid can hold. Suppose instead an optical pattern at 0.35 cycles per pixel is photographed, and the resulting image is then decimated by taking every second pixel. (a) What is the new Nyquist limit in cycles per <em>original</em> pixel? (b) At what apparent frequency does the 0.35-cycle pattern reappear in the decimated image? (c) Explain, citing Figure 4.4.1, why enlarging the decimated image back to full size cannot restore the truth.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.2: A Resize-Backend Audit Harness <span class="exercise-type coding">Coding</span></div>
+<p>Build a small audit script that shrinks the zone plate by factors 2, 4, and 8 through every backend you use in practice: cv2 (INTER_NEAREST, INTER_LINEAR, INTER_AREA, INTER_LANCZOS4), PIL's Image.resize, skimage.transform.resize with and without anti_aliasing, and torch F.interpolate with and without antialias. Quantify aliasing as the energy outside the central clean-ring region (define it from the best result) and produce a ranked table. Which combinations would you ban from a production shrink path?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.4.3: Shift Stability of Pooling <span class="exercise-type analysis">Analysis</span></div>
+<p>Implement two tiny feature extractors in PyTorch: conv, ReLU, stride-2 max pool, and the same with a 3x3 blur inserted before the stride (BlurPool style). Feed each a textured image and its copies shifted by 1 to 8 pixels, and plot the cosine similarity between the original and shifted feature maps (after aligning them back). Quantify how much the blur improves shift consistency, and explain the mechanism in one paragraph using the language of this section.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.3.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.3</span><span class="nav-title">Frequency-Domain Filtering: Low-Pass, High-Pass &amp; Notch</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="section-4.5.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.5</span><span class="nav-title">Image Pyramids: Gaussian &amp; Laplacian</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

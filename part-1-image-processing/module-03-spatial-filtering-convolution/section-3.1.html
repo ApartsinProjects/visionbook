@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.1: Convolution &amp; Correlation: The Workhorse Operation. Sliding-window filtering from scratch, the kernel flip that distinguishes convolution from correlation, and the same operation in NumPy, OpenCV, and PyTorch." name="description"/>
+<title>Section 3.1: Convolution &amp; Correlation: The Workhorse Operation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Spatial Filtering &amp; Convolution</a></div>
+<h1>Convolution &amp; Correlation: The Workhorse Operation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"People keep asking whether I flip before I slide. After forty years in this business, I can tell you: with a symmetric kernel, nobody can tell, and with an asymmetric one, nobody checks."</p>
+<cite>A Slightly Flipped Convolution Kernel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Almost every operation in classical image processing, and every convolutional layer in deep learning, is the same simple loop: center a small grid of weights on a pixel, multiply weights by the pixels underneath, sum, and write the result.</strong> This section builds that loop from nothing. We define correlation (slide and dot-product), then convolution (the same thing with the kernel flipped), explain why the flip exists and when it matters, and finish by running the identical operation through NumPy, OpenCV's <code>filter2D</code>, and PyTorch's <code>conv2d</code>, the function that will carry all of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<p>
+In <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> every output pixel was a function of exactly one input pixel: $g(x, y) = T(f(x, y))$. That restriction made point operations fast and simple, but it also made them blind. A point operation cannot reduce noise, because at a single pixel there is no way to distinguish noise from signal; it cannot detect an edge, because an edge is by definition a relationship between neighboring pixels. This section takes the step that changes everything: the output at $(x, y)$ now depends on a whole neighborhood of input pixels around $(x, y)$. The rest of Part I, and a striking fraction of Parts III and IV, is the study of what becomes possible once that step is taken.
+</p>
+
+<h2>1. From Points to Neighborhoods <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+A <strong>neighborhood operation</strong> computes each output pixel from a small window of input pixels, almost always a square window centered on the output position. The simplest useful example: replace every pixel with the average of the $3 \times 3$ block around it. Noise that fluctuates up at one pixel and down at its neighbor partially cancels in the average, while the underlying scene, which varies slowly, survives. That is already a working denoiser, and we will refine it in <a href="section-3.2.html">Section 3.2</a>.
+</p>
+<p>
+The key abstraction is to separate the <em>pattern of weights</em> from the <em>sliding machinery</em>. The weights live in a small matrix called a <strong>kernel</strong> (also: filter, mask, window, or in the deep learning literature, a filter bank entry). The machinery, identical for every kernel, slides the kernel across the image and computes a weighted sum at each stop. Change the kernel and the same machinery blurs, sharpens, differentiates, or detects patterns. This is precisely the design of a convolutional layer in <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>: the machinery is fixed in the architecture, and gradient descent chooses the weights.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Machine, Many Kernels</div>
+<p>Filtering separates <em>what</em> to compute (the kernel weights) from <em>how</em> to compute it (the sliding window). Every filter in this chapter differs only in its handful of weights. Deep learning's contribution, three chapters' worth of detail in Part III, is to stop choosing those weights by hand and let the data choose them. The machinery you learn in this section is reused unchanged, billions of times per second, inside every CNN ever trained.</p>
+</div>
+
+<h2>2. Correlation: Slide, Multiply, Sum <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Let $I$ be a grayscale image and $K$ a kernel of size $(2a+1) \times (2b+1)$, indexed so that $K(0,0)$ is its center. <strong>Cross-correlation</strong> (usually just "correlation") is defined as:
+</p>
+<p>
+$$ (I \otimes K)(x, y) \;=\; \sum_{i=-a}^{a} \sum_{j=-b}^{b} K(i, j)\, I(x + i,\; y + j) $$
+</p>
+<p>
+In words: lay the kernel on the image with its center at $(x, y)$, multiply each kernel weight by the pixel directly underneath it, and add everything up. Figure 3.1.1 traces one stop of this process: the shaded $3 \times 3$ patch of the input aligns with the kernel, their elementwise products are summed, and the single resulting number lands in the output image at the center position.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sliding window correlation: a 3 by 3 kernel overlaps a patch of the input image, elementwise products are summed, and the result is written to one output pixel">
+  <!-- Input grid 6x6 -->
+  <text x="95" y="28" font-family="sans-serif" font-size="15" fill="#2c3e50" text-anchor="middle" font-weight="bold">Input I</text>
+  <g stroke="#90a4ae" stroke-width="1" fill="none">
+    <rect x="20" y="40" width="180" height="180" fill="#ffffff"/>
+    <line x1="50" y1="40" x2="50" y2="220"/><line x1="80" y1="40" x2="80" y2="220"/><line x1="110" y1="40" x2="110" y2="220"/><line x1="140" y1="40" x2="140" y2="220"/><line x1="170" y1="40" x2="170" y2="220"/>
+    <line x1="20" y1="70" x2="200" y2="70"/><line x1="20" y1="100" x2="200" y2="100"/><line x1="20" y1="130" x2="200" y2="130"/><line x1="20" y1="160" x2="200" y2="160"/><line x1="20" y1="190" x2="200" y2="190"/>
+  </g>
+  <!-- highlighted 3x3 patch -->
+  <rect x="50" y="70" width="90" height="90" fill="#3498db" fill-opacity="0.25" stroke="#2980b9" stroke-width="2.5"/>
+  <!-- patch values -->
+  <g font-family="monospace" font-size="12" fill="#2c3e50" text-anchor="middle">
+    <text x="65" y="89">12</text><text x="95" y="89">10</text><text x="125" y="89">11</text>
+    <text x="65" y="119">90</text><text x="95" y="119">95</text><text x="125" y="119">88</text>
+    <text x="65" y="149">91</text><text x="95" y="149">93</text><text x="125" y="149">94</text>
+  </g>
+  <!-- Kernel grid -->
+  <text x="320" y="28" font-family="sans-serif" font-size="15" fill="#2c3e50" text-anchor="middle" font-weight="bold">Kernel K</text>
+  <g stroke="#c0392b" stroke-width="1.5" fill="#fdecea">
+    <rect x="275" y="70" width="90" height="90"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="1" fill="none">
+    <line x1="305" y1="70" x2="305" y2="160"/><line x1="335" y1="70" x2="335" y2="160"/>
+    <line x1="275" y1="100" x2="365" y2="100"/><line x1="275" y1="130" x2="365" y2="130"/>
+  </g>
+  <g font-family="monospace" font-size="12" fill="#7b241c" text-anchor="middle">
+    <text x="290" y="89">1/9</text><text x="320" y="89">1/9</text><text x="350" y="89">1/9</text>
+    <text x="290" y="119">1/9</text><text x="320" y="119">1/9</text><text x="350" y="119">1/9</text>
+    <text x="290" y="149">1/9</text><text x="320" y="149">1/9</text><text x="350" y="149">1/9</text>
+  </g>
+  <!-- multiply and sum annotation -->
+  <text x="237" y="120" font-family="sans-serif" font-size="22" fill="#2c3e50" text-anchor="middle">&#215;</text>
+  <text x="430" y="113" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle">multiply,</text>
+  <text x="430" y="131" font-family="sans-serif" font-size="14" fill="#2c3e50" text-anchor="middle">then sum</text>
+  <path d="M 375 115 L 480 115" stroke="#2c3e50" stroke-width="2" fill="none" marker-end="url(#arrow31)"/>
+  <defs>
+    <marker id="arrow31" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+  </defs>
+  <!-- Output grid -->
+  <text x="595" y="28" font-family="sans-serif" font-size="15" fill="#2c3e50" text-anchor="middle" font-weight="bold">Output</text>
+  <g stroke="#90a4ae" stroke-width="1" fill="none">
+    <rect x="505" y="40" width="180" height="180" fill="#ffffff"/>
+    <line x1="535" y1="40" x2="535" y2="220"/><line x1="565" y1="40" x2="565" y2="220"/><line x1="595" y1="40" x2="595" y2="220"/><line x1="625" y1="40" x2="625" y2="220"/><line x1="655" y1="40" x2="655" y2="220"/>
+    <line x1="505" y1="70" x2="685" y2="70"/><line x1="505" y1="100" x2="685" y2="100"/><line x1="505" y1="130" x2="685" y2="130"/><line x1="505" y1="160" x2="685" y2="160"/><line x1="505" y1="190" x2="685" y2="190"/>
+  </g>
+  <rect x="565" y="100" width="30" height="30" fill="#27ae60" fill-opacity="0.35" stroke="#1e8449" stroke-width="2.5"/>
+  <text x="580" y="120" font-family="monospace" font-size="12" fill="#145a32" text-anchor="middle">64.9</text>
+  <!-- caption arrows -->
+  <text x="352" y="262" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">The kernel visits every position; each stop produces exactly one output pixel.</text>
+  <text x="352" y="284" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">Here the window straddles an edge (dark sky over bright wall), so the mean lands in between.</text>
+</svg>
+<figcaption><strong>Figure 3.1.1</strong> One step of correlation with a $3 \times 3$ averaging kernel. The window (blue) is centered on a pixel, weights multiply the pixels beneath them, and the sum (green) becomes the output at that position. Sliding the window over every pixel produces the full output image.</figcaption>
+</figure>
+
+<p>
+Implementing this directly is the best way to internalize it. The version below uses two explicit loops over output positions and a vectorized multiply-sum for the window itself, the idiom established in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>. The input is padded by reflection so the output has the same size as the input; border strategies get a full treatment in <a href="section-3.6.html">Section 3.6</a>.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def correlate2d(img: np.ndarray, kernel: np.ndarray) -&gt; np.ndarray:
+    """Cross-correlation of a 2D grayscale image with a 2D kernel.
+    Output has the same shape as the input (reflect padding)."""
+    kh, kw = kernel.shape
+    ph, pw = kh // 2, kw // 2                      # padding on each side
+    padded = np.pad(img.astype(np.float64),
+                    ((ph, ph), (pw, pw)), mode="reflect")
+    out = np.empty(img.shape, dtype=np.float64)
+    for y in range(img.shape[0]):
+        for x in range(img.shape[1]):
+            window = padded[y:y + kh, x:x + kw]    # the pixels under the kernel
+            out[y, x] = np.sum(window * kernel)    # multiply-and-sum
+    return out
+
+box = np.full((3, 3), 1.0 / 9.0)                   # 3x3 averaging kernel
+img = np.array([[12, 10, 11, 12, 10],
+                [90, 95, 88, 92, 91],
+                [91, 93, 94, 90, 92],
+                [89, 92, 91, 93, 90],
+                [90, 91, 92, 90, 91]], dtype=np.float64)
+print(correlate2d(img, box)[2, 2])   # average of the central 3x3 block
+# Expected output: 92.0  (mean of 95, 88, 92, 93, 94, 90, 92, 91, 93)</code></pre>
+<div class="code-caption">A from-scratch cross-correlation in NumPy: two loops over output positions, one vectorized multiply-sum per window, and reflect padding so the output keeps the input's shape.</div>
+
+<p>
+This implementation is correct and instructive, and roughly a thousand times slower than production code. Each output pixel costs $k^2$ multiplications and additions, executed through the Python interpreter. <a href="section-3.6.html">Section 3.6</a> shows where the speed actually comes from; for now the loop's transparency is the point.
+</p>
+
+<h2>3. Convolution: The Flip That Matters <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+True <strong>convolution</strong> is correlation with the kernel rotated by 180 degrees (flipped both horizontally and vertically):
+</p>
+<p>
+$$ (I * K)(x, y) \;=\; \sum_{i=-a}^{a} \sum_{j=-b}^{b} K(i, j)\, I(x - i,\; y - j) $$
+</p>
+<p>
+The only change from correlation is the minus signs: the kernel indices run against the image indices. For any kernel that is symmetric under 180-degree rotation, which includes the box, the Gaussian of <a href="section-3.2.html">Section 3.2</a>, and the Laplacian of <a href="section-3.4.html">Section 3.4</a>, the flip changes nothing and the two operations coincide. So why does the flipped version get the famous name and the asterisk?
+</p>
+<p>
+The answer is algebra. With the flip, convolution becomes <em>commutative</em> ($I * K = K * I$) and, crucially, <em>associative</em>: $(I * K_1) * K_2 = I * (K_1 * K_2)$. Associativity is a working tool, not a formality. It means you can convolve two small kernels with each other once, offline, and apply the combined kernel in a single pass instead of two. It also underpins the convolution theorem of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, which converts convolution into multiplication in the frequency domain. Correlation without the flip satisfies neither property. The flip is the price of good algebra.
+</p>
+<p>
+The cleanest way to see the difference is the <strong>impulse response</strong>: filter an image that is all zeros except a single 1. Convolution stamps a copy of the kernel, exactly as written, centered on the impulse. Correlation stamps the kernel flipped. The following experiment makes the distinction concrete with an asymmetric kernel, using SciPy's reference implementations.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy import ndimage
+
+impulse = np.zeros((5, 5))
+impulse[2, 2] = 1.0                       # a single bright pixel
+
+k = np.array([[1., 2., 3.],
+              [4., 5., 6.],
+              [7., 8., 9.]])              # deliberately asymmetric
+
+conv = ndimage.convolve(impulse, k)       # true convolution (flips k)
+corr = ndimage.correlate(impulse, k)      # correlation (no flip)
+
+print(conv[1:4, 1:4])
+# [[1. 2. 3.]
+#  [4. 5. 6.]
+#  [7. 8. 9.]]    &lt;- convolution reproduces the kernel as written
+print(corr[1:4, 1:4])
+# [[9. 8. 7.]
+#  [6. 5. 4.]
+#  [3. 2. 1.]]    &lt;- correlation reproduces it rotated 180 degrees</code></pre>
+<div class="code-caption">The impulse-response test that separates convolution from correlation: convolving an impulse reproduces the kernel exactly, while correlating reproduces it rotated by 180 degrees.</div>
+
+<p>
+This experiment also demonstrates two properties worth naming. Filtering is <strong>linear</strong>: the response to a sum of images is the sum of the responses, scaled inputs give scaled outputs. And it is <strong>shift-invariant</strong>: move the impulse, and the stamped kernel moves with it, unchanged. Together these make filtering a <em>linear shift-invariant (LSI) system</em>, fully characterized by its impulse response. Knowing what a filter does to a single bright pixel tells you what it does to every image, because every image is a sum of scaled, shifted impulses.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Deep learning frameworks settled the flip debate by ignoring it. PyTorch's <code>Conv2d</code> and TensorFlow's <code>conv2d</code> both compute cross-correlation, and the documentation says so in the fine print. Since the weights are learned, the network simply learns flipped kernels if flipped kernels are what the loss demands; the distinction is invisible to training. Sixty years of signal-processing convention, resolved by gradient descent's total indifference.</p>
+</div>
+
+<h2>4. A Gallery of Kernels <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+To build intuition for how weights become behavior, Table 3.1.1 collects five canonical $3 \times 3$ kernels. Each one is a preview of a later section; reading the table now and again at the end of the chapter is a worthwhile exercise in itself.
+</p>
+
+<table>
+<caption><strong>Table 3.1.1</strong> Five canonical kernels and what their weights accomplish.</caption>
+<thead>
+<tr><th scope="col">Kernel</th><th scope="col">Weights</th><th scope="col">Effect</th><th scope="col">Detail</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>Identity</td>
+<td>$\begin{bmatrix} 0 &amp; 0 &amp; 0 \\ 0 &amp; 1 &amp; 0 \\ 0 &amp; 0 &amp; 0 \end{bmatrix}$</td>
+<td>No change</td>
+<td>All weight on the center: output equals input. The "1" in algebraic identities.</td>
+</tr>
+<tr>
+<td>Shift</td>
+<td>$\begin{bmatrix} 0 &amp; 0 &amp; 0 \\ 0 &amp; 0 &amp; 1 \\ 0 &amp; 0 &amp; 0 \end{bmatrix}$</td>
+<td>Translate by 1 pixel</td>
+<td>Weight on a neighbor: each output copies a shifted input pixel. Proof that even geometry can hide in a kernel.</td>
+</tr>
+<tr>
+<td>Box blur</td>
+<td>$\frac{1}{9}\begin{bmatrix} 1 &amp; 1 &amp; 1 \\ 1 &amp; 1 &amp; 1 \\ 1 &amp; 1 &amp; 1 \end{bmatrix}$</td>
+<td>Smooth / denoise</td>
+<td>Equal weights average the neighborhood (<a href="section-3.2.html">Section 3.2</a>). Weights sum to 1, preserving overall brightness.</td>
+</tr>
+<tr>
+<td>Sharpen</td>
+<td>$\begin{bmatrix} 0 &amp; -1 &amp; 0 \\ -1 &amp; 5 &amp; -1 \\ 0 &amp; -1 &amp; 0 \end{bmatrix}$</td>
+<td>Boost local contrast</td>
+<td>Center exaggerated, neighbors subtracted (<a href="section-3.3.html">Section 3.3</a>). Weights still sum to 1.</td>
+</tr>
+<tr>
+<td>Sobel (horizontal gradient)</td>
+<td>$\begin{bmatrix} -1 &amp; 0 &amp; 1 \\ -2 &amp; 0 &amp; 2 \\ -1 &amp; 0 &amp; 1 \end{bmatrix}$</td>
+<td>Detect vertical edges</td>
+<td>Right minus left estimates the horizontal derivative (<a href="section-3.4.html">Section 3.4</a>). Weights sum to 0: flat regions map to zero.</td>
+</tr>
+</tbody>
+</table>
+
+<p>
+Two normalization conventions in the table deserve attention because they generalize. Kernels whose weights sum to 1 preserve the average brightness of the image; all smoothing kernels obey this. Kernels whose weights sum to 0 respond only to <em>change</em>, returning zero on constant regions; all derivative kernels obey that. When a hand-designed kernel misbehaves, the weight sum is the first thing to check.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: One Kernel Saved the Line</div>
+<p><strong>Who:</strong> A vision engineer at a contract electronics manufacturer in Penang, running automated optical inspection (AOI) of solder joints on assembled circuit boards.</p>
+<p><strong>Situation:</strong> The AOI station flagged boards for human review whenever a solder pad's appearance deviated from a golden template. Review queues were growing: 11 percent of boards were being flagged, and operators confirmed defects in fewer than one flag in twenty.</p>
+<p><strong>Problem:</strong> The template comparison was done pixel-by-pixel, a pure point operation. Sub-pixel placement jitter between boards, well within mechanical spec, shifted every edge by a pixel or two and lit up the difference image even on perfect joints.</p>
+<p><strong>Decision:</strong> Before comparison, both template and captured image were filtered with a small Gaussian kernel ($\sigma = 1.2$), turning the brittle pixel-equality test into a neighborhood-tolerant one. Total change: three lines of OpenCV.</p>
+<p><strong>Result:</strong> False flags fell from 11 percent to 1.8 percent with no measured loss of true-defect recall over a month of production. The review team shrank from four operators per shift to one.</p>
+<p><strong>Lesson:</strong> The moment a comparison must tolerate small spatial misalignment, point operations stop being the right tool. A neighborhood operation, even the simplest one, buys exactly the tolerance that geometry demands.</p>
+</div>
+
+<h2>5. The Same Operation in OpenCV and PyTorch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+In production code, nobody writes the double loop. OpenCV's <code>cv2.filter2D</code> applies an arbitrary kernel to an image with SIMD vectorization, multithreading, and automatic switchover to a frequency-domain algorithm for large kernels. One subtlety hides in the documentation: <code>filter2D</code> computes <em>correlation</em>, not convolution. For a true convolution you must flip the kernel yourself, exactly as the impulse experiment above would reveal.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("street.jpg", cv2.IMREAD_GRAYSCALE)
+
+sharpen = np.array([[ 0, -1,  0],
+                    [-1,  5, -1],
+                    [ 0, -1,  0]], dtype=np.float32)
+
+# cv2.filter2D computes CORRELATION with the given kernel.
+out_corr = cv2.filter2D(img, ddepth=-1, kernel=sharpen)
+
+# For true convolution, flip the kernel 180 degrees first.
+out_conv = cv2.filter2D(img, ddepth=-1, kernel=cv2.flip(sharpen, -1))
+
+# For this symmetric kernel the two are identical:
+print(np.array_equal(out_corr, out_conv))   # True</code></pre>
+<div class="code-caption">Applying a sharpening kernel with <code>cv2.filter2D</code>, which computes correlation; flipping the kernel with <code>cv2.flip(k, -1)</code> converts it to true convolution, a distinction that vanishes for symmetric kernels.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.filter2D in Practice</div>
+<p>The 15-line <code>correlate2d</code> we wrote from scratch collapses to a single line: <code>cv2.filter2D(img, -1, kernel)</code>. Beyond the 15-to-1 line count reduction, the library version handles what our loop ignored: it processes multi-channel color images, exposes every border mode of <a href="section-3.6.html">Section 3.6</a> through <code>borderType</code>, runs SIMD-vectorized and multithreaded C++ under the hood, and silently switches to a DFT-based algorithm when the kernel is large (roughly $11 \times 11$ and up), where direct sliding becomes the slow path. Typical speedup over the Python loop on a 1080p frame: three orders of magnitude.</p>
+</div>
+
+<p>
+The PyTorch version of the same operation matters enormously for this book, because it is the bridge to Part III. <code>torch.nn.functional.conv2d</code> expects tensors shaped <code>(batch, channels, height, width)</code> and, as the fun fact above warned, computes cross-correlation despite the name. The code below applies our Sobel kernel from Table 3.1.1 and verifies the flip relationship numerically.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+x = torch.rand(1, 1, 64, 64)                  # (batch, channels, H, W)
+
+sobel = torch.tensor([[[[-1., 0., 1.],
+                        [-2., 0., 2.],
+                        [-1., 0., 1.]]]])     # (out_ch, in_ch, kH, kW)
+
+# F.conv2d computes cross-correlation (no flip), like cv2.filter2D.
+corr = F.conv2d(x, sobel, padding=1)
+
+# True convolution = correlate with the kernel flipped in both
+# spatial dimensions (dims 2 and 3 of the weight tensor).
+conv = F.conv2d(x, torch.flip(sobel, dims=[2, 3]), padding=1)
+
+print(torch.allclose(corr, -conv))   # True: flipping Sobel negates it</code></pre>
+<div class="code-caption">The deep-learning form of the workhorse: <code>F.conv2d</code> on a 4D tensor, with an explicit <code>torch.flip</code> showing that the framework's "convolution" is cross-correlation, and that flipping the antisymmetric Sobel kernel simply negates its response.</div>
+
+<p>
+Read that weight shape <code>(out_channels, in_channels, kH, kW)</code> carefully, because it quietly contains the whole design of a CNN layer: a stack of many kernels (out_channels of them), each spanning all input channels, applied by exactly the machinery of this section. When <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> swaps our hand-written Sobel values for <code>requires_grad=True</code> parameters, nothing else changes. And when <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a> builds the U-Net that powers diffusion models, it is this same call, repeated a few hundred times.
+</p>
+
+<h2>6. What Shift Invariance Buys, and What It Costs <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Shift invariance, the property that the kernel applies the same weights at every location, is both filtering's superpower and its built-in limitation. The superpower: one small set of weights serves the whole image, which is why a $3 \times 3$ kernel with 9 numbers can process a 12-megapixel photograph, and why CNNs need so many fewer parameters than fully connected networks. A pattern detector that works in the top-left corner works identically everywhere, matching the physics of photography: objects do not change identity by moving across the frame.
+</p>
+<p>
+The cost: a shift-invariant filter cannot adapt to content. It smooths edges exactly as enthusiastically as it smooths noise, a tension that dominates <a href="section-3.2.html">Section 3.2</a> and is only resolved in <a href="section-3.5.html">Section 3.5</a> by filters whose weights depend on local pixel values, deliberately breaking shift invariance. Keep this tradeoff in mind as a running theme: most of the chapter's intellectual drama is the struggle between uniform processing and content adaptation.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: How Big Should a Kernel Be?</div>
+<p>Classical practice kept kernels small ($3 \times 3$ to $7 \times 7$) for cost reasons, and early CNNs (VGG, ResNet) standardized on stacks of $3 \times 3$. The 2022-2026 literature reopened the question. RepLKNet (Ding et al., CVPR 2022, arXiv:2203.06717) showed that depthwise kernels as large as $31 \times 31$ rival vision transformers on ImageNet by capturing long-range context in a single layer. UniRepLKNet (CVPR 2024, arXiv:2311.15599) distilled design rules for large kernels across images, audio, and point clouds, and PeLK (CVPR 2024, arXiv:2403.07589) pushed to $101 \times 101$ "peripheral" kernels whose parameter sharing mimics the falloff of human peripheral vision. The sliding-window operation you implemented in 15 lines this section is, in 2026, still an active architectural battleground against attention and state-space models.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.1.1: Predict the Stamp <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Without running code, write down the $5 \times 5$ output of (a) convolving and (b) correlating an image containing a single impulse at position (1, 3) (row 1, column 3) with the asymmetric kernel $K$ from the impulse experiment in this section. Then explain in one sentence why <code>scipy.ndimage.convolve</code> and <code>scipy.ndimage.correlate</code> must agree exactly on Gaussian kernels but not on Sobel kernels.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.1.2: Convolution From Correlation <span class="exercise-type coding">Coding</span></div>
+<p>Extend the <code>correlate2d</code> function from this section into a <code>convolve2d(img, kernel)</code> that performs true convolution by flipping the kernel (use <code>np.flip(kernel)</code>, which flips both axes). Validate it against <code>scipy.ndimage.convolve</code> with <code>mode="reflect"</code> on a random $32 \times 32$ image and three kernels: the box, the Sobel, and a random $5 \times 3$ kernel. Report the maximum absolute difference for each (it should be at floating-point precision, below 1e-10).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.1.3: Kernel Forensics <span class="exercise-type analysis">Analysis</span></div>
+<p>A colleague hands you a mystery function <code>f(img)</code> that they claim is some linear shift-invariant filter. Design an experiment that recovers the kernel exactly using a single call to <code>f</code>, and explain why it works using the linearity and shift-invariance properties from this section. Then describe one simple test that would expose <code>f</code> as nonlinear if it were secretly a median filter (you may want to revisit this after <a href="section-3.2.html">Section 3.2</a>).</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 3 Overview</a>
+<a href="index.html">Chapter 3</a>
+<a class="next" href="section-3.2.html">Section 3.2: Smoothing: Box, Gaussian &amp; Median Filters &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

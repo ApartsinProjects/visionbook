@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.6: Borders, Separability &amp; Performance. Border padding modes and their artifacts, separable kernels and the SVD test, operation counts from direct to FFT convolution, and how production systems make filtering fast." name="description"/>
+<title>Section 3.6: Borders, Separability &amp; Performance | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Spatial Filtering &amp; Convolution</a></div>
+<h1>Borders, Separability &amp; Performance</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Everything was going wonderfully until I reached the edge of the image, at which point I was asked to summarize pixels that do not exist. I have been improvising ever since, and frankly some of my best work is out there."</p>
+<cite>A Convolution Kernel With Boundary Issues</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This section answers the two questions every filtering pipeline must settle before it ships: what happens where the kernel hangs off the image, and how the arithmetic gets done fast enough to matter.</strong> Border handling looks like trivia until a padding choice paints dark vignettes on your output or leaks one side of a panorama into the other. Performance looks like the library's problem until you learn that one algebraic fact, separability, routinely makes filters ten times faster, and that the convolution-as-matrix-multiply trick (im2col) is how GPUs run the CNNs of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>. These are the engineering load-bearing walls under everything this chapter built.</p>
+</div>
+
+<p>
+The previous sections treated filtering mathematically, on images that conveniently extended forever in all directions. Real images stop. And real systems have frame budgets. This closing section pays the chapter's two deferred debts, and in settling them connects hand-designed filtering to how deep learning frameworks implement the very same operation at scale.
+</p>
+
+<h2>1. The Border Problem <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Center a $k \times k$ kernel on a pixel in the top row and $\lfloor k/2 \rfloor$ of its rows dangle above the image, referencing pixels that do not exist. Exactly two honest responses exist. The first: refuse to compute those outputs, producing a result smaller than the input by $k - 1$ in each dimension ("valid" convolution; this is why un-padded CNN feature maps shrink layer by layer). The second: invent the missing pixels by <strong>padding</strong>, and the inventing policy matters far more than beginners expect. Figure 3.6.1 shows the five standard policies extending the same row.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Five padding strategies shown extending the row of letters a b c d e f to the left and right: constant zero, replicate, reflect, reflect 101, and wrap">
+  <text x="390" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">image row:  a b c d e f      (padding 3 cells on each side)</text>
+  <!-- column guides -->
+  <g font-family="monospace" font-size="14" text-anchor="middle">
+    <!-- header rows of cells: 12 cells of 46px starting x=130 -->
+    <!-- BORDER_CONSTANT -->
+    <text x="120" y="78" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="end">constant (0)</text>
+    <g>
+      <rect x="130" y="58" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <rect x="268" y="58" width="276" height="30" fill="#eaf2f8" stroke="#2980b9"/>
+      <rect x="544" y="58" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <text x="199" y="78" fill="#7e5109">0  0  0</text>
+      <text x="406" y="78" fill="#1a5276">a  b  c  d  e  f</text>
+      <text x="613" y="78" fill="#7e5109">0  0  0</text>
+    </g>
+    <!-- BORDER_REPLICATE -->
+    <text x="120" y="128" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="end">replicate</text>
+    <g>
+      <rect x="130" y="108" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <rect x="268" y="108" width="276" height="30" fill="#eaf2f8" stroke="#2980b9"/>
+      <rect x="544" y="108" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <text x="199" y="128" fill="#7e5109">a  a  a</text>
+      <text x="406" y="128" fill="#1a5276">a  b  c  d  e  f</text>
+      <text x="613" y="128" fill="#7e5109">f  f  f</text>
+    </g>
+    <!-- BORDER_REFLECT -->
+    <text x="120" y="178" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="end">reflect</text>
+    <g>
+      <rect x="130" y="158" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <rect x="268" y="158" width="276" height="30" fill="#eaf2f8" stroke="#2980b9"/>
+      <rect x="544" y="158" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <text x="199" y="178" fill="#7e5109">c  b  a</text>
+      <text x="406" y="178" fill="#1a5276">a  b  c  d  e  f</text>
+      <text x="613" y="178" fill="#7e5109">f  e  d</text>
+    </g>
+    <!-- BORDER_REFLECT_101 -->
+    <text x="120" y="228" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="end">reflect_101</text>
+    <g>
+      <rect x="130" y="208" width="138" height="30" fill="#d5f5e3" stroke="#1e8449" stroke-width="2"/>
+      <rect x="268" y="208" width="276" height="30" fill="#eaf2f8" stroke="#2980b9"/>
+      <rect x="544" y="208" width="138" height="30" fill="#d5f5e3" stroke="#1e8449" stroke-width="2"/>
+      <text x="199" y="228" fill="#145a32">d  c  b</text>
+      <text x="406" y="228" fill="#1a5276">a  b  c  d  e  f</text>
+      <text x="613" y="228" fill="#145a32">e  d  c</text>
+    </g>
+    <!-- BORDER_WRAP -->
+    <text x="120" y="278" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="end">wrap</text>
+    <g>
+      <rect x="130" y="258" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <rect x="268" y="258" width="276" height="30" fill="#eaf2f8" stroke="#2980b9"/>
+      <rect x="544" y="258" width="138" height="30" fill="#fdebd0" stroke="#ca6f1e"/>
+      <text x="199" y="278" fill="#7e5109">d  e  f</text>
+      <text x="406" y="278" fill="#1a5276">a  b  c  d  e  f</text>
+      <text x="613" y="278" fill="#7e5109">a  b  c</text>
+    </g>
+  </g>
+  <text x="390" y="318" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">reflect_101 (green) mirrors about the edge pixel without doubling it: OpenCV's default, and the safest general choice</text>
+</svg>
+<figcaption><strong>Figure 3.6.1</strong> Five border policies extending the row <em>abcdef</em>. Constant padding invents a false dark frame; replicate stretches edge pixels; reflect mirrors with the edge pixel doubled; reflect_101 mirrors about the edge pixel (OpenCV's default); wrap teleports the opposite side in, correct only for genuinely periodic data.</figcaption>
+</figure>
+
+<p>
+Each policy fails somewhere specific. <strong>Constant (zero) padding</strong> surrounds the image with blackness, so any smoothing filter darkens the frame's rim, a vignette artifact visible in careless thumbnail pipelines, and any derivative filter from <a href="section-3.4.html">Section 3.4</a> hallucinates a strong edge along the entire border. <strong>Replicate</strong> is safe and bland; it slightly overweights edge pixels. <strong>Reflect</strong> and <strong>reflect_101</strong> continue local statistics most gracefully, which is why reflect_101 is OpenCV's default (<code>cv2.BORDER_REFLECT_101</code>, alias <code>BORDER_DEFAULT</code>); the difference between them, whether the edge pixel itself is duplicated, matters mainly for derivative filters, where the doubled pixel of plain reflect creates a spurious zero-gradient line. <strong>Wrap</strong> is correct exactly when the data is periodic, which sounds exotic until <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>: FFT-based convolution wraps <em>implicitly</em>, whether you wanted it to or not, and that quietly mandatory wrap is one of that chapter's central gotchas.
+</p>
+<p>
+The NumPy and OpenCV vocabularies for identical policies differ, and one mismatch is a recurring source of off-by-the-border bugs: NumPy's <code>mode="reflect"</code> equals OpenCV's <code>BORDER_REFLECT_101</code>, while NumPy's <code>mode="symmetric"</code> equals OpenCV's <code>BORDER_REFLECT</code>. The demonstration below makes the policies tangible on a tiny array, and is worth running once just to fix Figure 3.6.1 in memory.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+row = np.array([10, 20, 30, 40, 50, 60])
+
+print(np.pad(row, 3, mode="constant"))   # [ 0  0  0 10 20 30 40 50 60  0  0  0]
+print(np.pad(row, 3, mode="edge"))       # [10 10 10 10 20 30 40 50 60 60 60 60]
+print(np.pad(row, 3, mode="symmetric"))  # [30 20 10 10 20 30 40 50 60 60 50 40]
+print(np.pad(row, 3, mode="reflect"))    # [40 30 20 10 20 30 40 50 60 50 40 30]
+print(np.pad(row, 3, mode="wrap"))       # [40 50 60 10 20 30 40 50 60 10 20 30]
+
+# Naming trap: np "reflect" == cv2.BORDER_REFLECT_101 (edge pixel NOT doubled)
+#              np "symmetric" == cv2.BORDER_REFLECT  (edge pixel doubled)</code></pre>
+<div class="code-caption">All five padding policies on one row of numbers, with exact printed outputs, plus the NumPy-to-OpenCV naming correspondence that regularly trips up engineers porting code between the two libraries.</div>
+
+<h2>2. Separability: The Free Order of Magnitude <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A 2D kernel $K$ is <strong>separable</strong> if it factors into an outer product of a column and a row, $K = v\,h^\top$. When it does, the associativity of convolution from <a href="section-3.1.html">Section 3.1</a> lets the single 2D pass split into two 1D passes (filter rows with $h$, then columns with $v$), and the per-pixel cost falls from $k^2$ multiplications to $2k$:
+</p>
+<p>
+$$ K * I = (v\,h^\top) * I = v * (h^\top * I) \qquad \Rightarrow \qquad \frac{k^2}{2k} = \frac{k}{2}\times \text{ speedup} $$
+</p>
+<p>
+For a $15 \times 15$ Gaussian that ratio is 7.5x; for the $31 \times 31$ kernels of the large-kernel renaissance it is 15.5x. The chapter's roster of separable kernels is no accident: the Gaussian of <a href="section-3.2.html">Section 3.2</a> (the <em>only</em> rotationally symmetric separable filter), the box, and the Sobel of <a href="section-3.4.html">Section 3.4</a>, whose $[1\;2\;1]^\top [-1\;0\;1]$ factorization we met explicitly. The Laplacian and the LoG are not separable, one reason the DoG approximation (a difference of two separable Gaussians) wins in practice.
+</p>
+<p>
+Linear algebra hands us both a test and a recipe. The outer product $v h^\top$ has rank 1, so <em>a kernel is separable exactly when its matrix rank is 1</em>, and the SVD both checks this and produces the factors:
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def separate_kernel(K, tol=1e-6):
+    """If K is rank-1 (separable), return (v, h) with K = outer(v, h)."""
+    U, S, Vt = np.linalg.svd(K)
+    if S[1] / S[0] &gt; tol:
+        return None                      # rank &gt; 1: not separable
+    v = U[:, 0] * np.sqrt(S[0])          # column factor
+    h = Vt[0, :] * np.sqrt(S[0])         # row factor
+    return v, h
+
+sobel_x = np.array([[-1., 0., 1.],
+                    [-2., 0., 2.],
+                    [-1., 0., 1.]])
+v, h = separate_kernel(sobel_x)
+print(np.round(v, 3), np.round(h, 3))
+# [-0.76  -1.521 -0.76 ] [ 1.316 -0.    -1.316]
+# (= [1,2,1] x [-1,0,1] up to sign and scale; only the product is unique)
+print(np.allclose(np.outer(v, h), sobel_x))       # True
+
+laplacian = np.array([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]])
+print(separate_kernel(laplacian))                  # None: rank 2, not separable</code></pre>
+<div class="code-caption">The SVD separability test: a rank-1 kernel factors into its first singular vectors, recovering Sobel's smoothing-times-derivative structure automatically, while the Laplacian is correctly rejected as inseparable.</div>
+
+<p>
+The payoff is measurable in three lines of timing. OpenCV exposes the two-pass path as <code>cv2.sepFilter2D</code>, and <code>cv2.GaussianBlur</code> uses it internally, which is why the library shortcut in <a href="section-3.2.html">Section 3.2</a> advertised separability as something you get without asking.
+</p>
+
+<pre><code class="language-python">import cv2, numpy as np, time
+
+img = np.random.rand(1080, 1920).astype(np.float32)   # one 1080p frame
+g = cv2.getGaussianKernel(31, 5.0)                     # 31-tap 1D Gaussian
+G2 = g @ g.T                                           # full 31x31 2D kernel
+
+def clock(fn, reps=20):
+    t0 = time.perf_counter()
+    for _ in range(reps): fn()
+    return (time.perf_counter() - t0) / reps * 1000    # ms per call
+
+t_full = clock(lambda: cv2.filter2D(img, -1, G2))
+t_sep  = clock(lambda: cv2.sepFilter2D(img, -1, g, g))
+print(f"full 2D: {t_full:.1f} ms   separable: {t_sep:.1f} ms   "
+      f"speedup: {t_full / t_sep:.1f}x")
+# Representative output (4-core laptop):
+# full 2D: 38.4 ms   separable: 4.9 ms   speedup: 7.8x</code></pre>
+<div class="code-caption">Timing a $31 \times 31$ Gaussian on a 1080p frame: the two-pass separable implementation lands near the theoretical $k/2$ speedup, turning a frame-budget-breaking 38 ms into a comfortable 5 ms.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Separability Is Why Gaussians Are Everywhere</div>
+<p>The Gaussian's mathematical virtues from <a href="section-3.2.html">Section 3.2</a> (cascading, no artifacts, rotational symmetry) explain why theoreticians like it; separability explains why engineers deploy it. It is the unique filter that is simultaneously rotationally symmetric and computable as two cheap 1D passes. Whenever a pipeline needs "some smoothing" at scale, the Gaussian wins the bid on price, which is why it is the default pre-filter of <a href="section-3.4.html">Section 3.4</a>'s derivatives, the pyramid generator of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and the scale-space engine behind the detectors of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>.</p>
+</div>
+
+<h2>3. Counting Operations: Direct, Separable, FFT <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+For an $N$-pixel image and a $k \times k$ kernel, the three families of convolution algorithm scale differently, and Table 3.6.1 puts numbers on a 1080p frame ($N \approx 2.07$ million pixels) to make the asymptotics concrete.
+</p>
+
+<table>
+<caption><strong>Table 3.6.1</strong> Multiplications per 1080p frame by algorithm and kernel size (orders of magnitude).</caption>
+<thead>
+<tr><th scope="col">Kernel size</th><th scope="col">Direct: $N k^2$</th><th scope="col">Separable: $2 N k$</th><th scope="col">FFT: $\approx N \log_2 N \times 3$</th><th scope="col">Cheapest</th></tr>
+</thead>
+<tbody>
+<tr><td>$3 \times 3$</td><td>1.9 &#215; 10&#8313;</td><td>1.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable (or direct)</td></tr>
+<tr><td>$15 \times 15$</td><td>4.7 &#215; 10&#8313;</td><td>6.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable</td></tr>
+<tr><td>$31 \times 31$ (inseparable)</td><td>2.0 &#215; 10&#185;&#8304;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT</td></tr>
+<tr><td>$101 \times 101$ (inseparable)</td><td>2.1 &#215; 10&#185;&#185;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT, decisively</td></tr>
+</tbody>
+</table>
+
+<p>
+Read the last column as a decision procedure. Small kernels: direct convolution, which modern SIMD hardware chews through with excellent cache behavior. Separable kernels of any size: two-pass, almost always optimal. Large inseparable kernels: transform to the frequency domain, multiply, transform back, at a cost that is <em>independent of kernel size</em>. The mathematics licensing that third route is the convolution theorem, the headline result of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>; OpenCV's <code>filter2D</code> already switches to it silently for kernels above roughly $11 \times 11$, so you have likely used FFT convolution without knowing. (Mind the implicit wrap-around border noted in Figure 3.6.1's discussion.)
+</p>
+
+<h2>4. How Production Systems Actually Do It <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Between the textbook loop and the datasheet speed sits a stack of engineering that is worth knowing even when you never write it, because its vocabulary surfaces in profiler output and framework documentation. Four layers do most of the work.
+</p>
+<p>
+<strong>Vectorization and threading.</strong> Libraries process 8 to 32 pixels per CPU instruction (SIMD) and split rows across cores: the baseline 100x over interpreted Python that <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>'s vectorization discussion promised. <strong>Integral images</strong> give the box filter (and through it, the guided filter of <a href="section-3.5.html">Section 3.5</a>) a constant cost per pixel at any radius: precompute running sums once, then any rectangle's sum is four lookups. <strong>im2col + GEMM</strong>: unroll every kernel-sized window into the row of a giant matrix, so convolution becomes one dense matrix multiply, the single most optimized routine in computing. This memory-hungry but blazingly regular formulation is how cuDNN and PyTorch execute the conv layers of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> on GPUs, alongside Winograd variants that trade additions for multiplications on $3 \times 3$ kernels. <strong>Downsample-filter-upsample</strong>: when a huge blur is the goal (backgrounds, bokeh), blur a quarter-resolution copy with a quarter-sized sigma and upsample; the error is invisible and the saving is 16x before any other trick, which is how phone "portrait mode" affords its giant background blurs.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Background Blur That Missed Its Frame Budget</div>
+<p><strong>Who:</strong> A backend video team at a video-conferencing company, building server-side background blur for clients too old to run it locally.</p>
+<p><strong>Situation:</strong> Product spec: 720p at 30 fps per stream, hundreds of concurrent streams per GPU node, with a person-segmentation model (a preview of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>) already consuming most of the budget. The blur itself was allotted 2 ms per frame.</p>
+<p><strong>Problem:</strong> The first implementation called a $51 \times 51$ Gaussian on the full frame: 21 ms on CPU, and even GPU-side it crowded the segmentation model's kernel queue. The team assumed they needed fancier hardware.</p>
+<p><strong>Decision:</strong> Three changes from this section, no new hardware: blur a 4x-downsampled frame with the correspondingly smaller $13 \times 13$ separable Gaussian, upsample, and composite through the (guided-filter-feathered) person mask. Cost: separability cut the kernel work 6x, downsampling cut pixel count 16x.</p>
+<p><strong>Result:</strong> 0.8 ms per frame, two orders of magnitude under the original, visually indistinguishable from the full-resolution blur in side-by-side review (a blurred background has no detail to lose). The hardware request was withdrawn.</p>
+<p><strong>Lesson:</strong> For large-radius smoothing, resolution is the cheapest knob: separability saves $k/2$, but downsampling saves $s^2$ and compounds with it. Spend algorithmic tricks before spending silicon.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Letting the Framework Choose the Algorithm</div>
+<p>Everything in this section, padding, separability, im2col, FFT switchover, Winograd, is an automatic decision inside modern frameworks. In PyTorch, <code>torch.nn.functional.conv2d(x, w, padding="same")</code> plus <code>torch.backends.cudnn.benchmark = True</code> makes cuDNN time the candidate algorithms on your exact shapes and cache the winner; in OpenCV, <code>filter2D</code> picks direct versus DFT by kernel size on its own. The from-scratch separable pipeline this section taught (SVD test, two passes, border bookkeeping: about 30 lines) collapses to one call whose internal dispatcher embodies the whole of Table 3.6.1. Write the 30 lines once to understand them; then never again.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Zero padding, the border mode this section just warned you about, is nonetheless the near-universal choice inside CNNs, and it has an upside nobody designed: the network can <em>feel</em> the zeros. Because the padding pattern differs at corners, edges, and interior, convolutional features pick up a weak position signal from their own borders, and published work has shown CNNs exploiting it to encode absolute position. A bug, a feature, and a research topic, all from the humblest setting in the API.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The Operation-Count Wars</div>
+<p>Table 3.6.1's arithmetic is the quiet protagonist of 2024-2026 architecture research. Large-kernel convnets such as UniRepLKNet (CVPR 2024, arXiv:2311.15599) lean on the depthwise trick (filter each channel independently) to keep $31 \times 31$ kernels affordable, while VMamba (2024, arXiv:2401.10166) sidesteps kernels entirely with selective state-space scans that cost $O(N)$ in sequence length, attacking the same long-range-context goal at box-filter prices. On the systems side, compiler stacks (torch.compile, Triton, TVM) now fuse convolutions with their surrounding pointwise operations automatically, eliminating the memory round-trips that dominate real latency, the modern descendant of this section's "do two 1D passes instead of one 2D pass" reasoning. The lesson generalizes: at every era of vision, the operations that win are the ones whose arithmetic the hardware of the day can afford, a thread continued in the deployment engineering of <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">Chapter 28</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.6.1: Pick the Padding <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, choose a border mode from Figure 3.6.1 and justify in one sentence: (a) Gaussian-smoothing photographs before thumbnailing; (b) Sobel gradients feeding the document-deskew estimator of <a href="section-3.4.html">Section 3.4</a>; (c) filtering a 360-degree equirectangular panorama along its horizontal axis; (d) filtering tiles of a gigapixel pathology slide that will be stitched back together (careful: the honest answer for (d) involves overlapping tiles rather than any padding mode, and you should explain why).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.6.2: Race Your Own Separability <span class="exercise-type coding">Coding</span></div>
+<p>Reproduce this section's timing experiment across kernel sizes $k \in \{3, 7, 15, 31, 63\}$ on a 1080p float32 image: time <code>cv2.filter2D</code> with the full $k \times k$ Gaussian against <code>cv2.sepFilter2D</code> with its 1D factors, 20 repetitions each. Plot both curves and the measured speedup against the theoretical $k/2$. Identify and explain any kernel size where <code>filter2D</code> suddenly gets faster than the trend (hint: this section mentioned OpenCV's silent DFT switchover).</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.6.3: The Vignette Forensic <span class="exercise-type analysis">Analysis</span></div>
+<p>A teammate reports that their batch thumbnailer darkens the outer 10 pixels of every image. Their pipeline: zero-pad, blur with $\sigma = 4$, downsample. Quantify the defect: for a constant white image of value 255, derive (or compute with <code>np.pad</code> and <code>cv2.GaussianBlur</code>) the output value at distances 0, 2, 5, and 10 pixels from the border under zero padding, then under reflect_101. Report the maximum brightness error of each mode and state the one-argument fix in OpenCV.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-3.5.html">&#8592; Section 3.5: Edge-Preserving Smoothing: Bilateral &amp; Guided Filters</a>
+<a href="index.html">Chapter 3</a>
+<a class="next" href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.2: The 2D DFT &amp; FFT in Practice. The discrete Fourier transform defined for images, fftshift and log display, FFT complexity, NumPy/SciPy/OpenCV/PyTorch APIs, FFT convolution, and phase correlation." name="description"/>
+<title>Section 4.2: The 2D DFT &amp; FFT in Practice | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>The 2D DFT &amp; FFT in Practice</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I do half the work and hand the other half to my twin, who does half the work and hands the other half to her twin. Somehow we finish in log time and management takes the credit."</p>
+<cite>An Overworked FFT Butterfly</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>The discrete Fourier transform is the exact, invertible, finite recipe that turns a pixel array into wave weights, and the fast Fourier transform is the algorithm that makes it cheap enough to call casually.</strong> This section nails down what the libraries actually compute: the DFT's definition and its three structural properties (conjugate symmetry, periodicity, and the corner-dwelling DC term), the display conventions every spectrum figure relies on, the performance landscape across NumPy, SciPy, OpenCV, and PyTorch, and the convolution theorem that makes large-kernel filtering hundreds of times faster.</p>
+</div>
+
+<p><a href="section-4.1.html">Section 4.1</a> argued that images are sums of waves; this section hands you the machine that finds the weights. The good news is that the machine is two function calls: one forward, one inverse. The work is in understanding its conventions, because nearly every confusing spectrum plot, mysterious wraparound artifact, and "why is my filtered image complex?" bug traces back to a convention that was never stated. We state them all.</p>
+
+<h2>1. The 2D Discrete Fourier Transform, Defined <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>For an $M \times N$ image $f(x, y)$, the 2D DFT produces an $M \times N$ array of complex coefficients:</p>
+
+<p>$$F(u, v) = \sum_{x=0}^{M-1} \sum_{y=0}^{N-1} f(x, y)\; e^{-j 2\pi \left( \frac{ux}{M} + \frac{vy}{N} \right)}$$</p>
+
+<p>and the inverse transform reconstructs the image exactly:</p>
+
+<p>$$f(x, y) = \frac{1}{MN} \sum_{u=0}^{M-1} \sum_{v=0}^{N-1} F(u, v)\; e^{+j 2\pi \left( \frac{ux}{M} + \frac{vy}{N} \right)}$$</p>
+
+<p>Each coefficient $F(u,v)$ is the inner product of the image with one complex sinusoid, exactly the gratings of <a href="section-4.1.html">Section 4.1</a> in complex form. Three structural facts follow directly from the definition, and all three matter daily in practice.</p>
+
+<p>First, $F(0, 0) = \sum_{x,y} f(x,y)$: the zero-frequency or <strong>DC coefficient</strong> is the plain sum of all pixels, so $F(0,0)/MN$ is the image mean. Second, for a real-valued image the spectrum has <strong>conjugate symmetry</strong>, $F(-u, -v) = F^{*}(u, v)$: half the coefficients are determined by the other half, which is why the spectrum dots in Figure 4.1.1 came in mirrored pairs, and why <code>rfft2</code> can store just over half the spectrum with no information loss. Third, the DFT treats the image as <strong>periodic</strong>: it analyzes an infinite tiling of your image, not the image alone. The right edge wraps to meet the left edge, and if those edges differ in brightness, the artificial seam injects a bright horizontal-plus-vertical cross into the spectrum. The same periodicity is why unpadded frequency-domain convolution wraps around the borders, the trap discussed in part 4 of this section.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The DFT Analyzes a Tiled Image</div>
+<p>Every property that puzzles newcomers (the cross artifact in spectra, wraparound in FFT convolution, the need for padding and windowing) is the same single fact wearing different costumes: the DFT's basis functions are periodic, so the transform sees your image repeated forever in all directions. When the spectrum surprises you, first ask what the infinite tiling of your image looks like at the seams.</p>
+</div>
+
+<h2>2. Computing and Displaying a Spectrum <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>The raw output of <code>np.fft.fft2</code> stores frequency $(0,0)$ at array index $[0, 0]$, the top-left corner, with positive frequencies counting up and negative frequencies stored in the upper half of each axis (an inheritance from the transform's periodicity). For viewing, everyone re-centers the spectrum with <code>fftshift</code> so DC sits in the middle, and compresses its enormous dynamic range with a log. The full display recipe:</p>
+
+<pre><code class="language-python">import numpy as np
+import matplotlib.pyplot as plt
+from skimage import data
+
+img = data.camera().astype(np.float64)         # 512 x 512 grayscale
+
+F = np.fft.fft2(img)                           # complex128, DC at [0, 0]
+F_shifted = np.fft.fftshift(F)                 # DC moved to the center
+magnitude = np.log1p(np.abs(F_shifted))        # log(1 + |F|) tames the range
+
+# Sanity checks worth internalizing
+print(F.shape, F.dtype)                        # (512, 512) complex128
+print(np.allclose(F[0, 0].real / img.size, img.mean()))   # True: DC = mean
+recon = np.real(np.fft.ifft2(F))
+print(np.allclose(recon, img))                 # True: perfectly invertible
+
+plt.imshow(magnitude, cmap="gray"); plt.axis("off"); plt.show()</code></pre>
+<div class="code-caption"><strong>Code 4.2.1:</strong> The canonical spectrum pipeline: fft2, fftshift, log1p of the magnitude. The printed checks confirm the DC coefficient equals the image mean times the pixel count and that the inverse transform reproduces the image to machine precision.</div>
+
+<p>Without the log, the DC term and its low-frequency neighbors are so much larger than everything else (often by six orders of magnitude) that the display would be a single white pixel on black. Without the shift, the visually meaningful "low frequencies in the middle, high frequencies at the edge" layout is scrambled into four corner fragments. Figure 4.2.1 shows exactly what <code>fftshift</code> rearranges; commit it to memory, because forgetting the shift (or applying it twice, or filtering a shifted spectrum with an unshifted mask) is the most common frequency-domain bug in student code.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="fftshift swaps the four quadrants of the DFT output so the DC term moves from the corners to the center">
+<text x="200" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Raw fft2 output: DC at corner</text>
+<text x="660" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">After fftshift: DC at center</text>
+<!-- left grid -->
+<rect x="80" y="50" width="240" height="240" fill="#fafbfd" stroke="#5a6b85" stroke-width="2"/>
+<line x1="200" y1="50" x2="200" y2="290" stroke="#5a6b85" stroke-width="1.5" stroke-dasharray="6,4"/>
+<line x1="80" y1="170" x2="320" y2="170" stroke="#5a6b85" stroke-width="1.5" stroke-dasharray="6,4"/>
+<!-- low frequency energy at the four corners -->
+<circle cx="92" cy="62" r="22" fill="#e94560" opacity="0.75"/>
+<circle cx="308" cy="62" r="14" fill="#e94560" opacity="0.45"/>
+<circle cx="92" cy="278" r="14" fill="#e94560" opacity="0.45"/>
+<circle cx="308" cy="278" r="10" fill="#e94560" opacity="0.35"/>
+<text x="140" y="80" font-family="sans-serif" font-size="12" fill="#9b1c31">DC</text>
+<text x="140" y="115" font-family="sans-serif" font-size="12" fill="#666">A</text>
+<text x="255" y="115" font-family="sans-serif" font-size="12" fill="#666">B</text>
+<text x="140" y="245" font-family="sans-serif" font-size="12" fill="#666">C</text>
+<text x="255" y="245" font-family="sans-serif" font-size="12" fill="#666">D</text>
+<!-- arrows showing swap -->
+<line x1="350" y1="170" x2="500" y2="170" stroke="#888" stroke-width="2"/>
+<polygon points="500,170 488,164 488,176" fill="#888"/>
+<text x="425" y="156" font-family="sans-serif" font-size="13" fill="#666" text-anchor="middle">np.fft.fftshift</text>
+<text x="425" y="192" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">A&#8596;D, B&#8596;C</text>
+<!-- right grid -->
+<rect x="540" y="50" width="240" height="240" fill="#fafbfd" stroke="#5a6b85" stroke-width="2"/>
+<line x1="660" y1="50" x2="660" y2="290" stroke="#5a6b85" stroke-width="1.5" stroke-dasharray="6,4"/>
+<line x1="540" y1="170" x2="780" y2="170" stroke="#5a6b85" stroke-width="1.5" stroke-dasharray="6,4"/>
+<circle cx="660" cy="170" r="26" fill="#e94560" opacity="0.8"/>
+<circle cx="660" cy="170" r="50" fill="#e94560" opacity="0.25"/>
+<circle cx="660" cy="170" r="80" fill="#e94560" opacity="0.10"/>
+<text x="660" y="148" font-family="sans-serif" font-size="12" fill="#9b1c31" text-anchor="middle">DC</text>
+<text x="600" y="115" font-family="sans-serif" font-size="12" fill="#666">D</text>
+<text x="715" y="115" font-family="sans-serif" font-size="12" fill="#666">C</text>
+<text x="600" y="245" font-family="sans-serif" font-size="12" fill="#666">B</text>
+<text x="715" y="245" font-family="sans-serif" font-size="12" fill="#666">A</text>
+<text x="660" y="315" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">low frequencies center, high frequencies at the border</text>
+</svg>
+<figcaption><strong>Figure 4.2.1:</strong> fftshift swaps the DFT's quadrants diagonally (A with D, B with C), moving the DC coefficient and the low-frequency energy from the array corners to the center. Filter masks built in centered coordinates must be applied to a shifted spectrum, or shifted back with ifftshift before use.</figcaption>
+</figure>
+
+<h2>3. The FFT and the Library Landscape <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Evaluating the DFT definition directly costs $O(M^2 N^2)$: every output coefficient touches every pixel. The fast Fourier transform computes the identical result in $O(MN \log MN)$ by recursively splitting each 1D transform into even-indexed and odd-indexed halves and reusing the shared work (the "butterfly" pattern). A 2D transform is just 1D FFTs over all rows, then all columns. At $4096 \times 4096$ the speedup factor is roughly a million; the FFT is the reason frequency-domain methods are practical at all, and it is routinely listed among the most important algorithms of the twentieth century.</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Cooley and Tukey published the FFT in 1965, motivated in part by the need to detect Soviet nuclear tests from seismometer data fast enough to matter. It later emerged that Carl Friedrich Gauss had worked out essentially the same trick in 1805, two years before Fourier's own memoir, and left it unpublished in his notebooks, in Latin. The fastest algorithm of the computer age predates the telegraph.</p>
+</div>
+
+<p>In the Python ecosystem you will meet four implementations, and it is worth knowing when each earns its keep. <code>numpy.fft</code> is always there and always correct; its <code>rfft2</code> exploits conjugate symmetry to do roughly half the work on real images. <code>scipy.fft</code> is a faster drop-in with a <code>workers=</code> argument for multi-core transforms and better support for odd sizes. OpenCV's <code>cv2.dft</code> is fastest when you feed it sizes it likes; <code>cv2.getOptimalDFTSize</code> tells you the next "friendly" size (products of 2, 3, and 5) to pad to, a habit inherited from the <a href="../module-00-python-imaging-stack/index.html">array-centric stack of Chapter 0</a> that can double throughput for awkward dimensions. And <code>torch.fft</code> runs on the GPU and, crucially, is differentiable, so a frequency-domain term can sit inside a training loss.</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+import torch
+
+img32 = img.astype(np.float32)
+h, w = img32.shape
+
+# --- OpenCV: pad to an FFT-friendly size, then transform -------------
+H_opt, W_opt = cv2.getOptimalDFTSize(h), cv2.getOptimalDFTSize(w)
+padded = cv2.copyMakeBorder(img32, 0, H_opt - h, 0, W_opt - w,
+                            cv2.BORDER_CONSTANT, value=0)
+dft = cv2.dft(padded, flags=cv2.DFT_COMPLEX_OUTPUT)   # (H_opt, W_opt, 2)
+mag_cv = cv2.magnitude(dft[..., 0], dft[..., 1])
+
+# --- PyTorch: half-spectrum of a real input, GPU and autograd ready ---
+x = torch.from_numpy(img)                  # add .cuda() if a GPU is present
+F_half = torch.fft.rfft2(x)                # shape (512, 257) complex
+power = F_half.real**2 + F_half.imag**2    # differentiable spectral power</code></pre>
+<div class="code-caption"><strong>Code 4.2.2:</strong> The same transform through two other doors. OpenCV wants float32 input, rewards padding to getOptimalDFTSize, and returns real and imaginary parts as two channels; torch.fft.rfft2 returns the non-redundant half-spectrum of a real tensor and participates in autograd.</div>
+
+<h2>4. The Convolution Theorem in Practice <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>The single most consequential theorem of this chapter connects it back to <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>: convolution in the spatial domain equals element-wise multiplication in the frequency domain,</p>
+
+<p>$$f * h \;\longleftrightarrow\; F \cdot H$$</p>
+
+<p>Sliding a kernel across an image, the operation you implemented with quadruple loops in Chapter 3, is the same as transforming both image and kernel, multiplying the spectra point by point, and transforming back. For a $K \times K$ kernel on an $M \times N$ image, direct convolution costs $O(MNK^2)$ while the FFT route costs $O(MN \log MN)$ regardless of kernel size. Small kernels are cheaper directly; large kernels are dramatically cheaper through the FFT. The crossover on typical hardware arrives surprisingly early, around kernel widths of 11 to 15:</p>
+
+<pre><code class="language-python">from time import perf_counter
+from scipy.signal import convolve2d, fftconvolve
+
+big = np.random.rand(1024, 1024)
+
+for k in [3, 7, 15, 31, 63]:
+    kernel = np.random.rand(k, k)
+    t0 = perf_counter(); convolve2d(big, kernel, mode="same"); t1 = perf_counter()
+    fftconvolve(big, kernel, mode="same");                     t2 = perf_counter()
+    print(f"{k:2d}x{k:<2d}  direct {t1-t0:7.2f} s   fft {t2-t1:6.3f} s")
+
+# Representative output (one laptop run; your numbers will differ,
+# the shape of the trend will not):
+#  3x3   direct    0.07 s   fft  0.090 s
+#  7x7   direct    0.30 s   fft  0.092 s
+# 15x15  direct    1.30 s   fft  0.095 s
+# 31x31  direct    5.50 s   fft  0.098 s
+# 63x63  direct   22.10 s   fft  0.103 s</code></pre>
+<div class="code-caption"><strong>Code 4.2.3:</strong> Direct versus FFT convolution as kernel size grows. Direct cost scales with the kernel area; FFT cost is essentially flat, so a 63-pixel kernel is two orders of magnitude faster through the frequency domain.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Circular Convolution Wraps Around</div>
+<p>Because the DFT assumes periodicity, multiplying unpadded spectra computes <em>circular</em> convolution: kernel mass that slides off the right edge re-enters on the left, smearing opposite borders into each other. Linear convolution requires zero-padding both signals to at least $(M + K - 1) \times (N + K - 1)$ before transforming. <code>scipy.signal.fftconvolve</code> handles the padding, the size bookkeeping, and the final cropping for you, which is the main reason to prefer it over a hand-rolled multiply.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: scipy.signal.fftconvolve and oaconvolve</div>
+<p>A correct hand-rolled FFT convolution (pad both arrays, transform, multiply, inverse-transform, crop the valid region, manage real/complex types) runs to about 15 lines with three classic off-by-one traps. The library form is one line:</p>
+<pre><code class="language-python">out = fftconvolve(big, kernel, mode="same")     # padding, cropping handled
+# scipy.signal.oaconvolve: same API, overlap-add, better for huge images</code></pre>
+<div class="code-caption"><strong>Code 4.2.5:</strong> Linear FFT convolution as a single SciPy call, with all padding, cropping, and real-input optimizations handled internally.</div>
+<p>That is roughly a 15-to-1 line reduction, and the library additionally picks real-input FFT paths automatically, chooses fast transform sizes, and offers <code>oaconvolve</code>, which processes enormous images in tiles so memory stays bounded. SciPy's <code>choose_conv_method</code> will even pick direct versus FFT for you based on measured heuristics.</p>
+</div>
+
+<p>This theorem is also a lens for what comes later in the book: the learned convolution layers of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> are, in the frequency view, learned spectral multipliers, and that equivalence is exactly what several of the architectures in this section's research frontier exploit.</p>
+
+<h2>5. Phase Correlation: Alignment in One Transform <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>Here is the frequency domain solving a real task end to end. If image $b$ is image $a$ shifted by $(\Delta x, \Delta y)$, the Fourier shift theorem says their spectra differ only by a phase ramp: $B(u,v) = A(u,v)\, e^{-j2\pi(u\Delta x/M + v\Delta y/N)}$. Dividing out the magnitudes leaves a pure complex exponential whose inverse transform is a single sharp spike located exactly at the displacement. This is <strong>phase correlation</strong>: translation estimation for the price of three FFTs, robust to global illumination changes (which live in magnitude, not phase) and indifferent to how feature-rich the scene is.</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage import data
+
+a = data.camera().astype(np.float32)
+b = np.roll(a, shift=(7, 15), axis=(0, 1))     # down 7 pixels, right 15
+
+(shift_x, shift_y), response = cv2.phaseCorrelate(a, b)
+print(f"shift = ({shift_x:.2f}, {shift_y:.2f}), response = {response:.3f}")
+# Recovers the 15-pixel horizontal and 7-pixel vertical displacement to
+# sub-pixel accuracy with a response near 1.0. The sign convention
+# follows the argument order: verify it once on a synthetic roll like
+# this one before trusting it in production.</code></pre>
+<div class="code-caption"><strong>Code 4.2.4:</strong> Phase correlation with cv2.phaseCorrelate recovers a known synthetic translation to sub-pixel precision. The response value near 1.0 indicates a confident, single-peak match.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Aligning Ten Thousand Farm Photos Before Lunch</div>
+<p><strong>Who:</strong> A backend engineer at an agricultural aerial-survey startup processing burst captures from fixed-wing drones.</p>
+<p><strong>Situation:</strong> Each survey produced tens of thousands of overlapping frames that needed pairwise alignment before stitching and crop-health analysis, with results due the same day.</p>
+<p><strong>Problem:</strong> The keypoint pipeline (detect, describe, match, fit) averaged 400 ms per pair and failed outright over uniform fields: freshly plowed earth and young wheat offer almost no distinctive corners to match.</p>
+<p><strong>Decision:</strong> Because consecutive burst frames differ almost purely by translation, the engineer replaced keypoint matching with FFT phase correlation, with a Hann window to suppress the spectral cross from frame borders, falling back to features only when the correlation response dropped below a threshold.</p>
+<p><strong>Result:</strong> Alignment fell to under 8 ms per pair on the same CPU, a 50-fold speedup, and the uniform-field failure mode vanished, since phase correlation uses the whole image's spectrum rather than scattered corners. The fallback triggered on under 2 percent of pairs.</p>
+<p><strong>Lesson:</strong> When the geometric relationship is simple (translation, or rotation-plus-scale via the log-polar Fourier-Mellin extension), the frequency domain solves globally and in near-constant time what feature pipelines solve locally and expensively. The full geometric toolbox for harder warps arrives in <a href="../module-05-geometric-transformations/index.html">Chapter 5</a>.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: The FFT Inside Modern Architectures</div>
+<p>The convolution theorem is enjoying a second career in deep learning. FNet (2021) replaced transformer self-attention with plain Fourier mixing; Hyena and other long-convolution sequence models (2023) rely on FFT convolution to apply sequence-length kernels, and FlashFFTConv (ICLR 2024) re-engineered the FFT around GPU tensor cores to make that practical at scale. Fourier Neural Operators learn solution operators for PDEs by parameterizing weights directly in the frequency domain, powering weather-scale models such as FourCastNet. The thread running through all of them is exactly this section's theorem: a global operation that is expensive as a sliding window becomes a cheap element-wise product after a transform, a trick the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">vision transformer lineage of Chapter 22</a> keeps rediscovering.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.2.1: Conventions Audit <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague computes <code>mask * np.fft.fft2(img)</code> where <code>mask</code> is a centered low-pass disk built in fftshift coordinates, then takes the inverse FFT and gets garbage that looks like four ghost images. Explain precisely what went wrong, two distinct ways to fix it (shifting the spectrum versus shifting the mask), and why the result of the correct version can still have a tiny imaginary part that is safe to discard.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.2.2: Find Your Own Crossover <span class="exercise-type coding">Coding</span></div>
+<p>Reproduce Code 4.2.3 on your machine, adding kernel sizes 5, 9, 11, and 21, and also timing <code>cv2.filter2D</code> (which uses heavily optimized direct convolution and switches to a DFT path for large kernels). Plot all three curves on a log scale and report the kernel size where the FFT route first wins against each competitor. Then repeat at image size 256&#215;256 and explain why the crossover moves.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.2.3: Stress-Testing Phase Correlation <span class="exercise-type analysis">Analysis</span></div>
+<p>Using Code 4.2.4 as a base, measure how the recovered shift and the response value degrade as you (a) add Gaussian noise of increasing strength, (b) brighten one frame by 30 percent, (c) rotate the second frame by 1, 2, 5, and 10 degrees. Which perturbation breaks the method first, and why does that follow from the fact that phase correlation models only translation?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.1.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.1</span><span class="nav-title">Fourier Intuition: Images as Sums of Waves</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="section-4.3.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.3</span><span class="nav-title">Frequency-Domain Filtering: Low-Pass, High-Pass &amp; Notch</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

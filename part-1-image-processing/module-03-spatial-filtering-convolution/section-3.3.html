@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.3: Sharpening &amp; Unsharp Masking. The blur-subtract-amplify recipe behind every sharpen slider, its single-kernel form, high-boost filtering, and the halo, noise, and clipping failure modes." name="description"/>
+<title>Section 3.3: Sharpening &amp; Unsharp Masking | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Spatial Filtering &amp; Convolution</a></div>
+<h1>Sharpening &amp; Unsharp Masking</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"To make something sharper, I first blur it. The committee asked me to repeat that. I repeated it. They asked me to leave. The results speak for themselves, loudly, with halos."</p>
+<cite>An Overcaffeinated Sharpening Filter</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Sharpening does not add detail; it finds the detail an image already has and exaggerates it, by subtracting a blurred copy and amplifying what remains.</strong> This section develops that one idea, unsharp masking, three ways: as the photographer's blur-subtract-add recipe, as a single $3 \times 3$ kernel built from the Laplacian, and as a per-pixel contract with consequences (halos, amplified noise, clipped highlights). It also draws a line that matters for the rest of the book: sharpening boosts <em>recorded</em> contrast, while true deblurring (deconvolution, in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>) and generative restoration (in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>) attempt to recover or invent what was never recorded.</p>
+</div>
+
+<p>
+The previous section smoothed: positive weights, summing to one, averaging detail away. This section runs the machine in reverse. The clients are everywhere: every camera pipeline sharpens after demosaicking, every scan-to-PDF tool sharpens text, every photo editor ships a sharpen slider, and radiologists have relied on unsharp masking since the era of film. All of them use, almost unmodified, the technique this section builds.
+</p>
+
+<h2>1. What "Sharp" Means to an Eye and to a Filter <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Perceived sharpness is mostly <em>edge contrast</em>: how rapidly intensity changes where two regions meet. An in-focus lens produces a step-like transition over one or two pixels; defocus, camera shake, sensor diffusion, and the smoothing of <a href="section-3.2.html">Section 3.2</a> all stretch that transition over more pixels, and the eye reads the stretch as blur. In the frequency vocabulary previewed in <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, blur attenuates high frequencies; sharpening is any operation that boosts them back.
+</p>
+<p>
+That framing immediately suggests the recipe. A blurred copy of an image contains its low frequencies. Subtracting the blurred copy from the original therefore isolates the high frequencies: edges, texture, fine detail, and, inconveniently, noise. Add a multiple of that difference back to the original and every transition steepens. This is <strong>unsharp masking</strong>, named not for what it does but for the blurred ("unsharp") mask at its core.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Unsharp masking predates digital computing by decades. Darkroom technicians in the 1930s would contact-print a deliberately defocused positive of a negative onto film, sandwich the two, and print through the pair: the fuzzy positive partially canceled the negative's low frequencies, letting edges through with extra punch. Astronomers refined the trick for telescope plates. When Photoshop 1.0 shipped an "Unsharp Mask" tool in 1990, it was a software port of a sixty-year-old analog hack, and the confusing name came along for the ride.</p>
+</div>
+
+<h2>2. Unsharp Masking, Step by Step <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Formally, with $G_\sigma * I$ denoting Gaussian blur from <a href="section-3.2.html">Section 3.2</a>:
+</p>
+<p>
+$$ \underbrace{M}_{\text{mask}} = I - G_\sigma * I, \qquad \underbrace{S}_{\text{sharpened}} = I + \alpha\, M $$
+</p>
+<p>
+Two knobs control everything. The blur scale $\sigma$ (the "radius" slider in photo editors) sets <em>which</em> details count as detail: small $\sigma$ targets fine texture and pixel-scale edges, large $\sigma$ boosts broader local contrast. The gain $\alpha$ (the "amount" slider) sets <em>how much</em> the chosen details are amplified; values between 0.5 and 1.5 are typical, and beyond 2 the artifacts of Section 4 arrive quickly. Figure 3.3.1 traces the full pipeline on a one-dimensional edge, and is worth a careful read: the overshoot and undershoot it shows at the sharpened edge are not a defect of the diagram but the entire mechanism of perceived sharpening.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four panels showing an intensity profile across an edge: the original soft step, the blurred copy, the mask formed by their difference, and the sharpened result with overshoot and undershoot">
+  <!-- Panel 1: original -->
+  <g>
+    <text x="105" y="26" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">1. original I</text>
+    <rect x="25" y="40" width="160" height="150" fill="#ffffff" stroke="#d1d4d8"/>
+    <path d="M 35 165 L 85 165 C 100 165, 110 75, 125 75 L 175 75" fill="none" stroke="#2c3e50" stroke-width="2.5"/>
+  </g>
+  <!-- Panel 2: blurred -->
+  <g>
+    <text x="300" y="26" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">2. blurred G&#963;&#8727;I</text>
+    <rect x="220" y="40" width="160" height="150" fill="#ffffff" stroke="#d1d4d8"/>
+    <path d="M 230 165 L 250 164 C 285 160, 315 80, 350 76 L 370 75" fill="none" stroke="#3498db" stroke-width="2.5"/>
+  </g>
+  <!-- Panel 3: mask -->
+  <g>
+    <text x="495" y="26" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">3. mask I &#8722; G&#963;&#8727;I</text>
+    <rect x="415" y="40" width="160" height="150" fill="#ffffff" stroke="#d1d4d8"/>
+    <line x1="425" y1="120" x2="565" y2="120" stroke="#90a4ae" stroke-width="1" stroke-dasharray="4,3"/>
+    <path d="M 425 120 L 455 120 C 470 122, 478 145, 495 145 C 505 145, 505 95, 515 95 C 532 95, 540 118, 555 120 L 565 120"
+          fill="none" stroke="#e67e22" stroke-width="2.5"/>
+  </g>
+  <!-- Panel 4: sharpened -->
+  <g>
+    <text x="690" y="26" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">4. S = I + &#945;&#183;mask</text>
+    <rect x="610" y="40" width="160" height="150" fill="#ffffff" stroke="#d1d4d8"/>
+    <path d="M 620 165 L 655 165 C 672 165, 672 180, 682 180 C 690 180, 690 60, 700 60 C 710 60, 712 75, 728 75 L 760 75"
+          fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <text x="700" y="215" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">overshoot + undershoot</text>
+    <text x="700" y="232" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">= steeper apparent edge</text>
+  </g>
+  <text x="300" y="225" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">the mask is zero on flat regions and swings</text>
+  <text x="300" y="243" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">negative-then-positive across each edge</text>
+</svg>
+<figcaption><strong>Figure 3.3.1</strong> Unsharp masking on a 1D intensity profile. The blurred copy (blue) lags the original's edge; their difference (orange) swings negative then positive across the transition; adding it back (green) darkens the dark side and brightens the bright side, producing the over/undershoot the eye reads as sharpness.</figcaption>
+</figure>
+
+<p>
+The implementation is three lines around a Gaussian blur, with one OpenCV idiom worth knowing: <code>cv2.addWeighted</code> computes $\beta_1 I_1 + \beta_2 I_2 + \gamma$ with saturation handling, so the whole formula $S = (1 + \alpha) I - \alpha (G_\sigma * I)$ fits in a single fused call.
+</p>
+
+<pre><code class="language-python">import cv2
+
+img = cv2.imread("cathedral.jpg")          # works per-channel on color too
+
+sigma, alpha = 2.0, 0.7                    # radius and amount
+
+blurred = cv2.GaussianBlur(img, (0, 0), sigma)
+
+# S = (1 + alpha) * img  -  alpha * blurred, saturated to [0, 255]
+sharp = cv2.addWeighted(img, 1 + alpha, blurred, -alpha, 0)
+
+cv2.imwrite("cathedral_sharp.jpg", sharp)
+# Visual check: edge transitions narrow from ~4 px to ~2 px;
+# flat sky regions are numerically unchanged (mask is ~0 there).</code></pre>
+<div class="code-caption">Unsharp masking in two OpenCV calls: a Gaussian blur and a fused weighted sum, with <code>addWeighted</code> handling the uint8 saturation that a naive NumPy subtraction would corrupt by wraparound.</div>
+
+<p>
+That saturation comment deserves a flag, because it is this section's most common bug in the wild. Computing <code>img - blurred</code> directly on uint8 arrays wraps negative values around to large positive ones (the dtype trap from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>), splattering bright garbage along every edge. Either use <code>addWeighted</code>, or cast to a signed or floating type before subtracting.
+</p>
+
+<h2>3. Sharpening as a Single Kernel <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Because blurring, subtracting, and scaling are all linear and shift-invariant, the entire unsharp pipeline must itself be a single convolution, and <a href="section-3.1.html">Section 3.1</a>'s algebra tells us how to find it. Writing $\delta$ for the identity (impulse) kernel:
+</p>
+<p>
+$$ S = (1+\alpha)\,I - \alpha\,(G_\sigma * I) = \big( (1+\alpha)\,\delta - \alpha\,G_\sigma \big) * I $$
+</p>
+<p>
+One kernel, applied once. If we replace the Gaussian with the smallest possible smoother and take $\alpha = 1$, the formula lands on the most famous sharpening kernel in existence, which the kernel gallery of <a href="section-3.1.html">Section 3.1</a> previewed:
+</p>
+<p>
+$$ \begin{bmatrix} 0 &amp; -1 &amp; 0 \\ -1 &amp; 5 &amp; -1 \\ 0 &amp; -1 &amp; 0 \end{bmatrix} \;=\; \delta \;-\; \begin{bmatrix} 0 &amp; 1 &amp; 0 \\ 1 &amp; -4 &amp; 1 \\ 0 &amp; 1 &amp; 0 \end{bmatrix} $$
+</p>
+<p>
+The matrix being subtracted is the <strong>Laplacian</strong> kernel, the discrete second derivative that <a href="section-3.4.html">Section 3.4</a> studies in depth. Subtracting the second derivative steepens transitions; this identity, $S = I - \nabla^2 I$, is the differential-equation view of sharpening, and it explains why the sharpen kernel's weights sum to 1 (brightness preserved) while the Laplacian's sum to 0 (responds only to change). The center value 5 is not arbitrary: it is $1 + 4$, the identity plus the Laplacian's center magnitude. The identity is not just an aesthetic observation; it is checkable in four lines, and checking it is a worthwhile habit whenever two filter pipelines are claimed to be equivalent.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+img = cv2.imread("cathedral.jpg", cv2.IMREAD_GRAYSCALE)
+
+kernel = np.array([[ 0, -1,  0],
+                   [-1,  5, -1],
+                   [ 0, -1,  0]], dtype=np.float32)
+one_pass = cv2.filter2D(img, -1, kernel)            # single-kernel sharpen
+
+# Two-step pipeline: compute the Laplacian, subtract it from the image.
+lap = cv2.Laplacian(img.astype(np.float32), cv2.CV_32F, ksize=1)
+two_step = np.clip(img.astype(np.float32) - lap, 0, 255).astype(np.uint8)
+
+print(np.abs(one_pass.astype(int) - two_step.astype(int)).max())
+# Expected output: 0   (bit-identical: the kernel IS identity minus Laplacian)</code></pre>
+<div class="code-caption">Verifying the kernel identity numerically: the famous center-5 sharpening kernel applied in one <code>filter2D</code> pass produces a bit-identical result to explicitly computing the Laplacian and subtracting it from the image.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sharpening Creates No Information</div>
+<p>Unsharp masking redistributes contrast that the sensor already captured; it cannot resurrect detail the optics never delivered. A truly out-of-focus image sharpened hard becomes a crisp-looking rendition of blur, with halos. Recovering lost detail requires modeling the blur and inverting it (deconvolution, <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>) or hallucinating statistically plausible detail with a generative model (<a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>). Knowing which of the three regimes a problem is in (enhance, invert, or generate) is a core practitioner judgment, and mislabeling it is how forensic teams end up testifying about "enhanced" license plates.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.filters.unsharp_mask in Practice</div>
+<p>Our blur-plus-<code>addWeighted</code> recipe, with its dtype caveats, is one call in scikit-image: <code>unsharp_mask(img, radius=2.0, amount=0.7)</code>. The reduction is modest in lines (roughly 6 to 1) but large in foot-guns avoided: the library converts to float internally, handles any input dtype without wraparound, processes multichannel images correctly via <code>channel_axis</code>, and clips the result back into the valid range. OpenCV alternatively offers <code>cv2.detailEnhance</code> for a stylized edge-aware boost built on the filters of <a href="section-3.5.html">Section 3.5</a>.</p>
+</div>
+
+<h2>4. The Fine Print: Halos, Noise, and Clipping <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The overshoot that creates sharpness becomes a visible artifact the moment it outgrows the edge it decorates. Three failure modes account for nearly all sharpening complaints in production, and all three are predictable from the formula.
+</p>
+<p>
+<strong>Halos.</strong> The over/undershoot of Figure 3.3.1 extends roughly $\sigma$ pixels to each side of an edge. With a large radius and strong amount, dark objects against bright skies grow glowing white outlines, the signature of over-processed HDR landscapes. The fix is almost always a smaller $\sigma$, not a smaller $\alpha$: halo width is set by the radius.
+</p>
+<p>
+<strong>Noise amplification.</strong> The mask $I - G_\sigma * I$ contains everything the blur removed, and <a href="section-3.2.html">Section 3.2</a> taught that high-frequency noise is the first thing any blur removes. Sharpening therefore amplifies noise preferentially, which is why camera pipelines denoise <em>before</em> sharpening, never after, and why sharpen sliders applied to high-ISO shots produce instant grain. Production implementations add a <strong>threshold</strong>: mask values with magnitude below a few gray levels are zeroed before the gain is applied, so smooth-region noise stays unamplified while real edges, whose mask values are large, pass through. The scikit-image and Photoshop implementations both expose this knob.
+</p>
+<p>
+<strong>Clipping.</strong> Overshoot near already-bright pixels saturates at 255 (and undershoot at 0), flattening highlight texture into white plateaus. Working in float and clipping once at the end, or sharpening the luminance channel only (in the color spaces of <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, to also avoid color fringing), contains the damage.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Marketplace That Sharpened Itself Into Returns</div>
+<p><strong>Who:</strong> The imaging platform team at a large second-hand fashion marketplace, processing about two million seller-uploaded photos per day.</p>
+<p><strong>Situation:</strong> An A/B test showed that mildly sharpened listing photos lifted click-through by 3 percent, so a global unsharp mask (radius 3, amount 1.5) was added to the upload pipeline.</p>
+<p><strong>Problem:</strong> Within weeks, returns citing "item looked different" rose measurably in the knitwear and silk categories. Investigation found two culprits: halos along garment silhouettes against the white photo-booth background made colors look oversaturated at the edges, and amplified sensor noise on dim phone photos read as fabric pilling. Buyers were, reasonably, judging texture from artifacts.</p>
+<p><strong>Decision:</strong> The team replaced the global setting with category-aware parameters (radius 1.2 for textiles), added a threshold of 4 gray levels so smooth fabric stayed smooth, sharpened only the luminance channel, and routed photos whose noise estimate (from a flat-patch variance probe) exceeded a bound through a denoiser first.</p>
+<p><strong>Result:</strong> The click-through gain survived (2.6 percent) while texture-related return complaints fell back to baseline within one quarter.</p>
+<p><strong>Lesson:</strong> Sharpening parameters are content decisions, not pipeline constants. The threshold parameter, absent from textbook formulas but present in every serious implementation, is the difference between enhancing detail and manufacturing it.</p>
+</div>
+
+<h2>5. High-Boost Filtering and Where Sharpening Goes Next <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A small generalization closes the classical story. <strong>High-boost filtering</strong> replaces the "1" multiplying the original image with a gain $A \ge 1$: $S = A \cdot I - G_\sigma * I$ (our unsharp mask is the case $A = 1 + \alpha$ rescaled). Values of $A$ slightly above 1 blend brightening with sharpening, a trick from the film era that occasionally still earns its keep on flat scans. More consequential for modern pipelines is <em>edge-aware</em> sharpening: replace the Gaussian in the mask with the bilateral or guided filter of <a href="section-3.5.html">Section 3.5</a>, and the mask stops swinging across strong edges, suppressing halos at their source. That construction, base layer plus boosted detail layer, is the backbone of HDR tone mapping and every "clarity" slider shipped in the last decade.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Sharpening Versus Hallucination</div>
+<p>The 2024-2026 restoration literature has largely left contrast redistribution behind and crossed into generation. SUPIR (Yu et al., CVPR 2024, arXiv:2401.13627) couples a 2.6-billion-parameter diffusion prior with degraded inputs to produce restorations whose "recovered" textures are synthesized, not measured; DiffBIR (ECCV 2024, arXiv:2308.15070) splits the job into a degradation-removal stage followed by a generative detail stage. The results can be spectacular and are categorically different from this section's mathematics: a diffusion restorer asked to sharpen a blurry face will invent a plausible face. For consumer photos that is often acceptable; for medical, forensic, and scientific imagery it is a correctness hazard, and the evaluation and governance frameworks of <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a> exist in part to police this exact boundary. Unsharp masking's great virtue in 2026 is that it provably cannot lie about anything the sensor did not record.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.3.1: Read the Kernel <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Using the identity $S = ((1+\alpha)\delta - \alpha G) * I$, derive the single $3 \times 3$ kernel for $\alpha = 2$ with the $3 \times 3$ box filter standing in for $G$. Verify that its weights sum to 1, identify which entries are negative and why, and predict (without computing) what this kernel does to a perfectly flat image and to a single-pixel impulse.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.3.2: Build the Threshold <span class="exercise-type coding">Coding</span></div>
+<p>Implement <code>unsharp_threshold(img, sigma, alpha, t)</code>: compute the float mask $I - G_\sigma * I$, zero all mask values with $|M| &lt; t$, then return $I + \alpha M$ clipped to [0, 255]. Test on a photo with visible sensor noise at $t \in \{0, 2, 4, 8\}$ and report, for each $t$, the standard deviation of a flat background patch and your visual judgment of edge crispness. Confirm the claim from this section that thresholding protects flat regions at minimal cost to edges.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.3.3: The Halo Budget <span class="exercise-type analysis">Analysis</span></div>
+<p>Create a synthetic image: a dark gray rectangle (value 60) on a light gray field (value 200). Apply unsharp masking across a grid of $\sigma \in \{1, 2, 4, 8\}$ and $\alpha \in \{0.5, 1, 2\}$, and for each result measure (a) the peak overshoot value adjacent to the edge and (b) the width in pixels of the overshoot region. Which parameter controls each measurement? Relate your findings to Figure 3.3.1 and state a practical rule for choosing $\sigma$ when halos must remain invisible at 100 percent zoom.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-3.2.html">&#8592; Section 3.2: Smoothing: Box, Gaussian &amp; Median Filters</a>
+<a href="index.html">Chapter 3</a>
+<a class="next" href="section-3.4.html">Section 3.4: Derivative Filters: Sobel, Laplacian &amp; LoG &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 3.2: Smoothing: Box, Gaussian &amp; Median Filters. Noise suppression by averaging, the Gaussian filter and its sigma, the nonlinear median filter for salt-and-pepper noise, and how to choose between them." name="description"/>
+<title>Section 3.2: Smoothing: Box, Gaussian &amp; Median Filters | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 3: Spatial Filtering &amp; Convolution</a></div>
+<h1>Smoothing: Box, Gaussian &amp; Median Filters</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My therapist says I average things out instead of confronting them. I told her that with enough neighbors, every problem regresses to the mean."</p>
+<cite>An Exceedingly Mellow Gaussian Filter</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Smoothing is a statistical bet: real scenes vary slowly across neighboring pixels while noise varies fast, so averaging neighbors keeps the scene and cancels the noise.</strong> This section develops the three smoothers every practitioner needs: the box filter (cheapest), the Gaussian (the principled default, and the most-executed filter in computer vision), and the median (a nonlinear order-statistic filter that does what no weighted average can). Smoothing is also the first move of nearly everything downstream: derivative filters in <a href="section-3.4.html">Section 3.4</a> fail on unsmoothed images, and the denoising story begun here grows into image restoration in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> and, astonishingly, into the training objective of diffusion models in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>.</p>
+</div>
+
+<p>
+The previous section built the sliding-window machinery and showed that the kernel weights determine the behavior. This section commits to the first and most common choice of weights: all of them positive, summing to one. Such kernels compute weighted averages, and weighted averages smooth. The question that separates a good smoother from a bad one is subtler than it looks: <em>which</em> average, over <em>which</em> neighborhood, and what happens to the parts of the image that are not noise?
+</p>
+
+<h2>1. Why Averaging Works: The Statistics of Noise <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Recall from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> where image noise comes from: photon shot noise, sensor read noise, and quantization, which together make each recorded pixel a noisy measurement of the true scene radiance. Model a pixel as $I(x,y) = s(x,y) + n(x,y)$, where $s$ is the clean signal and $n$ is zero-mean noise with standard deviation $\sigma_n$, independent across pixels. Averaging $N$ such measurements leaves the signal untouched (the average of $s$ is $s$, if $s$ is locally constant) while the noise standard deviation falls to $\sigma_n / \sqrt{N}$. A $3 \times 3$ average is nine measurements: noise drops by a factor of three. A $5 \times 5$ average drops it by five.
+</p>
+<p>
+That argument contains both the promise and the catch. The promise: noise reduction scales with the square root of the neighborhood size, for free, with nine numbers. The catch sits in the clause "if $s$ is locally constant." Real images are locally constant <em>almost</em> everywhere, but the exceptions, edges and fine texture, are precisely the parts that carry most of the visual information. Averaging across an edge mixes the two sides and produces blur. Every smoother in this section makes some version of this trade, and managing the trade is the art of denoising.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Smoothing Is a Bet on Smoothness</div>
+<p>Every averaging filter implicitly assumes the underlying scene varies more slowly than the noise. Where the assumption holds (skies, walls, skin), smoothing is nearly free noise reduction at a rate of $\sqrt{N}$. Where it fails (edges, text, texture), smoothing destroys signal at exactly the locations the eye cares about most. The history of denoising, from the Gaussian filter through the bilateral filter of <a href="section-3.5.html">Section 3.5</a> to learned denoisers, is the history of making this bet more selectively.</p>
+</div>
+
+<h2>2. The Box Filter <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The <strong>box filter</strong> (or mean filter) is the uniform average: every weight in a $k \times k$ kernel equals $1/k^2$. It is the filter we used to introduce correlation in <a href="section-3.1.html">Section 3.1</a>, it is the cheapest smoother in existence (Section <a href="section-3.6.html">3.6</a> shows it can run in constant time per pixel regardless of $k$, via running sums), and for casual noise knockdown it is fine. OpenCV exposes it as <code>cv2.blur</code>.
+</p>
+<p>
+But the box has a defect visible to the naked eye: it treats a pixel at the corner of the window as seriously as the center pixel, so the window's hard cutoff imprints itself on the output. Smoothed point lights become little squares, and repeated box filtering produces streaky, blocky artifacts. In the frequency-domain language of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, the box filter's spectrum rings: it fails to suppress some high frequencies while distorting mid frequencies. The fix is to let the weights taper smoothly with distance from the center, which is exactly the Gaussian.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bar charts comparing box filter weights, all equal, against Gaussian weights that taper smoothly from the center">
+  <text x="195" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Box: equal weights, hard cutoff</text>
+  <g fill="#3498db" stroke="#2980b9" stroke-width="1">
+    <rect x="60"  y="120" width="26" height="90"/>
+    <rect x="92"  y="120" width="26" height="90"/>
+    <rect x="124" y="120" width="26" height="90"/>
+    <rect x="156" y="120" width="26" height="90"/>
+    <rect x="188" y="120" width="26" height="90"/>
+    <rect x="220" y="120" width="26" height="90"/>
+    <rect x="252" y="120" width="26" height="90"/>
+    <rect x="284" y="120" width="26" height="90"/>
+    <rect x="316" y="120" width="26" height="90"/>
+  </g>
+  <line x1="50" y1="210" x2="352" y2="210" stroke="#2c3e50" stroke-width="2"/>
+  <text x="195" y="235" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">tap position (9-tap window)</text>
+  <text x="195" y="258" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">corner pixels count as much as the center</text>
+
+  <text x="585" y="30" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Gaussian: weights taper with distance</text>
+  <g fill="#27ae60" stroke="#1e8449" stroke-width="1">
+    <rect x="450" y="202" width="26" height="8"/>
+    <rect x="482" y="186" width="26" height="24"/>
+    <rect x="514" y="148" width="26" height="62"/>
+    <rect x="546" y="104" width="26" height="106"/>
+    <rect x="578" y="85"  width="26" height="125"/>
+    <rect x="610" y="104" width="26" height="106"/>
+    <rect x="642" y="148" width="26" height="62"/>
+    <rect x="674" y="186" width="26" height="24"/>
+    <rect x="706" y="202" width="26" height="8"/>
+  </g>
+  <path d="M 455 206 C 500 200, 530 120, 591 88 C 652 120, 682 200, 727 206"
+        fill="none" stroke="#145a32" stroke-width="2" stroke-dasharray="5,4"/>
+  <line x1="440" y1="210" x2="742" y2="210" stroke="#2c3e50" stroke-width="2"/>
+  <text x="585" y="235" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">tap position (9-tap window)</text>
+  <text x="585" y="258" font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">influence fades smoothly: no window imprint</text>
+</svg>
+<figcaption><strong>Figure 3.2.1</strong> Weight profiles of a 9-tap box filter (left) versus a Gaussian (right). The box's hard cutoff stamps window-shaped artifacts into the output; the Gaussian's smooth taper, following the dashed bell curve, leaves none.</figcaption>
+</figure>
+
+<h2>3. The Gaussian Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The <strong>Gaussian filter</strong> weights each neighbor by a bell curve over its distance from the center, as the right panel of Figure 3.2.1 shows:
+</p>
+<p>
+$$ G_\sigma(i, j) \;=\; \frac{1}{2\pi\sigma^2}\, \exp\!\left( -\,\frac{i^2 + j^2}{2\sigma^2} \right) $$
+</p>
+<p>
+The single parameter $\sigma$, the standard deviation in pixels, sets the smoothing scale: detail much finer than $\sigma$ is averaged away, structure much coarser survives. The kernel size is a separate, practical choice: since the bell decays fast, weights beyond about $3\sigma$ are negligible, and the standard recipe is a kernel of size $\lceil 6\sigma \rceil$ rounded up to the next odd integer. A $\sigma$ of 1.5 wants roughly an $11 \times 11$ kernel; pass <code>ksize=(0, 0)</code> to <code>cv2.GaussianBlur</code> and OpenCV computes this for you.
+</p>
+<p>
+Three properties make the Gaussian the default smoother of the field rather than just one option among many. First, it is the unique rotationally symmetric filter that is also <em>separable</em> (it factors into a horizontal pass followed by a vertical pass), which makes large-radius Gaussian smoothing cheap; <a href="section-3.6.html">Section 3.6</a> quantifies the speedup. Second, it <em>cascades</em> cleanly: blurring with $\sigma_1$ and then $\sigma_2$ equals one blur with $\sigma = \sqrt{\sigma_1^2 + \sigma_2^2}$, the property on which the scale spaces and image pyramids of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> are built. Third, it introduces no artifacts: smoothing with a wider Gaussian never creates structure that was not in the image, a guarantee (formalized in scale-space theory) that the box filter conspicuously lacks.
+</p>
+<p>
+Building the kernel from the formula is a five-line exercise, worth doing once to demystify it:
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def gaussian_kernel(size: int, sigma: float) -&gt; np.ndarray:
+    """Build a normalized 2D Gaussian kernel of odd size."""
+    ax = np.arange(size) - size // 2          # e.g. [-2,-1,0,1,2] for size 5
+    xx, yy = np.meshgrid(ax, ax)
+    k = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+    return k / k.sum()                         # normalize: weights sum to 1
+
+k = gaussian_kernel(5, sigma=1.0)
+print(k.round(3))
+# [[0.003 0.013 0.022 0.013 0.003]
+#  [0.013 0.06  0.098 0.06  0.013]
+#  [0.022 0.098 0.162 0.098 0.022]
+#  [0.013 0.06  0.098 0.06  0.013]
+#  [0.003 0.013 0.022 0.013 0.003]]
+img = cv2.imread("portrait.jpg", cv2.IMREAD_GRAYSCALE)
+smooth = cv2.filter2D(img, -1, k)              # apply with Section 3.1 machinery</code></pre>
+<div class="code-caption">Constructing a normalized $5 \times 5$ Gaussian kernel from the formula and applying it with <code>filter2D</code>; the printed weights show the center pixel contributing 16 percent and the corners 0.3 percent.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.GaussianBlur in Practice</div>
+<p>The twelve lines above (kernel construction plus application) are one library call: <code>cv2.GaussianBlur(img, (0, 0), sigmaX=1.0)</code>. Beyond the 12-to-1 reduction, the library version automatically chooses the kernel size from sigma, applies the filter <em>separably</em> (two cheap 1D passes instead of one expensive 2D pass, the optimization derived in <a href="section-3.6.html">Section 3.6</a>), uses fixed-point arithmetic on uint8 inputs, and handles borders and color channels. SciPy users get the same via <code>scipy.ndimage.gaussian_filter(img, sigma=1.0)</code>, which additionally supports per-axis sigmas.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Gaussian blur is one of the few image-processing operations with a fan base. It has its own Photoshop legend, an Instagram-era aesthetic ("bokeh-core"), and a starring role in nearly every "frosted glass" UI effect shipped since iOS 7. The same mathematics also describes heat diffusion: Gaussian-blurring an image is exactly what would happen if its brightness values were temperatures left to diffuse for a time proportional to $\sigma^2$.</p>
+</div>
+
+<h2>4. The Median Filter <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Now consider a different noise regime. Salt-and-pepper noise, from dead pixels, transmission glitches, or extreme sensor events, replaces isolated pixels with values near 0 or 255. Averaging is the <em>wrong</em> response: a single 255 outlier in a $3 \times 3$ window shifts the mean by up to 28 gray levels, smearing the corruption across the neighborhood instead of removing it. What you want is an estimator that ignores outliers entirely. Statistics has one ready: the median.
+</p>
+<p>
+The <strong>median filter</strong> replaces each pixel with the median of its window's values. As Figure 3.2.2 illustrates, an outlier in the window lands at the end of the sorted order and simply never gets selected; the output is an actual pixel value from the neighborhood majority. Up to half the window can be corrupted before the median breaks. Note what the median filter is not: it is not a weighted average, not linear, not expressible as any kernel. Our impulse-response analysis from <a href="section-3.1.html">Section 3.1</a> does not apply to it (filter an impulse and you get all zeros back, as the median of a window containing one bright pixel and eight black ones is black). It is the chapter's first genuinely nonlinear filter, the opening move of a theme that continues with the bilateral filter in <a href="section-3.5.html">Section 3.5</a>.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A window of pixel values containing one outlier is sorted; the median is selected and the outlier at the end of the sorted order is ignored">
+  <text x="180" y="32" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">window values (one hot pixel)</text>
+  <g font-family="monospace" font-size="14" text-anchor="middle">
+    <rect x="60"  y="50" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="84"  y="75" fill="#2c3e50">14</text>
+    <rect x="112" y="50" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="136" y="75" fill="#2c3e50">12</text>
+    <rect x="164" y="50" width="48" height="40" fill="#e74c3c" stroke="#922b21"/><text x="188" y="75" fill="#ffffff">255</text>
+    <rect x="216" y="50" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="240" y="75" fill="#2c3e50">15</text>
+    <rect x="268" y="50" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="292" y="75" fill="#2c3e50">13</text>
+  </g>
+  <path d="M 200 100 L 200 130" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow32)"/>
+  <text x="270" y="122" font-family="sans-serif" font-size="13" fill="#5a626c">sort</text>
+  <defs>
+    <marker id="arrow32" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+  </defs>
+  <text x="180" y="158" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">sorted order</text>
+  <g font-family="monospace" font-size="14" text-anchor="middle">
+    <rect x="60"  y="170" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="84"  y="195" fill="#2c3e50">12</text>
+    <rect x="112" y="170" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="136" y="195" fill="#2c3e50">13</text>
+    <rect x="164" y="170" width="48" height="40" fill="#27ae60" stroke="#145a32" stroke-width="2.5"/><text x="188" y="195" fill="#ffffff">14</text>
+    <rect x="216" y="170" width="48" height="40" fill="#eaf2f8" stroke="#90a4ae"/><text x="240" y="195" fill="#2c3e50">15</text>
+    <rect x="268" y="170" width="48" height="40" fill="#f5b7b1" stroke="#922b21"/><text x="292" y="195" fill="#7b241c">255</text>
+  </g>
+  <text x="188" y="232" font-family="sans-serif" font-size="13" fill="#145a32" text-anchor="middle" font-weight="bold">median: selected</text>
+  <text x="292" y="232" font-family="sans-serif" font-size="13" fill="#922b21" text-anchor="middle">outlier: never chosen</text>
+  <!-- right panel: mean comparison -->
+  <g font-family="sans-serif" fill="#2c3e50">
+    <text x="565" y="32" font-size="15" font-weight="bold" text-anchor="middle">mean vs median on this window</text>
+    <text x="430" y="80" font-size="14">mean&#160;&#160; = (14+12+255+15+13)/5 = 61.8</text>
+    <text x="430" y="106" font-size="14">median = 14</text>
+    <text x="430" y="150" font-size="13" fill="#5a626c">the mean smears the outlier across the</text>
+    <text x="430" y="170" font-size="13" fill="#5a626c">neighborhood; the median deletes it and</text>
+    <text x="430" y="190" font-size="13" fill="#5a626c">returns a value the neighborhood actually</text>
+    <text x="430" y="210" font-size="13" fill="#5a626c">contains.</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 3.2.2</strong> Why the median beats the mean on impulse noise. A 255 outlier in a window of values near 14 drags the mean to 61.8, but after sorting, the median selects 14 and the outlier is never chosen at all.</figcaption>
+</figure>
+
+<p>
+The experiment below corrupts an image with 5 percent salt-and-pepper noise and compares the two repair strategies head to head, scoring with PSNR (the fidelity metric from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>).
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(7)
+img = cv2.imread("lighthouse.png", cv2.IMREAD_GRAYSCALE)
+
+# Corrupt 5% of pixels: half to 0 (pepper), half to 255 (salt).
+noisy = img.copy()
+mask = rng.random(img.shape)
+noisy[mask &lt; 0.025] = 0
+noisy[mask &gt; 0.975] = 255
+
+gauss  = cv2.GaussianBlur(noisy, (5, 5), 1.0)   # linear repair attempt
+median = cv2.medianBlur(noisy, 5)               # order-statistic repair
+
+for name, result in [("noisy", noisy), ("gaussian", gauss), ("median", median)]:
+    print(f"{name:9s} PSNR = {cv2.PSNR(img, result):5.2f} dB")
+# Representative output:
+# noisy     PSNR = 15.21 dB
+# gaussian  PSNR = 26.88 dB   &lt;- outliers smeared, edges blurred
+# median    PSNR = 33.40 dB   &lt;- outliers deleted, edges intact</code></pre>
+<div class="code-caption">Head-to-head repair of 5 percent salt-and-pepper noise: <code>medianBlur</code> outscores Gaussian smoothing by more than 6 dB because it discards outliers instead of averaging them into their neighborhoods.</div>
+
+<p>
+Two practical notes on <code>cv2.medianBlur</code>. The kernel size must be odd, and for sizes above 5 the input must be 8-bit; OpenCV uses a constant-time histogram-based algorithm for uint8 that keeps large-window medians affordable. And because the median preserves sharp steps while flattening small fluctuations, heavy median filtering produces a distinctive posterized, "painted" look; that property is exploited deliberately by stylization apps, and is a clue that you have over-filtered when it appears by accident.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Dead-Pixel Harvest</div>
+<p><strong>Who:</strong> The perception team at an agricultural drone startup mapping crop stress from multispectral imagery.</p>
+<p><strong>Situation:</strong> Their per-field vegetation-index maps, thresholded into stress zones using methods from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, drove fertilizer prescriptions. After switching to a cheaper sensor for the new drone fleet, agronomists began reporting "confetti": thousands of single-pixel stress detections scattered uniformly across healthy fields.</p>
+<p><strong>Problem:</strong> The new sensor had a higher rate of hot and dead pixels, classic impulse noise. The team's existing cleanup, a Gaussian blur, did not remove the outliers; it diluted each one into a small soft blob that still crossed the stress threshold, while simultaneously blurring the genuine stress-zone boundaries the agronomists needed.</p>
+<p><strong>Decision:</strong> Replace the Gaussian with a $3 \times 3$ median filter applied to each spectral band before index computation, leaving all downstream thresholds untouched.</p>
+<p><strong>Result:</strong> False stress detections dropped by 97 percent in a validation set of 40 fields, and zone boundaries sharpened enough that prescription maps no longer needed manual cleanup. Processing cost rose by under 4 percent of the pipeline total.</p>
+<p><strong>Lesson:</strong> Match the filter to the noise model. Gaussian smoothing is the right tool for Gaussian-like noise; impulse noise calls for an order statistic. Diagnosing the noise type from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>'s sensor knowledge took the team an afternoon; the fix took one line.</p>
+</div>
+
+<h2>5. Choosing a Smoother <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Table 3.2.1 condenses the section into a decision aid. The columns reflect the three questions to ask of any smoothing job: what noise am I fighting, how much edge damage can I afford, and how fast must it run?
+</p>
+
+<table>
+<caption><strong>Table 3.2.1</strong> The three classical smoothers compared.</caption>
+<thead>
+<tr><th scope="col">Filter</th><th scope="col">Gaussian-like noise</th><th scope="col">Salt-and-pepper</th><th scope="col">Edge damage</th><th scope="col">Cost</th><th scope="col">Reach for it when</th></tr>
+</thead>
+<tbody>
+<tr><td>Box</td><td>Good</td><td>Poor (smears)</td><td>High, plus window artifacts</td><td>Lowest (O(1) per pixel possible)</td><td>Speed is everything and quality is negotiable</td></tr>
+<tr><td>Gaussian</td><td>Very good</td><td>Poor (smears)</td><td>Moderate, artifact-free</td><td>Low (separable)</td><td>Default pre-smoothing; scale-space work</td></tr>
+<tr><td>Median</td><td>Fair</td><td>Excellent</td><td>Low for small windows</td><td>Higher (sorting / histograms)</td><td>Impulse noise; edge-respecting cleanup</td></tr>
+</tbody>
+</table>
+
+<p>
+One pattern from the table is worth promoting to a habit: the Gaussian is the default <em>pre-filter</em>, not necessarily the final denoiser. Nearly every derivative computation in <a href="section-3.4.html">Section 3.4</a>, every detector in <a href="../../part-2-classical-computer-vision/module-09-edges-lines-curves/index.html">Chapter 9</a>, and every pyramid level in <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> begins with a Gaussian blur whose job is to set the analysis scale and tame noise before a more fragile operation runs. When the smoothed image is itself the product, and its edges matter, the median here and the edge-preserving filters of <a href="section-3.5.html">Section 3.5</a> take over.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: From Three Filters to One Network</div>
+<p>The choose-your-filter decision in Table 3.2.1 is itself being automated. All-in-one restoration models such as AdaIR (arXiv:2403.14614, ICLR 2025) handle noise, blur, rain, and haze in a single network that diagnoses the degradation and modulates its own frequency response per image, effectively learning the table above end to end. Plug-and-play methods like DPIR (arXiv:2008.13751) go the other direction, embedding a learned Gaussian denoiser as a drop-in module inside classical optimization loops. The deepest descendant of this section, developed in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>, is the diffusion model: a network trained to do nothing but denoise, applied iteratively until images emerge from pure noise. Smoothing, the humblest operation in vision, became generative AI's engine room.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.2.1: The Sigma Budget <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A pipeline blurs an image with $\sigma = 2$ and later blurs the result with $\sigma = 3$. Using the cascade property, what single Gaussian blur is equivalent? Why is the answer not $\sigma = 5$? Explain what this implies for an engineer who wants to add "just a little more" smoothing to an already-blurred image, and how the same property lets the pyramid construction of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> reuse work between levels.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.2.2: Break-Even Noise <span class="exercise-type coding">Coding</span></div>
+<p>Write a script that corrupts a test image with salt-and-pepper noise at densities 0.5%, 1%, 2%, 5%, 10%, and 20%, repairs each with <code>cv2.GaussianBlur</code> (try $\sigma \in \{0.8, 1.5\}$) and <code>cv2.medianBlur</code> (sizes 3 and 5), and plots PSNR versus density for all four repairs. At what density, if any, does the best Gaussian beat the worst median? Repeat with pure Gaussian noise ($\sigma_n = 15$) and describe how the ranking flips.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 3.2.3: The Median Is Not a Kernel <span class="exercise-type analysis">Analysis</span></div>
+<p>Prove by counterexample that no convolution kernel can reproduce the median filter: construct two small images $A$ and $B$ (as little as $1 \times 3$ each) such that $\mathrm{median}(A + B) \neq \mathrm{median}(A) + \mathrm{median}(B)$ for a 3-element window, violating the linearity that every kernel filter must satisfy. Then explain why the impulse-response characterization from <a href="section-3.1.html">Section 3.1</a> fails for the median even though feeding it an impulse produces a perfectly well-defined output.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-3.1.html">&#8592; Section 3.1: Convolution &amp; Correlation</a>
+<a href="index.html">Chapter 3</a>
+<a class="next" href="section-3.3.html">Section 3.3: Sharpening &amp; Unsharp Masking &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

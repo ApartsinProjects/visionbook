@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 5: Geometric Transformations &amp; Image Warping. The transformation hierarchy, homogeneous coordinates, interpolation kernels, inverse mapping, image registration, and a complete document scanner built from scratch." name="description"/>
+<title>Chapter 5: Geometric Transformations &amp; Image Warping | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a></div>
+<h1>Geometric Transformations &amp; Image Warping</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Translation, rotation, shear: cute warm-up acts. I have eight degrees of freedom and a vanishing point with your name on it."</p>
+<cite>A Grandiose Homography</cite>
+</blockquote>
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Point your phone at a restaurant receipt and tap the shutter. In well under a second, the app finds the paper, straightens the wild perspective of your hurried snapshot into a crisp rectangle, and hands you something that looks like it came out of a flatbed scanner. Sweep the same phone across a skyline and it stitches a dozen frames into one seamless panorama. Record a video while walking and stabilization quietly removes your footsteps from the footage. All three features, on every phone on Earth, are the same piece of mathematics: a small matrix that tells every pixel where to go, and a resampling routine that decides what value it carries when it gets there.
+</p>
+<p>
+This chapter builds that machinery from the ground up. We start with the question of <em>which</em> transformations exist: <a href="section-5.1.html">Section 5.1</a> lays out the hierarchy from translation through rigid, similarity, and affine maps up to the full projective homography, and shows that each level is defined by what it preserves rather than what it changes. <a href="section-5.2.html">Section 5.2</a> introduces homogeneous coordinates, the one weird trick that turns every transformation in the hierarchy into a single matrix multiplication, so that composing, inverting, and chaining warps becomes ordinary linear algebra.
+</p>
+<p>
+Knowing where a pixel goes is only half the job. Transformed coordinates almost never land on the integer grid, so <a href="section-5.3.html">Section 5.3</a> studies interpolation: the nearest-neighbor, bilinear, bicubic, and Lanczos kernels that read a value "between" pixels, and the aliasing traps that bite when you downscale. <a href="section-5.4.html">Section 5.4</a> then turns the theory into an executable algorithm, inverse mapping, and generalizes it to arbitrary pixel-level remapping: lens undistortion, fisheye correction, and the differentiable <code>grid_sample</code> operation that deep networks use to warp feature maps.
+</p>
+<p>
+The final third of the chapter asks where transformations come from when nobody hands them to you. <a href="section-5.5.html">Section 5.5</a> covers image registration: estimating the transform that aligns two images, by phase correlation, by direct intensity optimization, and by matching feature points with RANSAC playing referee. <a href="section-5.6.html">Section 5.6</a> closes the loop with a complete worked project, a document scanner built from scratch, that exercises every idea in the chapter in about a hundred lines of Python.
+</p>
+<p>
+This chapter also opens one of the book's longest story arcs. The homography you meet here returns wearing a camera model in <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>, drives stereo and structure-from-motion in <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapters 13</a> and <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">14</a>, and quietly underlies neural scene representations in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>. The same warps, applied with random parameters, become the geometric data augmentation that trains every modern vision model in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
+</p>
+</div>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every geometric operation on an image decomposes into exactly two questions: where does each pixel go, and what value does it take when it lands between grid points?</strong> The first question is answered by a transformation model (a matrix, once coordinates are homogeneous); the second by an interpolation kernel. Keep the two concerns separate in your head and every warping API, bug, and artifact in this chapter becomes legible.</p>
+</div>
+<div class="objectives">
+<h3>Learning Objectives</h3>
+<ul>
+<li>Classify planar transformations into the translation, rigid, similarity, affine, and projective families, and choose the smallest model a problem permits.</li>
+<li>Build, compose, and invert transformations as 3&times;3 matrices using homogeneous coordinates.</li>
+<li>Explain and implement nearest, bilinear, bicubic, and Lanczos interpolation, and pick the right one for upscaling, downscaling, and label maps.</li>
+<li>Implement inverse-mapping warps from scratch and use <code>cv2.remap</code> and <code>torch.nn.functional.grid_sample</code> for arbitrary and differentiable warping.</li>
+<li>Register two images using phase correlation, ECC intensity alignment, and ORB features with RANSAC homography estimation.</li>
+<li>Assemble the full pipeline into a working document scanner: page detection, corner ordering, perspective rectification, and binarization.</li>
+</ul>
+</div>
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+You should be comfortable with images as NumPy arrays and with pixel coordinate conventions from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1: Digital Image Fundamentals</a>, since this chapter manipulates coordinates relentlessly. <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3: Spatial Filtering &amp; Convolution</a> supplies two ideas we lean on directly: convolution (interpolation is convolution with a reconstruction kernel) and border-handling policy. <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a> explains sampling, Nyquist, and aliasing, which is the theory behind every downscaling artifact in Section 5.3, and the Fourier shift theorem behind phase correlation in Section 5.5. If your Python environment is not yet set up, start at <a href="../module-00-python-imaging-stack/index.html">Chapter 0: Foundations: The Python Imaging Stack</a>.
+</p>
+</div>
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num"><a href="section-5.1.html">5.1</a></span>
+<span class="section-title"><a href="section-5.1.html">The Transformation Hierarchy: Translation to Projective</a></span>
+<span class="section-desc">The five-level family tree of planar transforms, what each level preserves, and how to pick the smallest model that fits your geometry.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-5.2.html">5.2</a></span>
+<span class="section-title"><a href="section-5.2.html">Homogeneous Coordinates &amp; Transformation Matrices</a></span>
+<span class="section-desc">The extra coordinate that makes translation linear, turns composition into matrix multiplication, and gives points at infinity a street address.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-5.3.html">5.3</a></span>
+<span class="section-title"><a href="section-5.3.html">Interpolation: Nearest, Bilinear, Bicubic &amp; Lanczos</a></span>
+<span class="section-desc">What value lands on a fractional coordinate: the four classic kernels, their sharpness-versus-ringing trade-offs, and the downscaling aliasing trap.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-5.4.html">5.4</a></span>
+<span class="section-title"><a href="section-5.4.html">Warping, Remapping &amp; Inverse Mapping</a></span>
+<span class="section-desc">How warps actually execute: iterate over the output, pull from the input; plus cv2.remap for lens undistortion and differentiable grid_sample.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-5.5.html">5.5</a></span>
+<span class="section-title"><a href="section-5.5.html">Image Registration &amp; Alignment</a></span>
+<span class="section-desc">Estimating the transform from the images themselves: phase correlation, ECC intensity alignment, and feature matching with RANSAC.</span>
+</li>
+<li>
+<span class="section-num"><a href="section-5.6.html">5.6</a></span>
+<span class="section-title"><a href="section-5.6.html">Worked Example: A Document Scanner from Scratch</a></span>
+<span class="section-desc">A complete project that exercises the whole chapter: detect the page, order its corners, rectify the perspective, and binarize the result.</span>
+</li>
+</ul>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The first "office document scanner" most people ever owned was a phone app, and the core of it predates digital photography entirely. The projective geometry that unwarps your receipt was worked out in the 1800s for perspective drawing and cartography; the RANSAC algorithm that makes panorama stitching robust was published in 1981, the same year as the bicubic interpolation paper. Your camera app is largely a museum of very good ideas.</p>
+</div>
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+With geometry under control, the book turns from <em>where pixels sit</em> to <em>what shapes they form</em>. <a href="../module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a> picks up exactly where the document scanner leaves off: once an image is binarized, a compact algebra of erosions and dilations cleans noise, fills gaps, separates touching objects, and measures shape. The scanner you build in Section 5.6 will hand its thresholded output straight to those tools.
+</p>
+</div>
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Keys, R. "Cubic Convolution Interpolation for Digital Image Processing." IEEE TASSP (1981). <a href="https://ieeexplore.ieee.org/document/1163711" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">The paper behind every "bicubic" dropdown. Derives the piecewise-cubic kernel and the free parameter $a$ whose different defaults still cause cross-library mismatches today (Section 5.3).</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Fischler, M. and Bolles, R. "Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography." Communications of the ACM (1981). <a href="https://dl.acm.org/doi/10.1145/358669.358692" target="_blank" rel="noopener">ACM Digital Library</a></div>
+<p class="bib-annotation">The original RANSAC paper. Forty years on, it is still the default robust estimator inside <code>cv2.findHomography</code> and nearly every registration pipeline (Section 5.5).</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Evangelidis, G. and Psarakis, E. "Parametric Image Alignment Using Enhanced Correlation Coefficient Maximization." IEEE TPAMI (2008). <a href="https://ieeexplore.ieee.org/document/4515873" target="_blank" rel="noopener">IEEE Xplore</a></div>
+<p class="bib-annotation">The ECC algorithm exposed as <code>cv2.findTransformECC</code>: direct intensity-based alignment that is invariant to photometric gain and bias, ideal for cross-band and cross-exposure registration.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Jaderberg, M., Simonyan, K., Zisserman, A., and Kavukcuoglu, K. "Spatial Transformer Networks." NeurIPS (2015). <a href="https://arxiv.org/abs/1506.02025" target="_blank" rel="noopener">arXiv:1506.02025</a></div>
+<p class="bib-annotation">Made warping differentiable and put a learnable geometric transform inside a neural network. The <code>grid_sample</code> operation of Section 5.4 is its direct legacy.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">DeTone, D., Malisiewicz, T., and Rabinovich, A. "Deep Image Homography Estimation." (2016). <a href="https://arxiv.org/abs/1606.03798" target="_blank" rel="noopener">arXiv:1606.03798</a></div>
+<p class="bib-annotation">The first widely cited deep network that regresses a homography directly from an image pair, the ancestor of today's learned registration models.</p>
+</div>
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Hartley, R. and Zisserman, A. "Multiple View Geometry in Computer Vision." Cambridge University Press, 2nd ed. (2004). <a href="https://www.robots.ox.ac.uk/~vgg/hzbook/" target="_blank" rel="noopener">Book website</a></div>
+<p class="bib-annotation">The definitive reference on projective geometry, homographies, and robust estimation. Chapters 2 and 4 formalize everything Sections 5.1 and 5.2 introduce intuitively.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. "Computer Vision: Algorithms and Applications." Springer, 2nd ed. (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">Free online edition</a></div>
+<p class="bib-annotation">Chapter 3 (image processing) and Chapter 8 (image alignment and stitching) cover this chapter's material with extensive references; free PDF from the author's site.</p>
+</div>
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV: Geometric Image Transformations (imgproc module). <a href="https://docs.opencv.org/4.x/da/d54/group__imgproc__transform.html" target="_blank" rel="noopener">Official API reference</a></div>
+<p class="bib-annotation">The authoritative documentation for <code>warpAffine</code>, <code>warpPerspective</code>, <code>remap</code>, <code>resize</code>, and the interpolation flags used throughout this chapter.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">scikit-image: <code>skimage.transform</code> API. <a href="https://scikit-image.org/docs/stable/api/skimage.transform.html" target="_blank" rel="noopener">Official documentation</a></div>
+<p class="bib-annotation">A clean, NumPy-native alternative: <code>EuclideanTransform</code>, <code>SimilarityTransform</code>, <code>AffineTransform</code>, and <code>ProjectiveTransform</code> classes mirror Section 5.1's hierarchy one-to-one.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kornia: differentiable geometry for PyTorch. <a href="https://kornia.readthedocs.io/en/stable/geometry.html" target="_blank" rel="noopener">kornia.geometry documentation</a></div>
+<p class="bib-annotation">GPU-batched, autograd-compatible versions of nearly every operation in this chapter, from <code>warp_perspective</code> to RANSAC, used when warps must live inside a training loop.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">torchvision: Transforming and augmenting images (v2 transforms). <a href="https://pytorch.org/vision/stable/transforms.html" target="_blank" rel="noopener">Official documentation</a></div>
+<p class="bib-annotation">Where this chapter's geometric transforms reappear as data augmentation; note the <code>antialias</code> parameter discussed in Section 5.3.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">imutils: convenience functions for OpenCV. <a href="https://github.com/PyImageSearch/imutils" target="_blank" rel="noopener">GitHub repository</a></div>
+<p class="bib-annotation">Home of <code>four_point_transform</code>, the three-line library equivalent of the document scanner's rectification stage (Section 5.6).</p>
+</div>
+<h3>Tutorials</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV-Python Tutorials: Geometric Transformations of Images. <a href="https://docs.opencv.org/4.x/da/d6e/tutorial_py_geometric_transformations.html" target="_blank" rel="noopener">Official tutorial</a></div>
+<p class="bib-annotation">A gentle, code-first walkthrough of resize, rotate, affine, and perspective warps; a good companion while reading Sections 5.1 through 5.4.</p>
+</div>
+<h3>Recent Research (2024-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Edstedt, J. et al. "RoMa: Robust Dense Feature Matching." CVPR (2024). <a href="https://arxiv.org/abs/2305.15404" target="_blank" rel="noopener">arXiv:2305.15404</a></div>
+<p class="bib-annotation">State-of-the-art dense matching that survives extreme viewpoint and illumination change; the modern feature-based front end for the registration problems of Section 5.5.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Leroy, V., Cabon, Y., and Revaud, J. "Grounding Image Matching in 3D with MASt3R." ECCV (2024). <a href="https://arxiv.org/abs/2406.09756" target="_blank" rel="noopener">arXiv:2406.09756</a></div>
+<p class="bib-annotation">Treats two-view matching as a 3D reconstruction problem and delivers calibrated-quality correspondences from uncalibrated image pairs, foreshadowing the geometry of Chapters 12 through 14.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, J. et al. "DocRes: A Generalist Model Toward Unifying Document Image Restoration Tasks." CVPR (2024). <a href="https://arxiv.org/abs/2405.04408" target="_blank" rel="noopener">arXiv:2405.04408</a></div>
+<p class="bib-annotation">One model for dewarping, deshadowing, and appearance enhancement of documents; the learned successor to the homography-based scanner of Section 5.6.</p>
+</div>
+</section>
+<nav class="chapter-nav">
+<a class="prev" href="../module-04-frequency-domain-multiscale/index.html"><span class="nav-label">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="up" href="../index.html"><span class="nav-label">Part I: Image Processing</span></a>
+<a class="next" href="section-5.1.html"><span class="nav-label">Section 5.1: The Transformation Hierarchy</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

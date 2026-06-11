@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.3: Interpolation: Nearest, Bilinear, Bicubic &amp; Lanczos. How to read a pixel value at a fractional coordinate, the four classic kernels and their trade-offs, and the aliasing trap when downscaling." name="description"/>
+<title>Section 5.3: Interpolation: Nearest, Bilinear, Bicubic &amp; Lanczos | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a></div>
+<h1>Interpolation: Nearest, Bilinear, Bicubic &amp; Lanczos</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"People ask what lies between two pixels. I have four answers, ranked by how long you are willing to wait for them."</p>
+<cite>A Perfectionist Bicubic Interpolator</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Interpolation is the act of reconstructing a continuous image from discrete samples just long enough to read one value off it, and every interpolation method is just convolution with a different reconstruction kernel.</strong> Nearest neighbor, bilinear, bicubic, and Lanczos are four points on a single dial that trades blockiness against blur against ringing against compute. There is no universally best setting, but there are well-understood right choices for each job, and one famous trap (downscaling without an anti-alias filter) that this section will teach you to never fall into.</p>
+</div>
+<p>
+The previous section gave us matrices that move pixel coordinates anywhere we like, and therein lies the problem: "anywhere" is almost never an integer grid position. Rotate an image by 15 degrees and the pixel that should land at output position $(83, 41)$ comes from input position $(74.38, 52.91)$, where no sample exists. The image, as established in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, is a grid of point samples of a continuous light field; between the samples there is officially nothing. Interpolation manufactures the missing value, and the way it does so determines how sharp, how smooth, and how honest your warped image is.
+</p>
+<h2>1. Interpolation Is Convolution <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Every method in this section fits one formula. To estimate the image value at fractional position $x$ (we work in 1D first; 2D is two nested applications), place a kernel $k$ at $x$ and take a weighted sum of the nearby samples $f[i]$:
+</p>
+$$
+\hat{f}(x) \;=\; \sum_{i} f[i]\; k(x - i)
+$$
+<p>
+This is exactly the convolution machinery of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, evaluated at a non-integer location. The kernel's <em>support</em> (how many samples it touches) sets the cost; the kernel's <em>shape</em> sets the quality. Sampling theory from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> tells us the ideal reconstruction kernel for a band-limited signal is the infinite sinc function; everything in practice is a cheap, finite approximation to that ideal, and each approximation fails in its own characteristic way.
+</p>
+<p>
+Figure 5.3.1 plots the four kernels we cover. Keep it in view as you read: nearly every visual artifact in resized images can be diagnosed by looking at the shape of the kernel that produced it.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Four interpolation kernels plotted side by side: nearest box, linear tent, cubic with small negative lobes, Lanczos windowed sinc with larger oscillating lobes">
+<style>
+.pn { fill: #fafbfc; stroke: #d0d7de; stroke-width: 1; }
+.axis { stroke: #b6bec7; stroke-width: 1; }
+.krv { fill: none; stroke: #2563eb; stroke-width: 2.4; }
+.zero { stroke: #e5e7eb; stroke-width: 1; }
+.cap { font-family: Verdana, Arial, sans-serif; font-size: 13.5px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.sub2 { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #6b7280; text-anchor: middle; }
+.neg { font-family: Verdana, Arial, sans-serif; font-size: 10.5px; fill: #ef4444; text-anchor: middle; }
+</style>
+<!-- Panel 1: Nearest (box) -->
+<rect class="pn" x="15" y="15" width="210" height="230"/>
+<line class="axis" x1="25" y1="200" x2="215" y2="200"/>
+<line class="axis" x1="120" y1="35" x2="120" y2="230"/>
+<polyline class="krv" points="35,200 96,200 96,80 144,80 144,200 205,200"/>
+<text class="cap" x="120" y="272">Nearest (box)</text>
+<text class="sub2" x="120" y="292">support 1 &#183; piecewise constant</text>
+<!-- Panel 2: Linear (tent) -->
+<rect class="pn" x="245" y="15" width="210" height="230"/>
+<line class="axis" x1="255" y1="200" x2="445" y2="200"/>
+<line class="axis" x1="350" y1="35" x2="350" y2="230"/>
+<polyline class="krv" points="265,200 302,200 350,80 398,200 435,200"/>
+<text class="cap" x="350" y="272">Linear (tent)</text>
+<text class="sub2" x="350" y="292">support 2 &#183; continuous, kinked</text>
+<!-- Panel 3: Cubic -->
+<rect class="pn" x="475" y="15" width="210" height="230"/>
+<line class="axis" x1="485" y1="200" x2="675" y2="200"/>
+<line class="axis" x1="580" y1="35" x2="580" y2="230"/>
+<path class="krv" d="M 495,200 Q 510,212 532,206 Q 552,200 562,140 Q 572,84 580,80 Q 588,84 598,140 Q 608,200 628,206 Q 650,212 665,200" fill="none"/>
+<text class="neg" x="524" y="226">negative lobe</text>
+<text class="cap" x="580" y="272">Cubic (Keys)</text>
+<text class="sub2" x="580" y="292">support 4 &#183; smooth, mild overshoot</text>
+<!-- Panel 4: Lanczos -->
+<rect class="pn" x="705" y="15" width="210" height="230"/>
+<line class="axis" x1="715" y1="200" x2="905" y2="200"/>
+<line class="axis" x1="810" y1="35" x2="810" y2="230"/>
+<path class="krv" d="M 720,200 Q 728,193 736,200 Q 746,212 758,202 Q 770,190 780,140 Q 794,82 810,80 Q 826,82 840,140 Q 850,190 862,202 Q 874,212 884,200 Q 892,193 900,200" fill="none"/>
+<text class="neg" x="757" y="232">oscillating lobes</text>
+<text class="cap" x="810" y="272">Lanczos (windowed sinc)</text>
+<text class="sub2" x="810" y="292">support 6-8 &#183; sharpest, can ring</text>
+</svg>
+<figcaption><strong>Figure 5.3.1:</strong> The four classic reconstruction kernels (1D profiles; 2D versions are products of two 1D copies). Left to right, the kernels grow wider and better approximate the ideal sinc: the box ignores distance entirely, the tent weighs neighbors linearly, the cubic adds curvature and small negative lobes, and the windowed sinc of Lanczos oscillates around zero. The negative lobes are what create both extra sharpness and ringing artifacts near edges.</figcaption>
+</figure>
+<h2>2. The Four Kernels <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<h3>2.1 Nearest neighbor: just copy</h3>
+<p>
+The box kernel assigns the value of whichever sample is closest: $\hat{f}(x) = f[\mathrm{round}(x)]$. It is the fastest possible method, introduces no new values, and looks terrible on photographs: diagonal edges become staircases and smooth gradients become bands. Yet it is the <em>only correct choice</em> for one important class of images: label maps and masks. A segmentation mask containing class IDs $\{0, 1, 2\}$ must never be bilinearly resized, because averaging class 0 (background) with class 2 (vehicle) produces class 1 (pedestrian) along every boundary, a phantom-class bug that has burned countless practitioners and will matter again when we resize masks in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>.
+</p>
+<h3>2.2 Bilinear: the workhorse</h3>
+<p>
+The tent kernel performs linear interpolation between the two bracketing samples; applied along both axes it reads four neighbors and blends them by area. If the fractional position within the $2 \times 2$ cell is $(a, b)$ with $a, b \in [0, 1)$:
+</p>
+$$
+\hat{f} \;=\; (1-a)(1-b)\,f_{00} \;+\; a(1-b)\,f_{10} \;+\; (1-a)b\,f_{01} \;+\; ab\,f_{11}
+$$
+<p>
+Each sample's weight is the area of the sub-rectangle <em>diagonally opposite</em> it, a picture worth drawing once in your notebook and never forgetting. Bilinear is continuous (no blocking), cheap (4 reads, 3 multiply-adds per channel), and slightly blurry, since the tent kernel attenuates high frequencies noticeably. It is the default interpolation in most libraries and in nearly all real-time and GPU work; texture units in graphics hardware implement it in silicon.
+</p>
+<h3>2.3 Bicubic: the photographer's default</h3>
+<p>
+The cubic convolution kernel of Keys (1981) reads a $4 \times 4$ neighborhood and fits a smooth piecewise-cubic curve. The 1D kernel, parameterized by $a$:
+</p>
+$$
+k(t) =
+\begin{cases}
+(a+2)|t|^3 - (a+3)|t|^2 + 1 &amp; |t| \le 1 \\
+a|t|^3 - 5a|t|^2 + 8a|t| - 4a &amp; 1 &lt; |t| &lt; 2 \\
+0 &amp; \text{otherwise}
+\end{cases}
+$$
+<p>
+The negative lobes visible in Figure 5.3.1 give bicubic its mild edge-enhancing quality: output values can <em>overshoot</em> the input range slightly, which reads as sharpness. The parameter $a$ tunes the lobe depth, and here hides a notorious cross-library gotcha: <strong>OpenCV uses $a = -0.75$ while Pillow uses $a = -0.5$</strong> (the value Keys derived as optimal). "Bicubic" therefore names two different filters depending on which library resized your image, and the pixel differences are large enough to shift the metrics of trained models, as the research-frontier callout below recounts.
+</p>
+<h3>2.4 Lanczos: the archivist's choice</h3>
+<p>
+The Lanczos kernel is the ideal sinc multiplied by a window that tapers it to zero after $a$ lobes:
+</p>
+$$
+L(t) = \begin{cases}
+\operatorname{sinc}(t)\,\operatorname{sinc}(t/a) &amp; |t| &lt; a \\
+0 &amp; \text{otherwise}
+\end{cases}
+\qquad \operatorname{sinc}(t) = \frac{\sin(\pi t)}{\pi t}
+$$
+<p>
+OpenCV's <code>INTER_LANCZOS4</code> uses $a = 4$ (an $8 \times 8$ neighborhood); Pillow's <code>LANCZOS</code> uses $a = 3$. This is the closest practical approximation to the ideal reconstruction filter of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and it preserves fine detail best on upscales. The price is ringing: those oscillating negative lobes can paint faint halos around high-contrast edges, conspicuous around text and graphics. Photographic archives and astronomy pipelines accept the halos for the detail; user-interface code usually does not.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Negative Lobes Are Both the Sharpness and the Ringing</div>
+<p>The progression nearest &#8594; bilinear &#8594; bicubic &#8594; Lanczos is the progression of better sinc approximations, and the sinc has negative lobes. Kernels without them (box, tent) can only average, so they can only blur. Kernels with them can locally subtract, which restores edge contrast but also overshoots into halos. Sharpness and ringing are not separate properties to optimize independently; they are the same lobes seen from two sides. Choosing an interpolation method <em>is</em> choosing how much of one you will trade for the other.</p>
+</div>
+<h2>3. Implementing Bilinear From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The bilinear sampler below is the heart of every warp we write in this chapter; <a href="section-5.4.html">Section 5.4</a> will call it on millions of coordinates at once, so we write it vectorized from the start. It accepts <em>arrays</em> of fractional coordinates and returns sampled values, grayscale for clarity:
+</p>
+<pre><code class="language-python">import numpy as np
+
+def bilinear_sample(img, xs, ys):
+    """Sample a grayscale image at fractional coords (vectorized).
+
+    img: (H, W) float array.  xs, ys: arrays of x and y coordinates.
+    Returns an array shaped like xs with interpolated values.
+    """
+    h, w = img.shape
+    x0 = np.clip(np.floor(xs).astype(int), 0, w - 2)   # left column
+    y0 = np.clip(np.floor(ys).astype(int), 0, h - 2)   # top row
+    a = np.clip(xs - x0, 0.0, 1.0)                     # horizontal fraction
+    b = np.clip(ys - y0, 0.0, 1.0)                     # vertical fraction
+
+    f00 = img[y0,     x0    ]                          # top-left
+    f10 = img[y0,     x0 + 1]                          # top-right
+    f01 = img[y0 + 1, x0    ]                          # bottom-left
+    f11 = img[y0 + 1, x0 + 1]                          # bottom-right
+
+    return ((1 - a) * (1 - b) * f00 + a * (1 - b) * f10
+            + (1 - a) * b * f01 + a * b * f11)
+
+# Sanity check on a tiny ramp image: value at (0.5, 0.5) should be
+# the average of the four corner samples 0, 1, 10, 11 = 5.5
+ramp = np.array([[0., 1.], [10., 11.]])
+print(bilinear_sample(ramp, np.array([0.5]), np.array([0.5])))
+</code></pre>
+<div class="code-caption"><strong>Code 5.3.1:</strong> A vectorized bilinear sampler in 14 effective lines. The <code>clip</code> calls implement a "replicate border" policy at the image edge; Section 5.4 discusses border modes properly.</div>
+<pre class="code-output">[5.5]
+</pre>
+<div class="code-caption"><strong>Output 5.3.1a:</strong> The center of a 2&times;2 cell weighs all four corners equally, so the result is their mean, confirming the weight formula.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.resize Does All Four Kernels in One Line</div>
+<p>Our sampler plus a bicubic and a Lanczos variant would run to 60+ lines of NumPy, and a fast version (fixed-point weights, SIMD, multi-threading, multi-channel) to far more. <strong>OpenCV</strong> exposes the entire menu through one function and one flag:</p>
+<pre><code class="language-python">small = cv2.resize(img, (640, 480), interpolation=cv2.INTER_AREA)     # downscale
+big   = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)  # upscale
+</code></pre>
+<div class="code-caption"><strong>Code 5.3.3:</strong> The two resize calls that cover 95 percent of practice: area averaging for shrinking, bicubic for enlarging.</div>
+<p>That is roughly 60 lines reduced to 1 per call. Internally OpenCV precomputes per-row kernel weights in fixed-point arithmetic, vectorizes with SIMD intrinsics, parallelizes across rows, and (for <code>INTER_AREA</code>) switches to the pixel-area averaging that makes downscales alias-free. For training pipelines, <code>torchvision.transforms.Resize(..., antialias=True)</code> is the GPU-batched equivalent.</p>
+</div>
+<h2>4. Comparing the Kernels in Practice <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+A fair comparison needs ground truth, so we use the classic protocol: shrink an image, blow it back up with each method, and measure fidelity to the original with PSNR (introduced in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>):
+</p>
+<pre><code class="language-python">import cv2, time
+
+img = cv2.imread("detail_rich.jpg", cv2.IMREAD_GRAYSCALE)  # 1024 x 1024
+small = cv2.resize(img, None, fx=0.25, fy=0.25,
+                   interpolation=cv2.INTER_AREA)           # clean 4x shrink
+
+flags = {"nearest":  cv2.INTER_NEAREST,
+         "bilinear": cv2.INTER_LINEAR,
+         "bicubic":  cv2.INTER_CUBIC,
+         "lanczos4": cv2.INTER_LANCZOS4}
+
+for name, flag in flags.items():
+    t0 = time.perf_counter()
+    up = cv2.resize(small, img.shape[::-1], interpolation=flag)
+    dt = (time.perf_counter() - t0) * 1000
+    print(f"{name:9s}  PSNR {cv2.PSNR(img, up):5.2f} dB   {dt:5.1f} ms")
+</code></pre>
+<div class="code-caption"><strong>Code 5.3.2:</strong> The shrink-then-restore benchmark: each kernel upscales the same 4&times;-reduced image back to its original size and is scored against the original.</div>
+<pre class="code-output">nearest    PSNR 26.94 dB     0.8 ms
+bilinear   PSNR 30.11 dB     1.6 ms
+bicubic    PSNR 31.07 dB     3.9 ms
+lanczos4   PSNR 31.32 dB     9.7 ms
+</pre>
+<div class="code-caption"><strong>Output 5.3.2a:</strong> Representative numbers from a detail-rich 1024&times;1024 test photo (your values will shift with image content and hardware, the ordering will not). Each quality step costs roughly 2&times; the compute of the previous one, and the bicubic-to-Lanczos gain is small on most natural images.</div>
+<p>
+The pattern in Output 5.3.2a generalizes well: bilinear over nearest is a large, cheap win; bicubic over bilinear is a modest win photographers care about; Lanczos over bicubic is a subtle win that matters mostly for archival upscales and text. Table 5.3.1 summarizes the decision space, including the two special-purpose rows that the benchmark cannot show.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 5.3.1:</strong> <em>Choosing an interpolation method.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">Neighborhood</th><th scope="col">Character</th><th scope="col">Use it for</th></tr>
+</thead>
+<tbody>
+<tr><td>Nearest</td><td>1&times;1</td><td>blocky, value-preserving</td><td>label maps, masks, pixel art</td></tr>
+<tr><td>Bilinear</td><td>2&times;2</td><td>smooth, slightly soft</td><td>real-time warps, GPU pipelines, default</td></tr>
+<tr><td>Bicubic</td><td>4&times;4</td><td>sharper, mild overshoot</td><td>photo editing, moderate upscales</td></tr>
+<tr><td>Lanczos</td><td>6&times;6 / 8&times;8</td><td>sharpest, can ring</td><td>archival upscales, fine detail, text</td></tr>
+<tr><td>Area (<code>INTER_AREA</code>)</td><td>scale-dependent</td><td>alias-free averaging</td><td><strong>any downscale</strong></td></tr>
+</tbody>
+</table>
+</div>
+<h2>5. The Downscaling Trap <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Everything so far assumed we are reading values <em>between</em> samples, upscaling or warping at roughly constant scale. Downscaling is a different physics problem. Shrinking an image by 8&times; means the new sampling grid is 8&times; coarser, and the sampling theorem from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> is unambiguous: frequencies above the new, lower Nyquist limit must be removed <em>before</em> resampling, or they will fold back as aliasing. A bilinear or bicubic kernel evaluated at the new sample positions still only reads 2 or 4 input pixels per axis; at an 8&times; shrink it simply skips over 6 of every 8 pixels, and the skipped detail reappears as moiré patterns, shimmering textures, and crawling edges.
+</p>
+<p>
+The correct procedure is to low-pass filter to the new band limit, then sample, and good libraries fuse the two: <code>cv2.INTER_AREA</code> averages the source pixels covered by each destination pixel, while <code>torchvision</code>'s <code>antialias=True</code> stretches the reconstruction kernel by the scale factor. The same idea, executed octave by octave, is the Gaussian pyramid from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Whenever you shrink by more than about 2&times; with anything other than these, you are aliasing, whether you notice it or not.
+</p>
+<div class="callout warning">
+<div class="callout-title">Warning: "It Looks Fine" Is Not Evidence</div>
+<p>Aliasing from careless downscaling can be invisible in a single thumbnail and still poison downstream systems: it shifts feature statistics, adds phantom textures that confuse matching (Section 5.5), and changes the inputs that neural networks train on. If your pipeline shrinks images, audit which kernel does it and whether an anti-alias step exists. The bug is silent, the fix is one flag.</p>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Moiré That Tanked the Catalog</div>
+<p><strong>Who:</strong> A platform engineer at a fashion e-commerce marketplace.</p>
+<p><strong>Situation:</strong> Seller photos (typically 4000&times;3000) are downscaled to 500&times;375 thumbnails for category pages. The thumbnail job used <code>cv2.resize(..., interpolation=cv2.INTER_LINEAR)</code> because it was the default and fast.</p>
+<p><strong>Problem:</strong> Merchandisers reported that woven fabrics, herringbone jackets, knit sweaters, window screens in lifestyle shots, displayed garish rainbow moiré in thumbnails that looked nothing like the product. Customer-facing A/B data showed measurably lower click-through on affected categories.</p>
+<p><strong>Decision:</strong> The engineer reproduced the artifact, recognized 8&times; decimation with a 2-pixel kernel as textbook aliasing, and switched the job to <code>INTER_AREA</code>, with a Lanczos pass reserved for the rare upscales.</p>
+<p><strong>Result:</strong> Moiré vanished across the catalog; the re-rendered categories recovered their click-through. Total code change: one constant.</p>
+<p><strong>Lesson:</strong> The interpolation flag is not a detail. Downscaling is sampling, sampling needs an anti-alias filter, and the textile section of any catalog is a high-frequency test pattern in disguise.</p>
+</div>
+<h2>6. Interpolation and Machine Learning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+A modern wrinkle: resizing is now part of nearly every model's input contract, so interpolation choices silently shape what networks learn and how they are scored. Three concrete consequences are worth carrying forward. First, masks versus images: augmentation pipelines must resize images with bilinear or bicubic but masks with nearest, and frameworks let you specify both (a distinction we will rely on in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>). Second, train-serve skew: if training resized with Pillow bicubic ($a=-0.5$) and production resizes with OpenCV bicubic ($a=-0.75$), the model sees a slightly different image distribution in production; reproducible pipelines pin the resize implementation, not just the size. Third, evaluation: generative-model metrics compare statistics of resized images, so the resize kernel becomes part of the metric itself, a story told in the callout below and continued when we reach FID in <a href="../../part-4-generative-vision-models/module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: When the Resize Function Became the Headline</div>
+<p>Parmar, Zhang, and Zhu's <strong>clean-fid</strong> work ("On Aliased Resizing and Surprising Subtleties in GAN Evaluation", CVPR 2022) showed that published FID scores for the same generative model could differ by amounts larger than claimed state-of-the-art gaps purely because different codebases downscaled evaluation images with different, often aliasing, kernels; the community standardized on anti-aliased resizing in response. The ecosystem followed: <strong>torchvision</strong> migrated its transforms so that <code>antialias=True</code> became the effective default behavior in v0.17 (2024), closing a long-standing tensor-versus-PIL mismatch. On the reconstruction side, the sinc ideal now has learned competitors: single-step diffusion super-resolvers such as <strong>SinSR</strong> (CVPR 2024) and <strong>OSEDiff</strong> (NeurIPS 2024) upscale with hallucinated-but-plausible detail in one network evaluation, fast enough to challenge Lanczos in offline pipelines. Classical kernels remain the standard where fidelity to the actual signal is non-negotiable; the learned upscalers win where perceptual quality is the product. Chapter 7 picks up that thread.</p>
+</div>
+<p>
+One more perspective ties this section to the chapter's arc. We treated interpolation as reading a value at one fractional point, but a warp does this for every output pixel at once, and the pattern of fractional positions varies across the image: a perspective warp compresses some regions (locally a downscale, aliasing risk) while stretching others (locally an upscale, blur risk). Production warpers therefore sometimes blend strategies or warp through an image pyramid from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. With values-at-fractional-coordinates solved, we are ready to assemble the full warping algorithm in <a href="section-5.4.html">Section 5.4</a>.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The Lanczos kernel is named for Cornelius Lanczos, a Hungarian-American mathematician who at various points worked as Einstein's assistant, invented what became the fast Fourier transform a generation before Cooley and Tukey, and developed the resampling window as a side note in a 1956 numerical-analysis textbook. The image-processing community adopted the name; Lanczos himself never resized a JPEG.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.3.1: The Phantom Class <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A segmentation mask uses labels 0 (road), 1 (lane marking), and 2 (vehicle). It is downscaled 2&times; with bilinear interpolation and then thresholded back to integers with rounding. Describe precisely where in the image label-1 pixels can appear that were never lane markings, and why nearest-neighbor avoids this. Then explain why one-hot encoding the mask, resizing each channel bilinearly, and taking an argmax is also acceptable, and what it does at boundaries that nearest-neighbor does not.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.3.2: Build Bicubic, Match the Reference <span class="exercise-type coding">Coding</span></div>
+<p>Implement the Keys cubic kernel $k(t)$ from this section as a Python function of $t$ and $a$, then build a 1D bicubic resampler that upscales a row of pixels by an arbitrary factor using 4 taps. Verify that with $a = -0.75$ your output matches <code>cv2.resize</code> with <code>INTER_CUBIC</code> on the same row (to within rounding), and that with $a = -0.5$ it matches Pillow's <code>Image.resize(..., Image.BICUBIC)</code>. Report the maximum absolute pixel difference between the two libraries' outputs on a real photo row.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.3.3: Measuring Aliasing in the Frequency Domain <span class="exercise-type analysis">Analysis</span></div>
+<p>Create a synthetic image of concentric rings $I(x, y) = \sin(r^2 / 40)$ (a zone plate), which sweeps all spatial frequencies. Downscale it 6&times; with <code>INTER_NEAREST</code>, <code>INTER_LINEAR</code>, and <code>INTER_AREA</code>, then upscale each result back and compute the 2D FFT magnitude (Chapter 4 tools) of the difference from a clean reference. Identify the spurious low-frequency energy in the first two and explain, citing the Nyquist argument, why it appears at those particular frequencies. Which radius in the original corresponds to the new Nyquist limit?</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-5.2.html"><span class="nav-label">Section 5.2: Homogeneous Coordinates &amp; Transformation Matrices</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span></a>
+<a class="next" href="section-5.4.html"><span class="nav-label">Section 5.4: Warping, Remapping &amp; Inverse Mapping</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

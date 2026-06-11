@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.1: Fourier Intuition: Images as Sums of Waves. What spatial frequency means, how 2D sinusoids combine into images, why phase carries structure, and how to read a magnitude spectrum." name="description"/>
+<title>Section 4.1: Fourier Intuition: Images as Sums of Waves | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>Fourier Intuition: Images as Sums of Waves</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"People say I'm just a wave. But shift me half a cycle and the whole picture falls apart. Phase is character."</p>
+<cite>A Slightly Out-of-Phase Sinusoid</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Every image, without exception, can be written exactly as a weighted sum of two-dimensional sinusoidal waves, and the list of weights (the spectrum) is just the same image in a different coordinate system.</strong> Nothing is lost and nothing is approximated in the conversion; what changes is which questions become easy. Repetition, texture, blur, sharpness, and sampling all turn from vague visual impressions into precise statements about which waves are present and how strong they are. This section builds that intuition with pictures and a few dozen lines of NumPy, before <a href="section-4.2.html">Section 4.2</a> makes the machinery formal.</p>
+</div>
+
+<p>In <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> you processed images in the domain they arrive in: a grid of intensities indexed by position. That viewpoint is natural but it hides structure. A striped shirt and a plain wall look completely different as pixel arrays, yet the shirt is, in a precise sense, mostly one number: the frequency of its stripes. This section introduces the second great coordinate system of image processing, where the axes are not "where" but "how fast things change". Everything else in this chapter, filtering, aliasing, pyramids, and wavelets, is built on the intuition assembled here.</p>
+
+<h2>1. What "Frequency" Means in an Image <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>Start with sound, where frequency is familiar. A microphone records air pressure as a function of time, and Fourier's claim is that any such recording is a sum of pure tones: sine waves of different frequencies, loudnesses, and starting offsets. A bass note contributes a slow wave, a cymbal contributes fast ones. The recording and its list of tones are interchangeable descriptions.</p>
+
+<p>An image is the same story with two changes. First, the signal varies over space rather than time, so we speak of <strong>spatial frequency</strong>: how rapidly intensity changes as you move across the image, measured in cycles per pixel or cycles per image width. Second, space is two-dimensional, so each elementary wave needs a direction as well as a rate. A wave can undulate left-to-right, top-to-bottom, or at any angle in between. Slowly varying illumination, like the soft gradient across a clear sky, is low frequency. A picket fence, a houndstooth jacket, or the sensor noise from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> is high frequency. Most natural images are dominated by low frequencies, with energy falling off steeply as frequency rises; this single statistical fact will explain JPEG's success later in the chapter.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Two Equivalent Descriptions</div>
+<p>The pixel array answers "what is the intensity at position $(x, y)$?" The spectrum answers "how much of the wave with frequency $(u, v)$ does this image contain?" These are two coordinate systems for the same vector space, connected by an invertible linear transform. You lose nothing by switching views, and operations that are global and awkward in one view (such as removing a repeating pattern) become local and trivial in the other. Choosing the right domain for an operation is half of classical image processing.</p>
+</div>
+
+<h2>2. The 2D Sinusoid: Frequency, Orientation, Amplitude, Phase <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>The atom of the frequency domain is the two-dimensional sinusoidal grating:</p>
+
+<p>$$s(x, y) = A \cos\!\big(2\pi (u_0 x + v_0 y) + \phi\big)$$</p>
+
+<p>Four numbers define it completely. The pair $(u_0, v_0)$ sets both how fast the wave oscillates and in which direction: the stripes run perpendicular to the vector $(u_0, v_0)$, and the number of cycles you cross per unit distance is $\sqrt{u_0^2 + v_0^2}$. The amplitude $A$ sets the contrast between crests and troughs. The phase $\phi$ slides the whole pattern along its direction of travel without changing its look. Generating a few gratings makes this concrete:</p>
+
+<pre><code class="language-python">import numpy as np
+import matplotlib.pyplot as plt
+
+H, W = 256, 256
+yy, xx = np.mgrid[0:H, 0:W]            # row (y) and column (x) coordinates
+
+def grating(u, v, phase=0.0, amplitude=1.0):
+    """2D sinusoid with u cycles across the width and v cycles down the height."""
+    return amplitude * np.cos(2 * np.pi * (u * xx / W + v * yy / H) + phase)
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+for ax, (u, v) in zip(axes, [(4, 0), (16, 0), (0, 8), (10, 10)]):
+    ax.imshow(grating(u, v), cmap="gray")
+    ax.set_title(f"u={u}, v={v}")
+    ax.axis("off")
+plt.tight_layout()
+plt.show()</code></pre>
+<div class="code-caption"><strong>Code 4.1.1:</strong> Generating 2D sinusoidal gratings. The pair (u, v) counts cycles across the width and down the height: (4, 0) gives four coarse vertical bars, (16, 0) sixteen fine ones, (0, 8) horizontal bars, and (10, 10) a diagonal grating.</div>
+
+<p>Each grating you just generated corresponds to exactly one pair of points in the frequency plane (one point at $(u_0, v_0)$ and its mirror at $(-u_0, -v_0)$, a symmetry explained in <a href="section-4.2.html">Section 4.2</a>). Figure 4.1.1 shows the mapping: coarse stripes sit near the center of the frequency plane, fine stripes far from it, and the angle of the dot pair matches the orientation of the stripes. Learning to move mentally between the two panels of this figure is the core skill of the section.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three sinusoidal gratings on the left mapped to symmetric dot pairs in the frequency plane on the right">
+<defs>
+<pattern id="coarseV" width="30" height="10" patternUnits="userSpaceOnUse">
+<rect width="30" height="10" fill="#f2f4f8"/>
+<rect width="15" height="10" fill="#3a4a63"/>
+</pattern>
+<pattern id="fineV" width="10" height="10" patternUnits="userSpaceOnUse">
+<rect width="10" height="10" fill="#f2f4f8"/>
+<rect width="5" height="10" fill="#3a4a63"/>
+</pattern>
+<pattern id="diag" width="16" height="16" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+<rect width="16" height="16" fill="#f2f4f8"/>
+<rect width="8" height="16" fill="#3a4a63"/>
+</pattern>
+</defs>
+<text x="150" y="24" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Image domain</text>
+<text x="640" y="24" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Frequency domain (u, v)</text>
+<!-- grating 1: coarse vertical stripes -->
+<rect x="60" y="45" width="90" height="90" fill="url(#coarseV)" stroke="#1f77b4" stroke-width="3"/>
+<text x="170" y="95" font-family="sans-serif" font-size="12" fill="#1f77b4">low u, v = 0</text>
+<!-- grating 2: fine vertical stripes -->
+<rect x="60" y="155" width="90" height="90" fill="url(#fineV)" stroke="#d62728" stroke-width="3"/>
+<text x="170" y="205" font-family="sans-serif" font-size="12" fill="#d62728">high u, v = 0</text>
+<!-- grating 3: diagonal stripes -->
+<rect x="60" y="265" width="90" height="90" fill="url(#diag)" stroke="#2ca02c" stroke-width="3"/>
+<text x="170" y="315" font-family="sans-serif" font-size="12" fill="#2ca02c">u and v both nonzero</text>
+<!-- arrow -->
+<line x1="280" y1="200" x2="420" y2="200" stroke="#888" stroke-width="2"/>
+<polygon points="420,200 408,194 408,206" fill="#888"/>
+<text x="350" y="188" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">2D Fourier transform</text>
+<!-- frequency plane -->
+<rect x="490" y="50" width="300" height="300" fill="#fafbfd" stroke="#b9c2d0" stroke-width="1.5"/>
+<line x1="490" y1="200" x2="790" y2="200" stroke="#b9c2d0" stroke-width="1"/>
+<line x1="640" y1="50" x2="640" y2="350" stroke="#b9c2d0" stroke-width="1"/>
+<text x="797" y="204" font-family="sans-serif" font-size="13" fill="#666">u</text>
+<text x="636" y="44" font-family="sans-serif" font-size="13" fill="#666">v</text>
+<circle cx="640" cy="200" r="4" fill="#555"/>
+<text x="648" y="221" font-family="sans-serif" font-size="11" fill="#555">DC (mean)</text>
+<!-- dots: coarse vertical -> close pair on u axis -->
+<circle cx="670" cy="200" r="7" fill="#1f77b4"/>
+<circle cx="610" cy="200" r="7" fill="#1f77b4"/>
+<!-- fine vertical -> far pair on u axis -->
+<circle cx="760" cy="200" r="7" fill="#d62728"/>
+<circle cx="520" cy="200" r="7" fill="#d62728"/>
+<!-- diagonal -> pair at 45 degrees -->
+<circle cx="700" cy="140" r="7" fill="#2ca02c"/>
+<circle cx="580" cy="260" r="7" fill="#2ca02c"/>
+<text x="640" y="372" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">distance from center = stripe fineness; angle of pair = stripe orientation</text>
+</svg>
+<figcaption><strong>Figure 4.1.1:</strong> Each pure grating maps to a symmetric pair of points in the frequency plane. Coarse vertical stripes (blue) land close to the center on the u axis; fine vertical stripes (red) land far out on the same axis; diagonal stripes (green) land along a diagonal. The center point is the DC component, the image mean.</figcaption>
+</figure>
+
+<h2>3. Building Images Out of Waves <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>Decomposition only feels real once you run it in reverse. Can smooth, wavy ingredients really add up to something hard-edged? The classic demonstration is the square wave: a vertical black-and-white bar pattern with razor-sharp transitions. Fourier analysis says it equals an infinite sum of odd harmonics with amplitudes falling as $1/k$:</p>
+
+<p>$$\mathrm{sq}(t) = \frac{4}{\pi} \sum_{k=1,3,5,\dots} \frac{\sin(2\pi k t)}{k}$$</p>
+
+<p>The code below truncates this sum at increasing numbers of terms and renders each truncation as an image, so you can watch edges sharpen as high frequencies join the choir:</p>
+
+<pre><code class="language-python">n_terms = [1, 3, 11, 101]              # how many odd harmonics to keep
+t = xx / W                             # horizontal coordinate in [0, 1)
+
+fig, axes = plt.subplots(1, len(n_terms), figsize=(12, 3))
+for ax, n in zip(axes, n_terms):
+    wave = np.zeros_like(t, dtype=np.float64)
+    for k in range(1, 2 * n, 2):       # k = 1, 3, 5, ... (n odd harmonics)
+        wave += (4 / (np.pi * k)) * np.sin(2 * np.pi * 4 * k * t)
+    ax.imshow(wave, cmap="gray", vmin=-1.3, vmax=1.3)
+    ax.set_title(f"{n} harmonic(s)")
+    ax.axis("off")
+plt.tight_layout()
+plt.show()</code></pre>
+<div class="code-caption"><strong>Code 4.1.2:</strong> Synthesizing a bar pattern from sinusoids. One harmonic gives soft stripes; eleven give recognizable bars with visible ripples near each edge; a hundred and one give crisp bars whose tiny residual overshoot at the edges never fully disappears.</div>
+
+<p>Two lessons hide in this output. First, <em>sharp edges are expensive</em>: they require contributions from arbitrarily high frequencies, which is why blurring (removing high frequencies) always softens edges, as you saw operationally with the Gaussian kernels of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>. Second, the stubborn ripple that clings to each edge no matter how many terms you add is the <strong>Gibbs phenomenon</strong>, an overshoot of about 9 percent that merely squeezes closer to the edge as frequencies are added. It will return in <a href="section-4.3.html">Section 4.3</a> as the "ringing" artifact of ideal low-pass filters, and you will know exactly whom to blame.</p>
+
+<h2>4. Amplitude and Phase: Who Carries the Picture? <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Each frequency component of a real image carries two numbers, conveniently packed into one complex value $F(u, v) = |F(u, v)|\, e^{j \angle F(u, v)}$. The magnitude $|F(u,v)|$ says how strongly that wave is present; the phase $\angle F(u,v)$ says where its crests sit. A natural guess is that amplitude, the "how much", matters most. The most instructive experiment in classical image processing says otherwise. Take two unrelated photographs, compute both spectra, and recombine them crosswise: the amplitude of one with the phase of the other.</p>
+
+<pre><code class="language-python">import numpy as np
+from skimage import data
+from skimage.color import rgb2gray
+
+img_a = rgb2gray(data.astronaut())                 # 512 x 512, floats in [0, 1]
+img_b = data.camera().astype(np.float64) / 255.0   # 512 x 512
+
+FA, FB = np.fft.fft2(img_a), np.fft.fft2(img_b)
+amp_a, phase_a = np.abs(FA), np.angle(FA)
+amp_b, phase_b = np.abs(FB), np.angle(FB)
+
+# Marry the amplitude of one image to the phase of the other
+hybrid_1 = np.real(np.fft.ifft2(amp_a * np.exp(1j * phase_b)))
+hybrid_2 = np.real(np.fft.ifft2(amp_b * np.exp(1j * phase_a)))
+
+# hybrid_1 is recognizably the cameraman; hybrid_2 is recognizably
+# the astronaut. Phase, not amplitude, decides what you see.</code></pre>
+<div class="code-caption"><strong>Code 4.1.3:</strong> The phase-swap experiment. Each hybrid image looks like the photograph that donated its phase, even though its amplitude spectrum belongs entirely to the other photograph.</div>
+
+<p>The result is unambiguous: each hybrid resembles the image that contributed its <em>phase</em>. Amplitude tells you an image's statistical texture, how much energy lives at each frequency and orientation, but phase encodes where edges align, and aligned edges are what your visual system reads as objects. This is not just a parlor trick. It explains why amplitude-only descriptors are weak at recognition, and it powers practical methods: Fourier domain adaptation (FDA, CVPR 2020) makes synthetic training images look like real-camera images by swapping low-frequency amplitude between domains while preserving each image's own phase, and therefore its content.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Phase Is Structure, Amplitude Is Texture</div>
+<p>The magnitude spectrum of almost every natural photograph looks nearly the same: a bright blob at the center decaying smoothly outward, roughly as $1/f$. What distinguishes a face from a forest is almost entirely in the phase, the relative alignment of the waves. Whenever you inspect only magnitude spectra (as we do for filter design), remember you are looking at the part of the data that is most interchangeable between images, which is exactly why it is the right part to manipulate when you want to change appearance without destroying content.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The phase-swap experiment was popularized by Oppenheim and Lim in a 1981 Proceedings of the IEEE paper titled "The importance of phase in signals". It has been re-run by generations of students with whatever pair of test images their era favored, and it has never once come out the other way. Phase is undefeated.</p>
+</div>
+
+<h2>5. Reading a Spectrum Like a Map <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Once you can generate spectra (the full recipe, with shifting and log scaling, comes in <a href="section-4.2.html">Section 4.2</a>), a few reading rules cover most of what you will ever see. The bright center is the DC component and the low frequencies: overall brightness and large smooth regions. Energy spreads outward as the image gains fine detail. A strong oriented edge in the image produces a streak through the spectrum's center <em>perpendicular</em> to the edge, because an edge is locally a half-built square wave needing many collinear harmonics. A repeating pattern, like fabric weave or a printed halftone, produces isolated bright dots at the pattern's frequency and its harmonics. Noise sprinkles energy roughly uniformly everywhere, which is why the denoising filters of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> are, at heart, attempts to keep the signal's spectrum while discarding the noise's.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Loom That Showed Up in the Spectrum</div>
+<p><strong>Who:</strong> A quality engineer at a mid-size textile mill running camera-equipped inspection stations over its weaving looms.</p>
+<p><strong>Situation:</strong> Woven fabric is an almost perfectly periodic structure. The mill needed to catch weaving defects (a missed weft thread, a worn needle producing a doubled pick) within seconds, before hundreds of meters of flawed fabric wound onto the roll.</p>
+<p><strong>Problem:</strong> Pixel-space rules kept failing. Template matching broke under small fabric shifts and lighting drift, and per-pixel difference against a golden sample flagged nothing but false alarms, since no two meters of healthy fabric are pixel-identical.</p>
+<p><strong>Decision:</strong> The engineer switched the detector to the frequency domain. A healthy weave produces a stable lattice of bright peaks in the magnitude spectrum, one family of peaks per thread direction. The system tracked the energy at those peak locations and the energy between them, using a rolling baseline.</p>
+<p><strong>Result:</strong> A broken needle now announced itself within two seconds as a smeared peak plus new energy between lattice points, independent of where in the frame the defect sat, because the Fourier magnitude is insensitive to translation. False alarms dropped to near zero and scrap per incident fell from hundreds of meters to single digits.</p>
+<p><strong>Lesson:</strong> Periodic structure that is messy to characterize pixel by pixel becomes a handful of bright dots in the frequency domain. When the thing you care about is repetition, inspect the spectrum, not the pixels.</p>
+</div>
+
+<p>It is worth knowing what the transform looks like computed naively, if only to appreciate what the library call replaces. A direct implementation of the 2D discrete Fourier transform is four nested loops: for every output frequency $(u, v)$, sum over every pixel $(x, y)$ a term $f(x,y)\,e^{-j2\pi(ux/M + vy/N)}$. At $512 \times 512$ that is $512^4 \approx 6.9 \times 10^{10}$ complex multiply-adds, hours of pure Python. The library equivalent is one line.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: numpy.fft in Practice</div>
+<p>A from-scratch 2D DFT is roughly 20 lines of quadruple-nested loops with $O(M^2N^2)$ cost. NumPy reduces it to a single call with $O(MN \log MN)$ cost:</p>
+<pre><code class="language-python">F = np.fft.fft2(img)        # full complex spectrum in one call
+mag, phase = np.abs(F), np.angle(F)</code></pre>
+<div class="code-caption"><strong>Code 4.1.4:</strong> The one-line library replacement for a quadruple-loop DFT: fft2 returns the full complex spectrum, from which magnitude and phase are unpacked.</div>
+<p>That is a 20-to-1 reduction in code and a roughly 50,000-fold reduction in arithmetic at 512&#215;512. Internally NumPy applies the Cooley-Tukey factorization (recursive butterflies), exploits the symmetry of real inputs when you use <code>rfft2</code>, and runs cache-friendly, vectorized inner loops. <a href="section-4.2.html">Section 4.2</a> dissects exactly what this call computes.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Frequency Thinking in the Deep Learning Era</div>
+<p>The wave decomposition is having a renaissance inside neural networks. Networks exhibit <em>spectral bias</em>: they learn low-frequency content first and struggle with fine detail, which is why Fourier feature encodings (Tancik et al., NeurIPS 2020) feed coordinates through banks of sinusoids before the network sees them, the trick that makes NeRF-style methods sharp. FreeU (CVPR 2024) showed that simply re-weighting low-frequency backbone features against high-frequency skip connections inside a diffusion U-Net improves <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion model</a> outputs with zero retraining. And spectrum reading has become forensic: generated images carry characteristic frequency fingerprints, grid-like spectral peaks left by upsampling layers, and detection work from Corvi et al. (ICASSP 2023) through the 2024-2025 wave of AI-image detectors leans on exactly the magnitude-spectrum inspection skills this section teaches.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.1.1: Spectrum Prediction <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Without running any code, sketch the magnitude spectrum (as dots, streaks, or blobs in the (u, v) plane) of: (a) an image of fine horizontal stripes; (b) the same stripes rotated 30 degrees; (c) a checkerboard; (d) a perfectly uniform gray image; (e) a photograph of a picket fence in front of a smooth sky. For each, state which features are dot pairs, which are streaks, and why the spectrum is symmetric about the origin.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.1.2: Randomizing Amplitude versus Phase <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 4.1.3: instead of swapping spectra between two images, take one photograph and reconstruct it twice, once keeping its phase but replacing the amplitude with uniform random values, and once keeping its amplitude but replacing the phase with uniform random values in $[-\pi, \pi)$. (Be careful to keep the conjugate symmetry of the spectrum so the reconstruction stays real, or simply take the real part.) Which reconstruction is recognizable? Display both and explain the result in one paragraph.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.1.3: Measuring Gibbs Overshoot <span class="exercise-type analysis">Analysis</span></div>
+<p>Modify Code 4.1.2 to extract a single horizontal scanline of the synthesized bar pattern and measure the maximum overshoot above 1.0 as a function of the number of harmonics: n = 5, 25, 125, 625. Plot overshoot against n. Does the overshoot amplitude shrink toward zero, or does it converge to a constant while narrowing in width? Relate your finding to what you should expect from the ideal low-pass filter in Section 4.3.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Previous</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="section-4.2.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.2</span><span class="nav-title">The 2D DFT &amp; FFT in Practice</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

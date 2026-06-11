@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 1.3: Resolution, Bit Depth &amp; Dynamic Range. The three budgets of a digital image: how many pixels, how many intensity levels, and how wide a brightness span, plus HDR capture and tone mapping." name="description"/>
+<title>Section 1.3: Resolution, Bit Depth &amp; Dynamic Range | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 1: Digital Image Fundamentals</a></div>
+<h1>Resolution, Bit Depth &amp; Dynamic Range</h1>
+</header>
+<main class="content" id="main-content">
+<blockquote class="epigraph">
+<p>"The scene had twenty stops of dynamic range. I had eight bits. We compromised: I clipped."</p>
+<cite>A Permanently Clipped Highlight</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A digital image has three separate budgets, routinely confused with one another: resolution (how many pixels), bit depth (how many intensity levels per pixel), and dynamic range (how wide a span of real-world brightness those levels cover); any one of the three can be the bottleneck, and adding to the wrong one buys nothing.</strong> A billboard-sized image can still posterize, a 16-bit file can still be blurry, and a sharp, smooth image can still have its highlights burned to pure white. This section teaches you to diagnose which budget is short and how to spend wisely on each.</p>
+</div>
+<p><a href="section-1.2.html">Section 1.2</a> established the two discretizations: sampling and quantization. This section turns those abstractions into the three concrete specifications you will find on every camera datasheet and every dataset card, and adds the one that sampling and quantization together still miss: dynamic range, the question of what physical brightness interval your numbers span. The three budgets map cleanly onto the previous section's theory: resolution is your sampling budget, bit depth is your quantization budget, and dynamic range is where you choose to aim them.</p>
+
+<h2>1. Spatial Resolution: More Than Megapixels <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>Resolution colloquially means pixel count, but the useful engineering definition is resolving power: the finest real-world detail the whole system can distinguish. The two diverge constantly. As computed in <a href="section-1.1.html">Section 1.1</a>, diffraction at f/8 blurs a point into a disk wider than three phone-sensor pixels; through that lens, extra megapixels sample blur, not detail. Optics, focus accuracy, motion, atmospheric shimmer, and the demosaicing interpolation all cap resolving power below the pixel count. Lens and system sharpness is measured by the modulation transfer function (MTF), which reports how much contrast survives at each spatial frequency; system MTF is the product of every stage's MTF, so the weakest stage dominates.</p>
+<p>For scene understanding, the more actionable number is ground sample distance or its indoor cousin, pixels-per-object: how many pixels land on the thing you care about. Detection models do not need a 48-megapixel frame; they need enough pixels on target. A face recognizable to a human at roughly 30 pixels of eye-to-eye distance, a license plate readable at roughly 16 pixels of character height, a weld defect at 5 pixels of width: capacity planning for vision systems is the art of guaranteeing pixels-on-target, then choosing sensor and lens to deliver them. Meanwhile, classification networks routinely operate at 224&#215;224 because, after the augmentation and resizing pipelines of <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>, that is where their accuracy-compute tradeoff has historically settled.</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The megapixel race has reversed at the high end: flagship phone sensors with 200 megapixels ship firmware that bins 16 photosites into one output pixel by default, producing 12-megapixel photos with better noise. The marketing number and the engineering number live on the same chip, sixteen-to-one.</p>
+</div>
+
+<h2>2. Bit Depth: Levels, Headroom, and Windowing <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Bit depth sets the quantization ladder from <a href="section-1.2.html">Section 1.2</a>: $2^b$ levels, roughly 6 dB of signal-to-noise per bit. Eight bits suffice for final display of a single rendered image. The case for more bits is headroom for computation. Every brightness adjustment, gamma change, or contrast stretch (the point operations of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>) re-spaces the levels; in an 8-bit pipeline, stretching a dim region multiplies its quantization gaps into visible bands. Editing in 16-bit or float and converting to 8-bit once, at the very end, avoids accumulating that damage. The same logic is why we recommended float32 as the working dtype in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>.</p>
+<p>The clearest demonstration of bit depth as a budget is medical-style windowing. A CT scanner produces 12-bit data: 4096 levels spanning air to dense bone. Tissue differences a radiologist needs may be 20 levels apart, invisible when 4096 levels are crushed into 256. The fix is not more display bits; it is spending the 8 display bits only on the diagnostically relevant band. Code 1.3.1 builds a synthetic 12-bit image with a faint blob and shows the blob appear when windowed.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(seed=3)
+
+# Synthetic 12-bit "scan": background tissue near level 2048 (sigma 60),
+# plus a faint blob just +25 levels brighter, far below visual threshold
+# after naive 8-bit conversion.
+img12 = rng.normal(2048, 60, size=(256, 256))
+yy, xx = np.mgrid[0:256, 0:256]
+img12 += 25 * np.exp(-((xx - 170) ** 2 + (yy - 90) ** 2) / 400.0)
+img12 = np.clip(img12, 0, 4095).astype(np.uint16)
+
+blob_patch = (slice(80, 100), slice(160, 180))   # on the blob
+back_patch = (slice(80, 100), slice(20, 40))     # plain background
+
+# Naive 8-bit conversion: squeeze ALL 4096 levels into 256.
+naive8 = (img12 // 16).astype(np.uint8)
+print("naive  blob-background contrast:",
+      round(float(naive8[blob_patch].mean() - naive8[back_patch].mean()), 1))
+
+# Windowed conversion: spend all 256 levels on the 1900..2200 band.
+lo, hi = 1900, 2200
+win = np.clip((img12.astype(np.float32) - lo) / (hi - lo), 0, 1)
+win8 = (win * 255).astype(np.uint8)
+print("windowed blob-background contrast:",
+      round(float(win8[blob_patch].mean() - win8[back_patch].mean()), 1))
+</code></pre>
+<div class="code-caption"><strong>Code 1.3.1:</strong> Windowing as bit-budget reallocation. The same 12-bit data yields a roughly 1.5-level (invisible) blob under naive conversion and a roughly 21-level (clearly visible) blob when the 8 output bits are spent on a 300-level window of interest.</div>
+<pre><code class="language-text">naive  blob-background contrast: 1.6
+windowed blob-background contrast: 21.2
+</code></pre>
+<div class="code-caption"><strong>Output 1.3.1:</strong> Representative run. Windowing trades away everything outside the band (which clips to 0 or 255) to make in-band differences thirteen times larger on screen.</div>
+
+<h2>3. Dynamic Range: The Span Between Noise and Clipping <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Dynamic range (DR) is the ratio between the brightest and darkest signals a system can represent usefully in the same image: bounded above by clipping (the full well of <a href="section-1.1.html">Section 1.1</a>) and below by the noise floor. It is quoted as a ratio, in decibels, or most intuitively in stops (factors of two):</p>
+$$\mathrm{DR}_{\text{stops}} = \log_2 \frac{I_{\max}}{I_{\min}}, \qquad \mathrm{DR}_{\text{dB}} = 20 \log_{10} \frac{I_{\max}}{I_{\min}}.$$
+<p>The engineering problem is a mismatch of spans, which Figure 1.3.1 lays out. A sunlit street with open shade spans roughly 17 to 20 stops. A good modern sensor captures 12 to 14 stops in one exposure; a phone sensor closer to 10. An 8-bit file holds 256 linear levels, about 8 stops between its smallest and largest codes (gamma encoding, covered in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, spaces those codes perceptually but cannot widen the captured span). Something has to give: either highlights clip, shadows drown in noise, or the tones are compressed nonlinearly to fit.</p>
+<figure class="diagram">
+<svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Horizontal bars comparing the dynamic range in stops of a sunlit scene, a CMOS sensor, a smartphone sensor, and an 8-bit file, with a tone mapping arrow showing compression">
+<defs>
+<marker id="arr131" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 z" fill="#b8431f"/></marker>
+</defs>
+<style>
+.bar131 { stroke-width:0; rx:6; }
+.t131 { font:600 13.5px sans-serif; fill:#14385c; }
+.s131 { font:11.5px sans-serif; fill:#5a626c; }
+.axis131 { stroke:#5a626c; stroke-width:1.4; }
+.tick131 { stroke:#9aa3b2; stroke-width:1; stroke-dasharray:3 4; }
+</style>
+<!-- axis: stops 0..20 mapped to x = 180..820 (32 px per stop) -->
+<line class="axis131" x1="180" y1="300" x2="820" y2="300"/>
+<g>
+<line class="tick131" x1="180" y1="60" x2="180" y2="300"/><text class="s131" x="176" y="318">0</text>
+<line class="tick131" x1="340" y1="60" x2="340" y2="300"/><text class="s131" x="330" y="318">5</text>
+<line class="tick131" x1="500" y1="60" x2="500" y2="300"/><text class="s131" x="488" y="318">10</text>
+<line class="tick131" x1="660" y1="60" x2="660" y2="300"/><text class="s131" x="648" y="318">15</text>
+<line class="tick131" x1="820" y1="60" x2="820" y2="300"/><text class="s131" x="808" y="318">20</text>
+</g>
+<text class="s131" x="430" y="345">dynamic range (stops, factors of two)</text>
+<!-- bars -->
+<text class="t131" x="20" y="92">Sunlit scene</text>
+<rect class="bar131" x="180" y="76" width="608" height="24" fill="#14385c"/>
+<text class="s131" x="690" y="92" fill="#ffffff">~19 stops</text>
+<text class="t131" x="20" y="147">Good CMOS sensor</text>
+<rect class="bar131" x="180" y="131" width="448" height="24" fill="#1f7a4d"/>
+<text class="s131" x="540" y="147" fill="#ffffff">~14 stops</text>
+<text class="t131" x="20" y="202">Phone sensor (1 shot)</text>
+<rect class="bar131" x="180" y="186" width="320" height="24" fill="#2c7a7b"/>
+<text class="s131" x="412" y="202" fill="#ffffff">~10 stops</text>
+<text class="t131" x="20" y="257">8-bit file (linear)</text>
+<rect class="bar131" x="180" y="241" width="256" height="24" fill="#b8431f"/>
+<text class="s131" x="350" y="257" fill="#ffffff">~8 stops</text>
+<!-- tone mapping arrow -->
+<path d="M 788 100 C 830 150, 700 215, 444 241" fill="none" stroke="#b8431f" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arr131)"/>
+<text class="s131" x="660" y="190" fill="#b8431f">tone mapping / HDR merge:</text>
+<text class="s131" x="660" y="206" fill="#b8431f">compress 19 stops into 8</text>
+</svg>
+<figcaption><strong>Figure 1.3.1:</strong> The span mismatch that defines exposure engineering. Real scenes (top bar) exceed what one sensor exposure captures, which exceeds what an 8-bit file holds linearly. HDR capture widens the middle bar by merging exposures; tone mapping (dashed arrow) then compresses the result into the bottom bar for display.</figcaption>
+</figure>
+
+<h2>4. HDR Capture: Widening the Bar <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>If one exposure cannot span the scene, take several. A short exposure preserves the highlights; a long one digs detail out of the shadows; intermediate ones cover the middle. High dynamic range (HDR) imaging merges the stack, using each pixel from whichever exposures rendered it best. Code 1.3.2 simulates a full bracket-and-merge round trip with no input files: it builds a synthetic radiance map spanning roughly 13 stops, "photographs" it at three exposure times through the clip-and-gamma pipeline of <a href="section-1.1.html">Section 1.1</a>, and fuses the bracket with Mertens exposure fusion, which weights each pixel by how well exposed it is.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# Synthetic scene RADIANCE (linear light), spanning ~13 stops:
+# a dim interior, a deep-shadow corner, and a blazing window.
+h, w = 360, 480
+yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+radiance = 0.02 + 0.08 * (xx / w)              # interior, gently brightening
+radiance[60:180, 300:440] = 40.0               # window: 500x the interior
+radiance[200:320, 60:200] = 0.004              # shadow corner
+
+def expose(rad, t):
+    """One camera exposure: scale by time, clip the well, gamma-encode."""
+    linear = np.clip(rad * t, 0.0, 1.0)
+    return (255.0 * linear ** (1 / 2.2)).astype(np.uint8)
+
+times = [1 / 64, 1.0, 16.0]                    # 10-stop bracket
+stack = [cv2.cvtColor(expose(radiance, t), cv2.COLOR_GRAY2BGR)
+         for t in times]
+
+fused = cv2.createMergeMertens().process(stack)   # float32, ~[0, 1]
+fused8 = np.clip(fused * 255, 0, 255).astype(np.uint8)
+
+for t, s in zip(times, stack):
+    print(f"t={t:&gt;7}: clipped {(s == 255).mean():5.1%},"
+          f"  near-black {(s &lt;= 5).mean():5.1%}")
+print(f"fused   : clipped {(fused8 == 255).mean():5.1%},"
+      f"  near-black {(fused8 &lt;= 5).mean():5.1%}")
+</code></pre>
+<div class="code-caption"><strong>Code 1.3.2:</strong> A complete synthetic HDR experiment. Each single exposure either clips the window or crushes the shadows; Mertens fusion assembles a result in which both extremes carry usable detail simultaneously.</div>
+<pre><code class="language-text">t=0.015625: clipped  0.0%,  near-black  9.7%
+t=    1.0: clipped  9.7%,  near-black  0.0%
+t=   16.0: clipped 46.9%,  near-black  0.0%
+fused   : clipped  0.0%,  near-black  0.0%
+</code></pre>
+<div class="code-caption"><strong>Output 1.3.2:</strong> Representative run. The short exposure protects the window (zero clipping) at the cost of a crushed shadow corner; the long exposure clips nearly half the frame; the fused image suffers neither failure.</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: OpenCV's HDR Module Replaces a Research Paper's Worth of Code</div>
+<p>True radiometric HDR (recovering a physical radiance map, not just a nice-looking fusion) requires estimating the camera response curve from the bracket and inverting it, the algorithm of Debevec and Malik (1997): around 150 lines of careful least-squares if written by hand. OpenCV ships the whole pipeline:</p>
+<pre><code class="language-python">times_np = np.array(times, dtype=np.float32)
+response = cv2.createCalibrateDebevec().process(stack, times_np)
+hdr = cv2.createMergeDebevec().process(stack, times_np, response)  # float32 radiance
+ldr = cv2.createTonemapReinhard(gamma=2.2).process(hdr)            # display version
+</code></pre>
+<div class="code-caption"><strong>Code 1.3.3:</strong> Radiometric HDR in four lines: response-curve calibration, radiance merging, and Reinhard global tone mapping, each a published algorithm implemented and tested inside <code>cv2</code>.</div>
+</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Tunnel Exit That Ate the Lane Lines</div>
+<p><strong>Who:</strong> A perception engineer at an automotive ADAS supplier.</p>
+<p><strong>Situation:</strong> The lane-keeping camera performed flawlessly on highways and in tunnels, each taken separately.</p>
+<p><strong>Problem:</strong> At tunnel exits on sunny days, the scene contained both a dark interior and sunlit pavement, around 18 stops together. The auto-exposure chose the middle: for 1 to 2 seconds, the exit was a white clipped blob with no recoverable lane markings, and lane-keeping silently degraded exactly when the driver was least prepared.</p>
+<p><strong>Decision:</strong> The team specified an HDR automotive sensor (multi-exposure capture with on-chip merging, 120 dB class) and moved exposure control from full-frame average metering to a road-region weighting.</p>
+<p><strong>Result:</strong> Lane-detection availability through tunnel transitions rose from 71% to above 99% in validation drives; the incident class disappeared from the disengagement reports.</p>
+<p><strong>Lesson:</strong> Dynamic range failures are scene-dependent and intermittent, the worst kind of bug. Datasheet DR must be checked against the worst scene the product will face, not the average one.</p>
+</div>
+
+<h2>5. The Budgets Meet Machine Learning <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>Vision models inherit all three budgets through their training data. Resolution determines pixels-on-target and thus the detectability floor for small objects. Bit depth interacts with normalization: the standard practice of scaling images to $[0, 1]$ or standardizing with dataset statistics, which we will formalize in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>, silently assumes the input levels are perceptually spaced 8-bit values; feeding 12-bit linear data through the same constants wrecks the input distribution. Dynamic range determines what is in the data at all: a model trained on tone-mapped JPEGs has never seen the clipped-highlight failure mode of its deployment camera, and restoration methods from <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a> cannot reconstruct what was never recorded. When you control the capture stack, record the widest range you can and compress late; when you do not, audit the data for clipping before you blame the model.</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Clipping Is the Only Unfixable Artifact</div>
+<p>Noise can be averaged, blur can be partially deconvolved, banding can be dithered, and color casts can be corrected, all with bounded success. Clipped values are different in kind: every scene brightness above the threshold mapped to the same number, and no algorithm can tell which one it was. Generative models can hallucinate plausible content into clipped regions, but for measurement and safety systems, plausible is not the same as true. Protect the highlights at capture time; everything else has a remedy.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: HDR Goes Mainstream (2024 to 2026)</div>
+<p>After two decades as a photography niche, scene-referred HDR is becoming infrastructure. The gain-map approach (a standard JPEG plus a small map saying how much to brighten each region on capable displays) shipped as Ultra HDR in Android 14 and as Adaptive HDR on iPhones, and was standardized as ISO 21496-1 in 2025, giving the industry a backward-compatible HDR file format at last. On the sensor side, automotive and surveillance imagers now combine split-pixel designs (a large and a small photodiode per pixel) with dual conversion gain to exceed 120 dB in a single frame, with LED-flicker mitigation as a 2024 to 2026 research focus. And inverse tone mapping, reconstructing HDR from legacy SDR content with diffusion-based generative priors, is an active 2024 to 2026 topic for restoring film archives and training data alike, directly continuing this chapter's theme that what the pipeline discarded, learned models now try to guess back.</p>
+</div>
+<p>We now have the image's geometry (resolution), its level ladder (bit depth), and its physical span (dynamic range). The remaining unexplained axis of the array from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> is the channel dimension: what the three numbers per pixel mean. That is color science, the subject of <a href="section-1.4.html">Section 1.4</a>.</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.3.1: Diagnose the Bottleneck <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each complaint, name the short budget (resolution, bit depth, or dynamic range) and justify briefly: (a) a parking camera cannot read plates beyond 20 meters even in perfect light; (b) a sky-replacement app produces ring-like contours in smooth sunset gradients after editing; (c) an indoor robot is blinded for two seconds whenever it faces a window; (d) barcodes scan reliably, but only when held at one specific distance.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.3.2: Build a Window Explorer <span class="exercise-type coding">Coding</span></div>
+<p>Extend Code 1.3.1 into an interactive tool: load any 16-bit image (or generate the synthetic scan), and bind two keyboard keys to shift the window center and two to change its width, re-rendering the 8-bit view each keypress with OpenCV's <code>imshow</code>. Add an on-screen readout of the current window. Then find the narrowest window at which the synthetic blob is reliably visible and report it as a fraction of the full 12-bit range.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 1.3.3: How Many Exposures Are Enough? <span class="exercise-type analysis">Analysis</span></div>
+<p>Modify Code 1.3.2 to sweep bracket sizes: 1, 2, 3, 5, and 7 exposures spanning the same 10-stop range. For each, compute the fraction of pixels that are clipped or near-black in the fused result, and the mean absolute error between the fused image and an ideal tone-mapped reference built directly from the radiance map. Plot both curves against bracket size and identify the point of diminishing returns. How does your answer change if you add photon shot noise from Code 1.1.1 to each exposure?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-1.2.html"><span class="nav-label">Previous</span><span class="nav-num">Section 1.2</span><span class="nav-title">Sampling &amp; Quantization</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 1</span><span class="nav-num">Contents</span><span class="nav-title">Digital Image Fundamentals</span></a>
+<a class="next" href="section-1.4.html"><span class="nav-label">Next</span><span class="nav-num">Section 1.4</span><span class="nav-title">Color Science &amp; Color Spaces: RGB, HSV, Lab &amp; YCbCr</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

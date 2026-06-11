@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.1: Brightness, Contrast &amp; Gamma Correction. Point operations as per-pixel functions: linear brightness and contrast adjustment, power-law gamma curves, and lookup tables in NumPy and OpenCV." name="description"/>
+<title>Section 2.1: Brightness, Contrast &amp; Gamma Correction | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Point Operations, Histograms &amp; Thresholding</a></div>
+<h1>Brightness, Contrast &amp; Gamma Correction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They told me to brighten up. So I added 50 to everything and clipped my feelings at 255."</p>
+<cite>A Chronically Underexposed Security Camera</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A point operation transforms each pixel using only that pixel's own value, which means every such operation, no matter how fancy its formula, is just a curve from input intensity to output intensity.</strong> Brightness, contrast, gamma, the "curves" tool in Photoshop, the tone mapping inside your phone's camera app: all of them are functions $s = T(r)$ applied independently at every pixel, and all of them can be compiled into a 256-entry lookup table that runs at memory speed. Master the curve and you have mastered the entire family.</p>
+</div>
+
+<p>
+In <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> we followed light from photons to a quantized grid of numbers, and in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a> we learned to hold that grid as a NumPy array without mangling its dtype. Until now, though, we have only loaded, inspected, and converted images. This section is where we change one for the first time. We start with the gentlest possible change: transformations that look at a single pixel value and replace it with another, with no knowledge of any neighboring pixel. The restriction sounds severe, yet it covers nearly every exposure and tone adjustment performed in practice.
+</p>
+
+<h2>1. Point Operations: One Pixel In, One Pixel Out <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+Formally, a point operation (also called an intensity transformation) maps an input image $f$ to an output image $g$ via a function $T$ that depends only on the pixel's own value:
+</p>
+<p>
+$$g(x, y) = T\big(f(x, y)\big)$$
+</p>
+<p>
+The coordinates $(x, y)$ appear on both sides but $T$ itself ignores them: the same function is applied at every location. Contrast this with the neighborhood operations of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, where the output at $(x,y)$ depends on a whole window of surrounding pixels. The independence of point operations has three practical consequences. First, they are trivially parallel: every pixel can be processed at once, which is why they vectorize perfectly in NumPy and run essentially for free on a GPU. Second, they can never sharpen, blur, or denoise, because those effects require comparing neighbors. Third, for 8-bit images, any point operation whatsoever can be precomputed as a table of 256 output values, a fact we will exploit shortly.
+</p>
+
+<p>
+Because $T$ maps the interval $[0, 255]$ to itself, we can draw it: input intensity on the horizontal axis, output intensity on the vertical. Figure 2.1.1 plots the transfer curves of the four operations this section covers. The identity is the diagonal; brightness shifts the diagonal up; contrast rotates it steeper around a pivot; gamma bends it into a power-law curve. Reading transfer curves fluently is a genuinely useful skill: it is exactly how photographers read the "curves" panel, and how you will debug a mysterious tone shift in a data pipeline.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Transfer function plot showing identity, brightness, contrast, and gamma curves">
+<rect x="0" y="0" width="760" height="470" fill="#ffffff"/>
+<!-- plot frame -->
+<rect x="80" y="40" width="600" height="360" fill="#fafbfc" stroke="#cccccc"/>
+<!-- gridlines -->
+<line x1="380" y1="40" x2="380" y2="400" stroke="#e8e8e8"/>
+<line x1="80" y1="220" x2="680" y2="220" stroke="#e8e8e8"/>
+<!-- identity -->
+<line x1="80" y1="400" x2="680" y2="40" stroke="#999999" stroke-width="2" stroke-dasharray="6,5"/>
+<!-- brightness +60 -->
+<path d="M80,315 L539,40 L680,40" fill="none" stroke="#2980b9" stroke-width="2.5"/>
+<!-- contrast 1.8 about 128 -->
+<path d="M80,400 L214,400 L547,40 L680,40" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+<!-- gamma 0.45 -->
+<path d="M80,400 L118,297 L155,259 L231,207 L306,168 L381,136 L456,108 L532,83 L607,60 L680,40" fill="none" stroke="#c0392b" stroke-width="2.5"/>
+<!-- gamma 2.2 -->
+<path d="M80,400 L231,383 L306,358 L381,321 L456,271 L532,207 L607,130 L680,40" fill="none" stroke="#f39c12" stroke-width="2.5"/>
+<!-- axes labels -->
+<text x="380" y="436" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333">input intensity r</text>
+<text x="30" y="220" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#333" transform="rotate(-90 30 220)">output intensity s</text>
+<text x="80" y="418" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">0</text>
+<text x="380" y="418" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">128</text>
+<text x="680" y="418" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">255</text>
+<text x="68" y="404" text-anchor="end" font-family="sans-serif" font-size="12" fill="#666">0</text>
+<text x="68" y="224" text-anchor="end" font-family="sans-serif" font-size="12" fill="#666">128</text>
+<text x="68" y="46" text-anchor="end" font-family="sans-serif" font-size="12" fill="#666">255</text>
+<!-- legend -->
+<rect x="96" y="52" width="248" height="118" fill="#ffffff" stroke="#dddddd" rx="6"/>
+<line x1="108" y1="72" x2="140" y2="72" stroke="#999999" stroke-width="2" stroke-dasharray="6,5"/>
+<text x="148" y="76" font-family="sans-serif" font-size="13" fill="#333">identity s = r</text>
+<line x1="108" y1="94" x2="140" y2="94" stroke="#2980b9" stroke-width="2.5"/>
+<text x="148" y="98" font-family="sans-serif" font-size="13" fill="#333">brightness s = r + 60</text>
+<line x1="108" y1="116" x2="140" y2="116" stroke="#27ae60" stroke-width="2.5"/>
+<text x="148" y="120" font-family="sans-serif" font-size="13" fill="#333">contrast s = 1.8(r &#8722; 128) + 128</text>
+<line x1="108" y1="138" x2="140" y2="138" stroke="#c0392b" stroke-width="2.5"/>
+<text x="148" y="142" font-family="sans-serif" font-size="13" fill="#333">gamma 0.45 (brighten)</text>
+<line x1="108" y1="160" x2="140" y2="160" stroke="#f39c12" stroke-width="2.5"/>
+<text x="148" y="164" font-family="sans-serif" font-size="13" fill="#333">gamma 2.2 (darken)</text>
+</svg>
+<figcaption><strong>Figure 2.1.1</strong> Transfer curves of common point operations. Every point operation is a curve from input intensity $r$ to output intensity $s$. Brightness translates the identity line, contrast steepens it around a pivot, and gamma bends it into a power law. The flat segments at 0 and 255 are clipping: information in those ranges is permanently destroyed.</figcaption>
+</figure>
+
+<h2>2. Brightness and Contrast: The Linear Family <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The workhorse point operation is affine:
+</p>
+<p>
+$$g(x, y) = \alpha \cdot f(x, y) + \beta$$
+</p>
+<p>
+where $\alpha$ (the gain) controls contrast and $\beta$ (the bias) controls brightness. With $\alpha > 1$ the intensity range stretches and the image looks punchier; with $\alpha < 1$ it compresses and the image looks flat. Positive $\beta$ lifts everything toward white. The subtlety is not the formula but the arithmetic around it: the result $\alpha r + \beta$ routinely lands outside $[0, 255]$, and as we saw when discussing dtypes in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>, uint8 arithmetic wraps around rather than saturating. The from-scratch implementation below does it correctly: compute in float, clip, then convert back.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+img = cv2.imread("scene.jpg")          # uint8 BGR, shape (H, W, 3)
+
+def adjust_brightness_contrast(img, alpha=1.0, beta=0):
+    """Apply g = alpha * f + beta with correct saturation."""
+    out = img.astype(np.float32) * alpha + beta   # work in float32: no overflow
+    out = np.clip(out, 0, 255)                    # saturate instead of wrapping
+    return out.astype(np.uint8)                   # back to displayable uint8
+
+punchy = adjust_brightness_contrast(img, alpha=1.3, beta=-20)
+washed = adjust_brightness_contrast(img, alpha=0.6, beta=80)
+
+print(img[0, 0], "->", punchy[0, 0])
+# Example output for a pixel [200 180 90]:
+# [200 180 90] -> [240 214 97]   (the 200 channel hit 240 = 1.3*200 - 20)</code></pre>
+<div class="code-caption">A safe from-scratch brightness and contrast adjustment: float32 intermediate, explicit clip to [0, 255], then conversion back to uint8. Skipping the clip is the classic source of psychedelic wrap-around artifacts.</div>
+
+<p>
+The function above is six lines. OpenCV collapses it to one, and handles the saturation internally with optimized SIMD code. Whenever you see yourself writing the float-clip-convert dance for an affine adjustment, reach for the library instead.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.convertScaleAbs</div>
+<p>The six-line from-scratch version becomes a single call:</p>
+<pre><code class="language-python">punchy = cv2.convertScaleAbs(img, alpha=1.3, beta=-20)</code></pre>
+<div class="code-caption">The entire affine adjustment, saturation included, as a single OpenCV call.</div>
+<p>That is a 6-to-1 line reduction, and the library handles more than convenience: <code>convertScaleAbs</code> performs saturating arithmetic in vectorized SIMD instructions, processes all channels at once, and never materializes a float copy of the image, so it is both faster and more memory-frugal than the NumPy version. The one behavioral difference: it takes an absolute value before saturating, which only matters if your alpha or input can be negative.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Clipping Destroys Information Forever</div>
+<p>Every pixel that hits 0 or 255 after a point operation has lost its identity: distinct input values were mapped to the same output, and no later processing can tell them apart. A point operation is invertible only where its curve is strictly monotonic and unclipped. This is why professional pipelines adjust exposure on raw or float data and convert to uint8 last, and why in training pipelines you should apply photometric augmentation before quantizing, a discipline that returns in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.</p>
+</div>
+
+<h2>3. Gamma Correction: The Power-Law Curve <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Linear adjustments move all intensities by the same recipe, but human vision does not work linearly: we are far more sensitive to differences in shadows than in highlights. As covered in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, this is why almost every stored image is gamma-encoded: the camera applies a power law that allocates more of the 256 code values to darker tones, and the display applies the inverse. The same power law, applied deliberately, is the standard tool for tonal correction. On intensities normalized to $[0, 1]$:
+</p>
+<p>
+$$s = r^{\gamma}$$
+</p>
+<p>
+With $\gamma < 1$ the curve bows upward and shadows brighten dramatically while highlights barely move (the red curve in Figure 2.1.1). With $\gamma > 1$ the curve bows downward and the image darkens, with midtones affected most (the orange curve). Because the endpoints 0 and 1 map to themselves, gamma never clips: it redistributes the tonal range instead of truncating it, which is exactly why it is preferred over a brightness shift for fixing exposure.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def gamma_correct(img, gamma):
+    """Apply s = r**gamma on normalized intensities via a 256-entry LUT."""
+    r = np.arange(256, dtype=np.float32) / 255.0   # all possible inputs, normalized
+    table = np.clip(255.0 * (r ** gamma), 0, 255).astype(np.uint8)
+    return cv2.LUT(img, table)                     # one table lookup per pixel
+
+img = cv2.imread("underexposed_loading_dock.jpg")
+brighter = gamma_correct(img, gamma=0.5)   # gamma &lt; 1 lifts shadows
+darker   = gamma_correct(img, gamma=2.0)   # gamma &gt; 1 deepens them
+
+# Spot-check the curve itself:
+print(int(255 * (50/255) ** 0.5))    # 112  : deep shadow 50 jumps to 112
+print(int(255 * (200/255) ** 0.5))   # 225  : highlight 200 moves only to 225</code></pre>
+<div class="code-caption">Gamma correction implemented as a lookup table: the curve is evaluated once for the 256 possible input values, then applied to millions of pixels with a single <code>cv2.LUT</code> call. The printed spot-checks show the signature behavior: shadows move a lot, highlights barely move.</div>
+
+<p>
+Note what the code does: rather than computing <code>img ** gamma</code> over the whole array (millions of float power operations), it evaluates the curve at the 256 possible uint8 values and lets <code>cv2.LUT</code> do a table lookup per pixel. The spot-check printout confirms the asymmetry that makes gamma so useful: an input of 50 jumps to 112, while 200 only creeps to 225. If you work in PyTorch data pipelines, the equivalent is <code>torchvision.transforms.v2.functional.adjust_gamma</code>, and randomized gamma is a standard photometric augmentation we will meet again in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
+</p>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Know Whether Your Pixels Are Linear or Gamma-Encoded</div>
+<p>A JPEG straight from a camera is already sRGB gamma-encoded; pixel 128 is not half the light of 255. If you average, blend, or resize such an image, you are doing math on nonlinear values, which is usually acceptable but technically wrong; if you simulate physics or relight a scene, you must linearize first (apply roughly $\gamma = 2.2$), operate, and re-encode. Mixing up the two states is one of the most common silent bugs in imaging code, and it matters again when computing the quality metrics introduced in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Warehouse Cameras That "Needed Replacing"</div>
+<p><strong>Who:</strong> A computer-vision engineer at a logistics company running barcode and label detection on 240 fixed dock cameras.</p>
+<p><strong>Situation:</strong> Cameras at the loading docks faced bright doorways, so the auto-exposure metered for the daylight outside and the package labels in the foreground sat in the bottom eighth of the intensity range.</p>
+<p><strong>Problem:</strong> The label detector's recall at the dock cameras was 31 points below the warehouse average. The operations team proposed replacing all dock cameras with HDR units, a six-figure purchase.</p>
+<p><strong>Decision:</strong> Before approving hardware, the engineer added a single preprocessing step to the dock-camera streams: gamma correction with $\gamma = 0.45$ applied through a precomputed LUT, costing under a millisecond per frame on CPU.</p>
+<p><strong>Result:</strong> Label contrast in the shadow region roughly tripled, recall recovered to within 4 points of the warehouse average, and the camera replacement was shelved.</p>
+<p><strong>Lesson:</strong> When a model fails on dark inputs, try a 256-byte lookup table before a hardware budget. Point operations are the cheapest knob in the entire vision stack, so turn them first.</p>
+</div>
+
+<h2>4. Lookup Tables: Point Operations at Production Speed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The gamma example quietly introduced the most important implementation idea of this section: for 8-bit data there are only 256 possible input values, so any point operation, however expensive its formula, costs exactly 256 function evaluations plus one table lookup per pixel. Better still, lookup tables compose. If you want to apply contrast, then gamma, then a tone tweak, you do not run three passes over the image; you compose the three curves into one table and run a single pass. This is precisely how camera ISPs, video pipelines, and color-grading systems work internally, and it is why colorists exchange ".cube" LUT files rather than scripts.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def build_tone_lut(alpha=1.0, beta=0.0, gamma=1.0):
+    """Compose contrast/brightness and gamma into ONE 256-entry table."""
+    r = np.arange(256, dtype=np.float32)
+    r = np.clip(alpha * r + beta, 0, 255) / 255.0   # stage 1: affine
+    s = np.clip(255.0 * (r ** gamma), 0, 255)       # stage 2: gamma
+    return s.astype(np.uint8)
+
+lut = build_tone_lut(alpha=1.2, beta=-10, gamma=0.8)
+
+cap = cv2.VideoCapture("dock_camera.mp4")
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    corrected = cv2.LUT(frame, lut)    # entire tone pipeline: one lookup pass
+    # ... feed `corrected` to the detector ...</code></pre>
+<div class="code-caption">Composing an entire tone pipeline (contrast, brightness, gamma) into a single lookup table built once outside the video loop. Inside the loop, the whole adjustment is one <code>cv2.LUT</code> call per frame, regardless of how many stages were composed.</div>
+
+<p>
+The pattern in this code, build the table once and reuse it for every frame, is worth internalizing. It converts per-pixel math into per-codebook math, and it scales to color: a 3D LUT tabulates a function of (R, G, B) jointly on a coarse lattice and interpolates between entries, which is how film looks and display calibration are implemented. Keep this in mind when you reach learned enhancement later: several state-of-the-art methods literally predict LUTs.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Gamma Is a CRT Fossil That Turned Out to Be Genius</div>
+<p>The number 2.2 originally described the physics of cathode-ray tubes: the beam current of a CRT responded to voltage as roughly $V^{2.2}$, so cameras pre-distorted the signal with the inverse curve. When CRTs died, gamma should have died with them, except engineers noticed the pre-distortion was almost exactly the perceptual encoding you would design on purpose: it spends scarce bits where human vision is most sensitive. The fossil became the standard (sRGB), and every JPEG you have ever taken carries it.</p>
+</div>
+
+<h2>5. Choosing Parameters Automatically: Percentile Stretching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Everything so far required a human to pick $\alpha$, $\beta$, or $\gamma$. A first step toward automation is contrast stretching: map the darkest interesting intensity to 0 and the brightest to 255, linearly. Using the absolute minimum and maximum is fragile (one dead pixel ruins the stretch), so robust implementations use percentiles, typically the 2nd and 98th:
+</p>
+<p>
+$$g = 255 \cdot \frac{\mathrm{clip}(f,\, p_2,\, p_{98}) - p_2}{p_{98} - p_2}$$
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def autocontrast(gray, low_pct=2, high_pct=98):
+    """Percentile-based contrast stretch (robust to outlier pixels)."""
+    lo, hi = np.percentile(gray, [low_pct, high_pct])
+    if hi &lt;= lo:                       # flat image: nothing to stretch
+        return gray.copy()
+    out = (gray.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+# A hazy image occupying only [90, 170] gets remapped to use [0, 255]:
+hazy = np.random.randint(90, 171, size=(480, 640), dtype=np.uint8)
+stretched = autocontrast(hazy)
+print(hazy.min(), hazy.max(), "->", stretched.min(), stretched.max())
+# 90 170 -> 0 255</code></pre>
+<div class="code-caption">Automatic contrast stretching driven by the 2nd and 98th percentiles of the intensity distribution. The synthetic hazy image occupies less than a third of the available range before stretching and the full range after.</div>
+
+<p>
+Notice what <code>autocontrast</code> needed in order to act: the percentiles of the intensity distribution. We computed them directly here, but the principled tool for describing that distribution is the histogram, and once you have a histogram you can do far more than stretch endpoints: you can diagnose exposure problems, compare images, and derive optimal contrast curves and thresholds. That is the subject of the next two sections, beginning with <a href="section-2.2.html">Section 2.2</a>.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Point Operations, Learned</div>
+<p>The lowly tone curve is an active research object. Zero-DCE (Guo et al., CVPR 2020) trains a tiny network that outputs per-pixel curve parameters for low-light enhancement with no paired training data: a learned, spatially varying version of this section's gamma correction. Retinexformer (Cai et al., ICCV 2023) couples a Retinex decomposition with a one-stage transformer and remains a strong open baseline. NILUT (Conde et al., AAAI 2024) represents professional 3D LUTs as compact implicit neural networks, so a single model can carry multiple color-grading styles onto mobile hardware. LightenDiffusion (Jiang et al., ECCV 2024) pushes the same problem into the diffusion-model framework of Part IV, and the HVI color space (Yan et al., CVPR 2025) shows that even choosing the space in which the curves act is still publishable territory. The pattern across all of them: the operations of this section are not obsolete, they are now the output of neural networks.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.1: Curve Reading <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Sketch (or describe) the transfer curve $s = T(r)$ for each of the following, and state whether the operation is invertible: (a) a negative ($s = 255 - r$); (b) brightness $+100$ on uint8 with saturation; (c) gamma 0.5 followed by gamma 2.0; (d) posterization to 4 levels. For each non-invertible case, identify exactly which input values become indistinguishable.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.2: One-Pass Tone Pipeline <span class="exercise-type coding">Coding</span></div>
+<p>Extend <code>build_tone_lut</code> with an optional S-curve stage $s = \tfrac{1}{2}\big(1 + \tanh(k\,(r - \tfrac{1}{2}))\big)$ on normalized intensities, controlled by a strength parameter $k$. Verify on a test image that applying your composed LUT in one <code>cv2.LUT</code> call produces results identical (to within 1 intensity level) to applying the three stages as separate passes. Time both versions on a 4K frame with <code>time.perf_counter</code>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 2.1.3: Clipping Audit <span class="exercise-type analysis">Analysis</span></div>
+<p>Take any well-exposed photograph and apply brightness shifts $\beta \in \{20, 40, 80, 160\}$ with saturation. For each, measure the fraction of pixels clipped at 255 and compute the PSNR (from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>) between a round trip (brighten by $\beta$ then darken by $-\beta$) and the original. Plot clipped fraction versus round-trip PSNR and explain the shape of the relationship in one paragraph.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 2 Overview</a>
+<a href="index.html">Chapter 2</a>
+<a class="next" href="section-2.2.html">Section 2.2: Image Histograms &amp; Statistics &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

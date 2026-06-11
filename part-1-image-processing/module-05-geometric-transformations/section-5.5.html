@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.5: Image Registration &amp; Alignment. Estimating the transform that aligns two images: phase correlation via the Fourier shift theorem, ECC intensity optimization, ORB feature matching, and RANSAC homography estimation." name="description"/>
+<title>Section 5.5: Image Registration &amp; Alignment | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a></div>
+<h1>Image Registration &amp; Alignment</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Four hundred of us pointed at the wrong building, and the algorithm still found the homography. I demand a recount."</p>
+<cite>A Feature Point That Refused to Match</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Registration inverts the warping problem: given two images of the same scene, recover the transform that aligns them.</strong> Three families of solutions dominate practice. Phase correlation reads global shifts straight out of the Fourier transform; direct methods such as ECC optimize the transform parameters against pixel intensities; and feature-based methods match distinctive points and fit a model with RANSAC absorbing the inevitable mismatches. Knowing which family fits which problem, and how to pick the transform model from Section 5.1's hierarchy, is what separates a robust alignment pipeline from a demo.</p>
+</div>
+<p>
+So far in this chapter, someone always handed us the transform: we chose rotation angles, picked corner points, invented distortion coefficients. Production systems rarely enjoy that luxury. A panorama stitcher receives two overlapping photos and must <em>discover</em> the homography between them; a video stabilizer must discover the inter-frame motion; a remote-sensing pipeline must align today's satellite pass with last month's. This estimation problem is <strong>image registration</strong>, one of the oldest and most economically consequential problems in vision, and it ties the entire chapter together: the hierarchy of <a href="section-5.1.html">Section 5.1</a> tells us what to estimate, and the warping machinery of <a href="section-5.4.html">Section 5.4</a> executes whatever we find.
+</p>
+<h2>1. Phase Correlation: Alignment From the Fourier Domain <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+For pure translation there is a method of almost unreasonable elegance. The Fourier shift theorem from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> says that shifting an image by $(\Delta x, \Delta y)$ multiplies its Fourier transform by a phase ramp $e^{-i2\pi(u\Delta x + v\Delta y)}$ while leaving magnitudes untouched. So if $F_1$ and $F_2$ are the transforms of two shifted copies, the <strong>normalized cross-power spectrum</strong> isolates exactly that ramp:
+</p>
+$$
+R(u, v) \;=\; \frac{F_1(u,v)\, F_2^*(u,v)}{\left|F_1(u,v)\, F_2^*(u,v)\right|}
+\qquad\Longrightarrow\qquad
+\mathcal{F}^{-1}\{R\} = \delta(x - \Delta x,\; y - \Delta y)
+$$
+<p>
+The inverse transform of $R$ is, ideally, a single bright spike sitting at the shift. Find the spike, read off the translation; subpixel accuracy comes from fitting the peak's neighborhood. Because the normalization throws away all magnitude information, the method is remarkably immune to global illumination changes, and it considers <em>every pixel at once</em> rather than trusting any local landmark:
+</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+f1 = np.float32(cv2.imread("pass_may.png",  cv2.IMREAD_GRAYSCALE))
+f2 = np.float32(cv2.imread("pass_june.png", cv2.IMREAD_GRAYSCALE))
+
+# Hanning window suppresses the spectral leakage from image borders
+win = cv2.createHanningWindow(f1.shape[::-1], cv2.CV_32F)
+(dx, dy), response = cv2.phaseCorrelate(f1, f2, win)
+print(f"shift = ({dx:+.2f}, {dy:+.2f}) px,  peak response = {response:.3f}")
+</code></pre>
+<div class="code-caption"><strong>Code 5.5.1:</strong> Phase correlation in three effective lines. The <code>response</code> value (peak sharpness, 0 to 1) doubles as a confidence score: clean alignments score high, mismatched content scores near zero.</div>
+<pre class="code-output">shift = (+17.38, -4.92) px,  peak response = 0.871
+</pre>
+<div class="code-caption"><strong>Output 5.5.1a:</strong> A subpixel translation estimate with built-in confidence. Translations are all the basic method recovers; rotation and scale require the log-polar extension discussed below.</div>
+<p>
+The translation-only limitation has a classical workaround worth knowing: resample the Fourier <em>magnitude</em> spectra to log-polar coordinates, where rotation and scaling become translations, run phase correlation there to recover them, undo them, then run phase correlation again for the shift. This Fourier-Mellin pipeline (OpenCV provides <code>cv2.warpPolar</code> for the resampling) handles the full similarity group of <a href="section-5.1.html">Section 5.1</a> and is a staple of scan-matching and watermark-detection systems.
+</p>
+<h2>2. Direct Methods: ECC Alignment <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Phase correlation is global and rigid; the next family treats registration as continuous optimization. <strong>Direct (intensity-based) methods</strong> parameterize a warp $W_\mathbf{p}$ by the entries of a transformation matrix and search for the parameters that make the warped moving image best match the fixed image, descending the gradient of a similarity objective. The standard-bearer in OpenCV is <strong>ECC</strong> (Evangelidis and Psarakis, 2008), which maximizes the <em>enhanced correlation coefficient</em>, a similarity measure invariant to global brightness gain and bias, so a darker exposure of the same scene still registers cleanly:
+</p>
+<pre><code class="language-python">fixed  = cv2.imread("band_nir.png",  cv2.IMREAD_GRAYSCALE)
+moving = cv2.imread("band_red.png",  cv2.IMREAD_GRAYSCALE)
+
+warp = np.eye(2, 3, dtype=np.float32)              # identity initialization
+criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+
+cc, warp = cv2.findTransformECC(fixed, moving, warp,
+                                motionType=cv2.MOTION_EUCLIDEAN,
+                                criteria=criteria)
+print(f"final correlation: {cc:.4f}")
+aligned = cv2.warpAffine(moving, warp, fixed.shape[::-1],
+                         flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+</code></pre>
+<div class="code-caption"><strong>Code 5.5.2:</strong> ECC alignment of two spectral bands. <code>motionType</code> selects the rung of Section 5.1's hierarchy to optimize: <code>MOTION_TRANSLATION</code>, <code>MOTION_EUCLIDEAN</code>, <code>MOTION_AFFINE</code>, or <code>MOTION_HOMOGRAPHY</code>.</div>
+<p>
+Direct methods have a sharply defined personality. They use every pixel's gradient, so they achieve excellent subpixel accuracy and work on images with <em>no distinctive corners at all</em> (smooth terrain, medical slices, blurry frames). But the optimization is local: start it more than a few dozen pixels from the truth and it converges to the wrong valley. The standard remedy is coarse-to-fine: run ECC on the smallest level of a Gaussian pyramid from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, where the basin of convergence is wide, and propagate the result down the levels as initialization. Phase correlation also makes an excellent initializer. When we reach optical flow in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, you will recognize Lucas-Kanade as exactly this machinery applied to small patches.
+</p>
+<h2>3. Feature-Based Registration and RANSAC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+The third family is the one inside every panorama app. Instead of comparing all pixels, find a few hundred <em>distinctive</em> points in each image, describe each by a compact signature of its neighborhood, match signatures across images, and fit a transform to the matched pairs. The detection and description machinery (ORB here; SIFT, AKAZE, and learned successors) gets a full treatment in <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>; today we use it as a black box that outputs correspondences, because the interesting part for this chapter is what happens next.
+</p>
+<p>
+What happens next is that many correspondences are <em>wrong</em>. Repetitive windows match the wrong window; foliage matches other foliage; 10 to 70 percent outlier rates are routine. Least-squares fitting averages outliers into the answer and is destroyed by them. The fix, <strong>RANSAC</strong> (Random Sample Consensus, Fischler and Bolles, 1981), is one of the most-used algorithms in all of computer vision:
+</p>
+<div class="callout algorithm">
+<div class="callout-title">Algorithm 5.5.1: RANSAC for Transform Estimation</div>
+<pre><code class="language-text">Input: correspondences C, model family with minimal sample size s,
+       inlier threshold t (px), iterations N
+Best := empty
+Repeat N times:
+    1. Draw s correspondences from C at random
+       (s = 1 translation, 2 similarity, 3 affine, 4 homography)
+    2. Fit the model exactly to those s pairs
+    3. Count how many correspondences in C the model maps
+       within t pixels of their partner: the inlier set
+    4. If this inlier set is the largest so far, keep it
+Refit the model by least squares on the final inlier set
+Return model + inlier mask</code></pre>
+<div class="code-caption"><strong>Code 5.5.4:</strong> RANSAC in pseudocode: hypothesize from minimal samples, score by consensus, keep the most-agreed model.</div>
+<p>The minimal sample sizes in step 1 are exactly the "minimum point pairs" column of Table 5.1.1: the hierarchy of <a href="section-5.1.html">Section 5.1</a> determines how much randomness RANSAC needs.</p>
+</div>
+<p>
+The logic is probabilistic: a random minimal sample is <em>entirely</em> outlier-free with probability $w^s$ (where $w$ is the inlier fraction), and one clean sample is enough, because the model it generates will be confirmed by all the other inliers. To find at least one clean sample with confidence $p$, you need
+</p>
+$$
+N \;=\; \frac{\ln(1 - p)}{\ln(1 - w^s)}
+$$
+<p>
+iterations: for $w = 0.5$, $s = 4$, $p = 0.99$, about 72 draws, microseconds of work. Figure 5.5.1 shows the geometry of why counting inliers separates the true model from outlier-contaminated fits.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RANSAC concept: correspondence points with inliers along a consistent transform band and scattered outliers; the consensus model collects the inliers while a contaminated fit attracts few points">
+<style>
+.bg2 { fill: #fafbfc; stroke: #d0d7de; stroke-width: 1; }
+.inl { fill: #2563eb; }
+.outl { fill: #ef4444; }
+.modgood { stroke: #2563eb; stroke-width: 2.6; fill: none; }
+.modbad { stroke: #ef4444; stroke-width: 2.2; stroke-dasharray: 7 5; fill: none; }
+.band { fill: #dbeafe; fill-opacity: 0.5; }
+.lab { font-family: Verdana, Arial, sans-serif; font-size: 13px; fill: #1f2937; }
+.lab2 { font-family: Verdana, Arial, sans-serif; font-size: 12px; fill: #6b7280; }
+</style>
+<rect class="bg2" x="15" y="15" width="850" height="250" rx="8"/>
+<!-- inlier band around the good model -->
+<polygon class="band" points="55,212 815,76 815,106 55,242"/>
+<!-- good model line -->
+<line class="modgood" x1="55" y1="227" x2="815" y2="91"/>
+<!-- bad model line through 2 outliers -->
+<line class="modbad" x1="80" y1="60" x2="800" y2="235"/>
+<!-- inliers: on or near the good line -->
+<circle class="inl" cx="95" cy="219" r="5"/>
+<circle class="inl" cx="170" cy="208" r="5"/>
+<circle class="inl" cx="255" cy="190" r="5"/>
+<circle class="inl" cx="330" cy="180" r="5"/>
+<circle class="inl" cx="410" cy="163" r="5"/>
+<circle class="inl" cx="490" cy="151" r="5"/>
+<circle class="inl" cx="565" cy="135" r="5"/>
+<circle class="inl" cx="650" cy="122" r="5"/>
+<circle class="inl" cx="730" cy="105" r="5"/>
+<circle class="inl" cx="790" cy="97" r="5"/>
+<!-- outliers scattered -->
+<circle class="outl" cx="150" cy="75" r="5"/>
+<circle class="outl" cx="300" cy="110" r="5"/>
+<circle class="outl" cx="370" cy="245" r="5"/>
+<circle class="outl" cx="520" cy="55" r="5"/>
+<circle class="outl" cx="610" cy="225" r="5"/>
+<circle class="outl" cx="700" cy="190" r="5"/>
+<!-- labels -->
+<text class="lab" x="40" y="295">&#9679; inliers agree with one transform (blue band: within threshold t)</text>
+<text class="lab" x="540" y="295" fill="#ef4444">&#9679; outliers: wrong matches</text>
+<text class="lab2" x="585" y="73">consensus model: 10 inliers</text>
+<text class="lab2" x="115" y="48">sample hit 2 outliers: model attracts 2 points</text>
+</svg>
+<figcaption><strong>Figure 5.5.1:</strong> Why consensus counting works (transform error shown schematically in 2D). Inlier correspondences (blue) all agree with one underlying transform, so a minimal sample drawn from them generates a model whose threshold band collects every other inlier. A sample contaminated by outliers (red dashed) produces a model that fits almost nothing else. The largest consensus set therefore identifies the true model, even at high outlier rates.</figcaption>
+</figure>
+<p>
+OpenCV bundles the entire loop, including the final least-squares polish, inside <code>cv2.findHomography</code>. A complete feature-based registration pipeline is then short enough to memorize:
+</p>
+<pre><code class="language-python">img1 = cv2.imread("left.jpg",  cv2.IMREAD_GRAYSCALE)   # moving
+img2 = cv2.imread("right.jpg", cv2.IMREAD_GRAYSCALE)   # fixed
+
+orb = cv2.ORB_create(nfeatures=4000)
+k1, d1 = orb.detectAndCompute(img1, None)
+k2, d2 = orb.detectAndCompute(img2, None)
+
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+matches = sorted(bf.match(d1, d2), key=lambda m: m.distance)[:600]
+
+src = np.float32([k1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+dst = np.float32([k2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+H, inlier_mask = cv2.findHomography(src, dst, cv2.RANSAC,
+                                    ransacReprojThreshold=3.0)
+n_in = int(inlier_mask.sum())
+print(f"RANSAC kept {n_in}/{len(matches)} matches as inliers")
+
+aligned = cv2.warpPerspective(img1, H, img2.shape[::-1])
+</code></pre>
+<div class="code-caption"><strong>Code 5.5.3:</strong> The classic feature-based registration pipeline: detect, describe, match, RANSAC-fit, warp. Twelve effective lines from two photographs to an aligned pair.</div>
+<pre class="code-output">RANSAC kept 311/600 matches as inliers
+</pre>
+<div class="code-caption"><strong>Output 5.5.3a:</strong> Roughly half the matches were wrong, and it did not matter. The inlier count is your quality gauge: below about 30 inliers, or below 15 percent of matches, treat the estimated homography with suspicion.</div>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Robustness Beats Accuracy of Individual Matches</div>
+<p>The deep lesson of RANSAC is architectural, not algorithmic: <em>do not try to make every measurement correct; make the system indifferent to incorrect measurements.</em> Decades of effort went into better descriptors producing fewer mismatches, and that helps, but the pipeline's reliability comes from the estimator that tolerates 50 percent garbage. You will meet this design philosophy again in pose estimation, in SLAM's loop-closure verification in <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>, and in robust training losses, and it transfers to any system you build that consumes noisy upstream predictions.</p>
+</div>
+<h2>4. Choosing a Method, Choosing a Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+The three families are complements, not competitors. Table 5.5.1 is the decision matrix this book will reuse whenever alignment appears.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 5.5.1:</strong> <em>Registration method selection.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Method</th><th scope="col">Recovers</th><th scope="col">Strengths</th><th scope="col">Fails when</th></tr>
+</thead>
+<tbody>
+<tr><td>Phase correlation</td><td>translation (+ rotation/scale via log-polar)</td><td>global, illumination-immune, subpixel, fast</td><td>motion beyond similarity; small overlap</td></tr>
+<tr><td>ECC / direct</td><td>any matrix model, subpixel</td><td>no features needed; cross-exposure, cross-band</td><td>initialization far from truth; large motion without a pyramid</td></tr>
+<tr><td>Features + RANSAC</td><td>any matrix model</td><td>huge motions, partial overlap, outlier-immune</td><td>textureless or repetitive scenes; extreme appearance gaps</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+Orthogonal to method choice is <em>model</em> choice, and here Section 5.1's discipline pays its dividend: fit the smallest family the physics permits. A microscope stage needs translation; a scanning satellite needs similarity or affine; overlapping handheld photos of a facade need a homography. And when the scene has genuine depth parallax between camera positions, <em>no</em> global 2D model is correct: the best homography will align the dominant plane and ghost everything off it, which is the cue to graduate to the epipolar geometry of <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a> or to local deformable models.
+</p>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Ghost Crops in the NDVI Map</div>
+<p><strong>Who:</strong> A computer-vision engineer at an agritech startup processing drone imagery into crop-health (NDVI) maps.</p>
+<p><strong>Situation:</strong> The drone's multispectral camera exposes its five spectral bands through five separate lenses a few millimeters apart, so the red and near-infrared images are slightly misaligned at capture.</p>
+<p><strong>Problem:</strong> NDVI divides the difference of the two bands by their sum, pixel by pixel. With 3-pixel misalignment, every crop-row boundary produced a bright false-stress stripe; agronomists were dispatching scouts to perfectly healthy field edges. The first fix attempt, ORB matching between bands, produced almost no correct matches: the bands' intensities differ so much that descriptors of the same ground point disagree.</p>
+<p><strong>Decision:</strong> Descriptors compare appearance, but gradient <em>locations</em> are stable across bands. The engineer switched to ECC with <code>MOTION_EUCLIDEAN</code> per band pair, initialized by phase correlation, run coarse-to-fine on a 3-level pyramid.</p>
+<p><strong>Result:</strong> Residual misalignment dropped below 0.3 pixels; the phantom stress stripes disappeared, along with the wasted scouting trips.</p>
+<p><strong>Lesson:</strong> Feature descriptors assume the two images look alike. When modality or band differs, direct methods on intensity structure (or mutual information for truly different modalities, built from the joint histograms of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>) are the right family.</p>
+</div>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.Stitcher, the Whole Pipeline in Three Lines</div>
+<p>Code 5.5.3 plus exposure compensation, seam finding, multi-band blending, and multi-image bundle adjustment is a few hundred lines of careful work. For the panorama use case, OpenCV ships the entire system:</p>
+<pre><code class="language-python">stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+status, pano = stitcher.stitch([img_a, img_b, img_c])
+if status == cv2.Stitcher_OK: cv2.imwrite("pano.jpg", pano)
+</code></pre>
+<div class="code-caption"><strong>Code 5.5.5:</strong> Three lines from photo list to panorama: the stitcher hides eight pipeline stages behind one status code.</div>
+<p>Roughly 300 lines of pipeline collapse to 3. Internally the stitcher runs feature detection and pairwise matching, RANSAC homographies, a global bundle adjustment that reconciles all pairwise estimates (a preview of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>), wave-effect correction, exposure compensation, graph-cut seam selection, and multi-band blending using the pyramids of Chapter 4.</p>
+</div>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Learned Matchers and Foundation Registration</div>
+<p>Every stage of Code 5.5.3 now has a learned, stronger replacement. <strong>SuperPoint</strong> descriptors matched by <strong>LightGlue</strong> (Lindenberger et al., ICCV 2023) became the practical 2024-2026 default for hard wide-baseline pairs, fast enough for real time. <strong>RoMa</strong> (CVPR 2024) drops the sparse-keypoint abstraction entirely and predicts a dense warp with per-pixel certainty, surviving day-to-night and season changes that break ORB outright. <strong>MASt3R</strong> (ECCV 2024) goes further still, regressing 3D pointmaps from which correspondences and relative pose both fall out. Robust fitting evolved too: <strong>MAGSAC++</strong> (Barath et al., 2020), available as a flag in <code>cv2.findHomography</code> (<code>cv2.USAC_MAGSAC</code>), removes RANSAC's brittle threshold choice and should be your default today. In medical imaging, <strong>uniGradICON</strong> (Tian et al., MICCAI 2024) markets itself as a foundation model for deformable registration: one network registering across anatomies and modalities. The architecture of the pipeline, correspondences then robust model fitting then warp, has survived every one of these substitutions intact.</p>
+</div>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>RANSAC was invented in 1981 to help a robot cart figure out where it was by matching landmarks, on hardware so modest that the authors agonized over each random draw. The same algorithm, essentially unchanged, now runs inside your phone every time you take a panorama, and modern phones run it a few hundred times per second during capture. Few 1980s SRI technical reports have shipped in two billion consumer devices.</p>
+</div>
+<p>
+Registration completes the chapter's toolkit: we can now describe transforms, compose them, execute them, and recover them from data. The closing section spends the entire budget at once. We will build a document scanner from scratch, and every stage of it, model selection, corner correspondence, homography estimation, inverse warping, interpolation, will be a tool you can now name. Continue to <a href="section-5.6.html">Section 5.6</a>.
+</p>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.5.1: Minimal Samples and Confidence <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Explain from the DoF-counting argument of Section 5.1 why RANSAC needs 4 point pairs for a homography but only 2 for a similarity transform. (b) Using $N = \ln(1-p)/\ln(1-w^s)$, compute the required iterations at $p = 0.99$ for both models when $w = 0.5$ and when $w = 0.2$. (c) A teammate proposes "improving" robustness by fitting each RANSAC hypothesis to 8 pairs instead of the minimal 4, reasoning that more data gives better models. Explain quantitatively why this usually <em>hurts</em>.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.5.2: Rotation and Scale via Log-Polar <span class="exercise-type coding">Coding</span></div>
+<p>Implement Fourier-Mellin registration for a similarity transform without translation: (1) compute the FFT magnitude of both images (Chapter 4 tools); (2) resample each magnitude with <code>cv2.warpPolar</code> using the <code>WARP_POLAR_LOG</code> flag; (3) run <code>cv2.phaseCorrelate</code> on the two log-polar magnitudes and convert the recovered "shift" into a rotation angle and scale factor; (4) undo the rotation and scale, then recover the translation with a second phase correlation. Validate against synthetic rotations of 5 to 45 degrees combined with scales of 0.8 to 1.25, and report the error of each recovered parameter.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 5.5.3: Stress-Testing RANSAC <span class="exercise-type analysis">Analysis</span></div>
+<p>Build a synthetic correspondence set: 200 points transformed by a known homography plus Gaussian noise ($\sigma = 1$ px), contaminated with a controllable fraction of uniformly random outliers. Sweep the outlier fraction from 0 to 0.9 in steps of 0.1 and, for each level, run <code>cv2.findHomography</code> with (a) plain least squares (method 0), (b) RANSAC at threshold 3.0, and (c) <code>cv2.USAC_MAGSAC</code>. Plot the mean reprojection error of each estimator against outlier fraction over 50 trials. Identify the breakdown point of each method and relate the RANSAC curve to the iteration formula from this section.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="section-5.4.html"><span class="nav-label">Section 5.4: Warping, Remapping &amp; Inverse Mapping</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 5</span></a>
+<a class="next" href="section-5.6.html"><span class="nav-label">Section 5.6: Worked Example: A Document Scanner from Scratch</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 7.1: Noise Models &amp; Degradation Pipelines. The physics of image noise from photon shot noise to read noise, the degradation model g = h*f + n, variance stabilization, and building realistic degradation pipelines in code." name="description"/>
+<title>Section 7.1: Noise Models &amp; Degradation Pipelines | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 7: Image Restoration &amp; Enhancement</a></div>
+<h1>Noise Models &amp; Degradation Pipelines</h1>
+</header>
+<main class="content">
+<blockquote class="epigraph">
+<p>"Every photon is a coin flip and every electron has an opinion. I just write down the average and hope you call it a photograph."</p>
+<cite>A Statistically Honest Image Sensor</cite>
+</blockquote>
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>You cannot undo damage you cannot describe: every restoration algorithm begins as a forward model of how the clean image became the dirty one.</strong> This section builds that forward model piece by piece, from the quantum randomness of photon arrival to the blur of optics and the artifacts of compression, because the quality of every denoiser, deblurrer, and super-resolver in this chapter is bounded by the fidelity of the degradation model it assumes.</p>
+</div>
+<p>
+In <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a> we enjoyed the luxury of clean binary images, where every pixel was confidently foreground or background. That luxury was manufactured: real images arrive damaged, and pretending otherwise is how pipelines fail in production. This section opens the restoration chapter by studying the damage itself. Before asking "how do I remove noise?" we ask the better questions: what process generated the noise, what statistical signature does it carry, and how can we reproduce it faithfully enough to test our cures?
+</p>
+<h2>1. The Degradation Model <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+Nearly every problem in this chapter fits a single equation. Let $f(x, y)$ be the ideal image we wish we had captured, $h(x, y)$ a blur kernel called the <em>point spread function</em> (PSF), $\ast$ the convolution we built in <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, and $n(x, y)$ a random noise field. The observed image is
+</p>
+$$
+g(x, y) = (h \ast f)(x, y) + n(x, y).
+$$
+<p>
+Restoration is the attempt to recover $f$ from $g$, given whatever we know about $h$ and the statistics of $n$. Stated this way, the problem looks like algebra: subtract the noise, divide out the blur. The reason this chapter exists is that both steps are treacherous. The noise is random, so it cannot be subtracted, only suppressed at the cost of some signal. The blur, viewed in the frequency domain of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, multiplies some frequencies by numbers close to zero, and dividing by almost-zero amplifies whatever noise lives there. Restoration problems are <em>ill-posed</em>: many candidate images $f$ explain the observation $g$ essentially equally well, and picking among them requires assumptions about what images look like, assumptions this book will call <em>priors</em>.
+</p>
+<p>
+Figure 7.1.1 traces the full journey from scene to file, with each stage contributing its own term to the model. The pipeline mirrors the camera hardware tour of <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>, but now with an accountant's eye: every box is a place where information is lost, and every loss has a statistical fingerprint.
+</p>
+<figure class="diagram">
+<svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Degradation pipeline from ideal scene through optics, sensor, electronics, and compression to the observed image, with restoration as the reverse arrow">
+<style>
+.stage { fill: #f0f6ff; stroke: #2563eb; stroke-width: 1.6; }
+.dmg { fill: #fff3f0; stroke: #dc2626; stroke-width: 1.3; }
+.lbl { font-family: Verdana, Arial, sans-serif; font-size: 13px; font-weight: bold; fill: #1f2937; text-anchor: middle; }
+.sub { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #4b5563; text-anchor: middle; }
+.dmgtxt { font-family: Verdana, Arial, sans-serif; font-size: 11px; fill: #b91c1c; text-anchor: middle; }
+.arrow { stroke: #1f2937; stroke-width: 2; fill: none; marker-end: url(#ah); }
+.rarrow { stroke: #059669; stroke-width: 2.4; fill: none; marker-end: url(#ahg); stroke-dasharray: 7 5; }
+.math { font-family: Georgia, 'Times New Roman', serif; font-style: italic; font-size: 13px; fill: #1f2937; text-anchor: middle; }
+</style>
+<defs>
+<marker id="ah" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#1f2937"/></marker>
+<marker id="ahg" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="#059669"/></marker>
+</defs>
+<!-- Stage boxes -->
+<rect class="stage" x="15" y="60" width="130" height="64" rx="8"/>
+<text class="lbl" x="80" y="87">Ideal scene</text>
+<text class="math" x="80" y="107">f(x, y)</text>
+<rect class="stage" x="205" y="60" width="130" height="64" rx="8"/>
+<text class="lbl" x="270" y="87">Optics</text>
+<text class="sub" x="270" y="107">lens, motion, focus</text>
+<rect class="stage" x="395" y="60" width="130" height="64" rx="8"/>
+<text class="lbl" x="460" y="87">Sensor</text>
+<text class="sub" x="460" y="107">photon counting</text>
+<rect class="stage" x="585" y="60" width="130" height="64" rx="8"/>
+<text class="lbl" x="650" y="87">Electronics</text>
+<text class="sub" x="650" y="107">amplify, digitize</text>
+<rect class="stage" x="775" y="60" width="130" height="64" rx="8"/>
+<text class="lbl" x="840" y="87">Compression</text>
+<text class="math" x="840" y="107">g(x, y)</text>
+<!-- Arrows between stages -->
+<line class="arrow" x1="145" y1="92" x2="200" y2="92"/>
+<line class="arrow" x1="335" y1="92" x2="390" y2="92"/>
+<line class="arrow" x1="525" y1="92" x2="580" y2="92"/>
+<line class="arrow" x1="715" y1="92" x2="770" y2="92"/>
+<!-- Damage annotations below -->
+<rect class="dmg" x="205" y="160" width="130" height="52" rx="6"/>
+<text class="dmgtxt" x="270" y="182">blur: h &#8727; f</text>
+<text class="dmgtxt" x="270" y="200">PSF convolution</text>
+<rect class="dmg" x="395" y="160" width="130" height="52" rx="6"/>
+<text class="dmgtxt" x="460" y="182">shot noise</text>
+<text class="dmgtxt" x="460" y="200">Poisson(&#955;)</text>
+<rect class="dmg" x="585" y="160" width="130" height="52" rx="6"/>
+<text class="dmgtxt" x="650" y="182">read noise + ADC</text>
+<text class="dmgtxt" x="650" y="200">Gaussian + quantize</text>
+<rect class="dmg" x="775" y="160" width="130" height="52" rx="6"/>
+<text class="dmgtxt" x="840" y="182">JPEG artifacts</text>
+<text class="dmgtxt" x="840" y="200">blocking, ringing</text>
+<line class="arrow" x1="270" y1="158" x2="270" y2="128"/>
+<line class="arrow" x1="460" y1="158" x2="460" y2="128"/>
+<line class="arrow" x1="650" y1="158" x2="650" y2="128"/>
+<line class="arrow" x1="840" y1="158" x2="840" y2="128"/>
+<!-- Restoration reverse arrow -->
+<path class="rarrow" d="M 840 235 C 700 285, 220 285, 85 240"/>
+<text class="sub" x="460" y="262" style="fill:#059669; font-weight:bold;">restoration: infer f from g (this chapter, read right to left)</text>
+</svg>
+<figcaption><strong>Figure 7.1.1:</strong> The degradation pipeline. Each stage of the camera contributes a characteristic form of damage (red boxes): optics convolve the scene with a point spread function, the sensor adds signal-dependent shot noise, the electronics add Gaussian read noise and quantization, and compression adds structured artifacts. Restoration (green dashed arrow) runs the pipeline in reverse, which is only possible with a model of each stage.</figcaption>
+</figure>
+<h2>2. A Field Guide to Noise <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+"Noise" is not one thing. The label covers several physically distinct random processes, and each demands different treatment. The four entries below cover the vast majority of what you will meet in practice; Table 7.1.1 summarizes their signatures.
+</p>
+<p>
+<strong>Photon shot noise.</strong> Light is quantized. A pixel that "should" collect 100 photons during the exposure actually collects a Poisson-distributed count: sometimes 91, sometimes 107. The Poisson distribution's defining property is that its variance equals its mean, so a pixel collecting $\lambda$ photons fluctuates with standard deviation $\sqrt{\lambda}$. This has a consequence worth memorizing: <em>bright pixels are noisier in absolute terms but cleaner in relative terms</em>, since the signal-to-noise ratio is $\lambda / \sqrt{\lambda} = \sqrt{\lambda}$. Shot noise is not a defect of the sensor; it is a property of light itself, and no hardware will ever remove it.
+</p>
+<p>
+<strong>Read noise.</strong> Converting accumulated charge to a digital number involves amplifiers and an analog-to-digital converter, all of which add small, signal-independent fluctuations. Read noise is well modeled as zero-mean Gaussian noise with a fixed standard deviation, and it dominates in the darkest regions of an image, where the photon count is too small for shot noise to matter. This is why the shadows of a night photo look grainy while the bright window in the same frame looks clean.
+</p>
+<p>
+<strong>Impulse (salt-and-pepper) noise.</strong> Dead or hot pixels, transmission bit errors, and certain sensor defects replace individual pixels with extreme values: full black or full white. The defining feature is that affected pixels carry <em>no information at all</em> about the true value; the median filter from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> is the classical cure precisely because it discards extreme values rather than averaging them in.
+</p>
+<p>
+<strong>Speckle.</strong> Coherent imaging systems, including ultrasound, synthetic aperture radar, and laser imaging, produce multiplicative noise: the noise amplitude scales with the signal, $g = f + f \cdot n$. Multiplicative noise turns into additive noise under a logarithm, which is the standard preprocessing trick in those fields.
+</p>
+<div class="comparison-table">
+<div class="comparison-table-title"><strong>Table 7.1.1:</strong> <em>The main noise families, their models, and where they come from.</em></div>
+<table>
+<thead>
+<tr><th scope="col">Noise</th><th scope="col">Model</th><th scope="col">Signal-dependent?</th><th scope="col">Typical source</th><th scope="col">Classical cure</th></tr>
+</thead>
+<tbody>
+<tr><td>Shot (photon)</td><td>Poisson, $\sigma^2 = \lambda$</td><td>yes</td><td>quantum nature of light</td><td>averaging, variance stabilization</td></tr>
+<tr><td>Read</td><td>Gaussian, fixed $\sigma$</td><td>no</td><td>amplifier and ADC electronics</td><td>any linear or patch denoiser</td></tr>
+<tr><td>Salt-and-pepper</td><td>impulse, $p$ corrupted</td><td>no</td><td>dead pixels, bit errors</td><td>median filter</td></tr>
+<tr><td>Speckle</td><td>multiplicative, $g = f(1+n)$</td><td>yes</td><td>coherent imaging (ultrasound, SAR)</td><td>log transform, then denoise</td></tr>
+<tr><td>Quantization</td><td>uniform, $\pm \tfrac{1}{2}$ LSB</td><td>no</td><td>finite bit depth</td><td>dithering, higher bit depth</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+Two more degradations deserve membership in the field guide even though they are not "noise" in the random sense. <em>Quantization</em> rounds continuous values to the nearest of $2^b$ levels, contributing a small uniform error and, at low bit depths, visible banding (recall the bit-depth experiments of <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>). And <em>JPEG compression</em> introduces structured, deterministic artifacts: 8x8 blocking and ringing around edges, which behave nothing like random noise and defeat denoisers designed for it. A restoration pipeline that ignores compression artifacts will faithfully "denoise" the blocking pattern into the output.
+</p>
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Noise Model Is Half the Algorithm</div>
+<p>Mismatching the noise model costs more than choosing a mediocre denoiser. A Gaussian-noise denoiser applied to salt-and-pepper noise smears the impulses into blobs instead of removing them; applied to Poisson noise, it over-smooths shadows and under-smooths highlights because it assumes one global $\sigma$ where the truth varies per pixel. Before reaching for any algorithm in Section 7.2, identify the dominant noise source. The cure follows from the diagnosis, rarely the other way around.</p>
+</div>
+<h2>3. Synthesizing Noise in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Restoration research has a peculiar advantage over most of vision: you can manufacture perfect ground truth. Take a clean image, damage it with a known model, restore it, and compare against the original with the PSNR and SSIM metrics from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>. Everything in this chapter is evaluated that way, so our first piece of code, Code 7.1.1, is the damage generator itself.
+</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(seed=7)
+
+def add_gaussian(img, sigma=0.05):
+    """Additive read-noise model. img is float in [0, 1]."""
+    return np.clip(img + rng.normal(0, sigma, img.shape), 0, 1)
+
+def add_poisson(img, peak=100.0):
+    """Shot noise: scale to 'peak' photons, draw Poisson counts, rescale."""
+    photons = rng.poisson(img * peak)          # variance == mean, per pixel
+    return np.clip(photons / peak, 0, 1)
+
+def add_salt_pepper(img, amount=0.02):
+    """Impulse noise: a fraction 'amount' of pixels forced to 0 or 1."""
+    out = img.copy()
+    coords = rng.random(img.shape)
+    out[coords &lt; amount / 2] = 0.0             # pepper
+    out[coords &gt; 1 - amount / 2] = 1.0         # salt
+    return out
+
+def add_speckle(img, sigma=0.15):
+    """Multiplicative noise: g = f * (1 + n)."""
+    return np.clip(img * (1 + rng.normal(0, sigma, img.shape)), 0, 1)
+</code></pre>
+<div class="code-caption"><strong>Code 7.1.1:</strong> Four noise generators matching the rows of Table 7.1.1. Note the structural differences: Gaussian noise is added, Poisson noise is <em>drawn from</em> the scaled image (the image is the distribution's parameter), impulse noise replaces values outright, and speckle multiplies.</div>
+<p>
+The Poisson generator deserves a second look because it is the one that trips people up. There is no "Poisson noise array" to add: the image itself parameterizes the distribution, pixel by pixel. The <code>peak</code> argument sets how many photons the brightest pixel collects, and it is the single dial controlling noise severity. A <code>peak</code> of 10,000 simulates a sunny day (nearly invisible noise); a <code>peak</code> of 30 simulates a dim interior, and the shadows fall apart exactly the way they do in a real night shot.
+</p>
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>skimage.util.random_noise</code></div>
+<p>The four generators above, plus localvar and Poisson variants and all the clipping bookkeeping, ship as one function in scikit-image:</p>
+<pre><code class="language-python">from skimage.util import random_noise
+
+noisy_g  = random_noise(img, mode='gaussian', var=0.05**2)
+noisy_p  = random_noise(img, mode='poisson')
+noisy_sp = random_noise(img, mode='s&amp;p', amount=0.02)
+noisy_sk = random_noise(img, mode='speckle', var=0.15**2)
+</code></pre>
+<p>Roughly 25 lines of generator code become 4 calls. Internally the library handles float conversion, the rescaling conventions for Poisson mode, seed management, and clipping, the exact bookkeeping that produces subtle bugs when hand-rolled. Keep the from-scratch versions for understanding; use this one in pipelines.</p>
+</div>
+<h2>4. Signal-Dependent Noise &amp; Variance Stabilization <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<p>
+Real sensor noise is a mixture: Poisson shot noise plus Gaussian read noise, often summarized as the <em>Poisson-Gaussian model</em>. Its variance is an affine function of the true signal,
+</p>
+$$
+\operatorname{Var}[g(x,y)] = a \, f(x, y) + b,
+$$
+<p>
+where $a$ reflects the sensor gain (the Poisson part) and $b$ the read-noise floor (the Gaussian part). This signal dependence is awkward: nearly every classical denoiser in Section 7.2 assumes one global noise level. The classical workaround is elegant. A <em>variance-stabilizing transform</em> remaps intensities so that the noise becomes approximately uniform across the range. For pure Poisson data the standard choice is the <strong>Anscombe transform</strong>,
+</p>
+$$
+A(x) = 2\sqrt{x + \tfrac{3}{8}},
+$$
+<p>
+which converts Poisson noise of any mean into approximately unit-variance Gaussian noise. The recipe, demonstrated in Code 7.1.2, is a sandwich: transform, denoise with any Gaussian-noise method, transform back. The inverse must be applied carefully (the naive algebraic inverse is biased for small counts; libraries provide the corrected "exact unbiased" inverse), but the sandwich pattern itself is universal and reappears throughout imaging science.
+</p>
+<pre><code class="language-python">def anscombe(x):
+    return 2.0 * np.sqrt(x + 3.0 / 8.0)
+
+def inverse_anscombe(y):
+    # Simple algebraic inverse; biased at very low counts.
+    return (y / 2.0) ** 2 - 3.0 / 8.0
+
+photons = rng.poisson(img * 30.0)              # severe low-light shot noise
+
+stabilized = anscombe(photons)
+print(f"dark-region std:   {stabilized[img &lt; 0.2].std():.3f}")
+print(f"bright-region std: {stabilized[img &gt; 0.8].std():.3f}")
+# Both stds are now close to 1.0; before stabilization the bright
+# regions had ~5x the standard deviation of the dark ones.
+</code></pre>
+<div class="code-caption"><strong>Code 7.1.2:</strong> The Anscombe sandwich, step one. After the transform, dark and bright regions carry nearly identical noise levels (both near 1.0), so a single-sigma Gaussian denoiser treats the whole image fairly. Denoise the stabilized image, then map back through the inverse.</div>
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Denoiser That Failed in the Shadows</div>
+<p><strong>Who:</strong> An imaging engineer at a dental X-ray equipment manufacturer.</p>
+<p><strong>Situation:</strong> Marketing wanted diagnostic-quality images at 30 percent lower radiation dose, which means 30 percent fewer photons and visibly stronger noise.</p>
+<p><strong>Problem:</strong> The team's first attempt applied a well-tuned Gaussian denoiser uniformly. Radiologists rejected the result: fine trabecular bone texture was smeared away in bright regions while dark regions still crawled with residual noise. The single global sigma was simultaneously too aggressive and too timid.</p>
+<p><strong>Decision:</strong> An analysis of flat calibration exposures showed variance growing linearly with intensity, the signature of photon-limited imaging. The engineer inserted an Anscombe transform before the existing denoiser and the corrected inverse after it, changing fewer than twenty lines of code.</p>
+<p><strong>Result:</strong> The same denoiser, now operating on stabilized data, passed the radiologist review at the reduced dose. No new denoising algorithm was needed.</p>
+<p><strong>Lesson:</strong> When a denoiser fails differently in dark and bright regions, suspect the noise model before the denoiser. Signal-dependent noise wants stabilization, not stronger filtering.</p>
+</div>
+<h2>5. Estimating Noise From a Single Image <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Synthetic experiments hand you $\sigma$; real images do not. Most denoisers need a noise-level estimate, and getting one from the noisy image itself is a small art. The intuition: in a perfectly flat region, all variation <em>is</em> noise, so the local standard deviation there estimates $\sigma$ directly. The classical automated estimator (due to Donoho and Johnstone's wavelet work) is the <em>median absolute deviation</em> of the finest wavelet detail coefficients, which sees mostly noise and is robust to the minority of coefficients carrying real edges. Code 7.1.3 compares the flat-patch idea against scikit-image's wavelet estimator.
+</p>
+<pre><code class="language-python">from skimage.restoration import estimate_sigma
+from skimage import data, img_as_float
+
+clean = img_as_float(data.camera())            # 512x512 grayscale test image
+noisy = add_gaussian(clean, sigma=0.08)
+
+# Manual estimate: standard deviation inside a visually flat patch (sky).
+flat_patch = noisy[10:60, 200:300]
+print(f"flat-patch estimate: {flat_patch.std():.4f}")
+
+# Automated wavelet-based estimate over the whole image.
+print(f"estimate_sigma:      {estimate_sigma(noisy):.4f}")
+</code></pre>
+<div class="code-caption"><strong>Code 7.1.3:</strong> Two routes to the noise level of a single image. The flat-patch route requires a human to point at a flat region; the wavelet route is automatic and robust enough to feed directly into the denoisers of Section 7.2.</div>
+<pre class="code-output">flat-patch estimate: 0.0807
+estimate_sigma:      0.0792
+</pre>
+<div class="code-caption"><strong>Output 7.1.3a:</strong> Both estimators land within a few percent of the true $\sigma = 0.08$. The wavelet estimate runs a hair low because some noise energy is mistaken for fine image detail, a bias that grows in heavily textured images.</div>
+<h2>6. Degradation Pipelines: Damage as a Product <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<p>
+Single degradations are for textbooks. A photo shared on a messaging app has been blurred by optics, shot-noised by the sensor, denoised badly by the phone's ISP, downscaled, and JPEG-compressed twice. Restoration methods tuned for one pristine degradation routinely collapse on such compound damage. The modern response, which began in classical restoration and became the foundation of deep "blind" restoration, is to model degradation as a <em>pipeline</em>: a composition of randomized stages. Code 7.1.4 builds a representative one.
+</p>
+<pre><code class="language-python">import cv2
+
+def degrade(img_u8, rng):
+    """Compound degradation: blur -> downscale -> noise -> JPEG.
+    img_u8: uint8 BGR image. Returns a damaged uint8 image, same size."""
+    h, w = img_u8.shape[:2]
+
+    # 1. Optical blur with a random kernel width
+    k = rng.choice([3, 5, 7])
+    out = cv2.GaussianBlur(img_u8, (k, k), 0)
+
+    # 2. Downscale and re-upscale (resolution loss), random factor
+    s = rng.uniform(0.4, 0.8)
+    small = cv2.resize(out, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    out = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # 3. Sensor noise (Gaussian, random strength)
+    sigma = rng.uniform(2, 12)                  # in 8-bit units
+    out = np.clip(out + rng.normal(0, sigma, out.shape), 0, 255).astype(np.uint8)
+
+    # 4. JPEG round trip at a random quality
+    q = int(rng.uniform(35, 90))
+    ok, buf = cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY, q])
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+</code></pre>
+<div class="code-caption"><strong>Code 7.1.4:</strong> A four-stage randomized degradation pipeline: blur, resolution loss, noise, compression. Each call produces a differently damaged copy of the input, which is exactly what you need to test a restorer's robustness, or, later in the book, to train one.</div>
+<p>
+The randomization is the point. If you evaluate (or train) against one fixed degradation, you learn to invert that one recipe and nothing else. Sampling kernel widths, scales, noise levels, and JPEG qualities forces robustness across the whole neighborhood of plausible damage. This is precisely the idea that powers Real-ESRGAN's "high-order" degradation modeling: apply a pipeline like Code 7.1.4 <em>twice</em> in a row, and synthetic training data starts to resemble genuine internet-quality damage. We will reuse this generator when we evaluate denoisers in Section 7.2 and super-resolvers in <a href="section-7.5.html">Section 7.5</a>; the same philosophy of randomized corruption returns as data augmentation in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
+</p>
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>The most consequential noise generator of the 2020s is six lines long. Diffusion models, the engines behind modern image generators covered in <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>, train by deliberately adding Gaussian noise to clean images at a thousand graduated severities and learning to undo each step. The "noise schedule" they tune so carefully is, in the vocabulary of this section, just a parameterized family of <code>add_gaussian</code> calls. Damage synthesis grew up to become a generative industry.</p>
+</div>
+<h2>7. Scoring the Cure <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+<p>
+One final piece of apparatus before the cures begin. Throughout this chapter we score restorations with the fidelity metrics introduced in <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>: PSNR, which is a logarithmic repackaging of mean squared error, and SSIM, which compares local structure. Both require ground truth, which is why the synthetic pipeline of Section 6 matters so much. Keep two caveats in mind. First, PSNR rewards blur: an over-smoothed image often outscores a sharper one with mild residual noise, because squared error punishes outliers more than mush. Second, neither metric measures <em>plausibility</em>, which becomes the dominant criterion for inpainting in <a href="section-7.4.html">Section 7.4</a> and for generative restoration later in the book. Use the numbers, but look at the pictures.
+</p>
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Degradation Modeling Eats Restoration</div>
+<p>The frontier of restoration research in 2024 through 2026 is less about new denoisers and more about degradation realism. <strong>Real-ESRGAN</strong> (Wang et al., 2021) showed that a restorer trained purely on synthetic compound degradations generalizes to real photos, making the degradation pipeline itself the core intellectual property. <strong>DiffBIR</strong> (Lin et al., ECCV 2024) splits blind restoration into two stages, degradation removal followed by a generative diffusion prior, while <strong>SUPIR</strong> (Yu et al., CVPR 2024) scales the same recipe to a multi-billion-parameter prior that can reconstruct convincingly from near-total destruction. The open question these systems sharpen: when the prior is that strong, the output is no longer evidence of what the pixels were, only of what they plausibly could have been, a distinction that matters enormously for forensic and medical use.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.1.1: Diagnose the Damage <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, name the dominant degradation from Table 7.1.1 and justify your answer in one sentence: (a) a security camera image at night with grainy shadows but clean bright areas around streetlights; (b) an old scanned photograph with isolated pure-white specks; (c) an ultrasound scan whose noise is strongest in the brightest tissue; (d) a meme that has been re-shared many times and shows faint 8x8 grid seams; (e) a smooth sky gradient that shows visible stripes of constant color.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.1.2: Build and Validate a Noise Lab <span class="exercise-type coding">Coding</span></div>
+<p>Using Code 7.1.1 as a starting point, write a function that takes a clean image and produces a labeled grid of its Gaussian, Poisson, salt-and-pepper, and speckle corruptions at three severities each. For every cell, compute PSNR against the clean original. Then verify your Poisson implementation: for <code>peak</code> values of 30, 100, and 1000, plot per-pixel sample variance against mean intensity (bin pixels by intensity) and confirm the relationship is linear through the origin.</p>
+</div>
+<div class="callout exercise">
+<div class="callout-title">Exercise 7.1.3: How Much Does Stabilization Buy? <span class="exercise-type analysis">Analysis</span></div>
+<p>Corrupt a clean image with strong Poisson noise (<code>peak=25</code>). Denoise it two ways: (a) directly with a Gaussian blur of the best sigma you can find by sweeping; (b) with the Anscombe sandwich of Code 7.1.2 around the same sweep. Report the best PSNR of each route and, more importantly, compare crops of a dark region and a bright region. Explain the visual difference using the variance formula $\operatorname{Var} = a f + b$.</p>
+</div>
+<nav class="chapter-nav">
+<a class="prev" href="index.html"><span class="nav-label">Chapter 7 Overview</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter 7</span></a>
+<a class="next" href="section-7.2.html"><span class="nav-label">Section 7.2: Classical Denoising: From Gaussian to Non-Local Means</span></a>
+</nav>
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

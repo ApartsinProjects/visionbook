@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.5: Image Pyramids: Gaussian &amp; Laplacian. REDUCE and EXPAND, perfect reconstruction from Laplacian levels, multi-band blending, and how pyramids became feature hierarchies and multi-resolution diffusion." name="description"/>
+<title>Section 4.5: Image Pyramids: Gaussian &amp; Laplacian | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a></div>
+<h1>Image Pyramids: Gaussian &amp; Laplacian</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every floor of my building is a quarter the size of the one below, nobody can explain where the lost square footage went, and yet from the penthouse you can still reconstruct the lobby exactly. Real estate hates this one trick."</p>
+<cite>A Vertigo-Prone Image Pyramid</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A pyramid stores an image at a ladder of resolutions so that every scale of structure, from the silhouette of a building to the texture of its bricks, becomes available at a resolution where it is easy to find, and the Laplacian variant does this with no redundancy and perfect reconstruction.</strong> Pyramids are the simplest multi-scale representation in vision, the cheapest (a Gaussian pyramid costs only one third more memory than the original image), and the most influential: their descendants run inside every modern detection, segmentation, and generation network.</p>
+</div>
+
+<p><a href="section-4.4.html">Section 4.4</a> taught the safe way to halve an image: blur away the unrepresentable frequencies, then decimate. Do that once and you have a thumbnail; do it repeatedly, keeping every intermediate, and you have a <strong>Gaussian pyramid</strong>, a data structure so useful that Burt and Adelson's 1983 paper introducing its Laplacian refinement remains one of the most cited works in image processing. This section builds both pyramids from parts you already own, proves the Laplacian's perfect-reconstruction property in code, and closes with the trick that made the construction famous: blending two images so seamlessly that the seam cannot be found.</p>
+
+<h2>1. Why Multi-Scale? <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>Image content does not live at one scale. A face fills 400 pixels in a portrait and 12 pixels in a group photo; the same crosswalk is a texture from a drone and an obstacle from a bumper camera. Any algorithm with a fixed receptive footprint, a correlation template, a corner detector, a convolution kernel from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, is therefore tuned to one band of object sizes and blind outside it. The multi-scale answer is disarmingly literal: run the algorithm at many resolutions of the same image. Small templates on coarse levels find large objects; the same templates on fine levels find small ones. Coarse-to-fine search adds a second gift: solve the problem cheaply on a tiny level, then refine the answer down the ladder, touching only a neighborhood at each finer level. Registration, stereo, optical flow, and template matching all exploit this schedule, and you will meet it again as the scale space inside <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">SIFT in Chapter 10</a>.</p>
+
+<h2>2. The Gaussian Pyramid: REDUCE, Repeated <span class="level-badge basic" title="Beginner">Beginner</span></h2>
+
+<p>One pyramid step is the REDUCE operation: convolve with a small low-pass kernel $w$, then keep every second pixel in each direction,</p>
+
+<p>$$G_{k+1} = \big(w * G_k\big)\downarrow_2, \qquad G_0 = \text{the original image}$$</p>
+
+<p>Burt and Adelson's classic $w$ is the 5-tap binomial kernel $\tfrac{1}{16}[1, 4, 6, 4, 1]$ applied separably, a snug approximation to the Gaussian prefilter that <a href="section-4.4.html">Section 4.4</a> demands before 2x decimation. OpenCV packages the whole step as <code>cv2.pyrDown</code>:</p>
+
+<pre><code class="language-python">import numpy as np
+import cv2
+from skimage import data
+
+img = data.astronaut()                      # 512 x 512 x 3, uint8
+
+def gaussian_pyramid(image, levels):
+    pyr = [image]
+    for _ in range(levels - 1):
+        pyr.append(cv2.pyrDown(pyr[-1]))    # blur with [1,4,6,4,1]/16, then halve
+    return pyr
+
+gp = gaussian_pyramid(img, levels=5)
+print([level.shape[:2] for level in gp])
+# [(512, 512), (256, 256), (128, 128), (64, 64), (32, 32)]
+# Total storage: 1 + 1/4 + 1/16 + ... < 4/3 of the original image.</code></pre>
+<div class="code-caption"><strong>Code 4.5.1:</strong> A five-level Gaussian pyramid via cv2.pyrDown. Each level is a properly anti-aliased half-resolution copy of the previous one, and the whole ladder costs less than one third extra memory.</div>
+
+<p>Each level of the result answers a different question. $G_0$ holds everything; $G_2$ holds what survives viewing from four times the distance; $G_4$ holds only the broad strokes of the composition. What the Gaussian pyramid does <em>not</em> tell you is what each level lost, and that observation is the doorway to the second construction.</p>
+
+<h2>3. The Laplacian Pyramid: Storing the Differences <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Define EXPAND as the upsampling twin of REDUCE (insert zeros, interpolate with the same kernel; <code>cv2.pyrUp</code>). Then each <strong>Laplacian level</strong> is what a Gaussian level contains beyond what its coarser neighbor can explain:</p>
+
+<p>$$L_k = G_k - \text{EXPAND}(G_{k+1}), \qquad L_{\text{top}} = G_{\text{top}}$$</p>
+
+<p>Each $L_k$ is a <em>band-pass</em> image: it holds the detail in one octave of spatial frequency, the band that lives between level $k$'s resolution and level $k{+}1$'s. (It is the discrete sibling of the difference-of-Gaussians band-pass from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, which is why the name honors the Laplacian operator.) The construction is trivially invertible by running it backward, $G_k = L_k + \text{EXPAND}(G_{k+1})$, so the pyramid of differences plus the tiny top level is a complete, perfectly reconstructable code for the image. Figure 4.5.1 lays out both directions.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 860 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Gaussian pyramid built by repeated REDUCE on the left; Laplacian levels formed as differences and the reconstruction path on the right">
+<text x="180" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Gaussian pyramid (REDUCE &#8595;)</text>
+<text x="620" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Laplacian levels and reconstruction</text>
+<!-- Gaussian stack -->
+<rect x="60" y="50" width="240" height="150" fill="#dbe7f5" stroke="#1f77b4" stroke-width="2"/>
+<text x="180" y="130" font-family="sans-serif" font-size="14" fill="#1f4e79" text-anchor="middle">G0  (512 x 512)</text>
+<rect x="120" y="225" width="120" height="75" fill="#c3d9ef" stroke="#1f77b4" stroke-width="2"/>
+<text x="180" y="268" font-family="sans-serif" font-size="13" fill="#1f4e79" text-anchor="middle">G1 (256)</text>
+<rect x="150" y="325" width="60" height="38" fill="#abcbe9" stroke="#1f77b4" stroke-width="2"/>
+<text x="180" y="349" font-family="sans-serif" font-size="11" fill="#1f4e79" text-anchor="middle">G2</text>
+<rect x="165" y="385" width="30" height="20" fill="#93bde2" stroke="#1f77b4" stroke-width="2"/>
+<text x="180" y="399" font-family="sans-serif" font-size="9" fill="#1f4e79" text-anchor="middle">G3</text>
+<line x1="180" y1="200" x2="180" y2="222" stroke="#555" stroke-width="2"/>
+<polygon points="180,225 174,214 186,214" fill="#555"/>
+<line x1="180" y1="300" x2="180" y2="322" stroke="#555" stroke-width="2"/>
+<polygon points="180,325 174,314 186,314" fill="#555"/>
+<line x1="180" y1="363" x2="180" y2="382" stroke="#555" stroke-width="2"/>
+<polygon points="180,385 174,374 186,374" fill="#555"/>
+<text x="262" y="216" font-family="sans-serif" font-size="11" fill="#555">blur + halve</text>
+<!-- Laplacian: L0 = G0 - EXPAND(G1) -->
+<rect x="430" y="50" width="130" height="84" fill="#dbe7f5" stroke="#1f77b4" stroke-width="2"/>
+<text x="495" y="96" font-family="sans-serif" font-size="12" fill="#1f4e79" text-anchor="middle">G0</text>
+<text x="585" y="96" font-family="sans-serif" font-size="22" fill="#444" text-anchor="middle">&#8722;</text>
+<rect x="610" y="50" width="130" height="84" fill="#efe3c8" stroke="#c08a2d" stroke-width="2"/>
+<text x="675" y="89" font-family="sans-serif" font-size="12" fill="#7a5a14" text-anchor="middle">EXPAND(G1)</text>
+<text x="675" y="107" font-family="sans-serif" font-size="10" fill="#7a5a14" text-anchor="middle">(upsampled)</text>
+<text x="770" y="96" font-family="sans-serif" font-size="22" fill="#444" text-anchor="middle">=</text>
+<rect x="610" y="160" width="130" height="84" fill="#f7d9de" stroke="#d62728" stroke-width="2"/>
+<text x="675" y="199" font-family="sans-serif" font-size="12" fill="#8f1c2a" text-anchor="middle">L0 = fine detail</text>
+<text x="675" y="217" font-family="sans-serif" font-size="10" fill="#8f1c2a" text-anchor="middle">(one frequency octave)</text>
+<line x1="770" y1="108" x2="770" y2="150" stroke="#888" stroke-width="1.5"/>
+<polygon points="770,154 764,143 776,143" fill="#888"/>
+<rect x="430" y="160" width="130" height="84" fill="#f7d9de" stroke="#d62728" stroke-width="2" stroke-dasharray="6,4"/>
+<text x="495" y="196" font-family="sans-serif" font-size="12" fill="#8f1c2a" text-anchor="middle">L1, L2, ...</text>
+<text x="495" y="214" font-family="sans-serif" font-size="10" fill="#8f1c2a" text-anchor="middle">same recipe per level</text>
+<!-- reconstruction -->
+<rect x="430" y="300" width="310" height="100" fill="#fafbfd" stroke="#b9c2d0" stroke-width="1.5"/>
+<text x="585" y="326" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50" text-anchor="middle">Perfect reconstruction (run it backward)</text>
+<text x="585" y="352" font-family="sans-serif" font-size="13" fill="#444" text-anchor="middle">G&#8342; = L&#8342; + EXPAND(G&#8342;&#8330;&#8321;)</text>
+<text x="585" y="380" font-family="sans-serif" font-size="12" fill="#666" text-anchor="middle">start at the tiny top level, add back one octave of detail per step</text>
+</svg>
+<figcaption><strong>Figure 4.5.1:</strong> Left: repeated REDUCE builds the Gaussian pyramid. Right: each Laplacian level is the difference between a Gaussian level and the expanded version of the next coarser one, isolating one octave of detail; summing the levels back, coarsest first, reproduces the original image exactly.</figcaption>
+</figure>
+
+<pre><code class="language-python">def laplacian_pyramid(image, levels):
+    gp = gaussian_pyramid(image.astype(np.float32), levels)
+    lp = []
+    for i in range(levels - 1):
+        up = cv2.pyrUp(gp[i + 1], dstsize=gp[i].shape[1::-1])  # EXPAND to (w, h)
+        lp.append(gp[i] - up)                                  # one octave of detail
+    lp.append(gp[-1])                                          # coarse residual on top
+    return lp
+
+def reconstruct(lp):
+    out = lp[-1]
+    for lap in reversed(lp[:-1]):
+        out = cv2.pyrUp(out, dstsize=lap.shape[1::-1]) + lap
+    return out
+
+lp = laplacian_pyramid(img, levels=5)
+restored = reconstruct(lp)
+print(np.abs(restored - img.astype(np.float32)).max())   # 0.0 (exact in float32)</code></pre>
+<div class="code-caption"><strong>Code 4.5.2:</strong> Laplacian pyramid construction and perfect reconstruction. Because the same EXPAND used in analysis is reused in synthesis, the round trip is exact; the printed maximum error is zero in float32 arithmetic.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: A Pyramid Is a Cheap, Invertible Band-Pass Filter Bank</div>
+<p>The Laplacian pyramid factors an image into frequency octaves, like the filter bank of <a href="section-4.3.html">Section 4.3</a>, but computed with five-tap kernels instead of full-image FFTs, localized in space (each coefficient describes one neighborhood at one scale), and exactly invertible by construction. Whenever you want to process different scales differently (blend them, compress them, denoise them, generate them), decompose, act per level, reconstruct. Most of multi-scale vision is that sentence applied with taste.</p>
+</div>
+
+<h2>4. Multi-Band Blending: The Trick That Made Pyramids Famous <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>Paste two photos along a seam and your eye finds the cut instantly. Feather them with a wide alpha ramp and the seam blurs into a ghostly band instead. The diagnosis is spectral: a transition's correct width depends on wavelength. Coarse content (lighting, sky tone) should blend over a wide region; fine content (grass blades, fabric) should hand over within pixels. No single-width blend can satisfy both, but a pyramid blends every octave at its own natural width: decompose both images into Laplacian pyramids, blend each level under a Gaussian-pyramid-smoothed mask, and reconstruct.</p>
+
+<pre><code class="language-python">def multiband_blend(a, b, mask, levels=6):
+    """mask: float image in [0,1]; 1 keeps a, 0 keeps b."""
+    la = laplacian_pyramid(a, levels)
+    lb = laplacian_pyramid(b, levels)
+    gm = gaussian_pyramid(mask.astype(np.float32), levels)
+    blended = [m * x + (1.0 - m) * y for x, y, m in zip(la, lb, gm)]
+    return np.clip(reconstruct(blended), 0, 255).astype(np.uint8)
+
+a_img = data.astronaut().astype(np.float32)                  # 512 x 512 x 3
+b_img = cv2.resize(data.coffee(), (512, 512)).astype(np.float32)
+
+mask = np.zeros(a_img.shape[:2], np.float32)
+mask[:, : a_img.shape[1] // 2] = 1.0          # hard left/right split
+mask = mask[..., None].repeat(3, axis=2)      # broadcast over color channels
+
+seamless = multiband_blend(a_img, b_img, mask)
+# The hard mask edge is smoothed differently at every level: wide for
+# coarse bands, narrow for fine bands. The two photos fuse with no
+# visible seam, the same trick as Burt and Adelson's famous orapple.</code></pre>
+<div class="code-caption"><strong>Code 4.5.3:</strong> Multi-band blending in eleven lines on top of Code 4.5.2, demonstrated on two stock test images split down the middle. The Gaussian pyramid of the mask automatically gives each frequency octave a transition width proportional to its wavelength, which is exactly what a seamless composite requires.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Burt and Adelson demonstrated their 1983 blending algorithm by fusing the left half of an apple with the right half of an orange. The resulting "orapple" became one of the most reproduced figures in image processing, and the same algorithm shipped, essentially unchanged, in panorama stitchers two decades later. Few papers can claim their demo image outlived several generations of the hardware it was computed on.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Erasing the Seams in Ten Thousand Drone Photos</div>
+<p><strong>Who:</strong> A photogrammetry engineer at a drone-mapping company delivering weekly orthomosaics of construction sites.</p>
+<p><strong>Situation:</strong> Each site map is stitched from hundreds of overlapping nadir photographs taken across an hour of changing cloud cover, so adjacent frames differ in exposure and color temperature even after calibration.</p>
+<p><strong>Problem:</strong> Hard seam cuts left a patchwork of brightness steps that clients read as construction defects; wide feathered blends removed the steps but ghosted every slightly misaligned crane cable and washed out gravel texture, and the QA team rejected both versions.</p>
+<p><strong>Decision:</strong> The engineer switched the compositing stage to Laplacian multi-band blending (OpenCV ships it as <code>cv2.detail_MultiBandBlender</code> inside its stitching pipeline), with five bands and seams placed by a graph cut through low-gradient regions.</p>
+<p><strong>Result:</strong> Exposure steps disappeared into wide low-frequency transitions while edges handed over within a few pixels, double edges vanished, and the orthomosaic passed QA without per-seam manual retouching, saving roughly a day per delivery.</p>
+<p><strong>Lesson:</strong> When two signals must be joined, join each frequency band over a distance proportional to its wavelength. One blend width is always wrong; a pyramid gives you all widths at once.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage Pyramid Generators and OpenCV's Blender</div>
+<p>Our from-scratch pyramid pair plus blending is about 35 lines. The library equivalents:</p>
+<pre><code class="language-python">from skimage.transform import pyramid_gaussian, pyramid_laplacian
+gp = list(pyramid_gaussian(img, max_layer=4, channel_axis=-1))   # one line
+lp = list(pyramid_laplacian(img, max_layer=4, channel_axis=-1))  # one line
+
+blender = cv2.detail_MultiBandBlender(num_bands=5)   # production blending</code></pre>
+<div class="code-caption"><strong>Code 4.5.4:</strong> Library pyramids in one line each via scikit-image's generators, plus OpenCV's production multi-band blender from the stitching pipeline.</div>
+<p>Roughly 35 lines collapse to 2 or 3. skimage handles odd image sizes, arbitrary downscale factors, float conversion, and channel axes; OpenCV's MultiBandBlender adds the ROI bookkeeping, masking, and fixed-point optimizations that production panorama stitching needs. Keep the from-scratch version in your head, though: it is the one you will adapt when a custom per-level rule (denoise this band, boost that one) is the whole point.</p>
+</div>
+
+<h2>5. The Pyramid's Afterlife in Deep Learning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>Squint at a modern vision backbone and you will see this section's diagram. A CNN halves resolution stage by stage while deepening its channels: a learned Gaussian pyramid, with each stage's features playing the role of a level (the architectures of <a href="../../part-3-deep-learning-for-vision/module-20-cnn-architectures/index.html">Chapter 20</a> make the correspondence explicit). Feature Pyramid Networks bolt on a top-down path with lateral connections, adding coarse semantic context back into fine levels, which is EXPAND-and-add wearing learned weights, and FPN-style necks remain standard in the detection and <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">segmentation systems of Chapter 24</a>. The reconstruction direction has an afterlife too: generative models that synthesize coarse structure first and add octaves of detail are running Code 4.5.2's loop with a neural network inside.</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pyramids Inside Generative Models</div>
+<p>Coarse-to-fine generation is the Laplacian pyramid's second career. Cascaded diffusion systems (the design behind Imagen, 2022) chain a base generator with super-resolution stages, one model per pyramid level. Matryoshka Diffusion Models (ICLR 2024) train a single network jointly across nested resolutions, sharing information between levels the way a pyramid shares structure. Pyramidal Flow Matching (2024) generates video as a sequence of pyramid stages to cut the cost of high-resolution synthesis. Even latent diffusion's two-stage design, a compressing autoencoder below a generative model, echoes the pyramid bargain: spend capacity where the eye cares. When you reach <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>, notice how often "resolution schedule" decisions are pyramid decisions in modern dress.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.1: Budget Accounting <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Show that a full Gaussian pyramid (halving each axis per level) costs less than 4/3 of the original image's storage, summing the geometric series. (b) The Laplacian pyramid stores the same image in strictly more numbers than the original (count them for 512x512 and 5 levels), yet Burt and Adelson proposed it as a <em>compression</em> tool. Explain what property of the Laplacian levels' value distributions makes them highly compressible, and which chapter-2 tool you would use to verify it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.2: Hybrid Images <span class="exercise-type coding">Coding</span></div>
+<p>Using Code 4.5.2, build a "hybrid image": take the top three Laplacian levels (coarse bands) from a photo of one face and the bottom two levels (fine bands) from another, reconstruct, and view the result both full-size and shrunk to a thumbnail. Which face dominates at which viewing size, and why? Relate the effect to the band-pass interpretation of Laplacian levels.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 4.5.3: How Many Bands Are Enough? <span class="exercise-type analysis">Analysis</span></div>
+<p>Repeat the blend of Code 4.5.3 with levels = 1, 2, 4, 6, and 8 on a pair of photographs with different exposures. For each result, measure the maximum brightness step across the seam line and visually grade ghosting in a region with fine texture. Plot both against the number of levels and identify the point of diminishing returns. Explain why very deep pyramids stop helping once the top level is only a few pixels across.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.4.html"><span class="nav-label">Previous</span><span class="nav-num">Section 4.4</span><span class="nav-title">The Sampling Theorem, Aliasing &amp; Anti-Aliasing</span></a>
+<a class="up" href="index.html"><span class="nav-label">Chapter</span><span class="nav-num">Chapter 4</span><span class="nav-title">The Frequency Domain &amp; Multi-Scale Analysis</span></a>
+<a class="next" href="section-4.6.html"><span class="nav-label">Next</span><span class="nav-num">Section 4.6</span><span class="nav-title">Wavelets &amp; Time-Frequency Trade-offs</span></a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
