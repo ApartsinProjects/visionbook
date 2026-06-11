@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.1: Motion Fields &amp; the Brightness Constancy Assumption. The motion field versus optical flow, brightness constancy, the optical flow constraint equation, normal flow, and the aperture problem." name="description"/>
+<title>Section 15.1: Motion Fields &amp; the Brightness Constancy Assumption | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Motion Fields &amp; the Brightness Constancy Assumption</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I promise I am the same pixel you saw a thirtieth of a second ago. I have merely relocated. Please stop asking for identification."</p>
+<cite>An Optimistically Constant Pixel</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A camera never measures motion; it measures brightness twice, and motion is the story we tell to explain why the brightness moved.</strong> This section makes that story precise. The motion field is the geometric truth: where each 3D point's projection actually went. Optical flow is the observable: where the brightness patterns appear to go. The brightness constancy assumption is the bridge between them, and differentiating it yields the optical flow constraint equation, one equation in two unknowns. That deficit, the aperture problem, is the original sin of motion estimation: every method in this chapter, and every learned method in <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>, is at heart a different way of paying off the missing equation.</p>
+</div>
+
+<p>
+This chapter opens a new kind of input. Until now the book has processed single images; <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> used several, but each was a deliberate, well-separated viewpoint. Video is different: a dense stream of frames, typically 30 per second, in which almost nothing changes between consecutive samples. That redundancy is the opportunity. Because frames are so close in time, the change between them is small enough to treat with calculus, and calculus is exactly what this section applies.
+</p>
+
+<h2>1. From Images to Image Sequences <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Notation first. A grayscale video is a function of three variables, $I(x, y, t)$: intensity at pixel $(x, y)$ at time $t$. A single frame is a slice at constant $t$. Everything in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> about spatial derivatives $I_x = \partial I / \partial x$ and $I_y = \partial I / \partial y$ carries over unchanged; the new object is the temporal derivative $I_t = \partial I / \partial t$, estimated in the simplest case by subtracting one frame from the next. With three derivatives in hand, we can ask the question that defines this chapter: how is the brightness at one moment related to the brightness a moment later?
+</p>
+<p>
+The geometric answer is called the <strong>motion field</strong>. Every visible 3D point in the scene has some velocity relative to the camera (because it moves, or the camera moves, or both). Project each such velocity through the camera model of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> and you get a 2D vector at every pixel: the true image-plane displacement of the world. The motion field is what a physicist would want to measure. Unfortunately, no sensor measures it. The camera records brightness, and brightness is only loosely attached to geometry.
+</p>
+<p>
+What we can hope to estimate from pixels is <strong>optical flow</strong>: the apparent motion of brightness patterns. Define it operationally as the vector field $(u(x,y), v(x,y))$ that warps frame $t$ into frame $t+1$ as well as possible. In friendly conditions (matte surfaces, steady lighting, textured scenes) optical flow and the motion field agree, and flow is a perfectly good measurement of motion. The interesting failures happen when they part ways.
+</p>
+
+<h2>2. When Flow and Motion Disagree <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Two classic thought experiments calibrate your intuition. First, a perfectly smooth matte sphere rotating in place under fixed lighting: the motion field is large (every surface point sweeps sideways), yet the image does not change at all, because the sphere's shading depends only on geometry that is rotationally symmetric. Motion field large, optical flow zero. Second, the same sphere held still while a light source orbits it: now no point moves, but the shading sweeps across the surface and the image changes everywhere. Motion field zero, optical flow large. The barber pole illusion is the everyday version: the helical stripes physically rotate about a vertical axis (horizontal motion), but the flow you perceive, and that any algorithm estimates, runs vertically along the pole. Figure 15.1.1 sketches both sphere cases side by side.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two spheres: a rotating matte sphere with large motion field but zero optical flow, and a static sphere with a moving light source producing zero motion field but nonzero optical flow">
+  <text x="195" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Rotating sphere, fixed light</text>
+  <circle cx="195" cy="150" r="75" fill="#d6dbdf" stroke="#5a626c" stroke-width="1.5"/>
+  <ellipse cx="170" cy="125" rx="28" ry="20" fill="#fdfefe" opacity="0.85"/>
+  <path d="M 130 95 A 88 88 0 0 1 260 95" fill="none" stroke="#c0392b" stroke-width="2.2"/>
+  <polygon points="260,95 248,90 252,103" fill="#c0392b"/>
+  <text x="195" y="76" font-family="sans-serif" font-size="12" fill="#c0392b" text-anchor="middle">surface spins</text>
+  <text x="195" y="252" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle">motion field: large</text>
+  <text x="195" y="272" font-family="sans-serif" font-size="13" font-weight="bold" fill="#1e8449" text-anchor="middle">optical flow: zero (image unchanged)</text>
+
+  <text x="575" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Static sphere, moving light</text>
+  <circle cx="575" cy="150" r="75" fill="#d6dbdf" stroke="#5a626c" stroke-width="1.5"/>
+  <ellipse cx="548" cy="128" rx="28" ry="20" fill="#fdfefe" opacity="0.9"/>
+  <ellipse cx="604" cy="128" rx="28" ry="20" fill="#fdfefe" opacity="0.35"/>
+  <g fill="#f39c12" stroke="#f39c12">
+    <circle cx="470" cy="62" r="9"/>
+    <circle cx="575" cy="42" r="9" opacity="0.45"/>
+  </g>
+  <path d="M 487 58 A 95 60 0 0 1 558 42" fill="none" stroke="#f39c12" stroke-width="2" stroke-dasharray="5 4"/>
+  <polygon points="562,40 549,38 553,50" fill="#f39c12"/>
+  <text x="500" y="34" font-family="sans-serif" font-size="12" fill="#b9770e" text-anchor="middle">light orbits</text>
+  <path d="M 545 122 L 600 122" stroke="#1e8449" stroke-width="2.2"/>
+  <polygon points="606,122 594,116 594,128" fill="#1e8449"/>
+  <text x="575" y="110" font-family="sans-serif" font-size="12" fill="#1e8449" text-anchor="middle">highlight slides</text>
+  <text x="575" y="252" font-family="sans-serif" font-size="13" font-weight="bold" fill="#c0392b" text-anchor="middle">motion field: zero</text>
+  <text x="575" y="272" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle">optical flow: nonzero (shading moves)</text>
+</svg>
+<figcaption><strong>Figure 15.1.1</strong>: The motion field and optical flow are different quantities. Left: a rotating matte sphere has large surface motion but produces an unchanging image, so the estimated flow is zero. Right: a static sphere under an orbiting light does not move at all, yet the sliding highlight produces nonzero flow. Algorithms can only ever measure the right-hand quantity.</figcaption>
+</figure>
+
+<p>
+The practical reading of Figure 15.1.1 is not "flow is broken" but "flow measures brightness transport, and you must know when brightness transport equals motion." On textured, diffusely lit surfaces it does. On specular highlights, shadows, smoke, and screens it does not, and a system that feeds flow into downstream logic (a tracker, a SLAM front end like <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s, a video generator) inherits those mismatches as input errors.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Illusion That Ships</div>
+<p>The barber pole illusion is not just a perceptual curiosity; it is a hardware constraint. Optical computer mice estimate flow from a tiny patch of desk a few millimeters wide, and on a surface with strongly oriented grain (brushed metal, certain wood finishes) the sensor's flow estimate slides along the grain exactly like the barber pole's stripes. That is why some mice get visibly confused on glossy, striped, or transparent surfaces: the aperture problem, in your hand, at 8000 reports per second.</p>
+</div>
+
+<h2>3. Brightness Constancy and the Constraint Equation <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+To estimate flow we need an equation linking what we observe (derivatives of $I$) to what we want (the vector $(u, v)$). The link is the <strong>brightness constancy assumption</strong>: a small surface patch keeps its brightness as it moves. Formally, if the patch at $(x, y)$ at time $t$ moves by $(u, v)$ in one frame interval,
+</p>
+<p>
+$$ I(x + u,\; y + v,\; t + 1) \;=\; I(x, y, t). $$
+</p>
+<p>
+This is an assumption, not a law: it holds for Lambertian surfaces under constant illumination and fails for everything Figure 15.1.1 warned about. Accept it provisionally and apply a first-order Taylor expansion, legitimate because consecutive video frames differ by a pixel or two at most:
+</p>
+<p>
+$$ I(x+u, y+v, t+1) \;\approx\; I(x,y,t) + I_x u + I_y v + I_t . $$
+</p>
+<p>
+Setting the two sides equal cancels $I(x,y,t)$ and leaves the <strong>optical flow constraint equation</strong> (OFCE), the single most important formula in this chapter:
+</p>
+<p>
+$$ I_x u + I_y v + I_t = 0, \qquad \text{equivalently} \qquad \nabla I \cdot \mathbf{v} = -I_t . $$
+</p>
+<p>
+Pause on what this says. At every pixel, the three measurable derivatives constrain the two unknown flow components. But it is one linear equation in two unknowns: its solution set is not a point but a <em>line</em> in $(u, v)$ velocity space, perpendicular to the image gradient. Any flow vector on that line explains the observed brightness change equally well. The component of flow along the gradient (across the local edge) is pinned down; the component perpendicular to the gradient (along the edge) is invisible. Figure 15.1.2 draws this constraint line, and the next subsection gives the geometry its famous name.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: an edge viewed through a circular aperture with only the normal component of motion visible. Right: velocity space with the constraint line perpendicular to the image gradient and the normal flow vector marked">
+  <text x="195" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Through a small aperture</text>
+  <circle cx="195" cy="170" r="95" fill="#fbfcfc" stroke="#5a626c" stroke-width="2"/>
+  <g>
+    <polygon points="115,250 275,90 245,60 85,220" fill="#85c1e9" opacity="0.85"/>
+  </g>
+  <line x1="160" y1="135" x2="200" y2="175" stroke="#c0392b" stroke-width="2.6"/>
+  <polygon points="205,180 191,176 198,168" fill="#c0392b"/>
+  <text x="232" y="186" font-family="sans-serif" font-size="12" fill="#c0392b">normal flow (seen)</text>
+  <line x1="150" y1="210" x2="190" y2="170" stroke="#7f8c8d" stroke-width="2" stroke-dasharray="5 4"/>
+  <polygon points="195,165 183,168 189,176" fill="#7f8c8d"/>
+  <text x="106" y="240" font-family="sans-serif" font-size="12" fill="#7f8c8d">slide along edge (invisible)</text>
+  <text x="195" y="305" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle">an edge in motion: only the across-edge component shows</text>
+
+  <text x="575" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Velocity space (u, v)</text>
+  <line x1="440" y1="170" x2="720" y2="170" stroke="#aab7b8" stroke-width="1.4"/>
+  <line x1="575" y1="60" x2="575" y2="300" stroke="#aab7b8" stroke-width="1.4"/>
+  <text x="712" y="188" font-family="sans-serif" font-size="13" fill="#5a626c">u</text>
+  <text x="586" y="70" font-family="sans-serif" font-size="13" fill="#5a626c">v</text>
+  <line x1="470" y1="280" x2="700" y2="80" stroke="#2980b9" stroke-width="2.6"/>
+  <text x="688" y="106" font-family="sans-serif" font-size="12.5" fill="#2980b9" text-anchor="end">constraint line: I&#8339;u + I&#8359;v + I&#8348; = 0</text>
+  <line x1="575" y1="170" x2="619" y2="221" stroke="#c0392b" stroke-width="2.6"/>
+  <polygon points="624,227 610,223 617,215" fill="#c0392b"/>
+  <text x="640" y="244" font-family="sans-serif" font-size="12.5" fill="#c0392b">normal flow</text>
+  <line x1="575" y1="170" x2="505" y2="250" stroke="#7f8c8d" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="497" y="268" font-family="sans-serif" font-size="12" fill="#7f8c8d">&#8741; gradient</text>
+  <circle cx="648" cy="125" r="5" fill="#1e8449"/>
+  <text x="660" y="120" font-family="sans-serif" font-size="12.5" fill="#1e8449">true flow? could be anywhere on the line</text>
+</svg>
+<figcaption><strong>Figure 15.1.2</strong>: The aperture problem in two pictures. Left: an oblique edge translating behind a circular aperture; an observer (or algorithm) sees only the motion component perpendicular to the edge. Right: the same fact in velocity space; the OFCE confines the flow to a line perpendicular to the image gradient, and only the normal flow vector (red) is determined by local data.</figcaption>
+</figure>
+
+<h2>4. The Aperture Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The underdetermination in Figure 15.1.2 is called the <strong>aperture problem</strong>: viewed through a small window (and a derivative is the smallest window there is), a moving edge only reveals its motion across itself. The vector the data does pin down is the <strong>normal flow</strong>,
+</p>
+<p>
+$$ \mathbf{v}_\perp \;=\; -\,\frac{I_t}{\lVert \nabla I \rVert}\,\frac{\nabla I}{\lVert \nabla I \rVert}, $$
+</p>
+<p>
+the projection of the true flow onto the gradient direction. Where the gradient vanishes (flat regions), even that is gone: $0 \cdot u + 0 \cdot v = -I_t$ constrains nothing. So the local information budget has three tiers, and you have met them before. Flat regions say nothing about motion. Edges (one strong gradient direction) determine one component, exactly like the line structures of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a>. Corners and textured patches (two strong gradient directions) determine motion fully, which is precisely why <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> found corners to be the matchable points. The next section makes this correspondence exact: the matrix that decides trackability is the same structure tensor that decided cornerness.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Equation, Two Unknowns, Many Careers</div>
+<p>Everything in optical flow estimation is a strategy for funding the missing second equation. Lucas-Kanade (<a href="section-15.2.html">Section 15.2</a>) borrows equations from neighboring pixels by assuming they share one velocity. Horn-Schunck (<a href="section-15.3.html">Section 15.3</a>) borrows from the whole image by assuming the flow field is smooth. Learned methods such as RAFT (<a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>) borrow from millions of training videos by assuming the current scene moves like scenes seen before. The aperture problem is never solved; it is only ever paid for with assumptions, and each method's failure modes are exactly the places its assumption stops holding.</p>
+</div>
+
+<h2>5. Measuring the Derivatives <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The OFCE is built from three derivative images, and estimating them well matters more than beginners expect. The spatial derivatives $I_x, I_y$ come from the derivative filters of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> (Sobel or the smaller central-difference kernels). The temporal derivative $I_t$ is a difference between frames, ideally computed after slight smoothing so that noise does not masquerade as motion. The code below computes all three from a pair of frames and then forms the normal flow magnitude, the part of motion that local data actually determines.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+f0 = cv2.imread("frame_000.png", cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
+f1 = cv2.imread("frame_001.png", cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255
+
+# Mild blur first: derivatives amplify noise (Chapter 3's standard caution)
+f0s = cv2.GaussianBlur(f0, (5, 5), 1.0)
+f1s = cv2.GaussianBlur(f1, (5, 5), 1.0)
+
+Ix = cv2.Sobel(f0s, cv2.CV_32F, 1, 0, ksize=3) / 8.0   # /8 normalizes Sobel
+Iy = cv2.Sobel(f0s, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+It = f1s - f0s                                          # forward difference in time
+
+grad_mag = np.sqrt(Ix**2 + Iy**2)
+normal_flow = np.where(grad_mag &gt; 1e-3, -It / (grad_mag + 1e-8), 0.0)
+
+print(f"|It| mean: {np.abs(It).mean():.4f}")
+print(f"normal flow range: {normal_flow.min():.2f} .. {normal_flow.max():.2f} px")
+# Typical output for a slow traffic clip:
+# |It| mean: 0.0061
+# normal flow range: -2.31 .. 2.18 px</code></pre>
+<div class="code-caption">Estimating the three OFCE ingredients from a frame pair and forming the normal flow, the across-edge speed in pixels per frame; the <code>where</code> guard skips flat regions whose gradient is too weak to constrain anything, the aperture problem's third tier.</div>
+
+<p>
+Run this on any video pair and inspect <code>normal_flow</code>: it is large on moving edges, zero in flat sky and road, and ambiguous along structures aligned with their own motion. That image is the honest raw material of motion estimation; everything after it is inference. To see what a full estimator produces from the same two frames, the library shortcut below jumps ahead to a dense algorithm that Section 15.3 will open up properly.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Dense Flow in One Call</div>
+<p>The 20-line derivative pipeline above produces only the normal component. OpenCV's Farneback estimator delivers a complete dense flow field, both components at every pixel, in a single call, replacing the roughly 60 lines a minimal dense estimator takes from scratch (Section 15.3 builds one). Internally it fits local polynomial expansions, runs a coarse-to-fine pyramid to handle large motions, and iterates a displacement update, all of which Sections 15.2 and 15.3 unpack.</p>
+<pre><code class="language-python">flow = cv2.calcOpticalFlowFarneback(
+    (f0 * 255).astype(np.uint8), (f1 * 255).astype(np.uint8), None,
+    pyr_scale=0.5, levels=3, winsize=15, iterations=3,
+    poly_n=5, poly_sigma=1.2, flags=0)
+u, v = flow[..., 0], flow[..., 1]      # full flow, not just the normal part</code></pre>
+<div class="code-caption">Farneback dense optical flow as a one-call preview of where this chapter is heading: a complete $(u, v)$ field from the same frame pair, with the pyramid and iteration machinery handled internally.</div>
+</div>
+
+<h2>6. When Brightness Constancy Breaks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Brightness constancy fails in well-catalogued ways, and recognizing the catalogue saves debugging weeks. <em>Global illumination changes</em>: auto-exposure, auto-white-balance, clouds; the entire OFCE is violated at once because $I_t$ is nonzero everywhere with no motion at all. <em>Specularities and shadows</em>: brightness moves independently of surfaces, as in Figure 15.1.1. <em>Occlusions</em>: at object boundaries, pixels appear and disappear; no displacement explains them, so the Taylor story collapses there. <em>Large motion</em>: the first-order expansion assumed sub-pixel displacement; a car moving 40 pixels per frame makes the linearization meaningless, a failure called temporal aliasing that pyramids will repair in <a href="section-15.2.html">Section 15.2</a>.
+</p>
+<p>
+Classical remedies exist for each. Gradient constancy ($\nabla I$ preserved instead of $I$) survives additive illumination shifts. The census transform, which encodes each pixel by the sign pattern of its neighborhood, survives any monotonic brightness change and became the default data term in robust pipelines. Pre-smoothing and pyramids handle aliasing. None of these is exotic: they are all instances of the same move, replacing raw brightness with a representation more faithful to geometry, a thread that runs from <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>'s normalization tricks all the way to learned features.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Dusk That Ate the Flow Field</div>
+<p><strong>Who &amp; situation:</strong> a traffic-analytics vendor running flow-based queue-length estimation on 200 highway cameras, computing average motion in lane polygons from Farneback flow. <strong>Problem:</strong> every evening around dusk, queue estimates went haywire for 20 minutes: the system reported wall-to-wall motion on a stationary traffic jam. The cause was the cameras' auto-exposure ramping as light fell; each adjustment changed global brightness between frames, $I_t$ lit up everywhere, and the estimator dutifully explained it as motion. <strong>Decision:</strong> rather than fight the cameras, the team made the data term illumination-proof: each frame was census-transformed before flow estimation, and a cheap global-gain check (median of $I_t$ over the whole frame) flagged exposure steps so those frame pairs could be skipped. <strong>Result:</strong> dusk false motion disappeared, and the gain check incidentally caught two cameras with failing sensors that flickered at noon. <strong>Lesson:</strong> when flow output looks impossible, audit the assumption before the algorithm; brightness constancy is the component most likely to have silently failed.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Constancy, Learned and Replaced</div>
+<p>Modern flow networks no longer assume brightness constancy; they learn a matching cost from data. RAFT (ECCV 2020) compares learned per-pixel features across all pairs of positions, and SEA-RAFT (Wang, Lipson &amp; Deng, ECCV 2024, arXiv:2405.14793) streamlined that recipe to real-time speed while topping the Spring benchmark, using a mixture-of-Laplace loss to handle exactly the occlusion ambiguity cataloged above. MemFlow (CVPR 2024, arXiv:2404.04808) adds a memory module so the estimate at frame $t$ exploits history rather than a single pair, and event cameras sidestep the frame-pair formulation entirely by reporting per-pixel brightness changes with microsecond stamps, an active 2024-2026 hardware-plus-algorithms frontier. All of them still confront the aperture problem; they simply amortize its resolution into training data. <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a> dissects RAFT's architecture in detail.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.1.1: Field or Flow? <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each scenario, state whether the motion field and the optical flow agree, and if not, which is larger: (a) a stationary camera filming a rotating, heavily textured beach ball; (b) the same camera filming a rotating, perfectly uniform white ball; (c) a camera filming a fixed scene while the room lights dim smoothly; (d) a camera filming a waterfall where the water is featureless white foam; (e) an LED billboard playing a video of moving cars, filmed by a static camera. Justify each answer with the brightness constancy assumption.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.1.2: Verifying the OFCE Numerically <span class="exercise-type coding">Coding</span></div>
+<p>Create a synthetic pair: take any sharp grayscale image, shift it right by exactly 0.5 pixels using <code>cv2.warpAffine</code> with bilinear interpolation, and treat the original and shifted images as consecutive frames. Compute $I_x, I_y, I_t$ as in this section's code and evaluate the OFCE residual $|I_x \cdot 0.5 + I_y \cdot 0 + I_t|$ over all pixels with gradient magnitude above a threshold. Report the median residual. Then repeat with shifts of 1, 2, 4, and 8 pixels and plot median residual versus shift. At what displacement does the linearization visibly break, and how does pre-blurring with $\sigma = 2$ change that point?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.1.3: Mapping the Aperture Problem <span class="exercise-type analysis">Analysis</span></div>
+<p>Using a real video pair, compute the structure of local motion information: at every pixel, form the $2 \times 2$ matrix $\sum \nabla I \nabla I^T$ over a $7 \times 7$ window (this anticipates Section 15.2) and classify pixels into flat (both eigenvalues small), edge (one large), and corner (both large) using thresholds of your choice. Visualize the three classes as colors over the frame and overlay the normal flow from this section's code. Where in the image is full flow recoverable from local data alone? Estimate the fraction of pixels in each class and discuss what that implies for dense flow estimation.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 15 Overview</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="section-15.2.html">Section 15.2: Sparse Flow: Lucas-Kanade &amp; Feature Tracking &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

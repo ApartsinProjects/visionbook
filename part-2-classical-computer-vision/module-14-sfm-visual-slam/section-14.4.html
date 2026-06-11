@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 14.4: Visual SLAM: Mapping While Moving. Structure from motion re-engineered for real time: tracking, local mapping and loop-closing threads, keyframes and covisibility, pose-graph optimization against drift, and monocular, stereo, RGB-D and inertial variants." name="description"/>
+<title>Section 14.4: Visual SLAM: Mapping While Moving | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>Visual SLAM: Mapping While Moving</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Tourists get to reconstruct their vacation after they fly home. I have to know exactly where I am while the drone is still dodging the ceiling fan."</p>
+<cite>A Mildly Stressed SLAM System</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Visual SLAM (Simultaneous Localization and Mapping) is structure from motion under a deadline: the same geometry as <a href="section-14.2.html">Sections 14.2</a> and <a href="section-14.3.html">14.3</a>, re-architected so a moving camera can localize itself, in milliseconds, against a map it is simultaneously building and correcting.</strong> The re-architecture has three pillars: keyframes (process the map at a fraction of the frame rate), parallel threads (fast tracking decoupled from slow mapping), and loop closure (recognize a previously visited place and cancel the drift accumulated since). The result runs robot vacuums, warehouse fleets, drones, and the inside-out tracking of every consumer VR headset.</p>
+</div>
+
+<p>
+Everything in this chapter so far was offline: all images available up front, minutes or hours of compute acceptable, and the answer delivered once, at the end. A robot inverts every assumption. Frames arrive one at a time and the camera's pose is needed <em>now</em>, within a frame budget of about 33 ms, because a controller is waiting on it; compute and memory are bounded forever, even as the trajectory grows without limit; and there is no second pass: decisions about the past must be revised live, as new evidence arrives. SLAM is the family of designs that meets these constraints, and visual SLAM is its camera-only branch. Remarkably, it concedes very little geometry: the front end is still feature matching from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, pose estimation is still PnP, refinement is still bundle adjustment, only scheduled with extreme care about what gets computed when.
+</p>
+
+<h2>1. What the Deadline Changes <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The first casualty of real time is the idea of treating every frame equally. At 30 fps, consecutive frames are nearly identical; reconstructing from all of them wastes compute on redundant views with near-zero baseline, the degenerate-motion trap of <a href="section-14.2.html">Section 14.2</a>. The fix is the <strong>keyframe</strong>: a frame promoted to the permanent map only when it adds information, typically when tracking quality against the current map drops below a threshold or the view has translated enough since the last keyframe. Everything in between is localized against the map and discarded. The second casualty is the single computation loop, replaced by threads running at different rates. This architecture, introduced by PTAM in 2007 and matured by the ORB-SLAM line, is now standard; Figure 14.4.1 shows it.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture of a modern feature-based SLAM system: a tracking thread processes every frame and feeds keyframes to a local mapping thread, which maintains the map; a loop closing thread checks keyframes against a place-recognition database and triggers pose-graph correction on the map.">
+  <defs>
+    <marker id="arrA" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2471a3"/>
+    </marker>
+    <marker id="arrB" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b9770e"/>
+    </marker>
+    <marker id="arrC" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#27ae60"/>
+    </marker>
+  </defs>
+  <!-- camera input -->
+  <rect x="20" y="60" width="95" height="46" rx="8" fill="#eaf2f8" stroke="#2471a3" stroke-width="1.5"/>
+  <text x="67" y="80" font-family="sans-serif" font-size="12.5" fill="#1a5276" text-anchor="middle" font-weight="bold">camera</text>
+  <text x="67" y="96" font-family="sans-serif" font-size="11.5" fill="#1a5276" text-anchor="middle">30 fps</text>
+  <!-- tracking thread -->
+  <rect x="160" y="45" width="180" height="76" rx="8" fill="#fbfcfc" stroke="#2471a3" stroke-width="2"/>
+  <text x="250" y="68" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">TRACKING (every frame)</text>
+  <text x="250" y="86" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">match to local map, PnP pose,</text>
+  <text x="250" y="102" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">decide: new keyframe?</text>
+  <!-- local mapping -->
+  <rect x="420" y="45" width="180" height="76" rx="8" fill="#fbfcfc" stroke="#b9770e" stroke-width="2"/>
+  <text x="510" y="68" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">LOCAL MAPPING</text>
+  <text x="510" y="86" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">triangulate new points, cull,</text>
+  <text x="510" y="102" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">local bundle adjustment</text>
+  <!-- loop closing -->
+  <rect x="420" y="185" width="180" height="76" rx="8" fill="#fbfcfc" stroke="#27ae60" stroke-width="2"/>
+  <text x="510" y="208" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">LOOP CLOSING</text>
+  <text x="510" y="226" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">place recognition (BoW),</text>
+  <text x="510" y="242" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">verify, pose-graph optimize</text>
+  <!-- map store -->
+  <rect x="650" y="115" width="115" height="76" rx="8" fill="#fef9e7" stroke="#7d6608" stroke-width="1.5"/>
+  <text x="707" y="140" font-family="sans-serif" font-size="13" fill="#7d6608" text-anchor="middle" font-weight="bold">MAP</text>
+  <text x="707" y="158" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">keyframes, points,</text>
+  <text x="707" y="174" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">covisibility graph</text>
+  <!-- arrows -->
+  <line x1="115" y1="83" x2="154" y2="83" stroke="#2471a3" stroke-width="2" marker-end="url(#arrA)"/>
+  <line x1="340" y1="83" x2="414" y2="83" stroke="#2471a3" stroke-width="2" marker-end="url(#arrA)"/>
+  <text x="377" y="72" font-family="sans-serif" font-size="11.5" fill="#2471a3" text-anchor="middle">keyframes</text>
+  <line x1="600" y1="83" x2="668" y2="115" stroke="#b9770e" stroke-width="2" marker-end="url(#arrB)"/>
+  <text x="652" y="92" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">updates</text>
+  <line x1="510" y1="121" x2="510" y2="179" stroke="#b9770e" stroke-width="2" marker-end="url(#arrB)"/>
+  <text x="448" y="153" font-family="sans-serif" font-size="11.5" fill="#7d6608" text-anchor="middle">keyframes</text>
+  <line x1="600" y1="223" x2="668" y2="191" stroke="#27ae60" stroke-width="2" marker-end="url(#arrC)"/>
+  <text x="656" y="222" font-family="sans-serif" font-size="11.5" fill="#145a32" text-anchor="middle">correction</text>
+  <path d="M 650 137 L 250 137 L 250 127" fill="none" stroke="#27ae60" stroke-width="2" marker-end="url(#arrC)"/>
+  <text x="345" y="152" font-family="sans-serif" font-size="11.5" fill="#145a32" text-anchor="middle">local map served back to tracking</text>
+</svg>
+<figcaption><strong>Figure 14.4.1</strong> The three-thread architecture of feature-based SLAM, in the PTAM and ORB-SLAM lineage. Tracking touches every frame but does only cheap work (matching against the local map, PnP). Keyframes flow to local mapping, which triangulates, culls, and runs local bundle adjustment. Loop closing watches keyframes for revisited places and, on a verified hit, corrects the whole map; the corrected map is what tracking localizes against next frame.</figcaption>
+</figure>
+
+<p>
+The covisibility graph named inside the map deserves a word: it links keyframes that observe shared map points, generalizing the match graph of <a href="section-14.1.html">Section 14.1</a> to the online setting. Its role is locality. "The local map" that tracking matches against, and that local BA refines, is a neighborhood in this graph, not a radius in space, which is exactly right when trajectories cross themselves or hover in place.
+</p>
+
+<h2>2. A Minimal Visual Odometry Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Strip SLAM of its map, keyframes, and loop closure and what remains is <strong>visual odometry</strong> (VO): chain relative poses frame to frame and integrate them into a trajectory. It is the natural first build, and its failure is the best motivation for everything SLAM adds. The loop below runs the two-view machinery of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> on consecutive frames of a driving video (intrinsics here are from the KITTI benchmark's left camera) and composes the results.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+K = np.array([[718.856, 0.0, 607.193],      # KITTI sequence 00, left gray camera
+              [0.0, 718.856, 185.216],
+              [0.0, 0.0, 1.0]])
+
+orb = cv2.ORB_create(3000)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+cap = cv2.VideoCapture("kitti00.mp4")
+
+ok, frame = cap.read()
+prev = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+kp_p, des_p = orb.detectAndCompute(prev, None)
+
+pose = np.eye(4)                            # camera-to-world, starts at origin
+trail = [pose[:3, 3].copy()]
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kp, des = orb.detectAndCompute(gray, None)
+    knn = bf.knnMatch(des_p, des, k=2)
+    good = [m for m, n in knn if m.distance &lt; 0.8 * n.distance]
+    if len(good) &gt;= 60:                      # else: skip frame, keep last pose
+        p0 = np.float32([kp_p[m.queryIdx].pt for m in good])
+        p1 = np.float32([kp[m.trainIdx].pt for m in good])
+        E, _ = cv2.findEssentialMat(p1, p0, cameraMatrix=K,
+                                    method=cv2.USAC_MAGSAC, threshold=1.0)
+        _, R, t, _ = cv2.recoverPose(E, p1, p0, K)
+        step = np.eye(4)
+        step[:3, :3], step[:3, 3] = R, t.ravel()   # |t| = 1: scale unknown!
+        pose = pose @ step                   # compose into the global trajectory
+    trail.append(pose[:3, 3].copy())
+    kp_p, des_p = kp, des
+
+trail = np.array(trail)
+print(f"{len(trail)} poses, net displacement {np.linalg.norm(trail[-1]):.1f} units")
+# 4541 poses, net displacement 18.3 units  (ground truth: the loop returns to 0!)</code></pre>
+<div class="code-caption">Monocular visual odometry in forty lines: ORB matching between consecutive frames, essential-matrix pose recovery, and pose composition. The printed punchline is the lesson: on a KITTI loop that physically returns to its starting point, the integrated trajectory ends 18 units away, the accumulated drift this section's remaining machinery exists to cancel.</div>
+
+<p>
+Two structural flaws hide in this loop, and both are instructive. First, <strong>scale</strong>: <code>recoverPose</code> returns a unit-length translation every frame, because monocular geometry cannot know metric scale (<a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>'s lesson). Real monocular systems estimate relative scale by triangulating landmarks and tracking them across multiple steps, yet even then scale slowly <em>drifts</em>, a distinctly monocular disease. Second, <strong>compounding</strong>: each frame's small rotation error rotates all future displacement; errors integrate, and the trajectory bends away from truth without bound. VO with map points and windowed optimization can slow the bleed. Only recognizing a previously seen place can stop it.
+</p>
+
+<h2>3. Loop Closure: Recognizing Where You Have Been <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Loop closure is two problems chained. <strong>Detection</strong> is image retrieval under a time budget: does the current keyframe look like any old keyframe? The classical solution embeds each keyframe as a bag-of-visual-words vector over quantized binary descriptors (DBoW2 being the standard library), so candidate retrieval is an inverted-file lookup costing milliseconds even against thousands of keyframes; this is the same retrieval idea that <a href="../module-16-classical-recognition/index.html">Chapter 16</a> develops for recognition at large. Every candidate then faces <strong>geometric verification</strong>, a full relative-pose estimation with RANSAC, because perceptual aliasing (two identical corridors) makes appearance-only matches treacherous in exactly the way <a href="section-14.1.html">Section 14.1</a>'s doppelganger edges were.
+</p>
+<p>
+<strong>Correction</strong> is the second problem: the verified loop says keyframe 980 sits, say, 0.4 m from keyframe 12, while the integrated chain claims 9 m. The error must be redistributed over the whole loop, and running full bundle adjustment over every keyframe and point is too slow for the moment of closure. The standard tool is <strong>pose-graph optimization</strong>: forget the points temporarily, keep only keyframe poses $T_i \in \mathrm{SE}(3)$ as variables, with every odometry edge and the new loop edge contributing a measured relative pose $\hat{T}_{ij}$, and minimize
+</p>
+<p>
+$$ \sum_{(i,j)} \left\lVert \mathrm{Log}\!\left( \hat{T}_{ij}^{-1} \, T_i^{-1} T_j \right) \right\rVert^2_{\Sigma_{ij}}, $$
+</p>
+<p>
+where $\mathrm{Log}$ maps a pose error to a 6-vector and $\Sigma_{ij}$ weights each edge by its confidence. The optimization bends the trajectory smoothly so the loop meets itself, after which a background global BA re-polishes points and poses together. Monocular systems optimize over similarity transforms $\mathrm{Sim}(3)$ instead, with a 7th scale parameter per pose, so that accumulated scale drift is absorbed around the loop too. Figure 14.4.2 shows the before and after.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a drifted trajectory that should close a rectangular loop but spirals away from its start, with a dashed line marking the detected loop closure between the end pose and the start pose. Right: the same trajectory after pose-graph optimization, forming a closed rectangle.">
+  <text x="195" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">before: drift accumulates</text>
+  <rect x="40" y="40" width="310" height="190" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <!-- drifted open loop -->
+  <path d="M 90 200 L 280 195 L 296 110 L 130 90 L 110 165" fill="none" stroke="#c0392b" stroke-width="2.5"/>
+  <g fill="#c0392b">
+    <circle cx="90" cy="200" r="5"/><circle cx="280" cy="195" r="4"/>
+    <circle cx="296" cy="110" r="4"/><circle cx="130" cy="90" r="4"/><circle cx="110" cy="165" r="5"/>
+  </g>
+  <text x="78" y="220" font-family="sans-serif" font-size="12" fill="#2c3e50">start</text>
+  <text x="124" y="158" font-family="sans-serif" font-size="12" fill="#922b21">end</text>
+  <line x1="110" y1="165" x2="92" y2="203" stroke="#27ae60" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="170" y="135" font-family="sans-serif" font-size="11.5" fill="#145a32">loop closure detected:</text>
+  <text x="170" y="151" font-family="sans-serif" font-size="11.5" fill="#145a32">"end is near start"</text>
+
+  <text x="585" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">after: pose graph optimized</text>
+  <rect x="430" y="40" width="310" height="190" fill="#fbfcfc" stroke="#d5dbdb"/>
+  <path d="M 480 200 L 680 200 L 680 90 L 480 90 Z" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+  <g fill="#27ae60">
+    <circle cx="480" cy="200" r="5"/><circle cx="680" cy="200" r="4"/>
+    <circle cx="680" cy="90" r="4"/><circle cx="480" cy="90" r="4"/>
+  </g>
+  <text x="468" y="220" font-family="sans-serif" font-size="12" fill="#2c3e50">start = end</text>
+  <text x="585" y="155" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">error redistributed smoothly</text>
+  <text x="585" y="171" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">around the whole loop</text>
+</svg>
+<figcaption><strong>Figure 14.4.2</strong> What loop closure buys. Left: integrated odometry around a rectangular path drifts, so the trajectory fails to close; place recognition spots that the final keyframe sees the same scene as the first (dashed link). Right: pose-graph optimization treats that link as a measurement and bends the entire chain minimally to satisfy it, snapping global consistency back into a map whose local pieces were never far wrong.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Drift Is Unobservable Locally, So Only Recognition Can Fix It</div>
+<p>Every frame-to-frame estimate in the VO loop can be individually excellent and the trajectory still bends: drift lives in the accumulation, not in any step, so no amount of local polish (better matching, better PnP, more local BA) can remove it. The only cure is an independent, long-range measurement that contradicts the accumulated error, and recognizing a previously visited place is precisely such a measurement. This is why mature SLAM systems spend a startling fraction of their engineering not on geometry but on retrieval, and why "have I seen this before?" is, in mobile robotics, a question worth a whole research field.</p>
+</div>
+
+<h2>4. Sensors: Monocular, Stereo, RGB-D, Inertial <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The sensor suite determines which of SLAM's diseases you contract. <strong>Monocular</strong> is the minimal deployment: no scale, scale drift, and fragile initialization, but any camera works. <strong>Stereo</strong> fixes scale outright, since the calibrated baseline of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> makes every triangulation metric, and it initializes instantly from a single stereo pair. <strong>RGB-D</strong> sensors hand you per-pixel depth indoors, removing triangulation entirely from the critical path (their structured-light and time-of-flight ranging is sensor territory covered alongside <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>'s imaging pipeline). <strong>Visual-inertial</strong> systems (VIO) fuse an IMU, whose accelerometer makes scale and gravity observable and whose high-rate gyro carries tracking through motion blur, fast rotation, and textureless moments that starve any pure camera system. VIO is why a phone-based AR session (ARKit, ARCore) keeps virtual furniture glued to your floor while you whip the phone around: the camera corrects the IMU's drift, the IMU bridges the camera's failures, and each sensor's weakness is the other's strength. Production systems like ORB-SLAM3 support all of these modes over the same keyframe-and-graph backbone.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Two Hundred Robots, One Warehouse, Zero Lasers</div>
+<p><strong>Who:</strong> The autonomy team at a logistics-robotics company outfitting tote-carrying robots for a 40,000 square meter fulfillment center.</p>
+<p><strong>Situation:</strong> The incumbent navigation stack used 2D LiDAR, but the unit cost (several hundred dollars per robot, times a fleet of hundreds) pushed the company toward cameras: stereo pairs at a tenth the sensor cost.</p>
+<p><strong>Problem:</strong> Early camera-only trials failed in exactly the textbook ways: long, visually identical aisles caused perceptual aliasing (loop closures fired between <em>different</em> aisles, warping the map), and polished concrete floors plus motion blur during 2 m/s sprints starved the tracker of features several times per shift.</p>
+<p><strong>Decision:</strong> Stereo VIO rather than pure stereo (the IMU bridges blur and texture gaps); loop-closure candidates gated by a coarse position prior so an aisle-7 keyframe cannot match aisle 12; and a fleet-shared prior map built nightly by one surveying robot running full SLAM, with daytime robots doing cheap localization against it rather than full mapping.</p>
+<p><strong>Result:</strong> Position failures per robot-day dropped from 3.1 to 0.02 across the fleet; per-robot sensing cost fell 85 percent versus the LiDAR build; and the shared-map design cut tracking CPU enough to run on the robots' existing compute board.</p>
+<p><strong>Lesson:</strong> SLAM in production is rarely one robot heroically mapping alone. Separating slow, careful map building from fast, cheap localization, and constraining loop closure with whatever priors the deployment offers, converts a fragile research problem into boring, reliable infrastructure.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: A Full SLAM System as a Component</div>
+<p>Our 40-line loop is odometry only: no map, no keyframes, no loop closure, and it drifts accordingly. Complete open-source systems package this entire section behind one entry point: ORB-SLAM3 (C++ with ROS bindings) and its maintained community fork Stella-VSLAM both run monocular, stereo, or RGB-D SLAM from a configuration file and a video stream, in real time, with DBoW2 loop closure, pose-graph correction, full covisibility bookkeeping, and map save and reload. That replaces roughly 40,000 lines of hardened C++ you should not rewrite, and the practical integration effort drops to writing a camera-calibration YAML from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>. On the learned side, DROID-SLAM offers a Python demo that produces dense, drift-resistant trajectories from raw video on a GPU in a few commands.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: SLAM's Map Is Becoming Renderable</div>
+<p>The liveliest 2024-2026 question is what the map should <em>be</em>. Classical maps are sparse point clouds, useful for localizing, useless for much else. The new wave makes the map a renderable scene representation: SplaTAM (CVPR 2024) and MonoGS (CVPR 2024, best-paper honorable mention) track and map directly into 3D Gaussian splats, optimizing camera pose by differentiable rendering against incoming frames, so the SLAM by-product is a photorealistic reconstruction. MASt3R-SLAM (CVPR 2025) drops calibration requirements by building on two-view reconstruction priors, and DROID-SLAM's differentiable-bundle-adjustment lineage continues in faster descendants like DPV-SLAM (ECCV 2024). The common thread: the optimizer is still recognizably the bundle adjustment of <a href="section-14.3.html">Section 14.3</a>, but the residual is photometric and the map is the renderable scene representation that <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> studies in depth, a convergence of SLAM and neural rendering that neither field predicted a decade ago.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.1: The Keyframe Dial <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Suppose you promote keyframes (a) every frame, (b) every 30th frame regardless of content, (c) adaptively, when tracked-point overlap with the last keyframe falls below 60 percent. For each policy, predict the consequences for: local BA cost, triangulation angles of new map points, robustness to a fast 90-degree turn, and map size after an hour. Which failure of (b) does the warehouse story's motion-blur problem make vivid, and why does (c) handle hovering in place better than both?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.2: Measure Your Own Drift <span class="exercise-type coding">Coding</span></div>
+<p>Run the VO listing on KITTI odometry sequence 00 (or any video that physically returns to its start). Plot the trajectory top-down. Quantify drift as final-position error divided by path length, then test two mitigations: keep only every 3rd frame (larger baselines), and tighten the MAGSAC threshold to 0.5 px. Report the drift rate for each variant and one sentence on why neither fix can drive it to zero.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.4.3: Pose Graphs on a Napkin <span class="exercise-type analysis">Analysis</span></div>
+<p>A robot drives a square loop of four 10 m legs with four 90-degree turns, and each turn is measured 2 degrees too small. Compute the end-position error of raw odometry. Now write the pose-graph objective for the five poses (four odometry edges plus one loop edge measuring identity between end and start) and argue, without solving numerically, how the optimizer distributes the 8 degrees of angular error. What does the answer imply about where in a trajectory loop closures help most, and how does the $\mathrm{Sim}(3)$ variant change the story for a monocular robot whose scale also drifted 5 percent?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.3.html">&#8592; Section 14.3: Bundle Adjustment: Polishing the Reconstruction</a>
+<a href="index.html">Chapter 14</a>
+<a class="next" href="section-14.5.html">Section 14.5: COLMAP &amp; Modern Reconstruction Pipelines &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

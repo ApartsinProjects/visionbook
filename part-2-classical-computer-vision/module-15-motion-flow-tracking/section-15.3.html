@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.3: Dense Flow: Horn-Schunck to Variational Methods. The Horn-Schunck energy, smoothness priors, iterative solution, robust penalties and TV-L1, coarse-to-fine warping, Farneback and DIS in OpenCV, and flow visualization." name="description"/>
+<title>Section 15.3: Dense Flow: Horn-Schunck to Variational Methods | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Dense Flow: Horn-Schunck to Variational Methods</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I had no gradient, no texture, no information of any kind, and yet I have been assigned a velocity. My neighbors voted. Apparently this is called regularization."</p>
+<cite>A Peer-Pressured Pixel in a Flat Region</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Dense optical flow assigns a motion vector to every pixel by turning estimation into energy minimization: agree with the data where there is data, and agree with your neighbors where there is not.</strong> Horn and Schunck wrote that bargain as a single integral in 1981, and forty years of dense flow research, through robust penalties, TV-L1, and coarse-to-fine warping, has been a sequence of better terms for the same energy. This section builds Horn-Schunck from scratch, meets the practical OpenCV workhorses (Farneback, DIS), and learns to read the HSV flow visualizations used everywhere from benchmark papers to the video models of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>.</p>
+</div>
+
+<p>
+<a href="section-15.2.html">Section 15.2</a> computed excellent flow at corners and refused to answer anywhere else. Many applications cannot accept the refusal. Motion segmentation needs to know which pixels move together; frame interpolation must synthesize every in-between pixel; video compression, action recognition, and the temporally consistent generation of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> all want motion everywhere. Dense flow is the answer, and the aperture problem guarantees it cannot come from data alone: most pixels are flat or edge-like, so most of any dense field is necessarily inference. The question is how to infer with discipline.
+</p>
+
+<h2>1. The Horn-Schunck Energy <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Horn and Schunck's move was to stop solving pixels independently and instead score entire candidate flow fields $(u(x,y), v(x,y))$ with a global energy:
+</p>
+<p>
+$$ E(u, v) \;=\; \iint \underbrace{\left( I_x u + I_y v + I_t \right)^2}_{\text{data term}} \;+\; \alpha^2 \underbrace{\left( \lVert \nabla u \rVert^2 + \lVert \nabla v \rVert^2 \right)}_{\text{smoothness term}} \; dx\, dy . $$
+</p>
+<p>
+The data term is the squared OFCE residual from <a href="section-15.1.html">Section 15.1</a>: it punishes flow that disagrees with observed brightness change. The smoothness term punishes flow fields that vary rapidly, encoding the prior that nearby pixels usually belong to the same surface and move alike. The weight $\alpha$ arbitrates: small $\alpha$ trusts data and yields noisy, gappy flow; large $\alpha$ trusts the prior and yields smooth, blurry flow. If this structure feels familiar, it should: it is the same data-plus-regularizer template as the restoration energies of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>, with flow in place of the clean image.
+</p>
+<p>
+Minimizing $E$ with the calculus of variations gives a pair of Euler-Lagrange equations, and discretizing them produces a wonderfully simple update. Writing $\bar{u}$ for the average of $u$ over a pixel's four neighbors (a discrete Laplacian rearranged, as in <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>):
+</p>
+<p>
+$$ u^{(k+1)} = \bar{u}^{(k)} - I_x \frac{I_x \bar{u}^{(k)} + I_y \bar{v}^{(k)} + I_t}{\alpha^2 + I_x^2 + I_y^2}, \qquad
+v^{(k+1)} = \bar{v}^{(k)} - I_y \frac{I_x \bar{u}^{(k)} + I_y \bar{v}^{(k)} + I_t}{\alpha^2 + I_x^2 + I_y^2}. $$
+</p>
+<p>
+Read the update as a negotiation. Start from the neighborhood consensus $(\bar u, \bar v)$, then correct it just enough toward the local constraint line, with the correction scaled by how much gradient evidence the pixel actually has. Where gradients are strong, data wins; where the image is flat ($I_x = I_y = 0$), the update reduces to $u \leftarrow \bar u$: pure neighborhood averaging, which is exactly the heat-equation smoothing of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Information diffuses from textured regions into flat ones, iteration by iteration. Figure 15.3.1 visualizes this filling-in, the defining behavior of every global method.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three panels showing flow information diffusing from a textured moving square into the surrounding flat region as Horn-Schunck iterations proceed">
+  <text x="390" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Smoothness fills the silent regions: flow field across iterations</text>
+  <g font-family="sans-serif" font-size="13" fill="#5a626c" text-anchor="middle">
+    <text x="150" y="56">iteration 1</text>
+    <text x="390" y="56">iteration 30</text>
+    <text x="630" y="56">iteration 300</text>
+  </g>
+  <!-- panel frames -->
+  <g fill="#fbfcfc" stroke="#aab7b8" stroke-width="1.4">
+    <rect x="55" y="68" width="190" height="190"/>
+    <rect x="295" y="68" width="190" height="190"/>
+    <rect x="535" y="68" width="190" height="190"/>
+  </g>
+  <!-- textured squares -->
+  <g fill="#85c1e9" stroke="#2980b9" stroke-width="1.2">
+    <rect x="115" y="128" width="70" height="70"/>
+    <rect x="355" y="128" width="70" height="70"/>
+    <rect x="595" y="128" width="70" height="70"/>
+  </g>
+  <!-- panel 1: arrows only on the square edges -->
+  <g stroke="#c0392b" stroke-width="2">
+    <line x1="120" y1="140" x2="138" y2="140"/><line x1="120" y1="163" x2="138" y2="163"/>
+    <line x1="120" y1="186" x2="138" y2="186"/><line x1="160" y1="140" x2="178" y2="140"/>
+    <line x1="160" y1="163" x2="178" y2="163"/><line x1="160" y1="186" x2="178" y2="186"/>
+  </g>
+  <g fill="#c0392b">
+    <polygon points="142,140 134,136 134,144"/><polygon points="142,163 134,159 134,167"/>
+    <polygon points="142,186 134,182 134,190"/><polygon points="182,140 174,136 174,144"/>
+    <polygon points="182,163 174,159 174,167"/><polygon points="182,186 174,182 174,190"/>
+  </g>
+  <text x="150" y="240" font-family="sans-serif" font-size="11.5" fill="#7f8c8d" text-anchor="middle">flow only where gradients exist</text>
+  <!-- panel 2: arrows leaking outward a little -->
+  <g stroke="#c0392b" stroke-width="2">
+    <line x1="360" y1="140" x2="378" y2="140"/><line x1="360" y1="163" x2="378" y2="163"/>
+    <line x1="360" y1="186" x2="378" y2="186"/><line x1="400" y1="140" x2="418" y2="140"/>
+    <line x1="400" y1="163" x2="418" y2="163"/><line x1="400" y1="186" x2="418" y2="186"/>
+  </g>
+  <g fill="#c0392b">
+    <polygon points="382,140 374,136 374,144"/><polygon points="382,163 374,159 374,167"/>
+    <polygon points="382,186 374,182 374,190"/><polygon points="422,140 414,136 414,144"/>
+    <polygon points="422,163 414,159 414,167"/><polygon points="422,186 414,182 414,190"/>
+  </g>
+  <g stroke="#e59866" stroke-width="1.7">
+    <line x1="325" y1="110" x2="338" y2="110"/><line x1="325" y1="216" x2="338" y2="216"/>
+    <line x1="438" y1="110" x2="451" y2="110"/><line x1="438" y1="216" x2="451" y2="216"/>
+    <line x1="325" y1="163" x2="338" y2="163"/><line x1="438" y1="163" x2="451" y2="163"/>
+  </g>
+  <g fill="#e59866">
+    <polygon points="342,110 334,106 334,114"/><polygon points="342,216 334,212 334,220"/>
+    <polygon points="455,110 447,106 447,114"/><polygon points="455,216 447,212 447,220"/>
+    <polygon points="342,163 334,159 334,167"/><polygon points="455,163 447,159 447,167"/>
+  </g>
+  <text x="390" y="240" font-family="sans-serif" font-size="11.5" fill="#7f8c8d" text-anchor="middle">averaging leaks flow outward</text>
+  <!-- panel 3: arrows everywhere -->
+  <g stroke="#e59866" stroke-width="1.7">
+    <line x1="552" y1="90" x2="565" y2="90"/><line x1="600" y1="90" x2="613" y2="90"/><line x1="648" y1="90" x2="661" y2="90"/><line x1="696" y1="90" x2="709" y2="90"/>
+    <line x1="552" y1="125" x2="565" y2="125"/><line x1="696" y1="125" x2="709" y2="125"/>
+    <line x1="552" y1="163" x2="565" y2="163"/><line x1="696" y1="163" x2="709" y2="163"/>
+    <line x1="552" y1="200" x2="565" y2="200"/><line x1="696" y1="200" x2="709" y2="200"/>
+    <line x1="552" y1="237" x2="565" y2="237"/><line x1="600" y1="237" x2="613" y2="237"/><line x1="648" y1="237" x2="661" y2="237"/><line x1="696" y1="237" x2="709" y2="237"/>
+  </g>
+  <g fill="#e59866">
+    <polygon points="569,90 561,86 561,94"/><polygon points="617,90 609,86 609,94"/><polygon points="665,90 657,86 657,94"/><polygon points="713,90 705,86 705,94"/>
+    <polygon points="569,125 561,121 561,129"/><polygon points="713,125 705,121 705,129"/>
+    <polygon points="569,163 561,159 561,167"/><polygon points="713,163 705,159 705,167"/>
+    <polygon points="569,200 561,196 561,204"/><polygon points="713,200 705,196 705,204"/>
+    <polygon points="569,237 561,233 561,241"/><polygon points="617,237 609,233 609,241"/><polygon points="665,237 657,233 657,241"/><polygon points="713,237 705,233 705,241"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="2">
+    <line x1="600" y1="140" x2="618" y2="140"/><line x1="600" y1="163" x2="618" y2="163"/>
+    <line x1="600" y1="186" x2="618" y2="186"/><line x1="640" y1="140" x2="658" y2="140"/>
+    <line x1="640" y1="163" x2="658" y2="163"/><line x1="640" y1="186" x2="658" y2="186"/>
+  </g>
+  <g fill="#c0392b">
+    <polygon points="622,140 614,136 614,144"/><polygon points="622,163 614,159 614,167"/>
+    <polygon points="622,186 614,182 614,190"/><polygon points="662,140 654,136 654,144"/>
+    <polygon points="662,163 654,159 654,167"/><polygon points="662,186 654,182 654,190"/>
+  </g>
+  <text x="630" y="278" font-family="sans-serif" font-size="11.5" fill="#7f8c8d" text-anchor="middle">converged: flat region inherits the square's motion</text>
+  <text x="150" y="278" font-family="sans-serif" font-size="11.5" fill="#2c3e50" text-anchor="middle">textured square moves right</text>
+</svg>
+<figcaption><strong>Figure 15.3.1</strong>: The filling-in effect. A textured square (blue) translates right against a featureless background. At iteration 1, only edge pixels carry flow (red). The averaging in each Horn-Schunck update diffuses that flow outward (orange), and at convergence the silent background has inherited the square's motion. The smoothness prior answers where the data never speaks, for better (inside objects) and worse (across object boundaries).</figcaption>
+</figure>
+
+<h2>2. Horn-Schunck From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The update equations translate into remarkably little NumPy. The implementation below follows the original paper's derivative stencils and runs a fixed number of Jacobi-style sweeps; on a 640x480 pair it converges visually in a few hundred iterations and a couple of seconds.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def horn_schunck(im1, im2, alpha=15.0, n_iters=300):
+    """Dense flow via Horn-Schunck (1981). Returns (u, v) in px/frame."""
+    im1 = im1.astype(np.float32) / 255.0
+    im2 = im2.astype(np.float32) / 255.0
+    # Derivatives averaged across both frames (the paper's 2x2x2 stencils)
+    kx = np.array([[-1, 1], [-1, 1]], np.float32) * 0.25
+    ky = np.array([[-1, -1], [1, 1]], np.float32) * 0.25
+    kt = np.full((2, 2), 0.25, np.float32)
+    Ix = cv2.filter2D(im1, -1, kx) + cv2.filter2D(im2, -1, kx)
+    Iy = cv2.filter2D(im1, -1, ky) + cv2.filter2D(im2, -1, ky)
+    It = cv2.filter2D(im2, -1, kt) - cv2.filter2D(im1, -1, kt)
+
+    u = np.zeros_like(im1)
+    v = np.zeros_like(im1)
+    avg = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], np.float32) / 4.0
+    denom = alpha**2 + Ix**2 + Iy**2
+    for _ in range(n_iters):
+        u_bar = cv2.filter2D(u, -1, avg)          # neighborhood consensus
+        v_bar = cv2.filter2D(v, -1, avg)
+        t = (Ix * u_bar + Iy * v_bar + It) / denom
+        u = u_bar - Ix * t                        # consensus, corrected by data
+        v = v_bar - Iy * t
+    return u, v
+
+u, v = horn_schunck(f0, f1, alpha=15.0)
+print(f"mean speed: {np.hypot(u, v).mean():.2f} px/frame")
+# Expected on a walking-pedestrian clip: mean speed: 0.83 px/frame</code></pre>
+<div class="code-caption">Horn-Schunck in 25 lines: spatiotemporal derivatives from the paper's two-frame stencils, then repeated sweeps of "average the neighbors, correct toward the constraint line", with the correction strength governed by alpha squared in the denominator.</div>
+
+<p>
+Dense flow needs a dense visualization, and the field settled on one convention: hue encodes direction, saturation or value encodes speed, using the HSV color space from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>. Once you internalize the color wheel (rightward motion red-ish, downward green-ish, and so on, depending on the wheel's rotation), you can read a flow field at a glance, which is how every flow paper presents results.
+</p>
+
+<pre><code class="language-python">def flow_to_color(u, v):
+    """Standard HSV flow rendering: hue = direction, value = speed."""
+    mag, ang = cv2.cartToPolar(u, v, angleInDegrees=True)
+    hsv = np.zeros((*u.shape, 3), np.uint8)
+    hsv[..., 0] = (ang / 2).astype(np.uint8)            # OpenCV hue is 0..180
+    hsv[..., 1] = 255
+    hsv[..., 2] = cv2.normalize(mag, None, 0, 255,
+                                cv2.NORM_MINMAX).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+cv2.imwrite("flow_hs.png", flow_to_color(u, v))</code></pre>
+<div class="code-caption">The conventional flow-to-color rendering: direction becomes hue around the color wheel and speed becomes brightness, so a uniformly translating scene renders as one flat color and a rotating scene renders as a full rainbow around the rotation center.</div>
+
+<h2>3. Beyond Quadratic: Robust and Total-Variation Flow <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Horn-Schunck's two quadratic penalties are also its two weaknesses, and both fail at the same place: boundaries. The quadratic data term squares outliers, so occluded pixels (which satisfy no displacement) dominate the energy. The quadratic smoothness term charges a fortune for sharp changes in flow, so the estimate smears across object boundaries where the true field genuinely jumps; Figure 15.3.1's filling-in, so helpful inside an object, becomes leakage between objects. Notice the rhyme with <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>: quadratic regularization blurred image edges there, and total variation preserved them. The identical medicine works here. Replace squares with gentler penalties, the $L_1$ norm or its smooth Charbonnier approximation $\sqrt{x^2 + \epsilon^2}$, and you get the <strong>TV-L1 flow</strong> family: data outliers are tolerated rather than catastrophic, and the flow field is encouraged to be piecewise smooth with crisp motion boundaries instead of globally mushy.
+</p>
+<p>
+The second classical upgrade handles large motion. The linearized data term still only sees sub-pixel displacement, so robust methods embed the energy in the coarse-to-fine warping scheme that <a href="section-15.2.html">Section 15.2</a> introduced for points: solve on a coarse pyramid level, upsample the flow, <em>warp</em> the second image by it, solve for the residual flow, descend. By the mid-2000s the recipe (robust penalties, graduated warping, sometimes gradient-constancy data terms) defined state-of-the-art flow, and it held the benchmark lead until deep networks arrived.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Energy, Three Decades of Refinement</div>
+<p>Every dense flow method between 1981 and the deep era is the same two-term energy with upgraded ingredients: a data term (brightness constancy, then gradient constancy, then census), a prior (quadratic smoothness, then TV, then nonlocal), and an optimization strategy (Jacobi sweeps, then warping pyramids, then primal-dual solvers). Nothing was discarded, only refined. Even RAFT, the network that ended the variational reign, is best understood through this lens: its correlation volume is a learned data term, and its recurrent update operator is a learned optimizer iterating toward a flow field, with the prior absorbed into weights. Recognize the energy and you can read forty years of literature, classical and deep, as one conversation.</p>
+</div>
+
+<h2>4. The Practical Workhorses: Farneback and DIS <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+When you need dense flow in production OpenCV today, two non-deep options carry almost all the traffic. <strong>Farneback</strong> (2003) approximates each pixel's neighborhood with a quadratic polynomial and derives displacement from how the polynomial coefficients shift between frames; it is the default <code>cv2.calcOpticalFlowFarneback</code> and a reasonable all-rounder. <strong>DIS</strong> (Dense Inverse Search, 2016) is the speed champion: it computes fast inverse-compositional Lucas-Kanade matches on a grid of patches, densifies them, and runs a single variational refinement sweep, hitting hundreds of frames per second at usable quality. DIS at its fastest preset powers real-time stabilization and gesture systems on CPUs.
+</p>
+
+<pre><code class="language-python">import cv2
+
+prev = cv2.imread("frame_000.png", cv2.IMREAD_GRAYSCALE)
+curr = cv2.imread("frame_001.png", cv2.IMREAD_GRAYSCALE)
+
+# Option 1: Farneback, the long-standing default
+flow_fb = cv2.calcOpticalFlowFarneback(prev, curr, None, pyr_scale=0.5,
+                                       levels=3, winsize=15, iterations=3,
+                                       poly_n=5, poly_sigma=1.2, flags=0)
+
+# Option 2: DIS, much faster at comparable quality
+dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+flow_dis = dis.calc(prev, curr, None)
+
+print(flow_fb.shape, flow_dis.shape)   # (H, W, 2) (H, W, 2): u and v per pixel
+</code></pre>
+<div class="code-caption">The two production dense-flow calls in OpenCV 4.x: Farneback's polynomial-expansion method with its pyramid parameters exposed, and the DIS estimator whose presets (ULTRAFAST, FAST, MEDIUM) trade accuracy for speed; both return an H-by-W-by-2 float field directly comparable to our Horn-Schunck output.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: 25 Lines Become 2</div>
+<p>Our from-scratch <code>horn_schunck</code> is 25 lines, single-scale, quadratic, and slow in pure Python. <code>cv2.DISOpticalFlow_create().calc(prev, curr, None)</code> replaces it with 2 lines that run two orders of magnitude faster and handle what ours cannot: the coarse-to-fine warping pyramid for large motions, patch-based inverse search, SIMD-vectorized inner loops, and a variational refinement pass with robust penalties. If you want the modern learned option with the same two-line ergonomics, <code>torchvision.models.optical_flow.raft_large</code> ships pretrained RAFT weights in PyTorch 2.x. The from-scratch version exists to make the energy visible; the library versions exist to ship.</p>
+</div>
+
+<h2>5. Evaluating Flow: EPE and the Benchmarks <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Flow quality is measured by <strong>endpoint error</strong> (EPE): the Euclidean distance $\sqrt{(u - u^*)^2 + (v - v^*)^2}$ between estimated and ground-truth vectors, averaged over pixels. Ground truth is the hard part; you cannot annotate a million per-pixel vectors by hand. The field's answer was synthetic and instrumented data: MPI-Sintel renders an animated film with exact ground-truth flow (including a notoriously difficult "final" pass with motion blur and fog), and KITTI derives sparse ground truth for driving scenes from LiDAR and egomotion. Treat the numbers with respect and suspicion at once: EPE averages can hide boundary failures, which is why benchmarks also report outlier percentages and why visual inspection of the HSV rendering remains standard practice even in 2026 papers.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Slow Motion Without the Slow-Motion Camera</div>
+<p><strong>Who &amp; situation:</strong> a sports-streaming startup offering synthetic slow-motion replays by interpolating 30 fps footage to 240 fps, warping frames along estimated flow to synthesize in-betweens. <strong>Problem:</strong> demo clips looked stunning until a customer's hockey footage: the puck and stick blades produced ghosting and rubber-sheet artifacts in every interpolated frame. Diagnosis traced both to flow: the puck moved 35 pixels per frame (far beyond what the chosen Farneback configuration could track) and the smoothness prior smeared flow across the stick-ice boundary, exactly the failure modes this section predicts. <strong>Decision:</strong> the team switched the flow engine to a pretrained RAFT (via <code>torchvision</code>), whose correlation volume handles large displacement natively, and added an occlusion check (forward-backward consistency, borrowed from <a href="section-15.2.html">Section 15.2</a>) that fell back to frame blending in inconsistent regions rather than warping lies. <strong>Result:</strong> artifact complaints stopped, at a GPU cost the product absorbed by interpolating only replay segments rather than full streams. <strong>Lesson:</strong> interpolation quality is flow quality; budget your engineering where the motion is fastest and the boundaries sharpest, because that is where every flow method is weakest.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Dense Flow in the 2024-2026 Era</div>
+<p>The lineage continues past RAFT (ECCV 2020), whose all-pairs correlation volume and recurrent updates made it the reference architecture. SEA-RAFT (ECCV 2024, arXiv:2405.14793) is the current pragmatic favorite: simplified training, a mixture-of-Laplace loss, and direct flow regression that runs above 20 fps at high resolution while leading the Spring benchmark. MemFlow (CVPR 2024, arXiv:2404.04808) and StreamFlow (NeurIPS 2024, arXiv:2311.17099) push the video setting, reusing temporal memory and multi-frame batching so flow for a stream costs far less than per-pair estimation. Meanwhile dense flow has become infrastructure: video diffusion models in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> are evaluated on (and sometimes conditioned with) flow-based temporal-consistency measures, making a 1981 energy function's descendants part of the generative stack's quality control.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.1: The Two Failure Modes of Alpha <span class="exercise-type conceptual">Conceptual</span></div>
+<p>A colleague runs Horn-Schunck on footage of a single car driving through a parking lot and complains about two artifacts: (a) the asphalt around the car appears to move with it, and (b) with a different setting, the car's roof shows a noisy patchwork of inconsistent vectors. Identify which term of the energy is winning in each case, which direction $\alpha$ was set in each, and why no single $\alpha$ can fully fix both at once. What replacement for the smoothness term addresses artifact (a) more fundamentally?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.2: Racing the Implementations <span class="exercise-type coding">Coding</span></div>
+<p>Generate a synthetic pair with known ground truth: shift a textured image right by 3 pixels and down by 1 (so $u^* = 3, v^* = 1$ everywhere). Run (a) this section's <code>horn_schunck</code> with $\alpha \in \{1, 5, 15, 50\}$, (b) Farneback, and (c) DIS at the MEDIUM preset. For each, report mean EPE and wall-clock time. Then repeat with a 20-pixel shift. Which methods survive the large shift, and why does the single-scale Horn-Schunck fail it regardless of $\alpha$?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.3.3: Reading Flow Like a Reviewer <span class="exercise-type analysis">Analysis</span></div>
+<p>Compute DIS flow on three shots: a static camera with one moving object, a panning camera over a static scene, and a forward-moving camera (dashcam footage works). Render each with <code>flow_to_color</code> and, before reading further, write down what pattern you expect in each case. Verify: the pan should be one flat color, and the forward motion should form a radial rainbow expanding from a single point. That point is the focus of expansion; relate it to the epipole of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, and explain what its image position tells you about the camera's heading.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.2.html">&#8592; Section 15.2: Sparse Flow: Lucas-Kanade &amp; Feature Tracking</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="section-15.4.html">Section 15.4: Background Subtraction &amp; Change Detection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

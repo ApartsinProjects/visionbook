@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.4: Extrinsics &amp; Pose Estimation: The PnP Problem. Rotation and translation between world and camera, the Perspective-n-Point problem, P3P and EPnP solvers, solvePnP and solvePnPRansac in OpenCV, and ArUco marker pose with the planar ambiguity." name="description"/>
+<title>Section 12.4: Extrinsics &amp; Pose Estimation: The PnP Problem | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Camera Models &amp; Calibration</a></div>
+<h1>Extrinsics &amp; Pose Estimation: The PnP Problem</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Show me four landmarks I recognize and I will tell you exactly where I am standing. Show me three and I will give you four equally confident answers, one of which has me inside the wall."</p>
+<cite>A P3P Solver With Multiple Personalities</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Calibration measures the camera once; pose estimation locates it every frame, and the Perspective-n-Point problem is the bridge: given the calibrated intrinsics and a handful of known 3D points with their pixel observations, recover the rotation and translation that place the camera in the world.</strong> PnP is the most-executed geometric algorithm in production vision: every AR overlay, every marker-guided robot, and every visual-SLAM tracking thread solves it dozens of times per second. This section builds the extrinsic model, surveys the solver families, and hardens them against the real world's mismatched correspondences with RANSAC.</p>
+</div>
+
+<p>
+The calibration of <a href="section-12.3.html">Section 12.3</a> ended with a quiet bonus: alongside $K$ and distortion, it returned a rotation and translation for every board view. Those were extrinsics, computed as a byproduct. This section makes them the main event, because the question "where is the camera?" is asked far more often than "what is the camera?": intrinsics change when the lens does, extrinsics change every time anything moves. The tool that answers it is the <strong>Perspective-n-Point</strong> (PnP) problem, and its inputs come from sources you have already built: known 3D geometry (a calibration board, a CAD model, a map of triangulated landmarks) matched to pixels by the detection and matching machinery of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>.
+</p>
+
+<h2>1. Extrinsics: The Camera's Place in the World <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The extrinsic parameters are a rigid transform from world coordinates to camera coordinates:
+</p>
+<p>
+$$\mathbf{X}_{\text{cam}} = R\, \mathbf{X}_{\text{world}} + \mathbf{t},$$
+</p>
+<p>
+where $R$ is a $3 \times 3$ rotation matrix and $\mathbf{t}$ a translation vector, together six degrees of freedom (three of rotation, three of translation), the same rigid transforms you manipulated in 2D in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, promoted to 3D. Composing with the intrinsics gives the full projection $P = K[R\,|\,t]$ from <a href="section-12.1.html">Section 12.1</a>. One subtlety repays memorizing: $\mathbf{t}$ is <em>not</em> the camera's position. The transform maps world points into the camera frame, so the camera center $C$ (the point that maps to the origin) is
+</p>
+<p>
+$$C = -R^\top \mathbf{t}.$$
+</p>
+<p>
+Forgetting this and plotting $\mathbf{t}$ as the camera position is the single most common bug in homemade pose visualizers; the camera traces a mirror-warped path and everyone blames the solver. Figure 12.4.1 lays out the two frames and the transform between them.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A world coordinate frame and a camera coordinate frame, with the rigid transform R,t mapping world points into the camera frame, and a point P projecting onto the camera's image plane">
+<rect x="0" y="0" width="760" height="380" fill="#ffffff"/>
+<text x="380" y="28" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">Two frames, one rigid transform</text>
+<defs>
+<marker id="arrW" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#27ae60"/></marker>
+<marker id="arrC" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#2980b9"/></marker>
+<marker id="arrT" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#8e44ad"/></marker>
+</defs>
+<!-- world frame -->
+<g>
+<line x1="120" y1="300" x2="210" y2="300" stroke="#27ae60" stroke-width="2.5" marker-end="url(#arrW)"/>
+<line x1="120" y1="300" x2="120" y2="210" stroke="#27ae60" stroke-width="2.5" marker-end="url(#arrW)"/>
+<line x1="120" y1="300" x2="62" y2="352" stroke="#27ae60" stroke-width="2.5" marker-end="url(#arrW)"/>
+<circle cx="120" cy="300" r="4" fill="#1e8449"/>
+<text x="222" y="305" font-family="sans-serif" font-size="13" fill="#1e8449">X&#119908;</text>
+<text x="112" y="198" font-family="sans-serif" font-size="13" fill="#1e8449">Y&#119908;</text>
+<text x="44" y="366" font-family="sans-serif" font-size="13" fill="#1e8449">Z&#119908;</text>
+<text x="120" y="326" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1e8449" font-weight="bold">world origin</text>
+</g>
+<!-- camera frame -->
+<g>
+<line x1="560" y1="150" x2="640" y2="170" stroke="#2980b9" stroke-width="2.5" marker-end="url(#arrC)"/>
+<line x1="560" y1="150" x2="580" y2="72" stroke="#2980b9" stroke-width="2.5" marker-end="url(#arrC)"/>
+<line x1="560" y1="150" x2="486" y2="196" stroke="#2980b9" stroke-width="2.5" marker-end="url(#arrC)"/>
+<circle cx="560" cy="150" r="4" fill="#1a5276"/>
+<text x="652" y="176" font-family="sans-serif" font-size="13" fill="#1a5276">X&#99;</text>
+<text x="586" y="64" font-family="sans-serif" font-size="13" fill="#1a5276">Y&#99;</text>
+<text x="466" y="212" font-family="sans-serif" font-size="13" fill="#1a5276">Z&#99; (optical axis)</text>
+<text x="600" y="136" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#1a5276" font-weight="bold">camera center C</text>
+</g>
+<!-- image plane along optical axis -->
+<line x1="500" y1="146" x2="540" y2="236" stroke="#85c1e9" stroke-width="2.5"/>
+<text x="498" y="260" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#5499c7">image plane</text>
+<!-- transform arrow between frames -->
+<path d="M170,260 C280,160 380,130 540,142" fill="none" stroke="#8e44ad" stroke-width="2.5" stroke-dasharray="8,5" marker-end="url(#arrT)"/>
+<text x="330" y="142" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#8e44ad" font-weight="bold">X&#99; = R X&#119908; + t</text>
+<text x="330" y="162" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8e44ad">6 DOF: 3 rotation + 3 translation</text>
+<!-- scene point and projection ray -->
+<circle cx="300" cy="280" r="6" fill="#c0392b"/>
+<text x="300" y="304" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#c0392b" font-weight="bold">P (known 3D point)</text>
+<line x1="300" y1="280" x2="560" y2="150" stroke="#c0392b" stroke-width="1.6"/>
+<circle cx="521" cy="169.5" r="4.5" fill="#c0392b" stroke="#fff" stroke-width="1"/>
+<text x="540" y="196" font-family="sans-serif" font-size="12" fill="#c0392b">p (observed pixel)</text>
+<text x="380" y="356" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#888">PnP: given n pairs (P, p) and K, recover R and t. Note C = &#8722;R&#7488;t, not t.</text>
+</svg>
+<figcaption><strong>Figure 12.4.1</strong> Extrinsics relate the world frame (green) to the camera frame (blue) by a rigid transform (purple). A known world point $P$ projects along the red ray to the observed pixel $p$ on the image plane. The PnP problem inverts this picture: from $n$ such point-pixel pairs and the calibrated $K$, find the $R$ and $\mathbf{t}$ that make all the rays line up.</figcaption>
+</figure>
+
+<p>
+In code, rotations travel as <strong>Rodrigues vectors</strong>: a 3-vector whose direction is the rotation axis and whose length is the angle in radians. This is the <code>rvec</code> in every OpenCV pose function, compact (3 parameters for 3 DOF, no orthogonality constraints to maintain during optimization) and convertible to and from a matrix with <code>cv2.Rodrigues</code>.
+</p>
+
+<h2>2. The Perspective-n-Point Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+PnP is the formal statement of "where am I, given landmarks?": given $n$ world points $\mathbf{P}_i$, their observed pixels $\mathbf{p}_i$, and the intrinsics $K$, find $R, \mathbf{t}$ minimizing the reprojection error
+</p>
+<p>
+$$E(R, \mathbf{t}) = \sum_{i=1}^{n} \left\lVert \mathbf{p}_i - \pi(K, R, \mathbf{t}, \mathbf{P}_i) \right\rVert^2 .$$
+</p>
+<p>
+The solver landscape has three tiers, and OpenCV's <code>flags</code> argument selects among them:
+</p>
+<ul>
+<li><strong>Minimal: P3P.</strong> Three points yield a quartic with up to four geometrically valid poses; a fourth point picks the winner. P3P matters not for everyday use but inside RANSAC, where you want to hypothesize poses from the smallest possible sample (<code>SOLVEPNP_P3P</code>, <code>SOLVEPNP_AP3P</code>).</li>
+<li><strong>Closed-form for many points: EPnP.</strong> Expresses the $n$ points as combinations of four control points and solves linearly in $O(n)$, fast and accurate for $n \gtrsim 6$ (<code>SOLVEPNP_EPNP</code>).</li>
+<li><strong>Iterative refinement.</strong> Levenberg-Marquardt on the reprojection error from an initial guess, the most accurate finish and the default (<code>SOLVEPNP_ITERATIVE</code>); planar targets get dedicated solvers (<code>SOLVEPNP_IPPE</code>, <code>SOLVEPNP_IPPE_SQUARE</code>) that exploit the flat geometry.</li>
+</ul>
+<p>
+A useful mental model: the calibrated camera converts each observed pixel into a ray (the back-projection of <a href="section-12.1.html">Section 12.1</a>), so PnP is the problem of rigidly moving a known constellation of 3D points until each point impales its own ray. Three rays almost pin the constellation; more rays overdetermine it and average out the pixel noise.
+</p>
+
+<h2>3. solvePnP in Practice <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The code below estimates the pose of a checkerboard from a single image, using the $K$ and distortion calibrated in <a href="section-12.3.html">Section 12.3</a>. It then converts the Rodrigues vector to a matrix, computes the camera center with the formula from Subsection 1, and draws the world axes into the image, the canonical "is my pose right?" sanity check: the axes should sit on the board's corner and point along its edges.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# K, dist: from Section 12.3's calibration. objp: board corner coordinates.
+img = cv2.imread("board_pose.jpg")
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+ok, corners = cv2.findChessboardCornersSB(gray, (9, 6),
+                                          flags=cv2.CALIB_CB_EXHAUSTIVE)
+
+ok, rvec, tvec = cv2.solvePnP(objp, corners, K, dist)   # default: ITERATIVE
+
+R, _ = cv2.Rodrigues(rvec)              # 3-vector -> 3x3 rotation matrix
+C = -R.T @ tvec                         # camera center in WORLD coordinates
+angle = np.degrees(np.linalg.norm(rvec))
+
+print(f"distance to board origin: {np.linalg.norm(tvec):.3f} m")
+print(f"rotation angle: {angle:.1f} deg about axis {np.round(rvec.ravel()/np.linalg.norm(rvec), 2)}")
+print(f"camera center in board frame: {np.round(C.ravel(), 3)} m")
+# distance to board origin: 0.428 m
+# rotation angle: 28.4 deg about axis [-0.91  0.4   0.1 ]
+# camera center in board frame: [ 0.083 -0.144  0.392] m
+
+cv2.drawFrameAxes(img, K, dist, rvec, tvec, length=3 * 0.024)   # 3 squares long
+cv2.imwrite("board_axes.jpg", img)</code></pre>
+<div class="code-caption">Single-view pose of a calibrated board with <code>cv2.solvePnP</code>, followed by the two standard conversions: Rodrigues vector to rotation matrix, and $C = -R^\top \mathbf{t}$ for the camera's world-frame position. <code>drawFrameAxes</code> renders the recovered world axes into the image for an immediate visual audit.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Calibrate Once, Localize Every Frame</div>
+<p>The factorization $P = K[R\,|\,t]$ splits the camera into a slow part and a fast part. $K$ and distortion are properties of glass and silicon: they change when the lens or focus changes, so you measure them once per hardware configuration with the heavyweight procedure of <a href="section-12.3.html">Section 12.3</a>. $[R\,|\,t]$ changes with every twitch of motion, so it must be cheap, and PnP with a handful of points runs in microseconds. Every real-time geometric system, from AR frameworks to the visual-SLAM tracking loop of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, is built on this division of labor: expensive offline intrinsics, cheap per-frame extrinsics.</p>
+</div>
+
+<h2>4. When Correspondences Lie: PnP Meets RANSAC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A checkerboard's corners come with guaranteed identities, but most real correspondences come from the feature matching of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, and some fraction of matches are simply wrong. Least-squares solvers average over all input, so a single gross outlier can drag the pose meters off target. The remedy is the same RANSAC hypothesize-and-verify loop that chapter used for homographies: sample a minimal set (here, P3P's three or four points), solve, count how many other correspondences reproject within a pixel threshold, repeat, keep the consensus winner, and refine on its inliers. The demonstration below manufactures the failure and the rescue with synthetic data, so every quantity is known exactly.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(7)
+K = np.array([[1480., 0., 960.], [0., 1480., 540.], [0., 0., 1.]])
+
+# Ground-truth pose and a cloud of 120 world points, 4 to 8 m ahead.
+rvec_true = np.array([0.10, -0.30, 0.05])
+tvec_true = np.array([0.20, -0.10, 0.50])
+pts3d = rng.uniform([-1, -1, 4], [1, 1, 8], (120, 3)).astype(np.float32)
+
+img_pts, _ = cv2.projectPoints(pts3d, rvec_true, tvec_true, K, None)
+img_pts = img_pts.reshape(-1, 2) + rng.normal(0, 0.5, (120, 2))   # pixel noise
+
+bad = rng.choice(120, 30, replace=False)                  # 25% wrong matches
+img_pts[bad] = rng.uniform([0, 0], [1920, 1080], (30, 2))
+
+ok, rvec_ls, tvec_ls = cv2.solvePnP(pts3d, img_pts, K, None)
+ok, rvec_rs, tvec_rs, inliers = cv2.solvePnPRansac(
+    pts3d, img_pts, K, None, reprojectionError=2.0, iterationsCount=300)
+
+err_ls = np.linalg.norm(tvec_ls.ravel() - tvec_true)
+err_rs = np.linalg.norm(tvec_rs.ravel() - tvec_true)
+print(f"plain solvePnP   translation error: {err_ls:.3f} m")
+print(f"solvePnPRansac   translation error: {err_rs:.3f} m  ({len(inliers)} inliers)")
+# plain solvePnP   translation error: 1.176 m
+# solvePnPRansac   translation error: 0.004 m  (90 inliers)</code></pre>
+<div class="code-caption">Outlier contamination and its cure, measured against synthetic ground truth. With 25% wrong correspondences, plain least-squares PnP misses by over a meter; RANSAC recovers the pose to 4 millimeters and correctly identifies all 90 honest points as inliers.</div>
+
+<p>
+Two parameters do most of the work. <code>reprojectionError</code> (the inlier threshold, in pixels) should be 2 to 8 px: too tight rejects honest points under noise, too loose admits near-outliers that bias the refit. <code>iterationsCount</code> buys confidence against high outlier rates; with 25% contamination, 300 iterations of 4-point samples make a clean sample overwhelmingly likely. After RANSAC, a final <code>cv2.solvePnPRefineLM</code> on the inliers polishes the answer; production trackers do all three steps every frame.
+</p>
+
+<h2>5. Markers: ArUco, IPPE &amp; the Planar Flip <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+When you control the environment, you can skip natural features entirely and install <strong>fiducial markers</strong>: high-contrast binary squares whose corners are detectable in one pass and whose IDs are encoded in the pattern. OpenCV's ArUco module (a contrib citizen graduated into the main library; the object-oriented <code>ArucoDetector</code> API is current since 4.7) detects markers and identifies them; pose then comes from <code>solvePnP</code> on the four corners with the purpose-built <code>SOLVEPNP_IPPE_SQUARE</code> solver, which replaced the deprecated <code>estimatePoseSingleMarkers</code> helper.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+aruco = cv2.aruco
+detector = aruco.ArucoDetector(aruco.getPredefinedDictionary(aruco.DICT_4X4_50),
+                               aruco.DetectorParameters())
+
+frame = cv2.imread("workbench.jpg")
+corners, ids, _ = detector.detectMarkers(frame)
+
+MARKER = 0.05                     # printed marker side, meters
+h = MARKER / 2                    # IPPE_SQUARE requires EXACTLY this corner order:
+obj = np.array([[-h,  h, 0], [ h,  h, 0],          # top-left, top-right,
+                [ h, -h, 0], [-h, -h, 0]], np.float32)   # bottom-right, bottom-left
+
+for c, marker_id in zip(corners, ids.ravel()):
+    ok, rvec, tvec = cv2.solvePnP(obj, c.reshape(-1, 2), K, dist,
+                                  flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    cv2.drawFrameAxes(frame, K, dist, rvec, tvec, MARKER * 0.75)
+    print(f"marker {marker_id}: {np.linalg.norm(tvec):.3f} m from camera")
+# marker  7: 0.612 m from camera
+# marker 23: 0.841 m from camera</code></pre>
+<div class="code-caption">Marker-based pose with the modern ArUco API: <code>ArucoDetector</code> finds and identifies the squares, and <code>solvePnP</code> with <code>SOLVEPNP_IPPE_SQUARE</code> recovers each marker's 6-DOF pose from its four corners. The object-point ordering is part of the solver's contract; scrambling it produces confidently wrong poses.</div>
+
+<p>
+Planar targets carry a geometric trap worth knowing by name: the <strong>planar pose ambiguity</strong>. Viewed from far away or nearly head-on, a small flat square projects almost identically under two different tilts (mirror images about the viewing direction), and noise decides which one the solver returns, so the estimated orientation can flip frame to frame even while the corners are tracked perfectly. <code>SOLVEPNP_IPPE_SQUARE</code> returns the better-fitting solution, but when the two reprojection errors are close, only physics can save you: use bigger markers, mount several on a rigid board (<code>aruco.GridBoard</code>), or fuse over time. The story below is what the flip looks like in production.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Museum Hologram That Twitched</div>
+<p><strong>Who and what.</strong> A studio building an AR guide for a science museum anchored a virtual exhibit (a beating heart) to a 4 cm ArUco marker on a pedestal, rendering it through visitors' phones using per-frame marker pose.</p>
+<p><strong>The problem.</strong> From across the room the heart twitched: it would snap between two orientations several times a second, even on a tripod-mounted test phone. The corner tracks were sub-pixel stable, which made the twitching look like a renderer bug, and a week went into chasing the wrong layer of the stack.</p>
+<p><strong>The decision.</strong> Plotting the two candidate reprojection errors from the IPPE solver pair showed them crossing repeatedly at viewing distances beyond about 2.5 m: the textbook planar ambiguity, amplified by the small marker. The fix was layered: a 12 cm marker board (four markers on rigid acrylic) replaced the single small square, the pose was estimated from all 16 corners jointly, and a temporal filter rejected any frame whose orientation jumped more than 10 degrees while position moved less than a centimeter.</p>
+<p><strong>The result and the lesson.</strong> Orientation noise dropped 40-fold and the flipping vanished at all visitor distances. The lesson: when a planar pose misbehaves, suspect the geometry before the code; ambiguity is a property of the configuration, and the cure is more (or bigger, or non-coplanar) geometry, not more filtering alone.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: solvePnP Replaces a Solver Zoo</div>
+<p>A from-scratch PnP stack is a research project: a DLT initialization (30 lines), an EPnP implementation (150 lines of control-point algebra), a P3P quartic solver for the RANSAC core (100 lines), the RANSAC loop itself (40 lines), and Levenberg-Marquardt refinement with analytic Jacobians (another 100). OpenCV compresses the whole zoo behind two calls:</p>
+<pre><code class="language-python">ok, rvec, tvec, inliers = cv2.solvePnPRansac(pts3d, pts2d, K, dist,
+                                             reprojectionError=3.0)
+rvec, tvec = cv2.solvePnPRefineLM(pts3d[inliers], pts2d[inliers],
+                                  K, dist, rvec, tvec)</code></pre>
+<div class="code-caption">Robust pose plus refinement in two calls: roughly a 400-to-2 line reduction over implementing the solver families yourself.</div>
+<p>The flags expose the full menagerie (<code>P3P</code>, <code>AP3P</code>, <code>EPNP</code>, <code>IPPE</code>, <code>IPPE_SQUARE</code>, <code>SQPNP</code>) so you can match solver to geometry, and the library quietly handles degenerate configurations, coplanarity detection, and distortion-aware reprojection that homemade implementations routinely botch.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Pose Estimation Goes End to End</div>
+<p>The modern question is not whether to use PnP but where to put it relative to the learning. EPro-PnP (Chen et al., CVPR 2022, extended in TPAMI 2024, <a href="https://arxiv.org/abs/2203.13254" target="_blank" rel="noopener">arXiv:2203.13254</a>) makes the solver itself differentiable by treating pose as a probability distribution, so a network can learn <em>which</em> correspondences to predict by backpropagating through the PnP layer. FoundationPose (Wen et al., CVPR 2024, <a href="https://arxiv.org/abs/2312.08344" target="_blank" rel="noopener">arXiv:2312.08344</a>) delivers 6-DOF object pose and tracking for objects never seen in training, unifying model-based and model-free regimes. For camera (rather than object) pose, ACE0 (Brachmann et al., ECCV 2024, <a href="https://arxiv.org/abs/2404.14351" target="_blank" rel="noopener">arXiv:2404.14351</a>) learns scene coordinates incrementally and relocalizes by, in the end, solving PnP with RANSAC on the network's predicted 3D-2D matches. The pattern across all three: learned components replace the brittle correspondence stage, while the geometric solver from this section survives as the trusted final arbiter, now consuming learned matches instead of hand-crafted ones, a hand-off that continues into the neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.4.1: Frames and Centers <span class="exercise-type conceptual">Conceptual</span></div>
+<p>(a) Derive $C = -R^\top \mathbf{t}$ from the world-to-camera transform by asking which world point maps to the camera-frame origin. (b) A drone's PnP solution at two consecutive frames returns the same $R$ but $\mathbf{t}$ changes from $(0, 0, 5)$ to $(0.1, 0, 5)$. Did the drone move left or right in the world? Justify with the formula. (c) Explain geometrically why three points admit up to four valid P3P poses, and why a fourth point in general position eliminates the impostors.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.4.2: A Desk-Scale AR Anchor <span class="exercise-type coding">Coding</span></div>
+<p>Print one 5 cm ArUco marker and, using your calibration from <a href="section-12.3.html">Section 12.3</a>, run the marker-pose code on a live webcam loop. Render a virtual cube sitting on the marker by projecting its 8 corners with <code>cv2.projectPoints</code> and drawing its edges. Then log $\lVert\mathbf{t}\rVert$ and the rotation angle for 300 frames at three distances (0.3, 1.0, 2.0 m) with the camera fixed. Report the standard deviation of each quantity versus distance, and identify the distance at which orientation noise grows disproportionately, your personal onset of the planar ambiguity.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 12.4.3: Tuning RANSAC Like You Mean It <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the synthetic outlier experiment from this section, sweep the contamination rate from 0% to 60% in steps of 10%, and for each rate sweep <code>reprojectionError</code> over $\{0.5, 1, 2, 4, 8, 16\}$ px. Record translation error and inlier count for each cell. Produce a heatmap of pose error over the grid and answer: at what contamination does the default threshold begin to fail, and why does an overly tight threshold hurt even with zero contamination? Connect the answer to the pixel-noise level you injected.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-12.3.html">&#8592; Section 12.3: Camera Calibration: Zhang's Method in Practice</a>
+<a href="index.html">Chapter 12</a>
+<a class="next" href="section-12.5.html">Section 12.5: Calibration Workflows, Targets &amp; Quality Checks &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

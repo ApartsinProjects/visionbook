@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 14.3: Bundle Adjustment: Polishing the Reconstruction. Joint nonlinear least-squares refinement of all cameras and 3D points: Levenberg-Marquardt, sparse Jacobians, the Schur complement, robust losses, and a working SciPy implementation." name="description"/>
+<title>Section 14.3: Bundle Adjustment: Polishing the Reconstruction | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>Bundle Adjustment: Polishing the Reconstruction</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every camera is a little wrong and every point is a little wrong, and at two in the morning I redistribute the blame across nineteen thousand parameters until nobody can point fingers."</p>
+<cite>A Sleep-Deprived Bundle Adjuster</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Bundle adjustment is where reconstruction accuracy actually comes from: a joint nonlinear least-squares refinement of every camera pose and every 3D point at once, minimizing the total reprojection error over all observations; everything the previous sections built is, from its perspective, just a good initial guess.</strong> The method looks computationally hopeless, hundreds of thousands of coupled unknowns, until one structural observation rescues it: each observation links exactly one camera to one point, making the problem profoundly sparse. Exploiting that sparsity, via the Schur complement, is what lets COLMAP polish city-scale models and what the real-time SLAM systems of <a href="section-14.4.html">Section 14.4</a> run dozens of times per second on a laptop.</p>
+</div>
+
+<p>
+The incremental loop of <a href="section-14.2.html">Section 14.2</a> makes locally reasonable decisions: each pose from PnP is the best fit to the map as it stood, each triangulation the best fit to the cameras as they stood. But "as it stood" is the problem: the map used to register camera 41 already contained the small errors of cameras 1 through 40, so errors do not merely persist, they compound. What the reconstruction needs is a stage where no estimate is privileged: cameras and points all become variables simultaneously, and the data, the observed pixel locations of the tracks from <a href="section-14.1.html">Section 14.1</a>, arbitrates among them. That stage is bundle adjustment, named for the bundles of light rays connecting each 3D point to the cameras that observe it; the name predates computer vision by decades, coming from the photogrammetrists who adjusted aerial-survey bundles by hand calculation in the 1950s.
+</p>
+
+<h2>1. The Objective: Total Reprojection Error <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Let camera $i$ carry parameters $\boldsymbol{\theta}_i$ (rotation and translation; optionally intrinsics and distortion, as calibrated in <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>), let $\mathbf{X}_j$ be the position of track $j$, and let $\mathcal{O}$ be the set of observations: $(i, j) \in \mathcal{O}$ when camera $i$ observes track $j$ at pixel $\mathbf{x}_{ij}$. With $\pi$ the projection function from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>, bundle adjustment solves
+</p>
+<p>
+$$ \min_{\{\boldsymbol{\theta}_i\}, \{\mathbf{X}_j\}} \; \sum_{(i,j) \in \mathcal{O}} \rho\!\left( \left\lVert \pi(\boldsymbol{\theta}_i, \mathbf{X}_j) - \mathbf{x}_{ij} \right\rVert^2 \right), $$
+</p>
+<p>
+where $\rho$ is a robust loss we return to in Section 5 (for now, read it as the identity). The objective is exactly the reprojection error that <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> used to evaluate triangulations, summed over the entire model. Two properties shape everything that follows. First, the problem is <strong>nonlinear</strong>: $\pi$ involves a rotation and a perspective division, so no closed-form solution exists and we must iterate from the initialization that incremental SfM supplies. Second, it is <strong>not fully determined</strong>: moving every camera and every point by a common rigid transform, or scaling the whole scene, changes nothing about reprojection. This seven-dimensional family of equivalent solutions (3 rotation, 3 translation, 1 scale) is the <strong>gauge freedom</strong>; solvers handle it by fixing one camera and one distance, or by letting the normal equations' damping absorb it.
+</p>
+
+<h2>2. The Solver: Gauss-Newton and Levenberg-Marquardt <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Stack all residuals $\mathbf{r}(\mathbf{p}) = \left( \pi(\boldsymbol{\theta}_i, \mathbf{X}_j) - \mathbf{x}_{ij} \right)_{(i,j)\in\mathcal{O}}$ into one vector, where $\mathbf{p}$ collects every parameter. Gauss-Newton linearizes the residuals around the current estimate via the Jacobian $J = \partial \mathbf{r} / \partial \mathbf{p}$ and solves the <strong>normal equations</strong> for an update $\boldsymbol{\delta}$:
+</p>
+<p>
+$$ (J^\top J)\, \boldsymbol{\delta} = -J^\top \mathbf{r}. $$
+</p>
+<p>
+Far from the solution the linearization can overshoot, so Levenberg-Marquardt (LM) adds adaptive damping,
+</p>
+<p>
+$$ \left(J^\top J + \lambda \,\mathrm{diag}(J^\top J)\right) \boldsymbol{\delta} = -J^\top \mathbf{r}, $$
+</p>
+<p>
+shrinking $\lambda$ when a step reduces the cost (behaving like fast Gauss-Newton) and growing it when a step fails (retreating toward cautious gradient descent). LM is the default optimizer of every serious bundle adjuster, and its character matters for intuition: unlike the first-order stochastic optimizers you will meet training networks in <a href="../../part-3-deep-learning-for-vision/module-18-neural-networks-pytorch/index.html">Chapter 18</a>, LM uses curvature, converging in typically 10 to 50 iterations to sub-pixel consistency, and it is deterministic: the same input yields the same polished model.
+</p>
+
+<h2>3. The Sparsity Miracle and the Schur Complement <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Count parameters for a modest reconstruction: 500 cameras at 6 parameters and 200,000 points at 3 parameters give $n = 603{,}000$ unknowns. The matrix $J^\top J$ is $n \times n$; storing it densely needs about 2.9 terabytes, and solving it densely costs $O(n^3)$. Bundle adjustment is feasible only because of the structure visible in the objective: <em>each residual involves exactly one camera and exactly one point</em>. The Jacobian row for observation $(i,j)$ is zero everywhere except in the 6 columns of camera $i$ and the 3 columns of point $j$, so $J^\top J$ assembles into the famous arrowhead form
+</p>
+<p>
+$$ J^\top J = \begin{bmatrix} B &amp; E \\ E^\top &amp; C \end{bmatrix}, $$
+</p>
+<p>
+where $B$ (cameras by cameras) is small, $C$ (points by points) is enormous but <strong>block diagonal</strong> with independent $3 \times 3$ blocks, and $E$ encodes which camera sees which point. Block-diagonal matrices invert block by block, which enables the <strong>Schur complement</strong> trick: eliminate all point parameters analytically and solve the small <em>reduced camera system</em>
+</p>
+<p>
+$$ \left( B - E\, C^{-1} E^\top \right) \boldsymbol{\delta}_{\text{cam}} = -\mathbf{g}_{\text{cam}} + E\, C^{-1} \mathbf{g}_{\text{pt}}, $$
+</p>
+<p>
+then back-substitute each point's update independently (and in parallel). The expensive linear solve shrinks from 603,000 unknowns to 3,000, a workload a laptop handles in milliseconds per iteration. Figure 14.3.1 makes the structure visual; once you have seen it, you cannot unsee why bundle adjustment scales.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: the arrowhead sparsity pattern of the bundle adjustment normal matrix, with a small dense camera block B, a large block-diagonal point block C, and sparse coupling blocks E. Right: the reduced camera system after Schur elimination.">
+  <text x="200" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">structure of J&#7488;J</text>
+  <!-- big matrix outline -->
+  <rect x="60" y="45" width="280" height="240" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <!-- B block -->
+  <rect x="60" y="45" width="60" height="60" fill="#2471a3" opacity="0.85"/>
+  <text x="90" y="80" font-family="sans-serif" font-size="16" fill="#ffffff" text-anchor="middle" font-weight="bold">B</text>
+  <!-- E block (top right) -->
+  <g fill="#b9770e" opacity="0.75">
+    <rect x="130" y="50" width="14" height="10"/><rect x="168" y="62" width="14" height="10"/>
+    <rect x="206" y="50" width="14" height="10"/><rect x="244" y="74" width="14" height="10"/>
+    <rect x="282" y="56" width="14" height="10"/><rect x="310" y="86" width="14" height="10"/>
+    <rect x="150" y="86" width="14" height="10"/><rect x="226" y="92" width="14" height="10"/>
+  </g>
+  <text x="230" y="40" font-family="sans-serif" font-size="13" fill="#7d6608" text-anchor="middle">E (sparse: camera i sees point j)</text>
+  <!-- E transpose (bottom left) -->
+  <g fill="#b9770e" opacity="0.75">
+    <rect x="66" y="120" width="10" height="14"/><rect x="80" y="158" width="10" height="14"/>
+    <rect x="66" y="196" width="10" height="14"/><rect x="92" y="234" width="10" height="14"/>
+    <rect x="74" y="272" width="10" height="10"/><rect x="100" y="142" width="10" height="14"/>
+  </g>
+  <text x="46" y="200" font-family="sans-serif" font-size="13" fill="#7d6608" text-anchor="middle" transform="rotate(-90 46 200)">E&#7488;</text>
+  <!-- C block: block diagonal -->
+  <g fill="#27ae60" opacity="0.85">
+    <rect x="130" y="115" width="18" height="18"/>
+    <rect x="152" y="137" width="18" height="18"/>
+    <rect x="174" y="159" width="18" height="18"/>
+    <rect x="196" y="181" width="18" height="18"/>
+    <rect x="218" y="203" width="18" height="18"/>
+    <rect x="240" y="225" width="18" height="18"/>
+    <rect x="262" y="247" width="18" height="18"/>
+    <rect x="284" y="263" width="18" height="18"/>
+  </g>
+  <text x="252" y="160" font-family="sans-serif" font-size="16" fill="#145a32" font-weight="bold">C</text>
+  <text x="252" y="178" font-family="sans-serif" font-size="12" fill="#145a32">3&#215;3 blocks,</text>
+  <text x="252" y="193" font-family="sans-serif" font-size="12" fill="#145a32">trivially invertible</text>
+  <text x="200" y="305" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">cameras: few (6 params each) &#183; points: many (3 params each)</text>
+
+  <!-- arrow -->
+  <defs>
+    <marker id="arr143" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+  </defs>
+  <line x1="370" y1="165" x2="455" y2="165" stroke="#2c3e50" stroke-width="2.5" marker-end="url(#arr143)"/>
+  <text x="412" y="148" font-family="sans-serif" font-size="13" fill="#2c3e50" text-anchor="middle" font-weight="bold">Schur</text>
+  <text x="412" y="186" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">eliminate points</text>
+
+  <!-- reduced system -->
+  <text x="600" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">reduced camera system</text>
+  <rect x="540" y="115" width="100" height="100" fill="#2471a3" opacity="0.9"/>
+  <text x="590" y="160" font-family="sans-serif" font-size="14.5" fill="#ffffff" text-anchor="middle" font-weight="bold">B &#8722; E C&#8315;&#185;E&#7488;</text>
+  <text x="590" y="180" font-family="sans-serif" font-size="12" fill="#d6eaf8" text-anchor="middle">small &amp; dense</text>
+  <text x="600" y="245" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">solve for camera updates only,</text>
+  <text x="600" y="263" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">then back-substitute every point</text>
+  <text x="600" y="281" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="middle">independently, in parallel</text>
+</svg>
+<figcaption><strong>Figure 14.3.1</strong> Why bundle adjustment scales. Left: the normal matrix $J^\top J$ has arrowhead structure, a small dense camera block $B$, a huge but block-diagonal point block $C$, and sparse couplings $E$ wherever a camera observes a point. Right: because $C$ inverts block by block, the Schur complement reduces each LM iteration to a linear solve over cameras alone, shrinking the core problem by orders of magnitude.</figcaption>
+</figure>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: Adjusted by Hand Since the 1950s</div>
+<p>Photogrammetrists were solving bundle adjustment for aerial surveys decades before computer vision existed, originally with mechanical calculators and rooms of human computers; the "block adjustment" of a national mapping survey could take months. The 2000 survey paper that consolidated the theory for vision, Triggs et al.'s "Bundle Adjustment: A Modern Synthesis," is affectionately known as the field's longest apology for reinventing photogrammetry.</p>
+</div>
+
+<h2>4. Bundle Adjustment in Code <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SciPy's <code>least_squares</code> will not win speed records against Ceres, but it exposes every concept of this section honestly, and on problems up to a few hundred cameras it is perfectly serviceable. The implementation needs three ingredients: a residual function (project every observed point through its camera, subtract the observation), a parameter vector packing camera 6-vectors (axis-angle rotation plus translation) and point 3-vectors, and, crucially, the <strong>Jacobian sparsity pattern</strong>, without which SciPy would attempt dense finite differences over the full parameter count and never finish. The arrays <code>cam_idx</code>, <code>pt_idx</code>, and <code>obs</code> are exactly the observation list of the objective: row $k$ says camera <code>cam_idx[k]</code> saw point <code>pt_idx[k]</code> at pixel <code>obs[k]</code>, data that falls straight out of the track table built in <a href="section-14.1.html">Section 14.1</a>.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
+
+def rotate(pts, rvecs):
+    """Apply batched axis-angle rotations (Rodrigues formula)."""
+    theta = np.linalg.norm(rvecs, axis=1, keepdims=True)
+    with np.errstate(invalid="ignore"):
+        k = np.nan_to_num(rvecs / theta)              # unit axes (0 where theta=0)
+    cos, sin = np.cos(theta), np.sin(theta)
+    return (cos * pts + sin * np.cross(k, pts)
+            + (pts * k).sum(1, keepdims=True) * (1 - cos) * k)
+
+def residuals(params, n_cams, n_pts, cam_idx, pt_idx, obs, K):
+    cams = params[:n_cams * 6].reshape(n_cams, 6)     # [rvec | tvec] per camera
+    pts = params[n_cams * 6:].reshape(n_pts, 3)
+    Xc = rotate(pts[pt_idx], cams[cam_idx, :3]) + cams[cam_idx, 3:6]
+    proj = Xc @ K.T
+    proj = proj[:, :2] / proj[:, 2:]                  # perspective division
+    return (proj - obs).ravel()
+
+def jac_sparsity(n_cams, n_pts, cam_idx, pt_idx):
+    """Mark which parameters each residual can possibly touch."""
+    m = cam_idx.size * 2                              # two residuals per observation
+    A = lil_matrix((m, n_cams * 6 + n_pts * 3), dtype=int)
+    row = np.arange(cam_idx.size)
+    for s in range(6):                                # this residual's camera...
+        A[2 * row, cam_idx * 6 + s] = 1
+        A[2 * row + 1, cam_idx * 6 + s] = 1
+    for s in range(3):                                # ...and its point, nothing else
+        A[2 * row, n_cams * 6 + pt_idx * 3 + s] = 1
+        A[2 * row + 1, n_cams * 6 + pt_idx * 3 + s] = 1
+    return A
+
+x0 = np.hstack([cams_init.ravel(), pts_init.ravel()])
+A = jac_sparsity(n_cams, n_pts, cam_idx, pt_idx)
+res = least_squares(residuals, x0, jac_sparsity=A, method="trf",
+                    loss="huber", f_scale=1.0, x_scale="jac",
+                    args=(n_cams, n_pts, cam_idx, pt_idx, obs, K))
+
+r0 = residuals(x0, n_cams, n_pts, cam_idx, pt_idx, obs, K)
+print(f"reprojection RMSE: {np.sqrt((r0**2).mean()):.2f}px "
+      f"-&gt; {np.sqrt((res.fun**2).mean()):.2f}px in {res.nfev} evaluations")
+# reprojection RMSE: 3.84px -&gt; 0.47px in 23 evaluations</code></pre>
+<div class="code-caption">A complete sparse bundle adjuster in NumPy and SciPy: batched Rodrigues rotation, a residual function projecting every observation through its camera, the sparsity mask that tells the solver each residual touches only 9 of the hundreds of thousands of parameters, and a Huber loss for robustness. On the author's 60-camera test scene the RMSE drops roughly eightfold in two dozen evaluations.</div>
+
+<p>
+Watch what the printed before-and-after line says: the optimizer did not move any single camera dramatically, yet the collective consistency improved by nearly an order of magnitude. That is the signature of bundle adjustment: it harvests hundreds of small, correlated corrections that no per-camera or per-point estimator could see.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Joint Refinement Beats Sequential Refinement Because Errors Are Correlated</div>
+<p>Refining each camera against fixed points, then each point against fixed cameras, and alternating, looks like it should converge to the same place. It usually does not, and when it does, it crawls: an error in camera 12's pose is partially absorbed by the points it observes, which then mislead camera 31 that shares those points. Bundle adjustment moves both sides of every such bargain simultaneously, following the true joint curvature of the problem; this is precisely the coupling the Schur complement preserves (rather than ignores) while eliminating the point variables. The general lesson, that jointly optimizing coupled estimates outperforms coordinate-wise fixing, recurs throughout vision, from calibration in <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> to end-to-end network training in <a href="../../part-3-deep-learning-for-vision/module-18-neural-networks-pytorch/index.html">Chapter 18</a>.</p>
+</div>
+
+<h2>5. Robustness in Practice: Losses, Outliers, Scheduling <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A plain squared loss hands control of the model to its worst data: one contaminated track observation, 40 pixels off, contributes as much gradient as 1,600 observations that are one pixel off. Hence the robust loss $\rho$. The <strong>Huber loss</strong> is quadratic inside a threshold and linear beyond, so outliers retain influence but no longer dominate; the <strong>Cauchy loss</strong> goes further, asymptotically ignoring gross errors. Production systems pair a robust kernel with an eviction schedule: adjust, delete observations whose residuals remain large, adjust again, exactly the audit rhythm of <a href="section-14.2.html">Section 14.2</a> applied at global scale. Scheduling is the other practical lever. Running global bundle adjustment after every new camera would be ruinously slow, so incremental mappers interleave <strong>local BA</strong> (the new camera plus its covisible neighborhood, a few dozen cameras) after every registration with <strong>global BA</strong> at exponentially spaced milestones, when the model has grown by some percentage. And when many images share one physical camera, refining shared intrinsics inside the final global BA (self-calibration) recovers focal length and distortion better than any single image could; this is why COLMAP often reports better intrinsics than the EXIF data claimed.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Bowl-Shaped Parking Lot</div>
+<p><strong>Who:</strong> A photogrammetry engineer at a construction-tech company producing weekly drone surveys of building sites for volume and progress tracking.</p>
+<p><strong>Situation:</strong> Flat sites kept reconstructing with a subtle dish shape: corners of a level parking lot curved up to half a meter relative to its center, corrupting cut-and-fill volume estimates that fed invoices.</p>
+<p><strong>Problem:</strong> The dreaded "bowl effect," a classic systematic failure: slightly misestimated radial distortion bends every camera's geometry coherently, and bundle adjustment, given freedom only over poses and points, accommodates the bias by curving the world. Nadir-only imagery makes distortion and terrain curvature nearly indistinguishable to the optimizer.</p>
+<p><strong>Decision:</strong> Three changes to the BA configuration rather than the capture hardware: model and jointly refine a full radial-tangential distortion (shared across all images from the one camera) in global BA instead of trusting the lens profile; add oblique imagery (15 degrees off-nadir on the perimeter) to break the distortion-curvature ambiguity; and pin five surveyed ground control points as fixed 3D anchors with observation residuals in the objective.</p>
+<p><strong>Result:</strong> Vertical deviation on the flat-lot acceptance test dropped from 0.48 m to 0.019 m. Volume disputes with contractors, previously a monthly support burden, effectively ended.</p>
+<p><strong>Lesson:</strong> Bundle adjustment minimizes exactly what you ask, over exactly the parameters you free. Systematic shape errors usually mean the model is missing a parameter (here, distortion) or the data cannot disambiguate one; the fix is modeling and capture geometry, not more iterations.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ceres via pycolmap, Three Lines for the Industrial Version</div>
+<p>Our SciPy adjuster is about 50 lines and fine for hundreds of cameras; the production tool is Google's Ceres Solver, which COLMAP wraps so that refining an entire reconstruction is <code>pycolmap.bundle_adjustment(rec, pycolmap.BundleAdjustmentOptions())</code> on the model from <a href="section-14.2.html">Section 14.2</a>. Internally Ceres supplies what our version lacks: analytic or automatic derivatives (no finite differencing), specialized Schur-complement linear solvers with camera-ordering heuristics, multithreaded and optionally CUDA-accelerated factorization, robust kernels, and parameter blocks that stay fixed on demand (ground control points, calibrated intrinsics). The line-count reduction is roughly 50 to 3; the speedup on large problems is two to three orders of magnitude.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Bundle Adjustment Meets the GPU and the Gradient</div>
+<p>Bundle adjustment is having a second youth. One thread makes the classical solver differentiable and embeds it in networks: DROID-SLAM (NeurIPS 2021) iterates a dense BA layer inside a recurrent architecture, and its descendants (DPV-SLAM, ECCV 2024) keep the pattern at higher speed. A second thread re-platforms the solver: Ceres gained CUDA solvers, and dedicated GPU adjusters like MegBA (ECCV 2022) handle millions of cameras by distributing the Schur complement. A third thread sidesteps BA entirely, then sneaks it back in: feed-forward systems such as VGGT (CVPR 2025) regress poses directly, yet their best reported configurations still apply a final BA polish, and pose refinement inside 3D Gaussian splatting pipelines (taken up in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>) is bundle adjustment by another name, with photometric rather than reprojection residuals. Half a century in, the normal equations remain stubbornly load-bearing.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.3.1: Gauge Freedom Made Concrete <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The BA objective is invariant to 7 degrees of freedom. Enumerate them, then answer: what does this invariance do to the matrix $J^\top J$ (think eigenvalues), and why does LM's damping term let the solver proceed anyway? If a client requires the model in metric units with a specific site origin, which 7 numbers must come from outside the images, and name two realistic sources for them.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.3.2: Free the Focal Length <span class="exercise-type coding">Coding</span></div>
+<p>Extend the SciPy adjuster to refine a shared focal length: make $f$ parameter zero of the vector, update <code>residuals</code> and one column of the sparsity pattern (every residual now touches $f$). Initialize $f$ 10 percent wrong on a synthetic scene with known ground truth and report: does BA recover it? Then re-run with all cameras facing nearly the same direction and compare; relate the failure to the bowl-effect story.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.3.3: Measure the Sparsity Dividend <span class="exercise-type analysis">Analysis</span></div>
+<p>For a reconstruction with $C$ cameras, $P$ points, and $O$ observations, derive expressions for (a) the nonzero count of the Jacobian, (b) its dense element count, and (c) the size of the reduced camera system. Evaluate for the railway scenario of <a href="section-14.2.html">Section 14.2</a>: $C = 40{,}000$, $P = 12$ million, $O = 90$ million. Then time the SciPy adjuster on a synthetic problem at $C \in \{10, 30, 100\}$ with and without <code>jac_sparsity</code> and plot both curves. Where would the dense version exhaust your machine's memory?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.2.html">&#8592; Section 14.2: Incremental Structure from Motion</a>
+<a href="index.html">Chapter 14</a>
+<a class="next" href="section-14.4.html">Section 14.4: Visual SLAM: Mapping While Moving &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

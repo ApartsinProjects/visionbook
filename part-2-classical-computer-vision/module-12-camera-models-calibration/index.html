@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 12: Camera Models &amp; Calibration. The pinhole camera and the intrinsic matrix, lens distortion and its correction, Zhang's calibration method in practice, the PnP pose problem, and calibration workflows with quality diagnostics." name="description"/>
+<title>Chapter 12: Camera Models &amp; Calibration | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Camera Models &amp; Calibration</a></div>
+<h1>Camera Models &amp; Calibration</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I turn the entire world into pixels using five numbers and a small polynomial. Lose those numbers, and I am no longer a measuring instrument. I am modern art."</p>
+<cite>A Camera That Lost Its Calibration</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This chapter is where the image stops being a grid of colors and becomes a measurement of the 3D world: the pinhole model says how space projects to pixels, and calibration recovers the exact parameters of that projection for your specific camera.</strong> Every geometric capability that follows in this book, depth from stereo in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, structure from motion in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, the pose-hungry neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>, stands on the few numbers this chapter teaches you to estimate, doubt, and maintain.</p>
+</div>
+
+<div class="overview">
+<h2>Chapter Overview</h2>
+<p>
+Part II has so far stayed inside the image: <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> found edges and lines, <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> matched points between images, <a href="../module-11-classical-segmentation/index.html">Chapter 11</a> grouped pixels into regions. None of that answers the questions a robot, a drone, or an AR headset actually asks: how far away is that object, where am I standing, which way am I looking? Those are questions about the 3D world, and a 2D image can answer them only if you know precisely how the world was flattened into it. That flattening is the camera model, and measuring its parameters is calibration.
+</p>
+<p>
+The model itself is almost embarrassingly simple. A pinhole camera projects every 3D point along a straight ray through one center onto an image plane; with homogeneous coordinates the whole operation is one matrix, the intrinsic matrix $K$, holding the focal lengths in pixels, the principal point, and little else. Real lenses complicate the picture in exactly one well-behaved way, a radially symmetric distortion that a low-order polynomial captures, and correcting it restores the pinhole's pristine geometry. What elevates this from algebra to engineering is that the parameters can be measured cheaply and precisely: Zhang's method, the subject of the chapter's centerpiece section, recovers everything from a dozen photographs of a printed checkerboard, an idea that demolished the machined-target calibration rigs that came before it and that now lives behind a single OpenCV call.
+</p>
+<p>
+With intrinsics in hand, the chapter turns to the question asked most often in production: where is the camera right now? The Perspective-n-Point problem recovers the rotation and translation from a handful of known 3D points and their pixel observations, in microseconds, robustly even when a quarter of the correspondences are wrong, thanks to the same RANSAC logic that rescued matching in Chapter 10. PnP is the workhorse of augmented reality, marker-based robotics, and the tracking loops of visual SLAM; we treat its solver families, its failure modes (including the notorious planar flip), and its fiducial-marker ecosystem. The closing section is the field manual the rest of the chapter earns: which targets to print, how to capture views that constrain every parameter, how to read residual plots like an engineer, and how to keep a calibration trustworthy through months of heat, vibration, and helpful colleagues.
+</p>
+<p>
+A single thread stitches the five sections together: a calibrated camera converts pixels into rays, and rays are geometry you can compute with. One ray gives a direction; the depth along it is gone, lost to the projection. Recovering that lost dimension, by a second camera, by motion, by learned priors, is the business of the next two chapters and a recurring theme all the way to the generative world models of Part IV. This chapter buys the ticket.
+</p>
+</div>
+
+<div class="prereqs">
+<h3>Prerequisites</h3>
+<p>
+The geometry here leans directly on <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5: Geometric Transformations &amp; Image Warping</a>: homogeneous coordinates, homographies and their DLT estimation, and the remap machinery reappear constantly. From <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a> we reuse subpixel corner detection and the RANSAC robust-fitting pattern. The plumb-line diagnostics of Section 12.2 borrow line detection from <a href="../module-09-edges-lines-curves/index.html">Chapter 9: Edges, Lines &amp; Curves</a>, and the discussion of sensors, pixel pitch, and image sharpness assumes the imaging-pipeline vocabulary of <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1: Digital Image Fundamentals</a>. Mathematically, comfort with matrix multiplication, matrix inverses, and the idea of least-squares fitting is assumed; rotation matrices and SVD appear but are introduced as used.
+</p>
+</div>
+
+<h2>Chapter Roadmap</h2>
+<ul class="sections-list">
+<li>
+<span class="section-num">12.1</span>
+<a href="section-12.1.html"><span class="section-title">The Pinhole Camera &amp; Intrinsic Parameters</span></a>
+<span class="section-desc">Perspective projection from similar triangles, homogeneous coordinates that make it linear, the anatomy of the intrinsic matrix $K$, field of view versus focal length, and why every pixel is really a ray with its depth missing.</span>
+</li>
+<li>
+<span class="section-num">12.2</span>
+<a href="section-12.2.html"><span class="section-title">Lens Distortion &amp; Its Correction</span></a>
+<span class="section-desc">Barrel and pincushion distortion, the Brown-Conrady radial and tangential model in normalized coordinates, undistortion as a precomputed remap with the alpha trade-off, and the fisheye models that take over past 120 degrees.</span>
+</li>
+<li>
+<span class="section-num">12.3</span>
+<a href="section-12.3.html"><span class="section-title">Camera Calibration: Zhang's Method in Practice</span></a>
+<span class="section-desc">Why a flat checkerboard suffices: homographies constrain the intrinsics linearly, Levenberg-Marquardt polishes everything including distortion, and cv2.calibrateCamera runs the whole pipeline; reading RMS, per-view errors, and parameter uncertainties.</span>
+</li>
+<li>
+<span class="section-num">12.4</span>
+<a href="section-12.4.html"><span class="section-title">Extrinsics &amp; Pose Estimation: The PnP Problem</span></a>
+<span class="section-desc">Rotation and translation between world and camera, the Perspective-n-Point problem and its solver families (P3P, EPnP, iterative, IPPE), RANSAC against bad correspondences, and ArUco marker pose with the planar ambiguity.</span>
+</li>
+<li>
+<span class="section-num">12.5</span>
+<a href="section-12.5.html"><span class="section-title">Calibration Workflows, Targets &amp; Quality Checks</span></a>
+<span class="section-desc">Checkerboard versus circle grid versus ChArUco, a capture protocol that pays for every parameter, residual forensics beyond the RMS number, and running calibration as a versioned, monitored operational asset.</span>
+</li>
+</ul>
+
+<div class="whats-next">
+<h3>What's Next?</h3>
+<p>
+A calibrated camera turns every pixel into a ray, and one ray cannot tell you depth. <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a> adds the second camera: epipolar geometry constrains where matches can live, rectification (built from this chapter's intrinsics and distortion models) aligns the search to scanlines, and triangulation finally intersects the rays to recover the dimension that projection destroyed. From there, <a href="../module-14-sfm-visual-slam/index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a> scales the same geometry to thousands of views, with the PnP solver from this chapter running in its tracking loop. The arc continues into the learned era: the neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> consume exactly the poses and intrinsics taught here, and the 3D-aware generation of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> inherits the camera as its interface to space.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading</h2>
+
+<h3>Foundational Papers</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Zhang, Z. "A Flexible New Technique for Camera Calibration." IEEE TPAMI (2000). <a href="https://doi.org/10.1109/34.888718" target="_blank" rel="noopener">doi:10.1109/34.888718</a></div>
+<div class="bib-annotation">The planar-target calibration method that Section 12.3 teaches and that <code>cv2.calibrateCamera</code> implements: homography constraints on the image of the absolute conic, closed-form initialization, and maximum-likelihood refinement.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Tsai, R. "A Versatile Camera Calibration Technique for High-Accuracy 3D Machine Vision Metrology Using Off-the-Shelf TV Cameras and Lenses." IEEE Journal of Robotics and Automation (1987). <a href="https://doi.org/10.1109/JRA.1987.1087109" target="_blank" rel="noopener">doi:10.1109/JRA.1987.1087109</a></div>
+<div class="bib-annotation">The pre-Zhang standard, built around radial alignment with a 3D target. Worth reading to appreciate what the move to planar targets simplified, and still cited for its careful error analysis.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Lepetit, V., Moreno-Noguer, F., and Fua, P. "EPnP: An Accurate O(n) Solution to the PnP Problem." IJCV (2009). <a href="https://doi.org/10.1007/s11263-008-0152-6" target="_blank" rel="noopener">doi:10.1007/s11263-008-0152-6</a></div>
+<div class="bib-annotation">The control-point reformulation that made many-point pose estimation linear-time; the solver behind <code>SOLVEPNP_EPNP</code> in Section 12.4.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Gao, X.-S., Hou, X., Tang, J., and Cheng, H. "Complete Solution Classification for the Perspective-Three-Point Problem." IEEE TPAMI (2003). <a href="https://doi.org/10.1109/TPAMI.2003.1217599" target="_blank" rel="noopener">doi:10.1109/TPAMI.2003.1217599</a></div>
+<div class="bib-annotation">The definitive enumeration of P3P's up-to-four solutions, explaining the multiple-personality epigraph of Section 12.4 and underpinning the minimal solver inside every PnP RANSAC loop.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Fischler, M. and Bolles, R. "Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography." Communications of the ACM (1981). <a href="https://doi.org/10.1145/358669.358692" target="_blank" rel="noopener">doi:10.1145/358669.358692</a></div>
+<div class="bib-annotation">The RANSAC paper, which also happens to be the paper that named the Perspective-n-Point problem. Both halves of Section 12.4's robust pose pipeline trace to this single reference.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Collins, T. and Bartoli, A. "Infinitesimal Plane-Based Pose Estimation." IJCV (2014). <a href="https://doi.org/10.1007/s11263-014-0725-5" target="_blank" rel="noopener">doi:10.1007/s11263-014-0725-5</a></div>
+<div class="bib-annotation">IPPE, the planar-target pose solver behind <code>SOLVEPNP_IPPE_SQUARE</code>, with the cleanest published treatment of the two-fold planar ambiguity that Section 12.4's museum story dramatizes.</div>
+</div>
+
+<h3>Recent Research (2024-2026)</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Veicht, A., Sarlin, P.-E., Lindenberger, P., and Pollefeys, M. "GeoCalib: Learning Single-Image Calibration with Geometric Optimization." ECCV (2024). <a href="https://arxiv.org/abs/2409.06704" target="_blank" rel="noopener">arXiv:2409.06704</a></div>
+<div class="bib-annotation">Recovers focal length, gravity, and distortion from one uncontrolled image by differentiating through a geometric optimizer; the strongest current answer to "what if I cannot photograph a checkerboard?"</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, S. et al. "DUSt3R: Geometric 3D Vision Made Easy." CVPR (2024). <a href="https://arxiv.org/abs/2312.14132" target="_blank" rel="noopener">arXiv:2312.14132</a></div>
+<div class="bib-annotation">Feed-forward pointmaps from unposed, uncalibrated image pairs, with intrinsics recovered afterward from the predictions; the manifesto of the calibration-free reconstruction trend discussed in this chapter's research-frontier callouts.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wang, J. et al. "VGGT: Visual Geometry Grounded Transformer." CVPR (2025). <a href="https://arxiv.org/abs/2503.11651" target="_blank" rel="noopener">arXiv:2503.11651</a></div>
+<div class="bib-annotation">A single transformer pass predicting cameras, depth, and 3D points for hundreds of views; the feed-forward heir to the classical pipeline whose components this chapter and the next two build piece by piece.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Wen, B. et al. "FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects." CVPR (2024). <a href="https://arxiv.org/abs/2312.08344" target="_blank" rel="noopener">arXiv:2312.08344</a></div>
+<div class="bib-annotation">Object pose for instances never seen in training, model-based or model-free; the deep-era counterpart of Section 12.4's marker-based pose, and a bridge to the recognition material of Part III.</div>
+</div>
+
+<h3>Books</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">Hartley, R. and Zisserman, A. <em>Multiple View Geometry in Computer Vision</em>, 2nd edition (2004). <a href="https://www.robots.ox.ac.uk/~vgg/hzbook/" target="_blank" rel="noopener">robots.ox.ac.uk/~vgg/hzbook</a></div>
+<div class="bib-annotation">The bible of projective vision. Chapters 6 and 7 cover camera models and calibration at full mathematical depth; the notation of this chapter is deliberately compatible with it.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Szeliski, R. <em>Computer Vision: Algorithms and Applications</em>, 2nd edition (2022). <a href="https://szeliski.org/Book/" target="_blank" rel="noopener">szeliski.org/Book</a></div>
+<div class="bib-annotation">Chapter 11 (Structure from Motion and SLAM) and the camera-model material in Chapter 2 give a modern, implementation-aware treatment with generous references; free online.</div>
+</div>
+
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-entry-card">
+<div class="bib-ref">OpenCV. Camera Calibration and 3D Reconstruction (calib3d module) documentation. <a href="https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html" target="_blank" rel="noopener">docs.opencv.org</a></div>
+<div class="bib-annotation">The reference for every function this chapter calls: <code>calibrateCamera</code>, <code>solvePnP</code> and its flags, <code>undistort</code>, the fisheye namespace, and the ArUco/ChArUco detector objects. The official calibration tutorial pairs well with Section 12.3.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Kogan, D. mrcal: a camera calibration toolkit. <a href="https://mrcal.secretsauce.net/" target="_blank" rel="noopener">mrcal.secretsauce.net</a></div>
+<div class="bib-annotation">Splined lens models far richer than the Brown-Conrady polynomial, plus rigorous uncertainty propagation and the best residual-diagnostic tooling available; the professional-grade extension of Section 12.5's quality checks.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">ETH ASL. Kalibr: camera and camera-IMU calibration toolbox. <a href="https://github.com/ethz-asl/kalibr" target="_blank" rel="noopener">github.com/ethz-asl/kalibr</a></div>
+<div class="bib-annotation">The standard tool when calibration must extend beyond a lone camera: multi-camera rigs, camera-to-IMU transforms, and temporal offsets, the inputs that the SLAM systems of Chapter 14 depend on.</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="../module-11-classical-segmentation/index.html">&#8592; Chapter 11: Classical Segmentation &amp; Grouping</a>
+<a href="../index.html">Part II</a>
+<a class="next" href="section-12.1.html">Section 12.1: The Pinhole Camera &amp; Intrinsic Parameters &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

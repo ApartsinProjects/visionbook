@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 15.2: Sparse Flow: Lucas-Kanade &amp; Feature Tracking. Least-squares flow in a window, the structure tensor as trackability test, iterative and pyramidal Lucas-Kanade, and the KLT tracker with forward-backward checking." name="description"/>
+<title>Section 15.2: Sparse Flow: Lucas-Kanade &amp; Feature Tracking | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 15: Motion, Optical Flow &amp; Tracking</a></div>
+<h1>Sparse Flow: Lucas-Kanade &amp; Feature Tracking</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My therapist says I have boundary issues: I assume everyone within a 21-by-21 window is going exactly where I am going. So far, statistically, she is wrong."</p>
+<cite>A Confidently Extrapolating Corner Point</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Lucas-Kanade buys the missing flow equation in bulk: assume every pixel in a small window moves together, and one unsolvable equation becomes an overdetermined least-squares system.</strong> The normal-equations matrix of that system is the structure tensor from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, so the points where flow is reliably computable are exactly the corners we already know how to detect. Add Newton-style iteration for accuracy and a coarse-to-fine pyramid (from <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>) for large motions, and you get the KLT tracker: forty years old, still inside production SLAM systems, drones, and the feature-track front ends of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</p>
+</div>
+
+<p>
+<a href="section-15.1.html">Section 15.1</a> ended at an impasse: the optical flow constraint equation pins each pixel's motion to a line, never a point. This section resolves the impasse the local way, by assuming that motion is constant over a small neighborhood and letting the neighborhood's pixels vote. The result is sparse flow: superbly accurate motion estimates at well-chosen points, and silence everywhere else. For a great many applications (tracking, odometry, structure from motion) sparse is not a compromise but exactly the right product.
+</p>
+
+<h2>1. From One Equation to a Solvable System <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Take a window $W$ of $N$ pixels (say $21 \times 21$, so $N = 441$) around the point of interest and assume all of them share one velocity $(u, v)$. Each pixel $i$ contributes its own OFCE, $I_{x,i} u + I_{y,i} v = -I_{t,i}$, giving $N$ equations in 2 unknowns. Stack them into matrix form:
+</p>
+<p>
+$$ A \begin{bmatrix} u \\ v \end{bmatrix} = \mathbf{b}, \qquad
+A = \begin{bmatrix} I_{x,1} &amp; I_{y,1} \\ \vdots &amp; \vdots \\ I_{x,N} &amp; I_{y,N} \end{bmatrix}, \qquad
+\mathbf{b} = -\begin{bmatrix} I_{t,1} \\ \vdots \\ I_{t,N} \end{bmatrix}. $$
+</p>
+<p>
+With $N \gg 2$ the system is overdetermined, and the least-squares solution comes from the normal equations $A^T A \, \mathbf{v} = A^T \mathbf{b}$, written out:
+</p>
+<p>
+$$ \underbrace{\begin{bmatrix} \sum I_x^2 &amp; \sum I_x I_y \\ \sum I_x I_y &amp; \sum I_y^2 \end{bmatrix}}_{M,\ \text{the structure tensor}} \begin{bmatrix} u \\ v \end{bmatrix} = - \begin{bmatrix} \sum I_x I_t \\ \sum I_y I_t \end{bmatrix}. $$
+</p>
+<p>
+Look hard at the matrix $M$. It is, sum for sum, the structure tensor that <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> built to detect corners. There the question was "does this neighborhood change in two directions?"; here it is "do this neighborhood's gradients constrain motion in two directions?", and both questions are answered by the same eigenvalues. If both eigenvalues $\lambda_1 \ge \lambda_2$ are large, $M$ inverts stably and the flow is well determined. If $\lambda_2 \approx 0$, the window contains only an edge and the system is rank deficient: the aperture problem of <a href="section-15.1.html">Section 15.1</a>, now visible as a singular matrix. If both are small, the window is flat and there is nothing to solve.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Matchable Equals Trackable</div>
+<p>The deepest fact in this section is an identity, not an algorithm: the matrix that Lucas-Kanade must invert to compute flow is the matrix whose eigenvalues Harris and Shi-Tomasi threshold to declare a corner. Detection and tracking are not two topics that happen to share code; they are the same well-posedness condition read in two directions. Shi and Tomasi's 1994 paper made the connection official, defining "good features to track" as windows where $\lambda_2$ exceeds a threshold, which is precisely OpenCV's <code>goodFeaturesToTrack</code>. When your tracker fails on blank walls and picket fences, it is not a bug; it is the geometry of $M$ telling you the information is not there.</p>
+</div>
+
+<h2>2. Iterative Refinement: Getting Sub-Pixel Accuracy <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The one-shot least-squares solve is only as good as the first-order Taylor expansion behind it, which holds for displacements well under a pixel. Real displacements are larger, so practical Lucas-Kanade iterates, exactly in the spirit of Newton's method. Solve once to get an estimate $\mathbf{d}^{(0)}$; warp the second image by $-\mathbf{d}^{(0)}$ (bilinear interpolation, as in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>); recompute the temporal difference against the warped image, which is now small; solve again for a correction; repeat 3 to 10 times. Each iteration shrinks the residual displacement toward the sub-pixel regime where the linearization is honest, and the matrix $M$ stays fixed (it depends only on the first frame's gradients), so iterations are cheap: one warp, one residual, one $2 \times 2$ solve.
+</p>
+<p>
+The code below implements the full iterative scheme for a single point, with the eigenvalue check that rejects untrackable windows. It is deliberately bare: one window, no pyramid, NumPy only, so every line of the math above is visible.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def lk_track_point(I0, I1, x, y, win=10, n_iters=8, min_eig=1e-3):
+    """Iterative Lucas-Kanade for one point. Returns displacement (dx, dy) or None."""
+    I0 = I0.astype(np.float32); I1 = I1.astype(np.float32)
+    Ix = cv2.Sobel(I0, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    Iy = cv2.Sobel(I0, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+
+    ys, xs = np.mgrid[y - win:y + win + 1, x - win:x + win + 1]
+    A = np.stack([Ix[ys, xs].ravel(), Iy[ys, xs].ravel()], axis=1)   # (N, 2)
+    M = A.T @ A                                   # the structure tensor
+    if np.linalg.eigvalsh(M)[0] / A.shape[0] &lt; min_eig:
+        return None                               # edge or flat: aperture problem
+
+    patch0 = I0[ys, xs]
+    d = np.zeros(2, np.float32)
+    for _ in range(n_iters):                      # Newton iterations
+        map_x = (xs + d[0]).astype(np.float32)    # warp frame 1 back by current d
+        map_y = (ys + d[1]).astype(np.float32)
+        patch1 = cv2.remap(I1, map_x, map_y, cv2.INTER_LINEAR)
+        b = (patch0 - patch1).ravel()             # residual temporal difference
+        step = np.linalg.solve(M, A.T @ b)
+        d += step
+        if np.linalg.norm(step) &lt; 0.01:           # converged to 1/100 px
+            break
+    return d
+
+d = lk_track_point(f0, f1, x=412, y=233)
+print(None if d is None else f"point moved ({d[0]:+.2f}, {d[1]:+.2f}) px")
+# Expected on a corner of a car moving left: point moved (-3.87, +0.31) px</code></pre>
+<div class="code-caption">Iterative Lucas-Kanade for a single window: the structure tensor is factored once, then each Newton iteration warps the second frame by the current displacement estimate and solves a 2-by-2 system for the correction; the eigenvalue gate refuses windows where the aperture problem makes the answer fictional.</div>
+
+<h2>3. Large Motions: The Pyramid Rescue <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Iteration fixes accuracy but not range: if the true motion is 25 pixels and the window is 21 pixels wide, the matching content is not even inside the window, and no amount of iterating recovers it. The repair reuses an old friend: the Gaussian pyramid of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>. Downsample both frames by 2 per level; at the top of a 4-level pyramid, a 25-pixel motion has shrunk to about 3 pixels, comfortably within range. Solve there, multiply the displacement by 2, use it as the starting point one level down, refine, and repeat to the bottom. Figure 15.2.1 traces the scheme. This coarse-to-fine pattern is so effective that nearly every dense method in <a href="section-15.3.html">Section 15.3</a> adopts it, and its learned counterpart (correlation volumes at multiple resolutions) survives inside RAFT.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pyramidal Lucas-Kanade: three pyramid levels of two frames, with flow solved at the coarsest level, upsampled, and refined at each finer level">
+  <text x="390" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">Coarse-to-fine: solve small, upsample, refine</text>
+  <!-- level 2 (coarse) -->
+  <rect x="120" y="50" width="90" height="62" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5"/>
+  <rect x="250" y="50" width="90" height="62" fill="#d4e6f1" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="105" y="86" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="end">level 2 (&#247;4)</text>
+  <text x="430" y="72" font-family="sans-serif" font-size="12.5" fill="#c0392b">solve LK: motion &#8776; 3 px</text>
+  <line x1="165" y1="84" x2="186" y2="84" stroke="#c0392b" stroke-width="2.4"/>
+  <polygon points="192,84 181,79 181,89" fill="#c0392b"/>
+  <!-- level 1 -->
+  <rect x="100" y="140" width="130" height="90" fill="#aed6f1" stroke="#2980b9" stroke-width="1.5"/>
+  <rect x="250" y="140" width="130" height="90" fill="#aed6f1" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="85" y="190" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="end">level 1 (&#247;2)</text>
+  <text x="430" y="180" font-family="sans-serif" font-size="12.5" fill="#b9770e">init = 2 &#215; level-2 flow, then refine</text>
+  <line x1="155" y1="188" x2="196" y2="188" stroke="#b9770e" stroke-width="2.4"/>
+  <polygon points="202,188 191,183 191,193" fill="#b9770e"/>
+  <!-- level 0 (fine) -->
+  <rect x="80" y="258" width="170" height="84" fill="#85c1e9" stroke="#2980b9" stroke-width="1.5"/>
+  <rect x="250" y="258" width="170" height="84" fill="#85c1e9" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="65" y="304" font-family="sans-serif" font-size="12.5" fill="#5a626c" text-anchor="end">level 0 (full)</text>
+  <text x="470" y="298" font-family="sans-serif" font-size="12.5" fill="#1e8449">init = 2 &#215; level-1 flow, refine: final 25 px motion, sub-pixel accurate</text>
+  <line x1="135" y1="300" x2="216" y2="300" stroke="#1e8449" stroke-width="2.6"/>
+  <polygon points="222,300 211,295 211,305" fill="#1e8449"/>
+  <!-- down arrows -->
+  <g stroke="#7f8c8d" stroke-width="1.8" fill="none">
+    <path d="M 230 116 C 230 126, 230 128, 230 134"/>
+    <path d="M 240 234 C 240 244, 240 246, 240 252"/>
+  </g>
+  <polygon points="230,140 225,129 235,129" fill="#7f8c8d"/>
+  <polygon points="240,258 235,247 245,247" fill="#7f8c8d"/>
+  <text x="262" y="128" font-family="sans-serif" font-size="11.5" fill="#7f8c8d">&#215;2 + refine</text>
+  <text x="272" y="248" font-family="sans-serif" font-size="11.5" fill="#7f8c8d">&#215;2 + refine</text>
+</svg>
+<figcaption><strong>Figure 15.2.1</strong>: Pyramidal Lucas-Kanade. A 25-pixel motion at full resolution is only about 3 pixels at the top of a two-octave pyramid, small enough for the Taylor linearization. Each level's solution, doubled, seeds the next finer level, so the expensive full-resolution solve starts within a pixel of the truth.</figcaption>
+</figure>
+
+<h2>4. The KLT Tracker in Production Form <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Assembling the pieces (Shi-Tomasi detection, iterative pyramidal LK, health checks) yields the Kanade-Lucas-Tomasi tracker, and OpenCV ships every piece. The pipeline below tracks a few hundred points through a video, with the single most valuable reliability trick in the business: the <strong>forward-backward check</strong>. Track each point from frame $t$ to $t+1$, then track the result backward to $t$; if it does not land where it started (within a pixel), the track is lying, usually because of occlusion or a repeated pattern, and is dropped.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+cap = cv2.VideoCapture("traffic.mp4")
+ok, frame = cap.read()
+prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+p0 = cv2.goodFeaturesToTrack(prev_gray, maxCorners=400,        # Shi-Tomasi
+                             qualityLevel=0.01, minDistance=8, blockSize=7)
+lk = dict(winSize=(21, 21), maxLevel=3,                        # 4-level pyramid
+          criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+trails = np.zeros_like(frame)
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None, **lk)
+    p0r, st_b, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, p1, None, **lk)
+    fb_err = np.linalg.norm((p0 - p0r).reshape(-1, 2), axis=1)
+    good = (st.ravel() == 1) &amp; (st_b.ravel() == 1) &amp; (fb_err &lt; 1.0)
+
+    for (a, b), (c, d) in zip(p1[good].reshape(-1, 2), p0[good].reshape(-1, 2)):
+        cv2.line(trails, (int(c), int(d)), (int(a), int(b)), (0, 255, 0), 1)
+    cv2.imshow("KLT", cv2.add(frame, trails))
+    if cv2.waitKey(1) == 27:
+        break
+
+    prev_gray, p0 = gray, p1[good].reshape(-1, 1, 2)
+    if len(p0) &lt; 200:                                          # replenish dead tracks
+        fresh = cv2.goodFeaturesToTrack(gray, 400 - len(p0), 0.01, 8)
+        if fresh is not None:
+            p0 = np.vstack([p0, fresh])</code></pre>
+<div class="code-caption">A production-shaped KLT loop: Shi-Tomasi corners, pyramidal Lucas-Kanade with a 21-by-21 window and 4 levels, forward-backward verification at a 1-pixel tolerance, green motion trails, and automatic re-detection whenever the population of healthy tracks drops below 200.</div>
+
+<p>
+Three knobs matter in practice. <code>winSize</code> trades the constant-velocity assumption against information: bigger windows gather more gradients (stabler $M$) but are likelier to straddle two motions. <code>maxLevel</code> sets motion range: each extra level doubles the trackable displacement, at slight risk of locking onto the wrong large-scale match. The forward-backward threshold sets the paranoia level: 1 pixel is a sensible default; raise it for noisy footage, lower it when tracks feed geometry, as in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s reconstruction front ends, where one bad track can poison a bundle adjustment.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>calcOpticalFlowPyrLK</code></div>
+<p>Our from-scratch single-point tracker is about 35 lines and handles one level, one point, and no boundary cases. The OpenCV call <code>cv2.calcOpticalFlowPyrLK(prev, cur, pts, None, winSize=(21,21), maxLevel=3)</code> replaces it in one line per frame, tracking hundreds of points simultaneously. Internally it builds and caches both image pyramids, computes Scharr-filtered gradients, runs the iterative solve per point per level with sub-pixel bilinear sampling, handles points near borders, and reports a per-point status flag and residual error, easily 300+ lines of careful C++ you do not have to write or debug. The from-scratch version's job was to teach you what those 300 lines do; ship the library one.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Drone That Trusted Its Corners</div>
+<p><strong>Who &amp; situation:</strong> an engineering team building precision landing for an inspection drone, using a downward camera and KLT-based visual odometry to hold position over a landing pad when GPS degrades near structures. <strong>Problem:</strong> position hold worked over gravel and grass but drifted badly over the most common industrial surface: smooth painted concrete. Telemetry showed the tracker silently degrading: <code>goodFeaturesToTrack</code> returned a handful of low-quality points (dust specks), the structure tensors were near-singular, and the forward-backward check was killing most tracks within ten frames. <strong>Decision:</strong> two changes. The team mounted a small IR pattern projector that textured the ground invisibly, instantly giving the structure tensor two healthy eigenvalues everywhere, and they added a trackability health metric (median $\lambda_2$ of accepted points) that the flight controller monitored, falling back to other sensors below a threshold rather than trusting fictional flow. <strong>Result:</strong> drift over concrete dropped from meters to centimeters, and the health metric caught a lens-fogging incident months later. <strong>Lesson:</strong> Lucas-Kanade tells you when it cannot work; production systems must listen to the eigenvalues, not just read the output vectors.</p>
+</div>
+
+<h2>5. Track Lifecycles and What Sparse Flow Feeds <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A tracked point is born (detection), lives (frame-to-frame updates), accumulates a trajectory, and dies (occlusion, image exit, failed checks). Managed over thousands of frames, these lifecycles produce <strong>feature tracks</strong>, and feature tracks are a commodity with many buyers. <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> consumed them as the raw correspondences behind structure from motion and visual SLAM. Video stabilization fits a smooth camera path to them. Sparse-to-dense interpolation seeds <a href="section-15.3.html">Section 15.3</a>'s dense fields with them. And the object trackers later in this chapter (<a href="section-15.5.html">Section 15.5</a>) can be seen as feature tracking promoted from points to whole templates, inheriting the same drift problems and the same need for health checks.
+</p>
+<p>
+The honest limitation is occlusion. KLT has no memory: a point that disappears behind a pole is dead, and the point detected when it re-emerges is a stranger with a new identity. Re-identification across occlusions requires either appearance models (<a href="section-15.5.html">Section 15.5</a>), motion prediction (<a href="section-15.6.html">Section 15.6</a>'s Kalman filters), or the learned long-range memory of the methods below.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Track Any Point</div>
+<p>KLT's modern descendants are the "track any point" (TAP) models, which follow arbitrary physical points (not just corners) through long videos, occlusions included. TAPIR (ICCV 2023) matches per-point features globally then refines locally, a learned echo of detect-then-iterate. CoTracker3 (Karaev et al., 2024, arXiv:2410.11831) tracks tens of thousands of points <em>jointly</em> with a transformer so that points support each other through occlusions, and reached state of the art while training on pseudo-labelled real videos, with BootsTAP (2024, arXiv:2402.00847) showing a similar self-training recipe. LocoTrack (ECCV 2024, arXiv:2407.15420) brought local 4D correlation to the problem for a 6x speedup. The conceptual line from "assume the window moves together" to "let a transformer decide which pixels move together" is direct, and <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a> picks it up in earnest.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.2.1: Reading the Eigenvalues <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each window, predict the eigenvalue pattern of the structure tensor ($\lambda_1, \lambda_2$ both large, one large, or both small) and the resulting Lucas-Kanade behavior: (a) a checkerboard square's interior; (b) a checkerboard corner; (c) a vertical picket fence photographed so the pickets repeat every 9 pixels, tracked with a 21-pixel window; (d) blue sky; (e) a leafy tree in wind. For case (c), explain why both eigenvalues can be healthy and the track still wrong, and which check in this section's pipeline would catch it.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.2.2: Pyramid Levels Versus Motion Range <span class="exercise-type coding">Coding</span></div>
+<p>Take one sharp frame and synthesize its pair by shifting it horizontally by $s$ pixels for $s \in \{2, 5, 10, 20, 40, 80\}$. Detect 200 Shi-Tomasi corners and track them with <code>calcOpticalFlowPyrLK</code> using <code>maxLevel</code> 0, 1, 2, 3, and 4 (keep <code>winSize=(21,21)</code>). For each combination report the fraction of points whose recovered displacement is within 0.5 pixels of $s$. Plot success rate versus $s$ for each level count and verify the doubling rule from Figure 15.2.1: each added level roughly doubles the largest reliably trackable shift.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 15.2.3: How Long Do Tracks Live? <span class="exercise-type analysis">Analysis</span></div>
+<p>Run the KLT pipeline on 300 frames of any handheld video. Record each track's lifetime in frames and plot the survival curve (fraction of tracks alive after $k$ frames). Then re-run with (a) the forward-backward check disabled and (b) the threshold loosened to 5 pixels, and overlay the curves. Tracks live longer without the check; by sampling ten long-lived tracks from run (a) and inspecting them visually, estimate what fraction of that extra lifetime is genuine and what fraction is drift. What does this imply for using raw track length as a quality signal in a reconstruction pipeline like Chapter 14's?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-15.1.html">&#8592; Section 15.1: Motion Fields &amp; the Brightness Constancy Assumption</a>
+<a href="index.html">Chapter 15</a>
+<a class="next" href="section-15.3.html">Section 15.3: Dense Flow: Horn-Schunck to Variational Methods &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

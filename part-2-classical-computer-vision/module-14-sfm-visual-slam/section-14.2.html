@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 14.2: Incremental Structure from Motion. Bootstrapping a reconstruction from a two-view seed, registering new cameras with PnP and RANSAC, triangulating fresh structure, and the filtering loop that keeps the growing model healthy." name="description"/>
+<title>Section 14.2: Incremental Structure from Motion | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a></div>
+<h1>Incremental Structure from Motion</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Choose your first two friends carefully. Everyone who joins the party afterwards will be positioned, for all eternity, relative to them."</p>
+<cite>An Incremental Mapper With Strong Opinions About Seating</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Incremental SfM grows a reconstruction the way you assemble a jigsaw puzzle: start from the two pieces that fit together most convincingly, then repeatedly add the piece that connects best to what is already on the table, fixing mistakes as you go.</strong> The two pieces are a seed image pair reconstructed with the tools of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>; each new piece is a camera registered against existing 3D points via the Perspective-n-Point (PnP) problem; and after every addition, triangulation mints new points from the tracks of <a href="section-14.1.html">Section 14.1</a> while filtering and local bundle adjustment (the subject of <a href="section-14.3.html">Section 14.3</a>) keep errors from compounding. This loop is what runs inside COLMAP when you press reconstruct.</p>
+</div>
+
+<p>
+With tracks in hand, the reconstruction problem becomes concrete: estimate a rotation $R_i$ and translation $\mathbf{t}_i$ for every image and a 3D position $\mathbf{X}_j$ for every track, such that each track's observations land where the cameras say they should. Solving for everything at once from scratch is possible (global SfM, which we will meet at the end of this section), but the workhorse strategy of the last two decades is <em>incremental</em>: establish a small, high-quality core, then expand it one camera at a time. The order of operations matters enormously, and the algorithm's intelligence lives mostly in its choices of what to add next and what to throw away.
+</p>
+
+<h2>1. The Two-View Seed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Everything starts from one image pair, and the choice is consequential because the seed defines the coordinate frame and the (arbitrary) global scale that every later camera inherits. A good seed pair has three properties. First, <strong>many verified inliers</strong>, so the relative pose is reliable. Second, a <strong>wide baseline</strong>: a large triangulation angle between the viewing rays makes the initial points accurate, whereas a narrow baseline puts every point's depth in doubt, exactly the quadratic depth-error effect quantified in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>. Third, the pair must <strong>not be homography-dominated</strong>: if a single plane or a pure rotation explains the matches, as flagged on the match-graph edges of <a href="section-14.1.html">Section 14.1</a>, the pair carries almost no parallax and triangulating from it builds the whole model on sand. COLMAP scores candidate seeds by exactly these criteria.
+</p>
+<p>
+Once chosen, the seed reconstruction is pure Chapter 13: essential matrix, pose recovery, triangulation, plus the quality filters that incremental SfM applies relentlessly from the first moment. The listing below bootstraps a map from images 0 and 1, keeping only points that are in front of both cameras, triangulated with a sufficient ray angle, and consistent with their observations.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def reproj_error(P, X, x):
+    """Pixel distance between projection of 3D points X and observations x."""
+    Xh = np.hstack([X, np.ones((len(X), 1))])
+    proj = (P @ Xh.T).T
+    proj = proj[:, :2] / proj[:, 2:]
+    return np.linalg.norm(proj - x, axis=1)
+
+# p0, p1: Nx2 float32 arrays of verified matches between images 0 and 1
+E, _ = cv2.findEssentialMat(p0, p1, cameraMatrix=K,
+                            method=cv2.USAC_MAGSAC, threshold=1.5)
+n_inl, R, t, mask = cv2.recoverPose(E, p0, p1, K)     # cheirality check inside
+keep = mask.ravel().astype(bool)
+
+P0 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])     # camera 0 = world origin
+P1 = K @ np.hstack([R, t])                            # |t| = 1: scale is arbitrary
+Xh = cv2.triangulatePoints(P0, P1, p0[keep].T, p1[keep].T)
+X = (Xh[:3] / Xh[3]).T                                # Nx3 points, world frame
+
+# quality gates: ray angle and reprojection error
+rays0 = X / np.linalg.norm(X, axis=1, keepdims=True)
+C1 = (-R.T @ t).ravel()                               # center of camera 1
+rays1 = X - C1
+rays1 /= np.linalg.norm(rays1, axis=1, keepdims=True)
+angles = np.degrees(np.arccos(np.clip((rays0 * rays1).sum(1), -1, 1)))
+err = np.maximum(reproj_error(P0, X, p0[keep]), reproj_error(P1, X, p1[keep]))
+good = (angles &gt; 2.0) &amp; (err &lt; 2.0) &amp; (X[:, 2] &gt; 0)
+
+print(f"seed: {good.sum()} points kept of {len(X)} "
+      f"(median angle {np.median(angles):.1f} deg, median err {np.median(err):.2f}px)")
+# seed: 1376 points kept of 1671 (median angle 7.4 deg, median err 0.41px)</code></pre>
+<div class="code-caption">Bootstrapping the map from the seed pair: essential-matrix pose recovery and triangulation from Chapter 13, followed by the three quality gates every incremental mapper applies, positive depth, a minimum triangulation angle (here 2 degrees), and a reprojection-error ceiling.</div>
+
+<p>
+Two details deserve emphasis. The translation from <code>recoverPose</code> has unit norm: monocular reconstruction has no access to metric scale, so the seed baseline <em>defines</em> the map unit, a gauge freedom we will meet formally in <a href="section-14.3.html">Section 14.3</a>. And the angle gate is not cosmetic: a point triangulated from rays 0.5 degrees apart can move tens of map units along the ray while changing its reprojection by less than a pixel, so admitting it pollutes the map with pseudo-structure that later PnP steps will trust to their detriment.
+</p>
+
+<h2>2. Registering the Next Camera: PnP <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Here is the move that makes incremental SfM work. Once the seed map exists, some unregistered images observe tracks that already have 3D positions. For such an image we know a set of <strong>2D-3D correspondences</strong>: keypoint $\mathbf{x}_k$ in the new image belongs to a track whose point $\mathbf{X}_k$ is already triangulated. Estimating a camera's pose from $n$ such correspondences, given intrinsics $K$ from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>, is the <strong>Perspective-n-Point problem</strong>: find $R$, $\mathbf{t}$ minimizing
+</p>
+<p>
+$$ \sum_{k=1}^{n} \left\lVert \pi\!\left(K \left[ R \,|\, \mathbf{t} \right] \tilde{\mathbf{X}}_k\right) - \mathbf{x}_k \right\rVert^2 , $$
+</p>
+<p>
+where $\pi$ is the perspective division. The minimal case $n = 3$ (P3P) has up to four algebraic solutions and is the engine inside RANSAC; larger $n$ is solved by EPnP or SQPnP and refined iteratively. Because some 2D-3D correspondences are wrong (contaminated tracks from <a href="section-14.1.html">Section 14.1</a>, or map points that drifted), registration is always RANSAC-wrapped, just as every estimator has been since <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>:
+</p>
+
+<pre><code class="language-python"># X_map: Mx3 triangulated points visible in the new image (via track lookup)
+# x_new: Mx2 corresponding keypoint locations in the new image
+ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+    X_map, x_new, K, distCoeffs=None,
+    reprojectionError=4.0,           # pixel tolerance for an inlier vote
+    iterationsCount=5000,
+    confidence=0.999,
+    flags=cv2.SOLVEPNP_EPNP)         # minimal/efficient solver inside RANSAC
+
+assert ok and len(inliers) &gt; 50      # refuse weakly-supported registrations
+R_new, _ = cv2.Rodrigues(rvec)       # axis-angle to 3x3 rotation
+print(f"registered with {len(inliers)}/{len(X_map)} PnP inliers")
+# registered with 412/588 PnP inliers
+
+# refine on inliers only, Levenberg-Marquardt on reprojection error
+rvec, tvec = cv2.solvePnPRefineLM(X_map[inliers.ravel()],
+                                  x_new[inliers.ravel()], K, None, rvec, tvec)</code></pre>
+<div class="code-caption">Camera registration by RANSAC-wrapped PnP: <code>solvePnPRansac</code> finds the pose explaining the most 2D-3D correspondences within 4 pixels, the inlier threshold guards against contaminated tracks, and <code>solvePnPRefineLM</code> polishes the winning pose on inliers only.</div>
+
+<p>
+Which image should be registered next? Greedy intuition says the one seeing the most triangulated points, but COLMAP's next-best-view scoring refines this: it prefers images whose visible map points are <em>spatially well distributed</em> across the frame, because fifty correspondences concentrated in one corner constrain pose far worse than fifty spread evenly. Poor next-view choices were a chief cause of pre-2016 SfM failures: register a barely-connected image early, and its noisy pose seeds bad triangulations that cascade.
+</p>
+
+<h2>3. Growing Structure and the Audit Loop <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+A newly registered camera does two things. It adds observations to existing points (its inlier correspondences extend their tracks), and it makes new triangulations possible: every track observed by the new camera and at least one other registered camera, but not yet triangulated, is now a candidate 3D point, gated by the same angle and reprojection filters as the seed. Then comes the step that separates a working mapper from a toy: the <strong>audit</strong>. After each registration (or each few), the mapper re-examines the model: observations whose reprojection error has crept above threshold are removed from their tracks; points left with fewer than two observations, or with degenerate angles, are deleted; previously failed triangulations are retried now that more views exist (re-triangulation); and a <em>local</em> bundle adjustment refines the most recently touched cameras and points. Figure 14.2.1 lays out the full cycle.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flowchart of the incremental SfM loop: seed pair initialization feeds a cycle of next-best-view selection, PnP registration, triangulation, and filtering plus local bundle adjustment, with an arrow looping back to view selection and an exit to global bundle adjustment.">
+  <defs>
+    <marker id="arr142" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+    <marker id="arr142b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#b9770e"/>
+    </marker>
+  </defs>
+  <!-- seed box -->
+  <rect x="20" y="85" width="120" height="58" rx="8" fill="#eaf2f8" stroke="#2471a3" stroke-width="1.5"/>
+  <text x="80" y="109" font-family="sans-serif" font-size="12.5" fill="#1a5276" text-anchor="middle" font-weight="bold">initialize from</text>
+  <text x="80" y="126" font-family="sans-serif" font-size="12.5" fill="#1a5276" text-anchor="middle" font-weight="bold">seed pair</text>
+  <!-- loop boxes -->
+  <rect x="180" y="85" width="130" height="58" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="245" y="109" font-family="sans-serif" font-size="12.5" fill="#2c3e50" text-anchor="middle">select next view</text>
+  <text x="245" y="126" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">(most + best-spread points)</text>
+  <rect x="350" y="85" width="120" height="58" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="410" y="109" font-family="sans-serif" font-size="12.5" fill="#2c3e50" text-anchor="middle">register camera</text>
+  <text x="410" y="126" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">PnP + RANSAC</text>
+  <rect x="510" y="85" width="115" height="58" rx="8" fill="#fbfcfc" stroke="#7f8c8d" stroke-width="1.5"/>
+  <text x="567" y="109" font-family="sans-serif" font-size="12.5" fill="#2c3e50" text-anchor="middle">triangulate</text>
+  <text x="567" y="126" font-family="sans-serif" font-size="11.5" fill="#5a626c" text-anchor="middle">new tracks</text>
+  <rect x="660" y="85" width="105" height="58" rx="8" fill="#fef9e7" stroke="#b9770e" stroke-width="1.5"/>
+  <text x="712" y="105" font-family="sans-serif" font-size="12.5" fill="#7d6608" text-anchor="middle">filter, retry,</text>
+  <text x="712" y="121" font-family="sans-serif" font-size="12.5" fill="#7d6608" text-anchor="middle">local bundle</text>
+  <text x="712" y="137" font-family="sans-serif" font-size="12.5" fill="#7d6608" text-anchor="middle">adjustment</text>
+  <!-- forward arrows -->
+  <line x1="140" y1="114" x2="174" y2="114" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr142)"/>
+  <line x1="310" y1="114" x2="344" y2="114" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr142)"/>
+  <line x1="470" y1="114" x2="504" y2="114" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr142)"/>
+  <line x1="625" y1="114" x2="654" y2="114" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr142)"/>
+  <!-- loop back arrow: filter box bottom -> select next view bottom -->
+  <path d="M 712 143 L 712 200 L 245 200 L 245 149" fill="none" stroke="#b9770e" stroke-width="2" marker-end="url(#arr142b)"/>
+  <text x="478" y="218" font-family="sans-serif" font-size="12.5" fill="#7d6608" text-anchor="middle">repeat until no view can be registered</text>
+  <!-- exit arrow -->
+  <line x1="712" y1="85" x2="712" y2="46" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr142)"/>
+  <text x="712" y="32" font-family="sans-serif" font-size="12.5" fill="#2c3e50" text-anchor="middle" font-weight="bold">final global bundle adjustment (Section 14.3)</text>
+</svg>
+<figcaption><strong>Figure 14.2.1</strong> The incremental SfM loop. A seed pair initializes the map; then the mapper repeatedly selects the best next view, registers it with PnP plus RANSAC, triangulates newly observable tracks, and runs the audit (outlier filtering, re-triangulation, local bundle adjustment) before looping back. When no remaining image can be registered, a final global bundle adjustment polishes everything.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Robustness Comes from the Loop, Not the Steps</div>
+<p>No single step of incremental SfM is especially accurate: PnP poses wobble, triangulations scatter, and a few percent of track observations are simply wrong. The system works because estimation is interleaved with audit at every iteration: each new camera both consumes the map and stress-tests it, and anything that stops reprojecting consistently is evicted before it can recruit further errors. When you build any multi-stage estimation system, this pattern, grow a little, verify everything touched, repeat, transfers directly.</p>
+</div>
+
+<h2>4. Failure Modes: Drift, Degeneracy, and Doppelgangers <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Incremental SfM inherits three systematic weaknesses worth knowing before you trust its output. <strong>Drift</strong>: errors compound along the registration order, so a long chain of cameras (a street captured end to end) slowly bends; the reconstruction is locally crisp but globally warped. Only closing a loop in the capture, or external constraints like GPS, can anchor long chains, a theme that returns with full force in the SLAM setting of <a href="section-14.4.html">Section 14.4</a>. <strong>Degenerate motion</strong>: a segment of near-pure rotation provides no baseline, so nothing new can be triangulated and registration eventually starves; this is the capture-time failure that no algorithm fixes after the fact. <strong>Doppelgangers</strong>: the repeated-structure merges of <a href="section-14.1.html">Section 14.1</a>, which at reconstruction time manifest as a camera confidently registered to the wrong instance of a repeated facade. The audit loop catches many; the rest require the graph-level priors discussed there.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Mapping 30 Kilometers of Railway Corridor</div>
+<p><strong>Who:</strong> The perception lead at an infrastructure-inspection company under contract to model a regional railway corridor from a camera-equipped maintenance train.</p>
+<p><strong>Situation:</strong> 80,000 forward-facing frames along 30 km of track, to be reconstructed for clearance analysis (does vegetation or equipment intrude into the train envelope?).</p>
+<p><strong>Problem:</strong> Incremental SfM on the raw sequence drifted badly: by kilometer 8, the reconstructed track bed was 14 meters off the surveyed centerline and visibly bowed. A pure chain of forward motion is the worst case for drift, with no loops to close and a narrow effective baseline between consecutive frames.</p>
+<p><strong>Decision:</strong> Three interventions: subsample frames to enforce a minimum baseline (one frame per 2 meters of GPS-estimated motion); inject the train's GPS track as a soft prior on camera positions during bundle adjustment; and reconstruct in overlapping 2 km blocks, rigidly aligned via surveyed control points, rather than one 30 km chain.</p>
+<p><strong>Result:</strong> Maximum deviation from the survey dropped from 14 m to 0.21 m, comfortably inside the 0.5 m contract tolerance, and per-block reconstruction parallelized across machines, cutting wall-clock time by a factor of six.</p>
+<p><strong>Lesson:</strong> Drift is not a bug to fix downstream; it is a property of chain-shaped capture. Break the chain (blocks), anchor it (GPS, control points), or close it (loops): a capture plan decides reconstructability before any algorithm runs.</p>
+</div>
+
+<h2>5. Incremental versus Global SfM <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The incremental strategy is not the only one. <strong>Global SfM</strong> estimates all camera rotations at once by averaging the pairwise relative rotations on the match graph (rotation averaging), then solves all translations and triangulates everything in a second pass, finishing with one global bundle adjustment. It is dramatically faster, since there are no thousands of intermediate local adjustments, and free of registration-order drift; historically it was also far more brittle, because a few bad edges in the match graph could corrupt the averaged solution where the incremental audit loop would have caught them. That trade-off was substantially rebalanced in 2024: GLOMAP, from the COLMAP lineage, made global SfM robust enough to match incremental quality on standard benchmarks at one to two orders of magnitude less compute, mainly by skipping the fragile separate translation-averaging step and solving camera positions and 3D structure jointly. For very large, well-connected collections, global methods are now often the default; incremental mapping retains the edge on sparse, weakly connected, or sequentially captured sets where its caution pays.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: One Call Replaces the Whole Loop</div>
+<p>The full incremental machine of this section, seed scoring, next-best-view selection, PnP registration, triangulation with angle gates, outlier eviction, re-triangulation, and interleaved local plus periodic global bundle adjustment, is a single call on the database produced in <a href="section-14.1.html">Section 14.1</a>: <code>maps = pycolmap.incremental_mapping(db, image_dir, out_dir)</code>. Our didactic seed-plus-one-camera snippets total about 60 lines and cover perhaps a tenth of the real logic; the production loop is thousands of lines you do not have to write or tune, with two decades of failure-mode handling baked in. Use the from-scratch version to understand the loop; use COLMAP's to ship.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Reconstruction as a Forward Pass</div>
+<p>The 2024-2026 research wave asks whether the loop itself is necessary. VGGSfM (CVPR 2024) made the entire incremental pipeline differentiable and trained it end to end, removing the hand-tuned scheduling. MASt3R-SfM (2024) replaces two-view estimation with a learned reconstruction prior, then aligns the resulting pointmaps globally, making reconstruction usable from a handful of uncalibrated phone photos. VGGT (CVPR 2025) is the strongest statement: a transformer that ingests up to hundreds of images and directly outputs cameras, depth maps, and 3D points in seconds, no PnP, no triangulation, no adjustment loop, with accuracy competitive with optimization pipelines on many benchmarks. The pattern to watch is hybridization: feed-forward models provide initialization and robustness on sparse views, while classical bundle adjustment (<a href="section-14.3.html">Section 14.3</a>) still supplies the final metric polish wherever accuracy is contractual, and the neural scene representations of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> consume either source of poses indifferently.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.2.1: Anatomy of a Bad Seed <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Explain, in terms of triangulation angles and the gauge freedom of monocular reconstruction, what goes wrong downstream if the seed pair is (a) two nearly identical frames from a video, (b) two views of a flat poster filling the frame, (c) a wide-baseline pair with 40 inliers concentrated in one image corner. For each case, state which of the three seed criteria it violates and which later stage (PnP registration, triangulation, or bundle adjustment) first exposes the damage.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.2.2: A Three-Camera Reconstruction by Hand <span class="exercise-type coding">Coding</span></div>
+<p>Take three overlapping photos of a textured scene with a calibrated camera (intrinsics from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>). Implement the full path of this section: seed reconstruction from the best pair, track lookup to collect 2D-3D correspondences for the third image, <code>solvePnPRansac</code> registration, and triangulation of tracks newly visible from the third view. Report PnP inlier counts and the median reprojection error over all observations before and after <code>solvePnPRefineLM</code>. Then deliberately initialize from the worst pair instead and compare.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 14.2.3: Registration Order as an Experiment <span class="exercise-type analysis">Analysis</span></div>
+<p>Using COLMAP or pycolmap on a 30-to-60 image dataset, run incremental mapping three times: default settings, initialization forced to a deliberately poor pair (<code>init_image_id1/2</code>), and mapping with local bundle adjustment effectively disabled (set its interval very high). Compare registered-image counts, mean track lengths, and mean reprojection errors. Which intervention hurts more, and does the damage appear immediately or accumulate? Relate your observations to the audit-loop insight of this section.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.1.html">&#8592; Section 14.1: Feature Tracks &amp; Correspondence Across Many Views</a>
+<a href="index.html">Chapter 14</a>
+<a class="next" href="section-14.3.html">Section 14.3: Bundle Adjustment: Polishing the Reconstruction &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

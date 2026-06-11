@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 13.6: Triangulation &amp; 3D Point Recovery. Recovering 3D points when noisy rays never intersect: the midpoint method, linear DLT triangulation, reprojection error, cheirality and parallax checks, and a complete two-view reconstruction pipeline." name="description"/>
+<title>Section 13.6: Triangulation &amp; 3D Point Recovery | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a></div>
+<h1>Triangulation &amp; 3D Point Recovery</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"We were supposed to meet at the point. I came in from the left camera, she came in from the right, and we missed each other by half a millimeter, forever. Now a least-squares solver decides where our relationship 'really' was."</p>
+<cite>A Slightly Skew Triangulation Ray</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Triangulation, the final step that turns a verified match into a 3D point, sounds like "intersect two rays" but is really "two noisy rays never intersect, so define the best non-intersection", and the right definition is the one that minimizes error where it actually lives: in the image.</strong> This section walks the ladder of answers (midpoint, linear DLT, reprojection-optimal), implements them, and wires the chapter's full toolkit into a working two-view reconstructor: matches to essential matrix to pose to point cloud, with the cheirality and parallax checks that keep the output honest. This pipeline, run pairwise and stitched globally, is the inner loop of <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s structure from motion.</p>
+</div>
+
+<p>
+<a href="section-13.5.html">Section 13.5</a> recovered depth densely, but only for the rectified, calibrated, short-baseline world of stereo rigs. The general problem is sparser and wilder: two arbitrary cameras, poses recovered by <a href="section-13.2.html">Section 13.2</a>'s essential-matrix machinery, and a few thousand verified matches from <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>. Each match nominates two rays in space; geometry says they should cross at the scene point. Then measurement noise has its say.
+</p>
+
+<h2>1. Why the Rays Miss <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Each detected keypoint is off by some fraction of a pixel (recall the sub-pixel refinement battles of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>); each camera pose carries its own estimation error. Back-project two such corrupted measurements and you get two lines in 3D space, and two lines in 3D, unlike two lines in a plane, generically do not intersect at all: they pass by each other, skew, at some closest-approach distance. "The triangulated point" is therefore a decision, not an observation, and Figure 13.6.1 shows both the decision and the geometry that controls its quality: the angle between the rays.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: two skew rays from two cameras passing near each other, with the closest-approach segment and its midpoint marked. Right: comparison of wide and narrow parallax angles showing the uncertainty region stretching into a long sliver when rays are nearly parallel">
+  <g font-family="sans-serif" font-size="13">
+    <!-- LEFT: skew rays and midpoint -->
+    <text x="200" y="26" text-anchor="middle" font-weight="bold" fill="#2c3e50">rays miss; pick the midpoint</text>
+    <circle cx="80" cy="280" r="5" fill="#2c3e50"/>
+    <text x="68" y="302" fill="#2c3e50">C_L</text>
+    <circle cx="320" cy="280" r="5" fill="#2c3e50"/>
+    <text x="310" y="302" fill="#2c3e50">C_R</text>
+    <!-- two rays, nearly crossing -->
+    <line x1="80" y1="280" x2="245" y2="60" stroke="#2980b9" stroke-width="2"/>
+    <line x1="320" y1="280" x2="148" y2="74" stroke="#1e8449" stroke-width="2"/>
+    <!-- closest approach segment -->
+    <line x1="193" y1="125" x2="207" y2="142" stroke="#c0392b" stroke-width="2.4"/>
+    <circle cx="200" cy="133" r="5.5" fill="#c0392b"/>
+    <text x="262" y="120" fill="#c0392b" font-weight="bold">midpoint X&#770;</text>
+    <text x="212" y="166" fill="#5a626c" font-size="12">closest-approach</text>
+    <text x="212" y="182" fill="#5a626c" font-size="12">segment</text>
+    <!-- RIGHT: parallax comparison -->
+    <text x="630" y="26" text-anchor="middle" font-weight="bold" fill="#2c3e50">parallax angle decides precision</text>
+    <!-- wide parallax -->
+    <circle cx="480" cy="150" r="4" fill="#2c3e50"/>
+    <circle cx="640" cy="150" r="4" fill="#2c3e50"/>
+    <line x1="480" y1="150" x2="560" y2="58" stroke="#2980b9" stroke-width="1.6"/>
+    <line x1="640" y1="150" x2="560" y2="58" stroke="#1e8449" stroke-width="1.6"/>
+    <ellipse cx="560" cy="58" rx="13" ry="10" fill="#c0392b" opacity="0.35"/>
+    <circle cx="560" cy="58" r="3.5" fill="#c0392b"/>
+    <text x="560" y="38" text-anchor="middle" fill="#145a32">wide angle: compact uncertainty</text>
+    <!-- narrow parallax -->
+    <circle cx="480" cy="290" r="4" fill="#2c3e50"/>
+    <circle cx="520" cy="290" r="4" fill="#2c3e50"/>
+    <line x1="480" y1="290" x2="700" y2="200" stroke="#2980b9" stroke-width="1.6"/>
+    <line x1="520" y1="290" x2="706" y2="212" stroke="#1e8449" stroke-width="1.6"/>
+    <ellipse cx="660" cy="216" rx="78" ry="9" fill="#c0392b" opacity="0.35" transform="rotate(-21 660 216)"/>
+    <circle cx="660" cy="216" r="3.5" fill="#c0392b"/>
+    <text x="600" y="258" text-anchor="middle" fill="#c0392b">narrow angle: sliver along the rays</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 13.6.1</strong> Triangulation under noise. Left: back-projected rays from a noisy match are skew; the midpoint of their closest-approach segment (red) is the simplest estimate of the 3D point. Right: the same pixel noise produces a compact uncertainty region when the rays meet at a wide parallax angle, and a long sliver stretched along the viewing direction when the angle is small, the geometric twin of Section 13.5's quadratic error law.</figcaption>
+</figure>
+
+<p>
+The right panel of Figure 13.6.1 is the section's recurring warning. When the parallax angle between rays is small (short baseline relative to depth), pixel noise barely changes where the rays <em>are</em> but enormously changes where they <em>nearly cross</em>: the uncertainty region stretches into a sliver along the viewing direction. This is <a href="section-13.5.html">Section 13.5</a>'s quadratic law wearing general-geometry clothes, and it is why every serious pipeline filters triangulated points by parallax angle before trusting them.
+</p>
+
+<h2>2. The Midpoint Method <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The estimate drawn in Figure 13.6.1's left panel is the <strong>midpoint method</strong>: find the unique points $\mathbf{p}_1 = \mathbf{C}_L + s\,\mathbf{r}_L$ and $\mathbf{p}_2 = \mathbf{C}_R + u\,\mathbf{r}_R$ minimizing $\lVert \mathbf{p}_1 - \mathbf{p}_2 \rVert$ (two linear equations from perpendicularity of the connecting segment to both rays), and return their midpoint. It is intuitive, fast, and fine for visualization or initialization. Its weakness is principle: it minimizes a distance in 3D space, where errors are anisotropic and depth-dependent (that sliver again), so it silently weights distant points' wild depth axes the same as their well-measured lateral axes. The measurements we actually trust live in the image plane, which suggests minimizing there instead.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Minimize Error Where the Noise Is</div>
+<p>The noise model owns the objective. Keypoint detectors err by roughly Gaussian fractions of a pixel <em>in the image</em>; nothing errs "in 3D", because 3D was never measured. The statistically right estimate of $\mathbf{X}$ therefore minimizes <strong>reprojection error</strong>, the summed squared image distance between each observation and the reprojection of the candidate point, $\sum_i \lVert \mathbf{x}_i - \pi(P_i \mathbf{X}) \rVert^2$. This single principle organizes the entire reconstruction stack: Hartley and Sturm's optimal two-view triangulation solves it exactly (a degree-6 polynomial), nonlinear refinement solves it iteratively from a linear initialization, and <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s bundle adjustment is nothing but the same objective minimized over <em>all</em> points and <em>all</em> cameras at once. When in doubt about any geometric estimate in vision, ask what it costs in reprojected pixels.</p>
+</div>
+
+<h2>3. Linear Triangulation: The DLT Again <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The workhorse algorithm is the linear one, and it recycles this chapter's favorite move (one homogeneous equation set, one SVD null space). A camera with $3 \times 4$ projection matrix $P$ maps the homogeneous point $\mathbf{X}$ to $\mathbf{x} \sim P\mathbf{X}$; equality up to scale means the cross product vanishes, $\mathbf{x} \times P\mathbf{X} = \mathbf{0}$, giving two independent linear equations per view. Stack the four equations from two views into $A\mathbf{X} = \mathbf{0}$ and take the SVD null vector, exactly as in the eight-point algorithm of <a href="section-13.2.html">Section 13.2</a> and the homography DLT of <a href="section-13.3.html">Section 13.3</a>:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def triangulate_dlt(P1, P2, x1, x2):
+    """One 3D point from one match. P1, P2: 3x4. x1, x2: pixel coords."""
+    A = np.stack([
+        x1[0] * P1[2] - P1[0],      # x * (row 3) - (row 1) = 0
+        x1[1] * P1[2] - P1[1],      # y * (row 3) - (row 2) = 0
+        x2[0] * P2[2] - P2[0],
+        x2[1] * P2[2] - P2[1]])
+    _, _, Vt = np.linalg.svd(A)
+    X = Vt[-1]
+    return X[:3] / X[3]             # dehomogenize
+
+# left camera at origin, right camera from Section 13.2's recoverPose
+P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+P2 = K @ np.hstack([R, t.reshape(3, 1)])
+
+X = triangulate_dlt(P1, P2, ptsL[0], ptsR[0])
+print(np.round(X, 3))               # e.g. [-0.214  0.078  3.642]
+
+# the same, vectorized over all matches, via OpenCV
+Xh = cv2.triangulatePoints(P1, P2, ptsL.T.astype(np.float64),
+                                   ptsR.T.astype(np.float64))
+pts3d = (Xh[:3] / Xh[3]).T          # Nx3</code></pre>
+<div class="code-caption">Linear (DLT) triangulation: two cross-product equations per view stack into a $4 \times 4$ homogeneous system whose SVD null vector is the 3D point; <code>cv2.triangulatePoints</code> runs the identical construction across all matches at once, returning $4 \times N$ homogeneous coordinates that must be dehomogenized by hand.</div>
+
+<p>
+Caveats that bite in practice: <code>cv2.triangulatePoints</code> wants points as $2 \times N$ arrays and returns <em>homogeneous</em> $4 \times N$ output, and forgetting the divide-by-$w$ is a rite of passage. The linear solve minimizes an algebraic quantity, not reprojection error; with Hartley normalization of image coordinates it is typically within a whisker of optimal at sane parallax, and a few Gauss-Newton steps on the reprojection objective (or Hartley-Sturm's exact polynomial method for the two-view case) close the remaining gap when millimeters matter. Because the result is computed in homogeneous coordinates, a point can come back with $w$ of the sign that places it behind a camera, which is not a bug but a verdict: that match was wrong, and the check belongs in the pipeline.
+</p>
+
+<h2>4. The Complete Two-View Reconstructor <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Everything this chapter built now snaps together into a single pipeline: matches (Chapter 10), essential matrix and pose (<a href="section-13.2.html">Section 13.2</a>), triangulation (this section), and the two filters this section has motivated: <strong>cheirality</strong> (positive depth in both cameras, the same test that picked the true pose from four candidates) and <strong>parallax angle</strong> (discard the slivers). Calibration $K$ comes from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>.
+</p>
+
+<pre><code class="language-python">def two_view_reconstruct(ptsL, ptsR, K, min_parallax_deg=1.5):
+    """Matches + intrinsics -&gt; relative pose and a filtered 3D point set."""
+    E, mask = cv2.findEssentialMat(ptsL, ptsR, K,
+                                   method=cv2.USAC_MAGSAC,
+                                   prob=0.999, threshold=1.0)
+    _, R, t, pose_mask = cv2.recoverPose(E, ptsL, ptsR, K, mask=mask)
+    keep = pose_mask.ravel().astype(bool)
+    pL, pR = ptsL[keep], ptsR[keep]
+
+    P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    P2 = K @ np.hstack([R, t])
+    Xh = cv2.triangulatePoints(P1, P2, pL.T.astype(np.float64),
+                                       pR.T.astype(np.float64))
+    X = (Xh[:3] / Xh[3]).T
+
+    # cheirality: positive depth in BOTH camera frames
+    z1 = X[:, 2]
+    z2 = (R @ X.T + t).T[:, 2]
+    ok = (z1 &gt; 0) &amp; (z2 &gt; 0)
+
+    # parallax: angle between the two viewing rays at each point
+    r1 = X / np.linalg.norm(X, axis=1, keepdims=True)
+    C2 = (-R.T @ t).ravel()                  # right camera center
+    r2 = X - C2
+    r2 /= np.linalg.norm(r2, axis=1, keepdims=True)
+    cosang = np.clip((r1 * r2).sum(axis=1), -1, 1)
+    ok &amp;= np.degrees(np.arccos(cosang)) &gt; min_parallax_deg
+
+    return R, t, X[ok], ok.sum() / len(X)
+
+R, t, cloud, keep_frac = two_view_reconstruct(ptsL[inl], ptsR[inl], K)
+print(f"{len(cloud)} points kept ({100 * keep_frac:.0f}%), "
+      f"baseline direction {t.ravel().round(2)}")
+# 1147 points kept (83%), baseline direction [-0.97  0.03  0.24]</code></pre>
+<div class="code-caption">The chapter in forty lines: robust essential-matrix estimation, pose recovery with its internal cheirality vote, batch DLT triangulation, then the two trust filters (positive depth in both frames, parallax angle above a threshold) that separate measured structure from geometric noise; the returned cloud is metric up to the global scale of $\lVert \mathbf{t} \rVert$.</div>
+
+<p>
+Two properties of the output deserve flagging. The cloud is <strong>scaleless</strong>: <code>recoverPose</code> returns $\mathbf{t}$ as a unit vector, so the reconstruction floats at an arbitrary global scale until something metric pins it (a known baseline as in <a href="section-13.5.html">Section 13.5</a>, a known object size, GPS, or an IMU). And it is <strong>sparse and view-dependent</strong>: points exist only where Chapter 10 found matchable texture. Both limitations are the opening brief for <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>, which chains many pairs, shares scale through overlapping views, and polishes everything with bundle adjustment; the densification story then continues into the multi-view stereo and neural fields of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.triangulatePoints, and When to Step Up to COLMAP</div>
+<p>Within a script, <code>cv2.triangulatePoints(P1, P2, x1, x2)</code> replaces the 12-line DLT with one vectorized call (plus your dehomogenization), and <code>cv2.sfm</code> in opencv-contrib offers <code>triangulatePoints</code> for $N$-view tracks. But the honest library shortcut for "I have a folder of images and want 3D" is a level higher: COLMAP runs this entire section (plus Chapter 10's matching and Chapter 14's bundle adjustment) behind one command, <code>colmap automatic_reconstructor --image_path imgs --workspace_path out</code>, reducing a few hundred lines of careful pipeline to zero while adding track building, incremental pose chaining, outlier-aware multi-view triangulation with exactly this section's parallax checks, and global refinement. The two-view code above is still the right tool when you need a fast pairwise depth probe inside a larger system, and the only tool when you need to understand why COLMAP rejected half your images.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Turbine Inspector and the Forbidden Angle</div>
+<p><strong>Who:</strong> A drone-inspection company reconstructing wind-turbine blades for crack measurement, contracted to localize defects to within 5 mm.</p>
+<p><strong>Situation:</strong> The drone orbited each blade capturing overlapping photos; a two-view module triangulated surface points between consecutive frames to seed the dense model.</p>
+<p><strong>Problem:</strong> Blade-tip reconstructions showed centimeter-scale "breathing": surface points scattered several centimeters along the viewing direction, while the blade root reconstructed beautifully. The matches were excellent in both regions; the team initially blamed the matcher anyway and burned a week tightening it.</p>
+<p><strong>Decision:</strong> Plotting triangulation parallax angles told the real story: near the slim blade tip the pilot had widened the orbit for safety clearance, so consecutive frames viewed tip points just 0.4 degrees apart, the sliver regime of Figure 13.6.1, against 4 degrees at the root. The fix was capture-side and software-side at once: a flight-plan rule enforcing a minimum triangulation angle of 2 degrees (skip frames until the angle clears it), plus the parallax filter from this section's pipeline so under-angled points seed nothing downstream.</p>
+<p><strong>Result:</strong> Tip surface noise fell from 31 mm RMS to 3.2 mm, meeting spec without any matcher changes. The "minimum parallax" rule went into the company's flight-planning checklist alongside battery margins.</p>
+<p><strong>Lesson:</strong> Triangulation precision is set at capture time by geometry, not at compute time by code. When a reconstruction is noisy along viewing rays specifically, audit the angles before the algorithms.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Triangulation Without Triangulating</div>
+<p>The 2024-2026 wave already met in <a href="section-13.1.html">Section 13.1</a> reaches its logical endpoint here. DUSt3R (CVPR 2024) outputs dense per-pixel 3D pointmaps for an image pair directly, in effect performing matching and triangulation jointly inside a transformer, and MASt3R (ECCV 2024) sharpens the matching head until classical solvers can be run on its correspondences as a cross-check of its own geometry. VGGT (CVPR 2025) scales the recipe to long sequences, regressing cameras, depth maps, and point tracks in a single feed-forward pass at speeds incremental pipelines cannot touch. Yet the classical machinery refuses retirement for three reasons worth knowing. Metric integrity: feed-forward pointmaps inherit their scale and calibration priors from training data, while two-view triangulation with a measured baseline is metric by construction. Auditability: a triangulated point's reprojection error (the principle of this section's Key Insight) is a per-point certificate that regulators and engineering customers can check; a pointmap's confidence channel is a learned opinion. And hybrid reality: the strongest 2025-2026 systems initialize or regularize learned predictions with classically triangulated anchors, and 3D Gaussian Splatting pipelines (<a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>) still overwhelmingly begin from a COLMAP sparse cloud, which is to say: from this section, run well.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.6.1: Objectives in Conflict <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Construct (on paper, with a sketch) a two-view configuration in which the midpoint estimate and the reprojection-optimal estimate of the same match differ substantially: place one camera much farther from the point than the other, and reason about how each objective weighs a fixed pixel error in the near versus the far view. Which estimate moves toward the near camera's ray, and why is that the statistically defensible behavior? Then explain why the two estimates nearly coincide for a symmetric, wide-parallax stereo pair.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.6.2: Noise, Angle, and the Sliver <span class="exercise-type coding">Coding</span></div>
+<p>Build a synthetic experiment: place a 3D point at depth 10 (arbitrary units), two cameras with $f = 800$ px separated by a baseline you will vary so the parallax angle spans 0.2 to 20 degrees, project the point into both views, add Gaussian pixel noise ($\sigma = 0.5$), and triangulate with this section's <code>triangulate_dlt</code> over 2,000 noise draws per angle. Plot the standard deviation of the recovered point along the viewing direction and perpendicular to it, against parallax angle, on log-log axes. At what angle does the along-ray error exceed 10x the lateral error, and how does your curve justify the turbine team's 2-degree rule?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.6.3: Your First Reconstruction, Audited <span class="exercise-type analysis">Analysis</span></div>
+<p>Run <code>two_view_reconstruct</code> on a pair of photos of a textured 3D scene taken roughly 10 to 20 degrees apart with a calibrated camera, export the cloud as PLY (reuse <a href="section-13.5.html">Section 13.5</a>'s writer), and audit it three ways: (a) compute the reprojection error of every kept point in both views and report the median and 95th percentile; (b) histogram the parallax angles and relate their spread to the cloud's visual quality in MeshLab; (c) measure a known object in the cloud, derive the scene's true scale factor, and verify that one scalar multiplication metricizes your whole reconstruction. Report which of the three audits would have caught a hypothetical bug where $\mathbf{t}$ was accidentally negated.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.5.html">&#8592; Section 13.5: From Disparity to Depth Maps</a>
+<a href="index.html">Chapter 13</a>
+<a class="next" href="../module-14-sfm-visual-slam/index.html">Chapter 14: Structure from Motion &amp; Visual SLAM &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

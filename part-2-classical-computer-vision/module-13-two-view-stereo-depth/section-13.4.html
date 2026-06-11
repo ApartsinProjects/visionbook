@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="Section 13.4: Stereo Rectification &amp; Disparity Estimation. Warping a stereo pair so epipolar lines become scanlines, then dense matching: block matching, semi-global matching, SGBM parameters that matter, and disparity post-processing." name="description"/>
+<title>Section 13.4: Stereo Rectification &amp; Disparity Estimation | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Two-View Geometry, Stereo &amp; Depth</a></div>
+<h1>Stereo Rectification &amp; Disparity Estimation</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I compare a million pixels against a million pixels before breakfast, and all I ask in return is that somebody straightens the epipolar lines first. I match along rows. I do not do diagonals. Have some respect."</p>
+<cite>An Uncompromisingly Horizontal Block Matcher</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Dense stereo splits into a geometry problem that is solved once (warp both images so corresponding points share a row) and a matching problem that is solved per pixel (find each pixel's partner along its row, and call the column shift its disparity).</strong> This section does both. Rectification rotates the two views of <a href="section-13.1.html">Section 13.1</a> into the side-by-side configuration where epipolar lines are scanlines. Disparity estimation then matches every pixel: naive block matching first, its failures diagnosed second, and semi-global matching (SGM) as the classical production answer. The disparity map this section produces becomes metric depth through one formula in <a href="section-13.5.html">Section 13.5</a>.</p>
+</div>
+
+<p>
+Everything so far in this chapter operated on sparse keypoints: a few hundred matches, carefully verified. Applications want more. A robot avoiding obstacles, a car braking for a pedestrian, a phone faking background blur: all need depth at <em>every</em> pixel, which means correspondence at every pixel, including the boring, textureless ones that <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>'s detectors deliberately skip. Dense matching is only computationally sane because of the epipolar constraint, and it becomes downright pleasant when the constraint is given its friendliest shape.
+</p>
+
+<h2>1. Rectification: Engineering the Easy Geometry <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+<a href="section-13.1.html">Section 13.1</a> identified the dream configuration: cameras side by side, optical axes parallel, epipoles at infinity, epipolar lines horizontal and row-aligned. Physical rigs only approximate it; lens distortion and millimeter-level mounting errors leave corresponding points a few rows apart, which is fatal for a matcher that searches only along rows. <strong>Rectification</strong> fixes this in software: rotate each camera (virtually, by warping its image) about its own optical center until the dream configuration holds exactly. Rotating about the center changes no ray origins, so this is the rotation-only homography of <a href="section-13.3.html">Section 13.3</a> applied to each image, computed so that both new image planes are coplanar and parallel to the baseline. Figure 13.4.1 shows the before and after.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 840 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: two verged cameras with slanted epipolar lines through their image planes. Right: after rectification both image planes are coplanar and epipolar lines are horizontal rows; a point's two projections share a row and differ by a disparity along it">
+  <g font-family="sans-serif" font-size="13">
+    <!-- BEFORE -->
+    <text x="200" y="28" text-anchor="middle" font-weight="bold" fill="#2c3e50">before: verged pair</text>
+    <circle cx="110" cy="250" r="5" fill="#2c3e50"/>
+    <circle cx="290" cy="250" r="5" fill="#2c3e50"/>
+    <line x1="110" y1="250" x2="290" y2="250" stroke="#2c3e50" stroke-width="1.6"/>
+    <!-- tilted image planes -->
+    <g stroke="#2980b9" stroke-width="2">
+      <line x1="85" y1="160" x2="175" y2="190"/>
+      <line x1="225" y1="190" x2="315" y2="160"/>
+    </g>
+    <!-- slanted epipolar lines on planes -->
+    <g stroke="#8e44ad" stroke-width="1.3">
+      <line x1="95" y1="166" x2="165" y2="184"/>
+      <line x1="100" y1="156" x2="170" y2="176"/>
+      <line x1="235" y1="184" x2="305" y2="166"/>
+      <line x1="230" y1="176" x2="300" y2="156"/>
+    </g>
+    <circle cx="200" cy="80" r="5.5" fill="#c0392b"/>
+    <text x="200" y="64" text-anchor="middle" font-weight="bold" fill="#c0392b">X</text>
+    <line x1="110" y1="250" x2="200" y2="80" stroke="#c0392b" stroke-width="1.3"/>
+    <line x1="290" y1="250" x2="200" y2="80" stroke="#c0392b" stroke-width="1.3"/>
+    <text x="200" y="278" text-anchor="middle" fill="#5a626c">epipolar lines slanted, rows misaligned</text>
+    <!-- arrow between panels -->
+    <line x1="370" y1="150" x2="440" y2="150" stroke="#5a626c" stroke-width="2.4"/>
+    <polygon points="448,150 434,143 434,157" fill="#5a626c"/>
+    <text x="408" y="136" text-anchor="middle" fill="#5a626c">rectify</text>
+    <!-- AFTER -->
+    <text x="640" y="28" text-anchor="middle" font-weight="bold" fill="#2c3e50">after: row-aligned pair</text>
+    <circle cx="540" cy="250" r="5" fill="#2c3e50"/>
+    <circle cx="740" cy="250" r="5" fill="#2c3e50"/>
+    <line x1="540" y1="250" x2="740" y2="250" stroke="#2c3e50" stroke-width="1.6"/>
+    <!-- coplanar image planes -->
+    <g stroke="#1e8449" stroke-width="2">
+      <line x1="495" y1="175" x2="585" y2="175"/>
+      <line x1="695" y1="175" x2="785" y2="175"/>
+    </g>
+    <!-- horizontal epipolar lines -->
+    <g stroke="#8e44ad" stroke-width="1.3">
+      <line x1="495" y1="166" x2="585" y2="166"/>
+      <line x1="695" y1="166" x2="785" y2="166"/>
+      <line x1="495" y1="184" x2="585" y2="184"/>
+      <line x1="695" y1="184" x2="785" y2="184"/>
+    </g>
+    <circle cx="640" cy="80" r="5.5" fill="#c0392b"/>
+    <text x="640" y="64" text-anchor="middle" font-weight="bold" fill="#c0392b">X</text>
+    <line x1="540" y1="250" x2="640" y2="80" stroke="#c0392b" stroke-width="1.3"/>
+    <line x1="740" y1="250" x2="640" y2="80" stroke="#c0392b" stroke-width="1.3"/>
+    <!-- projections sharing the row -->
+    <circle cx="599" cy="166" r="4" fill="#c0392b"/>
+    <circle cx="681" cy="166" r="4" fill="#c0392b"/>
+    <text x="595" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_L</text>
+    <text x="686" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_R</text>
+    <text x="640" y="278" text-anchor="middle" fill="#5a626c">same row; disparity d = x_L &#8722; x_R along it</text>
+  </g>
+</svg>
+<figcaption><strong>Figure 13.4.1</strong> Rectification in one picture. Left: a real (verged) rig produces slanted epipolar lines that cross image rows. Right: virtually rotating each camera about its own optical center makes both image planes coplanar and parallel to the baseline, so every epipolar line becomes a shared row, and correspondence reduces to a horizontal shift, the disparity.</figcaption>
+</figure>
+
+<p>
+With calibration from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> (intrinsics of both cameras plus the rig's $R, T$ from stereo calibration), OpenCV computes the rectifying rotations and the new projection matrices in one call, and the warps in two more. These maps are computed once per rig and reused for every frame:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+# K1, dist1, K2, dist2, R, T come from cv2.stereoCalibrate (Chapter 12)
+R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+    K1, dist1, K2, dist2, (w, h), R, T,
+    alpha=0)                      # alpha=0: crop to valid pixels only
+
+mapLx, mapLy = cv2.initUndistortRectifyMap(K1, dist1, R1, P1, (w, h), cv2.CV_32FC1)
+mapRx, mapRy = cv2.initUndistortRectifyMap(K2, dist2, R2, P2, (w, h), cv2.CV_32FC1)
+
+rectL = cv2.remap(imgL, mapLx, mapLy, cv2.INTER_LINEAR)   # per-frame, fast
+rectR = cv2.remap(imgR, mapRx, mapRy, cv2.INTER_LINEAR)
+
+# sanity check: matched features should now land on (nearly) equal rows;
+# on a good calibration the mean row difference is below 0.5 pixels
+sift = cv2.SIFT_create(nfeatures=500)
+kL, dL = sift.detectAndCompute(rectL, None)
+kR, dR = sift.detectAndCompute(rectR, None)
+mm = [m for m, n in cv2.BFMatcher(cv2.NORM_L2).knnMatch(dL, dR, k=2)
+      if m.distance &lt; 0.7 * n.distance]
+dy = [abs(kL[m.queryIdx].pt[1] - kR[m.trainIdx].pt[1]) for m in mm]
+print(f"mean |row difference|: {np.mean(dy):.2f} px")   # e.g. 0.31 px</code></pre>
+<div class="code-caption">One-time rectification setup: <code>cv2.stereoRectify</code> returns the virtual rotations <code>R1, R2</code>, new projections <code>P1, P2</code>, and the reprojection matrix <code>Q</code> (saved for Section 13.5), while <code>initUndistortRectifyMap</code> bakes undistortion and rectification into lookup maps that <code>cv2.remap</code> applies to every incoming frame.</div>
+
+<p>
+Two practical notes. The <code>alpha</code> parameter trades field of view against black borders: 0 crops to fully valid pixels, 1 keeps everything. And the returned $Q$ matrix is not rectification's business at all; it is the disparity-to-depth reprojection that <a href="section-13.5.html">Section 13.5</a> runs on, so keep it. For pairs <em>without</em> calibration, <code>cv2.stereoRectifyUncalibrated</code> computes rectifying homographies from a fundamental matrix (<a href="section-13.2.html">Section 13.2</a>), good enough for visualization though not for metric depth.
+</p>
+
+<h2>2. Disparity, and the Simplest Matcher That Could Work <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+On a rectified pair, a scene point projects to $(x_L, y)$ on the left and $(x_R, y)$ on the right, and since the right camera sits to the right, $x_R \le x_L$: everything shifts left, near things more than far things (hold a finger close to your face and alternate eyes). The <strong>disparity</strong> $d = x_L - x_R \ge 0$ is the entire output of stereo matching: a map of horizontal shifts, large for near pixels, small for far ones, inversely proportional to depth in a way <a href="section-13.5.html">Section 13.5</a> makes exact.
+</p>
+<p>
+The simplest dense matcher is <strong>block matching</strong>: for each left pixel, slide a small window along the same row of the right image over a disparity range $[0, d_{\max}]$, score each shift by a dissimilarity such as the sum of absolute differences (SAD), and keep the minimizer:
+</p>
+<p>
+$$ d(x, y) \;=\; \arg\min_{d' \in [0, d_{\max}]} \sum_{(u,v) \in W} \big| I_L(x+u,\, y+v) - I_R(x+u-d',\, y+v) \big|. $$
+</p>
+<p>
+A single pixel carries too little information to match (any gray value occurs thousands of times per row), hence the window $W$: the matching unit is a neighborhood, on the bet that neighborhoods are distinctive where pixels are not. That bet, and where it loses, structures the rest of the section. Block matching fails in three canonical places: <strong>textureless regions</strong> (blank walls: every shift scores alike, the minimum is noise), <strong>repetitive structure</strong> (fences, brick, racking: several shifts score well, the wrong minimum wins), and <strong>occlusions</strong> (pixels near depth edges visible to only one camera: the true match does not exist, but the matcher returns a minimum anyway). A fourth, subtler failure is <strong>edge fattening</strong>: a window straddling a depth boundary contains two motions, and the textured side wins, bleeding foreground disparity into the background.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Per-Pixel Decisions Need Neighborhood Opinions</div>
+<p>Every weakness of block matching traces to one root: it decides each pixel independently, trusting the local appearance to be informative. Where appearance is ambiguous (blank, repetitive, or occluded), the local decision is arbitrary, even though the <em>right</em> answer is obvious from context: disparities of neighboring pixels on the same surface vary smoothly. Stereo matching is therefore best treated not as a million independent searches but as one joint labeling problem with a smoothness prior, the same insight that powered the graph-cut segmentation of <a href="../module-11-classical-segmentation/index.html">Chapter 11</a>. Full 2D optimization of that labeling is expensive; the next subsection's algorithm is the field's beloved compromise, and the learned matchers at the frontier are, at heart, neural machinery for propagating exactly this contextual information further.</p>
+</div>
+
+<h2>3. Semi-Global Matching: Smoothness at Scanline Prices <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Semi-global matching (SGM, Hirschm&#252;ller 2008) keeps a per-pixel matching cost $C(\mathbf{p}, d)$ but adds a smoothness penalty: a small constant $P_1$ for neighbors whose disparity differs by exactly 1 (sloped surfaces are fine), a larger $P_2$ for jumps greater than 1 (depth discontinuities are allowed but must pay). Minimizing the joint energy over the full 2D grid is NP-hard, but along a single 1D path it is classic dynamic programming. SGM's move: run the 1D optimization along 8 (or 16) directions through each pixel (horizontal, vertical, diagonals), sum the directional costs, and pick each pixel's best disparity from the aggregate. Smoothness information flows in from all around the image at a cost linear in pixels times disparities, and the streaking artifacts of single-direction scanline stereo cancel out across paths.
+</p>
+<p>
+OpenCV's <code>StereoSGBM</code> ("semi-global block matching") implements a practical variant whose handful of parameters do real work, annotated below. The non-obvious convention: <code>compute</code> returns disparities as 16-bit integers scaled by 16, so divide before use.
+</p>
+
+<pre><code class="language-python">block = 5
+stereo = cv2.StereoSGBM_create(
+    minDisparity=0,
+    numDisparities=128,            # search range; MUST be divisible by 16.
+                                   # ceiling on measurable nearness (Sec 13.5)
+    blockSize=block,               # odd; 3-9: small=detail, large=smooth
+    P1=8 * 3 * block ** 2,         # penalty for |delta d| == 1 (slopes)
+    P2=32 * 3 * block ** 2,        # penalty for jumps; P2 &gt; P1 enforces
+                                   # piecewise-smooth surfaces
+    uniquenessRatio=10,            # best cost must beat runner-up by 10%
+    speckleWindowSize=100,         # remove disparity blobs smaller than this
+    speckleRange=2,                # ...if they jump by more than 2 levels
+    disp12MaxDiff=1,               # left-right consistency tolerance (px)
+    mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)   # faster 3-path aggregation
+
+disp = stereo.compute(rectL, rectR).astype(np.float32) / 16.0
+valid = disp &gt; 0                   # negative/zero = no reliable match
+print(f"valid: {100 * valid.mean():.1f}%, "
+      f"range: {disp[valid].min():.1f} to {disp[valid].max():.1f} px")
+# valid: 91.3%, range: 4.2 to 97.8 px</code></pre>
+<div class="code-caption">A production-grade SGBM configuration with the reasoning attached to each parameter: the P1/P2 pair encodes the piecewise-smooth world assumption, uniqueness and left-right checks discard ambiguous pixels rather than guessing, and the final division by 16 converts OpenCV's fixed-point output into float disparities.</div>
+
+<p>
+The quality-control parameters deserve emphasis because they implement the failure analysis of subsection 2. <code>uniquenessRatio</code> attacks repetitive structure: if the runner-up disparity scores nearly as well as the winner, the pixel is marked invalid instead of guessed. <code>disp12MaxDiff</code> enforces <strong>left-right consistency</strong>: matching right-to-left as well, and invalidating pixels whose two answers disagree, which catches most occluded pixels (their two matches land on different surfaces). The speckle filter removes small floating islands of disparity, usually mismatches in low texture. A mature pipeline often adds a weighted-least-squares smoothing pass (<code>cv2.ximgproc.createDisparityWLSFilter</code> in opencv-contrib) that fills the invalidated holes from confident neighbors, guided by the image edges, a direct cousin of the edge-aware filtering in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Two Classes Hide Three Decades of Stereo</div>
+<p>From-scratch SGM (cost volume, 8-path dynamic programming, uniqueness and consistency checks, subpixel interpolation) is a 300-plus-line project and a genuinely instructive one, but <code>cv2.StereoBM_create</code> (block matching, hundreds of FPS on VGA) and <code>cv2.StereoSGBM_create</code> (the code above, real-time at moderate resolution) reduce it to one constructor and one <code>compute</code> call each, roughly 150-to-1. Internally they add what a naive implementation forgets: Birchfield-Tomasi sampling-insensitive costs, prefiltering, fixed-point subpixel refinement via parabola fitting of the cost minimum, and SIMD vectorization. The constructor parameters are the SGM theory exposed by name, which is why this section explained them rather than the inner loops.</p>
+</div>
+
+<h2>4. Reading a Disparity Map Like a Professional <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Visualize <code>disp</code> with a colormap and inspect it against the failure catalog. Smooth surfaces should show smooth gradients; staircase banding indicates integer disparities (check the divide-by-16 and subpixel settings). A halo of invalid pixels hugging the <em>left</em> side of every foreground object is normal: those are right-camera occlusions, the geometry's fault, not the matcher's. Fat foreground edges that spill onto the background by half a block width are the edge-fattening signature; shrink <code>blockSize</code> or add the WLS filter. And a hard band of garbage along the left image border is the search range itself: a pixel at column $x &lt; d_{\max}$ cannot have its match in view, so the leftmost <code>numDisparities</code> columns are structurally unmatchable. Production rigs simply crop them.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Pallet Robot That Could Not See the Shrink-Wrap</div>
+<p><strong>Who:</strong> An engineer at a warehouse-automation vendor, owning the stereo obstacle-detection stack on autonomous pallet trucks.</p>
+<p><strong>Situation:</strong> Trucks used a calibrated stereo pair and SGBM at 720p to detect obstacles in the drive path. Acceptance tests (boxes, cones, people) passed with margins.</p>
+<p><strong>Problem:</strong> In production, trucks occasionally clipped pallets wrapped in clear plastic shrink-wrap. The disparity maps showed the pallet's load fine but returned invalid or background disparity exactly on large glossy wrap regions: textureless, view-dependent specular highlights gave the matcher nothing consistent to match, and left-right checking (correctly) invalidated the area. The planner treated invalid as free space.</p>
+<p><strong>Decision:</strong> Two changes. First, the cheap one: invalid disparity regions above a size threshold inside the drive corridor were reclassified as "unknown, slow down" rather than "free", an admission that no answer is information. Second, the rig gained a static texture projector (an IR dot pattern, the active-stereo trick of <a href="section-13.5.html">Section 13.5</a>), giving the matcher artificial texture on optically blank surfaces.</p>
+<p><strong>Result:</strong> Shrink-wrap incidents went to zero across the next quarter; average speed dropped 2 percent from the new caution rule, recovered after the projector retrofit reduced unknown regions by 80 percent.</p>
+<p><strong>Lesson:</strong> A disparity map's holes carry meaning. Passive stereo measures texture, not geometry; where the world refuses to be textured, either add texture or make the planner respect ignorance.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Stereo Matching Became a Foundation-Model Problem</div>
+<p>Learned stereo replaced the cost-aggregation heart of this section while keeping its rectified-epipolar skeleton. RAFT-Stereo (3DV 2021) made recurrent refinement over a correlation volume the standard template; IGEV-Stereo (CVPR 2023) and its successors fused geometry-encoding volumes into the recurrence; Selective-IGEV (CVPR 2024) routes information adaptively between frequency branches. The 2025 inflection is generalization: FoundationStereo (CVPR 2025), trained on a million-pair synthetic dataset with a vision-foundation-model backbone, matches or beats per-dataset fine-tuned networks <em>zero-shot</em> across Middlebury, KITTI, and ETH3D, and DEFOM-Stereo (CVPR 2025) bootstraps the recurrent estimator with a monocular depth foundation model (the Depth Anything lineage of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>), fusing learned single-image priors with two-view geometry. Notice what survived every revolution: rectification, the disparity parameterization, left-right consistency as a confidence signal, and the benchmarks. The classical scaffolding of this section is the fixed coordinate system in which the learning happens.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.1: Why Rotation-Only Warps Suffice <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Rectification claims that warping with rotation-only homographies ($H = K_{new} R K_{old}^{-1}$, <a href="section-13.3.html">Section 13.3</a>) can align any stereo pair's epipolar geometry. (a) Explain why a warp that corresponds to rotating the camera about its optical center cannot change which scene points are occluded by which, while a warp corresponding to translation would. (b) Identify the one camera configuration from <a href="section-13.1.html">Section 13.1</a> for which rectification of this kind fails badly, and explain the failure in terms of where the epipole must be sent. (c) Propose what a system observing that configuration (a forward-moving vehicle camera) should use instead of horizontal-disparity stereo.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.2: Build the Cost Volume Yourself <span class="exercise-type coding">Coding</span></div>
+<p>Implement block matching from scratch as a vectorized cost volume: for a rectified pair (use a Middlebury training pair with ground truth), compute SAD over a $7 \times 7$ window for all disparities in $[0, 64]$ using only NumPy shifts and <code>cv2.boxFilter</code> (no per-pixel Python loops), take the argmin, and add the uniqueness test. Report your error rate (fraction of pixels off by more than 2 from ground truth) and runtime, then compare both against <code>StereoBM</code> and <code>StereoSGBM</code>. Where on the image do your extra errors concentrate, relative to the failure catalog of subsection 2?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 13.4.3: The P2 Dial <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the section's SGBM configuration on one indoor pair, sweep <code>P2</code> across $\{4, 8, 16, 32, 64\} \times 3 \cdot \text{block}^2$ while holding <code>P1</code> fixed, and produce a five-panel figure of the resulting disparity maps. Describe the qualitative transition: what happens to thin structures (chair legs, door frames) at high <code>P2</code>, and to flat walls at low <code>P2</code>? Connect the observed trade-off to the piecewise-smooth prior, and explain why no single <code>P2</code> can be optimal for both a close-range cluttered desk and a long corridor.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-13.3.html">&#8592; Section 13.3: Homographies &amp; Panorama Stitching</a>
+<a href="index.html">Chapter 13</a>
+<a class="next" href="section-13.5.html">Section 13.5: From Disparity to Depth Maps &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
