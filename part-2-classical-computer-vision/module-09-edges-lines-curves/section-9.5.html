@@ -119,7 +119,10 @@ The first stage converts the frame into a binary mask: 1 where a pixel plausibly
 <strong>Color evidence.</strong> Lane paint is engineered to be visible, which in color terms means saturated white or yellow. The S channel of the HLS representation from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> captures exactly this: paint stays high-saturation as overall brightness drops into shade, where raw RGB thresholds collapse. A fixed threshold on S, chosen with the histogram-reading skills of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, lights up the <em>body</em> of each stripe, not just its flanks, so the union of the two channels turns every marking into one solid blob and dissolves the double-line problem; a single morphological opening from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> then deletes the speckles both channels produce. The function below implements the whole stage.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Stage 1 of the lane pipeline: build a binary evidence mask by unioning two
+# independent cues, an x-gradient that fires on stripe flanks and an HLS
+# saturation threshold that fills stripe bodies, then opening away speckle.
+import cv2
 import numpy as np
 
 def lane_evidence(bgr):
@@ -139,7 +142,7 @@ mask = lane_evidence(frame)
 print(f"evidence pixels: {(mask &gt; 0).mean():.1%} of the frame")
 # Representative output:
 # evidence pixels: 3.4% of the frame</code></pre>
-<div class="code-caption">Gradient and color evidence united: the x-direction Sobel fires on both flanks of each paint stripe while the HLS saturation channel fills its body, so their union turns every marking into one solid blob; a single morphological opening then deletes isolated speckles before any geometry runs.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Gradient and color evidence united in <code>lane_evidence</code>: the x-direction Sobel fires on both flanks of each paint stripe while <code>hls[:, :, 2]</code> (the saturation channel) fills its body, so <code>grad | color</code> turns every marking into one solid blob; a single <code>cv2.morphologyEx</code> opening then deletes isolated speckles before any geometry runs.</div>
 
 <p>
 Notice what we did <em>not</em> use: the full Canny detector of <a href="section-9.2.html">Section 9.2</a>. Canny's non-maximum suppression thins edges to one pixel, which is ideal when edges are the product but counterproductive here, where we want fat blobs of paint pixels for the histogram search to count. Choosing which tool a stage actually needs, rather than the most sophisticated tool available, is most of pipeline engineering.
@@ -154,7 +157,10 @@ In the camera view, perspective entangles everything: parallel lane lines conver
 The warp is a planar homography, exactly the $3 \times 3$ machinery built in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>: the road is (assumed) flat, so four point correspondences determine the mapping. Calibration is a one-time manual act: on a frame where the road is known to be straight, mark a trapezoid whose sides lie on the two lane lines, and declare that it should map to a rectangle. The code below performs the warp; Figure 9.5.2 (in the next stage) shows it visually.
 </p>
 
-<pre><code class="language-python">h, w = mask.shape
+<pre><code class="language-python"># Stage 2: warp the road plane to a synthetic overhead view, so lane lines
+# become near-vertical and parallel. A single planar homography from four
+# correspondences does it; the inverse is kept for painting results back.
+h, w = mask.shape
 # source trapezoid: marked once on a straight-road frame, reused forever
 src = np.float32([[w * 0.43, h * 0.65], [w * 0.57, h * 0.65],
                   [w * 0.90, h * 0.96], [w * 0.10, h * 0.96]])
@@ -164,7 +170,7 @@ M    = cv2.getPerspectiveTransform(src, dst)   # 3x3 homography
 Minv = cv2.getPerspectiveTransform(dst, src)   # for painting results back
 birds = cv2.warpPerspective(mask, M, (w, h),
                             flags=cv2.INTER_NEAREST)  # keep mask binary</code></pre>
-<div class="code-caption">The bird's-eye warp in four lines of OpenCV: a source trapezoid marked once on a straight-road frame maps to a rectangle, nearest-neighbor interpolation keeps the mask strictly binary, and the inverse matrix is computed up front because the final overlay must travel back to the camera view.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The bird's-eye warp in four lines of OpenCV: <code>cv2.getPerspectiveTransform</code> turns the source trapezoid into the rectangle <code>M</code>, <code>cv2.warpPerspective</code> with <code>INTER_NEAREST</code> keeps the mask strictly binary, and the inverse matrix <code>Minv</code> is computed up front because the final overlay must travel back to the camera view.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Four Correspondences, One Call</div>
@@ -239,7 +245,10 @@ The warped mask contains lane blobs plus clutter: shadow fragments, asphalt seam
 The implementation below returns the raw pixel coordinates assigned to each marking, ready for fitting. It is deliberately plain NumPy: one histogram, one <code>nonzero</code>, and a short loop over windows.
 </p>
 
-<pre><code class="language-python">def sliding_window_search(birds, n_windows=9, margin=80, minpix=50):
+<pre><code class="language-python"># Stage 3: assign warped evidence pixels to the left and right markings.
+# Bottom-half column sums nominate two base columns (a degenerate Hough
+# vote), then stacked windows climb each marking, recentering as it curves.
+def sliding_window_search(birds, n_windows=9, margin=80, minpix=50):
     """Collect lane pixels by climbing windows from two histogram peaks."""
     hist = birds[birds.shape[0] // 2:, :].sum(axis=0)   # bottom-half votes
     mid = hist.shape[0] // 2
@@ -261,7 +270,7 @@ The implementation below returns the raw pixel coordinates assigned to each mark
         sel = np.logical_or.reduce(keep[side])
         out.append((nz_x[sel], nz_y[sel]))
     return out                                          # [(xl, yl), (xr, yr)]</code></pre>
-<div class="code-caption">The sliding-window search: bottom-half column sums nominate two base positions, nine stacked windows climb each marking, and every window recenters on the mean x of its captured pixels so the stack tracks the curve; the function returns raw pixel coordinates ready for the polynomial fit.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The <code>sliding_window_search</code>: bottom-half column sums nominate two base positions, nine stacked windows climb each marking, and every window with more than <code>minpix</code> pixels recenters on their mean x so the stack tracks the curve; the function returns the raw <code>(x, y)</code> coordinates for each side, ready for the polynomial fit.</div>
 
 <p>
 The <code>minpix</code> gate matters more than it looks: a window over a gap in a dashed marking catches almost nothing, and recentering on three noise pixels would fling the stack sideways; by refusing to recenter on thin evidence, the stack coasts straight through dashes, the correct prior for road paint. On video there is a further shortcut: after a good fit, the next frame skips the histogram and windows and harvests evidence pixels within a margin of the previous polynomial. Exercise 9.5.2 builds that fast path and the sanity gates that decide when to fall back to the full search.
@@ -282,7 +291,10 @@ $$ R \;=\; \frac{\bigl(1 + (2Ay_0 + B)^2\bigr)^{3/2}}{\lvert 2A \rvert}, $$
 and the lateral offset is the difference between the image center (where the camera, and approximately the car, sits) and the midpoint of the two fitted curves at the bumper, scaled to meters. The code below completes the pipeline.
 </p>
 
-<pre><code class="language-python">XM = 3.7 / 640    # meters per warped pixel in x: lane width 3.7 m = 640 px
+<pre><code class="language-python"># Stage 4: turn the captured lane pixels into steering geometry. Fit the
+# quadratic x = Ay^2 + By + C twice (pixels for drawing, meters for control),
+# then read off curvature radius and lateral offset in physical units.
+XM = 3.7 / 640    # meters per warped pixel in x: lane width 3.7 m = 640 px
 YM = 30.0 / 720   # meters per warped pixel in y: warp covers ~30 m of road
 
 (xl, yl), (xr, yr) = sliding_window_search(birds)
@@ -299,7 +311,7 @@ offset = (w / 2 - lane_mid) * XM           # + means car is right of center
 print(f"radius of curvature {radius:7.0f} m   lateral offset {offset:+.2f} m")
 # Representative output:
 # radius of curvature     886 m   lateral offset -0.12 m</code></pre>
-<div class="code-caption">From pixels to steering geometry: the same quadratic is fit twice (pixel units for drawing, metric units for measurement), the curvature radius comes from the analytic formula evaluated at the bumper line, and the lateral offset compares image center with lane center under the meters-per-pixel calibration.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> From pixels to steering geometry: <code>np.polyfit</code> fits the same quadratic twice (pixel units for drawing, metric units via <code>XM</code> and <code>YM</code> for measurement), the curvature <code>radius</code> comes from the analytic formula evaluated at the bumper line, and <code>offset</code> compares image center with lane center under the meters-per-pixel calibration.</div>
 
 <p>
 On a clean frame, plain least squares is the right fitter, because the sliding windows have already done the robustness work: they are a membership filter, the two-step recipe of <a href="section-9.4.html">Section 9.4</a> wearing different clothes. On a bad frame the corridor itself can be captured: Section 9.4 warned that most thresholded pixels can belong to shadows and asphalt texture rather than paint, and a window stack can lock onto a shadow band running beside the marking. Production pipelines therefore add defenses: <strong>sanity gates</strong> that reject a frame whose two fits are not roughly parallel, whose implied lane width is wrong at any of three heights, or whose left and right curvatures disagree wildly; <strong>temporal smoothing</strong> that coasts on the last good fit through rejected frames, a job done properly by the Kalman filters of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>; and, on the worst frames, a RANSAC fit over the window centroids, exactly as built in <a href="section-9.4.html">Section 9.4</a>.

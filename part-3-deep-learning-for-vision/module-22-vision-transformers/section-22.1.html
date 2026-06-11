@@ -119,7 +119,10 @@ where $d_k$ is the dimension of the query and key vectors. The matrix $QK^\top$ 
 The code below implements exactly this formula on a batch of sequences. Read it against the figure: <code>Q @ K.transpose</code> is the score matrix, the scaling and softmax follow, and the final matmul with <code>V</code> produces the output.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Scaled dot-product attention from the formula up: score every query
+# against every key, normalize the scores with a softmax, then take the
+# value-weighted sum. Passing one tensor as Q, K, and V gives self-attention.
+import torch
 import torch.nn.functional as F
 
 def scaled_dot_product_attention(Q, K, V):
@@ -136,7 +139,7 @@ X = torch.randn(1, 4, 8)
 out, attn = scaled_dot_product_attention(X, X, X)  # self-attention: Q=K=V=X
 print("output shape:", out.shape)       # output shape: torch.Size([1, 4, 8])
 print("attention rows sum to:", attn.sum(-1))  # tensor([[1., 1., 1., 1.]])</code></pre>
-<div class="code-caption">Scaled dot-product attention in five lines. Passing the same tensor as Q, K, and V makes it self-attention; the printed row sums confirm each query distributes a total weight of one across all four tokens.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Scaled dot-product attention in five lines. Passing the same tensor as Q, K, and V makes it self-attention; the printed row sums confirm each query distributes a total weight of one across all four tokens.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Attention Is Content-Dependent, Convolution Is Not</div>
@@ -161,7 +164,10 @@ $$\text{MultiHead}(X) = \big[\,\text{head}_1; \ldots; \text{head}_h\,\big]\, W_O
 The implementation below packs all heads into single weight matrices for efficiency and reshapes to expose the head dimension, which is how every production library does it.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Multi-head attention: project to Q, K, V with one fused matrix, split the
+# width into independent heads so each can specialize, attend per head, then
+# concatenate and re-project. The output shape matches the input so blocks stack.
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -187,7 +193,7 @@ class MultiHeadAttention(nn.Module):
 mha = MultiHeadAttention(dim=64, num_heads=8)
 x = torch.randn(2, 16, 64)               # batch 2, 16 tokens, dim 64
 print("output shape:", mha(x).shape)     # output shape: torch.Size([2, 16, 64])</code></pre>
-<div class="code-caption">Multi-head self-attention with all heads fused into one <code>qkv</code> projection. The 64-dimensional input is split into 8 heads of width 8, attended independently, and recombined, preserving the input shape so the block can be stacked.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Multi-head self-attention with all heads fused into one <code>qkv</code> projection. The 64-dimensional input is split into 8 heads of width 8, attended independently, and recombined, preserving the input shape so the block can be stacked.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: One Fused Call Replaces the Whole Block</div>
@@ -195,7 +201,7 @@ print("output shape:", mha(x).shape)     # output shape: torch.Size([2, 16, 64])
 <pre><code class="language-python">from torch.nn.functional import scaled_dot_product_attention as sdpa
 # q, k, v shaped (B, heads, N, d_k); fused scale + softmax + matmul:
 out = sdpa(q, k, v)   # no explicit scores tensor materialized in memory</code></pre>
-<div class="code-caption">The fused production call. With pre-shaped <code>(B, heads, N, d_k)</code> tensors, <code>sdpa</code> collapses the scale, softmax, and value matmul of the hand-rolled block into one FlashAttention-backed kernel that never materializes the full score matrix.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The fused production call. With pre-shaped <code>(B, heads, N, d_k)</code> tensors, <code>sdpa</code> collapses the scale, softmax, and value matmul of the hand-rolled block into one FlashAttention-backed kernel that never materializes the full score matrix.</div>
 <p>The library handles the $\sqrt{d_k}$ scaling, an optional causal or padding mask, and the memory-efficient streaming softmax that never builds the full $N \times N$ score matrix. For long sequences this is the difference between fitting in GPU memory and not, and it is why you should reach for <code>sdpa</code> (or <code>nn.MultiheadAttention</code>) rather than the hand-rolled version once you have understood it.</p>
 </div>
 
@@ -266,7 +272,10 @@ Read that as: normalize, attend, add back; normalize, transform, add back. The r
 <figcaption><strong>Figure 22.1.2:</strong> The pre-norm transformer block. Each of the two sub-layers (attention, then MLP) is preceded by a LayerNorm and wrapped in a residual connection (dashed purple). The running sum, the residual stream, flows along the top, gathering each sub-layer's additive contribution without ever being overwritten.</figcaption>
 </figure>
 
-<pre><code class="language-python">import torch.nn as nn
+<pre><code class="language-python"># A pre-norm transformer block: LayerNorm then attention with a residual add,
+# then LayerNorm then a 4x-expansion MLP with a residual add. Normalizing before
+# each sub-layer keeps deep stacks trainable without learning-rate warmup.
+import torch.nn as nn
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0):
@@ -289,7 +298,7 @@ class TransformerBlock(nn.Module):
 block = TransformerBlock(dim=64, num_heads=8)
 import torch
 print("block output:", block(torch.randn(2, 16, 64)).shape)  # torch.Size([2, 16, 64])</code></pre>
-<div class="code-caption">A complete pre-norm transformer block. The two <code>x = x + ...</code> lines are the residual stream of Figure 22.1.2; the MLP expands the dimension fourfold with a GELU non-linearity before projecting back, the standard ViT feed-forward.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> A complete pre-norm transformer block. The two <code>x = x + ...</code> lines are the residual stream of Figure 22.1.2; the MLP expands the dimension fourfold with a GELU non-linearity before projecting back, the standard ViT feed-forward.</div>
 
 <p>
 That block is the entire reusable engine of the chapter. Stack $L$ of these, feed them a sequence of token vectors, and you have a transformer encoder. The only thing left, the thing that turns this language-shaped machine into a vision model, is deciding what the tokens are and how to inject the spatial information that the permutation-invariant attention throws away. That is the subject of <a href="section-22.2.html">Section 22.2</a>.

@@ -46,7 +46,10 @@ The previous section (<a href="section-8.1.html">Section 8.1</a>) chose the libr
 <p>
 Optimization without measurement is superstition. Before rewriting anything, establish a number with a harness that handles the three classic timing traps: one-time costs (thread-pool spin-up, JIT compilation, lazy library initialization) that inflate the first call, run-to-run noise from the operating system, and, for GPUs, asynchronous execution that makes naive stopwatch timing measure only the kernel <em>launch</em>. Code 8.2.1 is the small harness used for every number in this section.
 </p>
-<pre><code class="language-python">import time
+<pre><code class="language-python"># Honest-timing harness used for every measurement in this section.
+# Warm-up runs absorb one-time costs; the median of several repeats
+# resists operating-system scheduling noise.
+import time
 import numpy as np
 
 def bench(fn, *args, repeats=7, warmup=2):
@@ -66,9 +69,12 @@ Two habits complete the discipline. First, time the <em>stages</em> of a pipelin
 </p>
 <h2>2. The Vectorization Ladder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <p>
-The single most common performance bug in imaging code is a per-pixel Python loop. Code 8.2.2 implements the same gamma correction (the point operation from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, $I' = 255\,(I/255)^{\gamma}$) four ways, from a raw double loop to OpenCV's SIMD lookup table.
+The single most common performance bug in imaging code is a per-pixel Python loop. Code 8.2.2 implements the same gamma correction (the point operation from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, $I' = 255\,(I/255)^{\gamma}$) four ways, from a raw double loop to OpenCV's SIMD lookup table (LUT).
 </p>
-<pre><code class="language-python">import numpy as np, cv2
+<pre><code class="language-python"># Four climbs up the performance ladder for one gamma correction:
+# a pure-Python double loop, a vectorized expression, a NumPy lookup
+# table, and OpenCV's SIMD-dispatched LUT, timed against each other.
+import numpy as np, cv2
 
 img = np.random.default_rng(0).integers(0, 256, (1080, 1920), dtype=np.uint8)
 GAMMA = 0.5
@@ -149,7 +155,10 @@ The ladder generalizes far beyond gamma. Whole-array arithmetic, boolean masking
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Local Statistics Without the Loop</div>
 <p>A from-scratch local standard deviation map (the texture measure used for adaptive thresholding in <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>) is a roughly 25-line windowed double loop with border bookkeeping. The identity $\operatorname{Var}[x] = \mathbb{E}[x^2] - \mathbb{E}[x]^2$ turns it into three calls to a box filter from <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>:</p>
-<pre><code class="language-python">from scipy import ndimage
+<pre><code class="language-python"># Local standard deviation map without an explicit window loop:
+# the identity Var[x] = E[x^2] - E[x]^2 turns it into three
+# box-filter passes over the image.
+from scipy import ndimage
 
 f  = img.astype(np.float32)
 m  = ndimage.uniform_filter(f, size=7)        # E[x]  over each 7x7 window
@@ -163,7 +172,10 @@ sigma = np.sqrt(np.maximum(m2 - m * m, 0.0))  # clamp tiny negatives (round-off)
 <p>
 OpenCV is fast by default, but it pays to know which gears are turning. Builds dispatch at runtime to the widest SIMD instruction set the CPU offers (SSE4, AVX2, AVX-512, NEON), many functions parallelize across a thread pool, and <code>cv2.useOptimized()</code> reports whether the optimized dispatch is active. Algorithmic gears matter even more: <code>cv2.GaussianBlur</code> runs as two separable 1D passes, turning the $O(k^2)$ per-pixel cost derived in <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a> into $O(2k)$, and <code>cv2.filter2D</code> silently switches to the FFT route from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a> when the kernel is large enough for the $O(N \log N)$ transform to win. Code 8.2.3 inspects and exercises these gears, reusing the harness from Code 8.2.1.
 </p>
-<pre><code class="language-python">import cv2, numpy as np
+<pre><code class="language-python"># Inspect and exercise three OpenCV speed gears on a 4K frame:
+# runtime SIMD dispatch, the thread pool (toggled via setNumThreads),
+# and the Transparent API that routes the same calls through OpenCL.
+import cv2, numpy as np
 
 img = np.random.default_rng(1).integers(0, 256, (2160, 3840), dtype=np.uint8)
 print("optimized:", cv2.useOptimized(), "| threads:", cv2.getNumThreads())
@@ -198,7 +210,10 @@ One caution: the pip wheels of <code>opencv-python</code> ship without CUDA, so 
 <p>
 Some algorithms resist whole-array form because each output depends on a previously computed output: scanline accumulations, region growing, dithering with error diffusion (<a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>), adaptive recursions. For these, <a href="https://numba.pydata.org/" target="_blank" rel="noopener">Numba</a> compiles the Python loop itself to machine code. Code 8.2.4 shows the pattern on a per-row exponential moving average, a data-dependent scan NumPy cannot vectorize directly.
 </p>
-<pre><code class="language-python">from numba import njit, prange
+<pre><code class="language-python"># Numba compiles a data-dependent scan that NumPy cannot vectorize:
+# a per-row exponential moving average where each output depends on
+# the previous one, with independent rows parallelized across cores.
+from numba import njit, prange
 import numpy as np
 
 @njit(parallel=True, cache=True)
@@ -235,7 +250,10 @@ Typical results land within a small factor of hand-written C, which puts Numba o
 <p>
 <a href="https://cupy.dev/" target="_blank" rel="noopener">CuPy</a> reimplements the NumPy API on NVIDIA GPUs: <code>cp.asarray</code> ships an array to device memory, the familiar operations run as CUDA kernels, and <code>cupyx.scipy.ndimage</code> mirrors the SciPy filters used throughout Part I. The catch is the toll booth: data must cross the PCIe bus in both directions, and kernels launch asynchronously, so honest timing needs the library's own benchmark utility. Code 8.2.5 shows the workflow.
 </p>
-<pre><code class="language-python">import cupy as cp
+<pre><code class="language-python"># The CuPy round trip: ship the array to GPU memory, run a Gaussian
+# filter as a CUDA kernel, and bring the result back, timing the
+# kernel with a device-synchronizing benchmark rather than a stopwatch.
+import cupy as cp
 from cupyx.scipy import ndimage as cundi
 from cupyx.profiler import benchmark
 
@@ -259,7 +277,7 @@ so a pipeline that is only 70 percent GPU-eligible caps below $1/0.3 \approx 3.3
 </p>
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: Compiled and Batched Image Processing (2024-2026)</div>
-<p>The acceleration story is consolidating around compilers and batching. <strong>PyTorch 2.x's <code>torch.compile</code></strong> (the TorchInductor backend, maturing through 2024-2025) fuses chains of tensor operations into single generated kernels, attacking exactly the temporary-array traffic this section warned about, and <strong>Triton</strong>, the Python-embedded kernel language it emits, has become the standard way to hand-write a custom GPU kernel without CUDA C++. <strong>NVIDIA CV-CUDA</strong> (open-sourced 2023, with steady releases through 2025) provides batched GPU implementations of classical pre- and post-processing (resize, warp, color conversion, morphology) for inference services that process thousands of images per second, and <strong>cuCIM</strong> (RAPIDS) keeps a scikit-image-compatible API on GPUs for gigapixel biomedical work. Tying the ecosystem together, the <strong>DLPack</strong> interchange protocol lets NumPy, CuPy, PyTorch, and JAX hand each other arrays without copies, so a pipeline can cross library borders at zero transfer cost. The practical reading: learn the array model once; the compilers are coming to you.</p>
+<p>The acceleration story is consolidating around compilers and batching. <strong>PyTorch 2.x's <code>torch.compile</code></strong> (the TorchInductor backend, maturing through 2024-2025) fuses chains of tensor operations into single generated kernels, attacking exactly the temporary-array traffic this section warned about, and <strong>Triton</strong>, the Python-embedded kernel language it emits, has become the standard way to hand-write a custom GPU kernel without CUDA C++. <strong>NVIDIA CV-CUDA</strong> (first released as open source in late 2022, with steady releases through 2025) provides batched GPU implementations of classical pre- and post-processing (resize, warp, color conversion, morphology) for inference services that process thousands of images per second, and <strong>cuCIM</strong> (RAPIDS) keeps a scikit-image-compatible API on GPUs for gigapixel biomedical work. Tying the ecosystem together, the <strong>DLPack</strong> interchange protocol lets NumPy, CuPy, PyTorch, and JAX hand each other arrays without copies, so a pipeline can cross library borders at zero transfer cost. The practical reading: learn the array model once; the compilers are coming to you.</p>
 </div>
 <div class="callout exercise">
 <div class="callout-title">Exercise 8.2.1: Place the Operation on the Ladder <span class="exercise-type conceptual">Conceptual</span></div>

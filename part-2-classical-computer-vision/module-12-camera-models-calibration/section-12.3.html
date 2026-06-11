@@ -123,10 +123,12 @@ where $\pi$ is the full projection of <a href="section-12.1.html">Section 12.1</
 <line x1="555" y1="170" x2="555" y2="190" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr123)"/>
 <!-- arrow to output -->
 <path d="M555,242 L555,314 L529,314" fill="none" stroke="#2c3e50" stroke-width="2" marker-end="url(#arr123)"/>
-<!-- annotation: corners feed LM too -->
-<path d="M205,242 L205,400 L380,400 L380,342" fill="none" stroke="#7f8c8d" stroke-width="1.6" stroke-dasharray="6,4" marker-end="url(#arr123)"/>
-<text x="292" y="392" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#7f8c8d">detected corners are the measurements</text>
-<text x="292" y="408" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#7f8c8d">the refinement is fitted against</text>
+<!-- annotation: detected corners are the measurements the LM refinement is fitted against -->
+<defs>
+<marker id="arr123g" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#7f8c8d"/></marker>
+</defs>
+<path d="M150,170 L150,410 L480,410 L480,246" fill="none" stroke="#7f8c8d" stroke-width="1.6" stroke-dasharray="6,4" marker-end="url(#arr123g)"/>
+<text x="352" y="402" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#7f8c8d">detected corners are the measurements the refinement is fitted against</text>
 <text x="380" y="448" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#888">linear stage = good initial guess; nonlinear stage = the actual estimate</text>
 </svg>
 <figcaption><strong>Figure 12.3.1</strong> The two-stage architecture of Zhang's method. The left column extracts subpixel corners and a homography from every view; the right column solves the linear system for $B$ (hence $K$ and the extrinsics) and then refines everything, now including distortion, by minimizing reprojection error with Levenberg-Marquardt against the detected corners (dashed feed). <code>cv2.calibrateCamera</code> is this entire diagram behind one function signature.</figcaption>
@@ -138,7 +140,10 @@ where $\pi$ is the full projection of <a href="section-12.1.html">Section 12.1</
 Here is the complete, runnable procedure: collect photos of a printed checkerboard (a 10 by 7 squares board has $9 \times 6$ inner corners), detect corners in each, pair them with their known board coordinates, and hand everything to <code>cv2.calibrateCamera</code>. The modern detector <code>findChessboardCornersSB</code> (OpenCV 4.x) returns subpixel-accurate corners directly, replacing the older two-step <code>findChessboardCorners</code> plus <code>cornerSubPix</code> dance and tolerating more blur and stronger perspective.
 </p>
 
-<pre><code class="language-python">import glob
+<pre><code class="language-python"># Full Zhang calibration: build the exact board-frame corner coordinates,
+# detect subpixel corners in every photo, then hand both to calibrateCamera,
+# which runs corner-detection through nonlinear refinement in one call.
+import glob
 import cv2
 import numpy as np
 
@@ -171,7 +176,7 @@ print("dist =", dist.ravel())
 #   [   0.   1537.95  549.86]
 #   [   0.      0.      1.  ]]
 # dist = [-0.34  0.15  0.    0.   -0.04]</code></pre>
-<div class="code-caption">Full Zhang calibration in under 30 lines. The board-frame corner coordinates <code>objp</code> are exact by construction; the detected <code>corners</code> carry the noise; <code>calibrateCamera</code> runs the entire Figure 12.3.1 pipeline and returns the refined intrinsics, distortion, per-view extrinsics, and the RMS reprojection error in pixels.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Full Zhang calibration in under 30 lines. The board-frame corner coordinates <code>objp</code> are exact by construction; the detected <code>corners</code> carry the noise; <code>calibrateCamera</code> runs the entire Figure 12.3.1 pipeline and returns the refined intrinsics, distortion, per-view extrinsics, and an RMS reprojection error of 0.187 px across 23 views.</div>
 
 <p>
 Two practical notes on the inputs. First, <code>SQUARE</code> must be the measured size of the printed squares, not the size requested from the printer; printers rescale, and an error here scales every translation in <code>tvecs</code> (though it leaves $K$ and distortion untouched, since the homography constraints are scale-invariant). Second, the returned <code>rvecs</code> and <code>tvecs</code> are the board poses for each view, which makes <code>calibrateCamera</code> secretly also a pose estimator, foreshadowing the PnP problem of <a href="section-12.4.html">Section 12.4</a>.
@@ -193,7 +198,10 @@ Two practical notes on the inputs. First, <code>SQUARE</code> must be the measur
 The single RMS figure averages over all views, and averages hide outliers: one image where the board moved during exposure can quietly degrade every parameter. Recomputing the error per view takes five lines with <code>cv2.projectPoints</code> (the same function from <a href="section-12.1.html">Section 12.1</a>, now wearing its diagnostic hat), and any view sitting far above its peers should be deleted, followed by recalibration.
 </p>
 
-<pre><code class="language-python">for i, (op, ip) in enumerate(zip(obj_points, img_points)):
+<pre><code class="language-python"># Recompute reprojection error per view to find outliers the pooled RMS hides.
+# Each view's corners are reprojected through its own extrinsics, and any view
+# more than 2.5x the global RMS is flagged for inspection (often motion blur).
+for i, (op, ip) in enumerate(zip(obj_points, img_points)):
     proj, _ = cv2.projectPoints(op, rvecs[i], tvecs[i], K, dist)
     err = np.sqrt(np.mean(np.sum((ip - proj) ** 2, axis=2)))
     flag = "  &lt;-- inspect this image" if err &gt; 2.5 * rms else ""
@@ -203,13 +211,16 @@ The single RMS figure averages over all views, and averages hide outliers: one i
 # view  2: 0.694 px  &lt;-- inspect this image
 # view  3: 0.166 px
 # ...</code></pre>
-<div class="code-caption">Per-view reprojection errors expose problem images that the pooled RMS conceals. View 2 here turned out to be motion-blurred; removing it and recalibrating dropped the global RMS from 0.187 to 0.139 px.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Per-view reprojection errors expose problem images that the pooled RMS conceals. The <code>2.5 * rms</code> flag catches view 2 at 0.694 px; it turned out to be motion-blurred, and removing it then recalibrating dropped the global RMS from 0.187 to 0.139 px.</div>
 
 <p>
 OpenCV will also tell you how confident it is in each parameter. <code>cv2.calibrateCameraExtended</code> returns standard deviations for every intrinsic and distortion coefficient, derived from the curvature of the error function at the optimum. These numbers convert calibration from ritual to measurement: a focal length of $1538.4 \pm 1.2$ px is a usable result, while $1538.4 \pm 40$ px from the same RMS tells you the views did not constrain focal length, almost always because nobody tilted the board.
 </p>
 
-<pre><code class="language-python">(rms, K, dist, rvecs, tvecs,
+<pre><code class="language-python"># calibrateCameraExtended also returns per-parameter standard deviations,
+# read from the curvature of the error function at the optimum. These turn
+# calibration from a ritual into a measurement with stated uncertainty.
+(rms, K, dist, rvecs, tvecs,
  std_intrinsics, std_extrinsics, per_view_errors) = cv2.calibrateCameraExtended(
     obj_points, img_points, gray.shape[::-1], None, None)
 
@@ -227,14 +238,16 @@ for name, val, std in zip(names,
 # p1  =     0.001  +/- 0.000
 # p2  =    -0.001  +/- 0.000
 # k3  =    -0.040  +/- 0.012</code></pre>
-<div class="code-caption">Parameter standard deviations from <code>calibrateCameraExtended</code>. Healthy numbers look like these: focal length known to better than 0.1%, principal point to under a pixel. A $\pm 40$ px focal uncertainty at similar RMS is the fingerprint of insufficient board tilt.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Parameter standard deviations from <code>calibrateCameraExtended</code>, paired by name with their values. Healthy numbers look like these: <code>fx</code> at $1538.4 \pm 1.2$ px is known to better than 0.1%, the principal point to under a pixel. A $\pm 40$ px focal uncertainty at similar RMS is the fingerprint of insufficient board tilt.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: One Call Replaces a 200-Line Implementation</div>
 <p>Implementing Figure 12.3.1 from scratch is a rite of passage: normalized DLT for each homography (about 40 lines), the $2n \times 6$ constraint stack and SVD solve (20 lines), the Cholesky unpacking of $K$ with its sign gymnastics (15 lines), rotation orthogonalization via SVD (10 lines), and a Levenberg-Marquardt loop over all $9 + 6n$ parameters with numerically stable Jacobians (100+ lines with <code>scipy.optimize.least_squares</code>). Call it 200 lines and two days of debugging the corner cases.</p>
-<pre><code class="language-python">rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+<pre><code class="language-python"># The entire two-stage Zhang pipeline (DLT, linear B-solve, K extraction,
+# and Levenberg-Marquardt refinement) collapses into this single call.
+rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
     obj_points, img_points, image_size, None, None)</code></pre>
-<div class="code-caption">The entire Zhang pipeline as a single OpenCV call, the 200-to-1 reduction this chapter leans on.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> The entire Zhang pipeline as a single <code>cv2.calibrateCamera</code> call, the 200-to-1 reduction this chapter leans on, with the conditioning, analytic Jacobians, and degenerate-view handling that a homemade version usually gets wrong all hidden inside.</div>
 <p>Beyond brevity, the library handles what a homemade version typically gets wrong: conditioning normalization inside the homography DLT, the analytic (not finite-difference) Jacobians of the distortion model, parameter fixing flags (<code>CALIB_FIX_ASPECT_RATIO</code>, <code>CALIB_RATIONAL_MODEL</code>, <code>CALIB_FIX_K3</code>) for constraining ill-determined coefficients, and robust handling of views where the board is near-degenerate.</p>
 </div>
 

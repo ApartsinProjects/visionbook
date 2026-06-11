@@ -116,13 +116,16 @@ Center a $k \times k$ kernel on a pixel in the top row and $\lfloor k/2 \rfloor$
 </figure>
 
 <p>
-Each policy fails somewhere specific. <strong>Constant (zero) padding</strong> surrounds the image with blackness, so any smoothing filter darkens the frame's rim, a vignette artifact visible in careless thumbnail pipelines, and any derivative filter from <a href="section-3.4.html">Section 3.4</a> hallucinates a strong edge along the entire border. <strong>Replicate</strong> is safe and bland; it slightly overweights edge pixels. <strong>Reflect</strong> and <strong>reflect_101</strong> continue local statistics most gracefully, which is why reflect_101 is OpenCV's default (<code>cv2.BORDER_REFLECT_101</code>, alias <code>BORDER_DEFAULT</code>); the difference between them, whether the edge pixel itself is duplicated, matters mainly for derivative filters, where the doubled pixel of plain reflect creates a spurious zero-gradient line. <strong>Wrap</strong> is correct exactly when the data is periodic, which sounds exotic until <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>: FFT-based convolution wraps <em>implicitly</em>, whether you wanted it to or not, and that quietly mandatory wrap is one of that chapter's central gotchas.
+Each policy fails somewhere specific. <strong>Constant (zero) padding</strong> surrounds the image with blackness, so any smoothing filter darkens the frame's rim, a vignette artifact visible in careless thumbnail pipelines, and any derivative filter from <a href="section-3.4.html">Section 3.4</a> hallucinates a strong edge along the entire border. <strong>Replicate</strong> is safe and bland; it slightly overweights edge pixels. <strong>Reflect</strong> and <strong>reflect_101</strong> continue local statistics most gracefully, which is why reflect_101 is OpenCV's default (<code>cv2.BORDER_REFLECT_101</code>, alias <code>BORDER_DEFAULT</code>); the difference between them, whether the edge pixel itself is duplicated, matters mainly for derivative filters, where the doubled pixel of plain reflect creates a spurious zero-gradient line. <strong>Wrap</strong> is correct exactly when the data is periodic, which sounds exotic until <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>: fast Fourier transform (FFT) based convolution wraps <em>implicitly</em>, whether you wanted it to or not, and that quietly mandatory wrap is one of that chapter's central gotchas.
 </p>
 <p>
 The NumPy and OpenCV vocabularies for identical policies differ, and one mismatch is a recurring source of off-by-the-border bugs: NumPy's <code>mode="reflect"</code> equals OpenCV's <code>BORDER_REFLECT_101</code>, while NumPy's <code>mode="symmetric"</code> equals OpenCV's <code>BORDER_REFLECT</code>. The demonstration below makes the policies tangible on a tiny array, and is worth running once just to fix Figure 3.6.1 in memory.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Make the five border policies tangible on one short row, then flag the
+# naming trap: NumPy's "reflect" is OpenCV's BORDER_REFLECT_101, while
+# NumPy's "symmetric" is OpenCV's BORDER_REFLECT (edge pixel doubled).
+import numpy as np
 
 row = np.array([10, 20, 30, 40, 50, 60])
 
@@ -134,7 +137,7 @@ print(np.pad(row, 3, mode="wrap"))       # [40 50 60 10 20 30 40 50 60 10 20 30]
 
 # Naming trap: np "reflect" == cv2.BORDER_REFLECT_101 (edge pixel NOT doubled)
 #              np "symmetric" == cv2.BORDER_REFLECT  (edge pixel doubled)</code></pre>
-<div class="code-caption">All five padding policies on one row of numbers, with exact printed outputs, plus the NumPy-to-OpenCV naming correspondence that regularly trips up engineers porting code between the two libraries.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> All five <code>np.pad</code> policies on one row of numbers, with exact printed outputs, plus the NumPy-to-OpenCV naming correspondence (<code>reflect</code> equals <code>BORDER_REFLECT_101</code>, <code>symmetric</code> equals <code>BORDER_REFLECT</code>) that regularly trips up engineers porting code between the two libraries.</div>
 
 <h2>2. Separability: The Free Order of Magnitude <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -151,7 +154,10 @@ For a $15 \times 15$ Gaussian that ratio is 7.5x; for the $31 \times 31$ kernels
 Linear algebra hands us both a test and a recipe. The outer product $v h^\top$ has rank 1, so <em>a kernel is separable exactly when its matrix rank is 1</em>, and the SVD both checks this and produces the factors:
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Test separability with the SVD: a kernel splits into a column-times-row
+# outer product exactly when its matrix rank is 1. The first singular
+# vectors give the factors; Sobel passes, the Laplacian is rejected.
+import numpy as np
 
 def separate_kernel(K, tol=1e-6):
     """If K is rank-1 (separable), return (v, h) with K = outer(v, h)."""
@@ -173,13 +179,16 @@ print(np.allclose(np.outer(v, h), sobel_x))       # True
 
 laplacian = np.array([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]])
 print(separate_kernel(laplacian))                  # None: rank 2, not separable</code></pre>
-<div class="code-caption">The SVD separability test: a rank-1 kernel factors into its first singular vectors, recovering Sobel's smoothing-times-derivative structure automatically, while the Laplacian is correctly rejected as inseparable.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The SVD separability test: a rank-1 kernel factors into its first singular vectors, recovering Sobel's smoothing-times-derivative structure automatically (<code>np.allclose</code> returns True), while the Laplacian is correctly rejected as inseparable (returns None).</div>
 
 <p>
 The payoff is measurable in three lines of timing. OpenCV exposes the two-pass path as <code>cv2.sepFilter2D</code>, and <code>cv2.GaussianBlur</code> uses it internally, which is why the library shortcut in <a href="section-3.2.html">Section 3.2</a> advertised separability as something you get without asking.
 </p>
 
-<pre><code class="language-python">import cv2, numpy as np, time
+<pre><code class="language-python"># Measure the separability payoff: time a full 31x31 Gaussian against the
+# two-pass separable form on a 1080p frame. The clock helper averages many
+# repetitions so the per-call milliseconds are stable enough to compare.
+import cv2, numpy as np, time
 
 img = np.random.rand(1080, 1920).astype(np.float32)   # one 1080p frame
 g = cv2.getGaussianKernel(31, 5.0)                     # 31-tap 1D Gaussian
@@ -196,7 +205,7 @@ print(f"full 2D: {t_full:.1f} ms   separable: {t_sep:.1f} ms   "
       f"speedup: {t_full / t_sep:.1f}x")
 # Representative output (4-core laptop):
 # full 2D: 38.4 ms   separable: 4.9 ms   speedup: 7.8x</code></pre>
-<div class="code-caption">Timing a $31 \times 31$ Gaussian on a 1080p frame: the two-pass separable implementation turns a frame-budget-breaking 38 ms into a comfortable 5 ms. The measured 7.8x sits below the theoretical 15.5x for two reasons explored later in this section: <code>filter2D</code> already switches to FFT convolution at this kernel size, and at these speeds memory traffic, not multiplication, sets the pace.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Timing a $31 \times 31$ Gaussian on a 1080p frame: the two-pass <code>cv2.sepFilter2D</code> turns a frame-budget-breaking 38 ms into a comfortable 5 ms. The measured 7.8x sits below the theoretical 15.5x for two reasons explored later in this section: <code>filter2D</code> already switches to FFT convolution at this kernel size, and at these speeds memory traffic, not multiplication, sets the pace.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Separability Is Why Gaussians Are Everywhere</div>
@@ -215,10 +224,10 @@ For an $N$-pixel image and a $k \times k$ kernel, the three families of convolut
 <tr><th scope="col">Kernel size</th><th scope="col">Direct: $N k^2$</th><th scope="col">Separable: $2 N k$</th><th scope="col">FFT: $\approx N \log_2 N \times 3$</th><th scope="col">Cheapest</th></tr>
 </thead>
 <tbody>
-<tr><td>$3 \times 3$</td><td>1.9 &#215; 10&#8313;</td><td>1.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable (or direct)</td></tr>
-<tr><td>$15 \times 15$</td><td>4.7 &#215; 10&#8313;</td><td>6.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable</td></tr>
-<tr><td>$31 \times 31$ (inseparable)</td><td>2.0 &#215; 10&#185;&#8304;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT</td></tr>
-<tr><td>$101 \times 101$ (inseparable)</td><td>2.1 &#215; 10&#185;&#185;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT, decisively</td></tr>
+<tr><td>$3 \times 3$</td><td>1.9 &#215; 10&#8311;</td><td>1.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable (or direct)</td></tr>
+<tr><td>$15 \times 15$</td><td>4.7 &#215; 10&#8312;</td><td>6.2 &#215; 10&#8311;</td><td>1.3 &#215; 10&#8312;</td><td>Separable</td></tr>
+<tr><td>$31 \times 31$ (inseparable)</td><td>2.0 &#215; 10&#8313;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT</td></tr>
+<tr><td>$101 \times 101$ (inseparable)</td><td>2.1 &#215; 10&#185;&#8304;</td><td>n/a</td><td>1.3 &#215; 10&#8312;</td><td>FFT, decisively</td></tr>
 </tbody>
 </table>
 
@@ -232,7 +241,7 @@ Read the last column as a decision procedure. Small kernels: direct convolution,
 Between the textbook loop and the datasheet speed sits a stack of engineering that is worth knowing even when you never write it, because its vocabulary surfaces in profiler output and framework documentation. Four layers do most of the work.
 </p>
 <p>
-<strong>Vectorization and threading.</strong> Libraries process 8 to 32 pixels per CPU instruction (SIMD) and split rows across cores: the baseline 100x over interpreted Python that <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>'s vectorization discussion promised. <strong>Integral images</strong> give the box filter (and through it, the guided filter of <a href="section-3.5.html">Section 3.5</a>) a constant cost per pixel at any radius: precompute running sums once, then any rectangle's sum is four lookups. <strong>im2col + GEMM</strong>: unroll every kernel-sized window into the row of a giant matrix, so convolution becomes one dense matrix multiply, the single most optimized routine in computing. This memory-hungry but blazingly regular formulation is how cuDNN and PyTorch execute the conv layers of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> on GPUs, alongside Winograd variants that trade additions for multiplications on $3 \times 3$ kernels. <strong>Downsample-filter-upsample</strong>: when a huge blur is the goal (backgrounds, bokeh), blur a quarter-resolution copy with a quarter-sized sigma and upsample; the error is invisible and the saving is 16x before any other trick, which is how phone "portrait mode" affords its giant background blurs.
+<strong>Vectorization and threading.</strong> Libraries process 8 to 32 pixels per CPU instruction (SIMD) and split rows across cores: the baseline 100x over interpreted Python that <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>'s vectorization discussion promised. <strong>Integral images</strong> give the box filter (and through it, the guided filter of <a href="section-3.5.html">Section 3.5</a>) a constant cost per pixel at any radius: precompute running sums once, then any rectangle's sum is four lookups. <strong>im2col plus GEMM</strong> (image-to-column unrolling followed by a general matrix multiply): unroll every kernel-sized window into the row of a giant matrix, so convolution becomes one dense matrix multiply, the single most optimized routine in computing. This memory-hungry but blazingly regular formulation is how cuDNN and PyTorch execute the conv layers of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> on GPUs, alongside Winograd variants that trade additions for multiplications on $3 \times 3$ kernels. <strong>Downsample-filter-upsample</strong>: when a huge blur is the goal (backgrounds, bokeh), blur a quarter-resolution copy with a quarter-sized sigma and upsample; the error is invisible and the saving is 16x before any other trick, which is how phone "portrait mode" affords its giant background blurs.
 </p>
 
 <div class="callout practical-example">

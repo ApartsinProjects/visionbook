@@ -53,7 +53,10 @@ The trilemma of <a href="section-30.5.html">Section 30.5</a> told you what to ca
 PSNR and SSIM, the metrics you learned in <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a>, both compare a candidate image against a specific reference image. That works for restoration, where you denoise or super-resolve a known target and ask how close you got. It is meaningless for generation, because a generated image has no reference: a model asked to produce "a face" can produce any of billions of valid faces, none of which is the right answer. There is no target to subtract. Even worse, a per-pixel comparison would punish a perfectly plausible generated face for not matching some arbitrary real face pixel for pixel, while rewarding a blurry average of many faces (which minimizes pixel error but looks terrible). The mismatch is fundamental, as the snippet below illustrates: two equally valid generated samples have a large pixel distance from each other, so pixel distance cannot be the score.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Show why pixel metrics cannot score generation: two equally valid faces are far
+# apart in pixel space (terrible PSNR), and the blurry average of many faces wins
+# on pixel error while looking like no real sample at all.
+import torch
 
 # Two equally valid "generated faces" (here, two different real samples stand in).
 face_a = torch.rand(3, 64, 64)
@@ -68,7 +71,7 @@ print(f"PSNR between two valid faces: {psnr:.1f} dB")   # PSNR between two valid
 mean_face = torch.stack([torch.rand(3, 64, 64) for _ in range(50)]).mean(0)
 print("mean-face std (lower = blurrier):", round(mean_face.std().item(), 3))
 # A low-variance, washed-out image "wins" on pixel error while looking nothing like a sample.</code></pre>
-<div class="code-caption">Why pixel metrics break for generation. Two equally valid faces score a terrible PSNR against each other because there is no shared reference, and the blurry pixel-wise average of many faces, which no one would accept as a sample, actually minimizes pixel error. Generation must be scored at the level of the distribution, not the individual pixel.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Why pixel metrics break for generation. The <code>psnr</code> between <code>face_a</code> and <code>face_b</code> is terrible (around 7 to 8 dB) because there is no shared reference, and the low-variance <code>mean_face</code>, which no one would accept as a sample, actually minimizes pixel error. Generation must be scored at the level of the distribution, not the individual pixel.</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Note</div>
@@ -130,7 +133,10 @@ $$\mathrm{FID} = \|\boldsymbol{\mu}_r - \boldsymbol{\mu}_g\|^2 + \operatorname{t
 Lower is better; FID is zero only when the two feature distributions have identical mean and covariance. The first term penalizes a shift in average content; the second penalizes a mismatch in spread and correlation, which is sensitive to both blur (collapses covariance) and mode collapse (shrinks the generated cloud). FID has been the default generative-image metric since 2017, and you will see it in nearly every paper in the rest of the part. The code below computes it from two sets of feature vectors, exactly the computation behind the libraries.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Compute FID directly from two clouds of feature vectors: model each as a Gaussian
+# and take the Frechet (Wasserstein-2) distance between them. The mean term catches a
+# content shift; the covariance term catches a mismatch in spread and correlation.
+import numpy as np
 from scipy import linalg
 
 def frechet_distance(feat_real, feat_gen):
@@ -151,7 +157,7 @@ close = rng.normal(0.1, 1, size=(2000, 64))           # slightly shifted: small 
 far   = rng.normal(2.0, 1.5, size=(2000, 64))         # shifted and wider: large FID
 print("FID (close):", round(frechet_distance(real, close), 2))   # FID (close): ~0.7
 print("FID (far):  ", round(frechet_distance(real, far), 2))     # FID (far):   ~150+</code></pre>
-<div class="code-caption">Computing FID from two clouds of feature vectors. The mean term captures a shift in average content; the covariance term, via the matrix square root, captures mismatch in spread and correlation. A generated cloud close to the real one scores near zero; one that is shifted and wrongly spread scores high. In practice the features come from Inception-v3, not random Gaussians, but the arithmetic is exactly this.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Computing FID from two clouds of feature vectors. In <code>frechet_distance</code>, the <code>diff @ diff</code> term captures a shift in average content while the trace term, built from the <code>linalg.sqrtm</code> matrix square root, captures mismatch in spread and correlation. The <code>close</code> cloud scores near zero against <code>real</code>; the shifted, wider <code>far</code> cloud scores high. In practice the features come from Inception-v3, not random Gaussians, but the arithmetic is exactly this.</div>
 
 <h2>4. Precision and Recall: Splitting Fidelity From Coverage <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
@@ -167,7 +173,10 @@ FID is a single number, which means it inherits the ambiguity of <a href="sectio
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: FID, IS, and KID in One Call</div>
 <p>The from-scratch FID above omits the Inception forward pass, the preprocessing, and numerical safeguards that real evaluation needs. The <code>torch-fidelity</code> library packages all of it, computing Inception Score, FID, and KID from two image folders in a single call:</p>
-<pre><code class="language-python">import torch_fidelity
+<pre><code class="language-python"># Production-grade evaluation in one call: point torch-fidelity at a folder of
+# generated images and a folder of real ones. It runs the Inception forward pass,
+# handles resizing and value ranges, and returns Inception Score, FID, and KID.
+import torch_fidelity
 
 metrics = torch_fidelity.calculate_metrics(
     input1="generated_images/",      # folder of generated samples
@@ -176,7 +185,7 @@ metrics = torch_fidelity.calculate_metrics(
     cuda=True,
 )
 print(metrics["frechet_inception_distance"])   # the FID, computed with proper Inception features</code></pre>
-<div class="code-caption">Inception Score, FID, and KID in one <code>torch-fidelity</code> call. Pointed at a folder of generated images and a folder of real ones, the library runs the Inception forward pass, handles resizing and value ranges, and computes all three metrics, the careful preprocessing the from-scratch <code>frechet_distance</code> deliberately omitted.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Inception Score, FID, and KID in one <code>torch_fidelity.calculate_metrics</code> call. Pointed at the <code>input1</code> folder of generated images and the <code>input2</code> folder of real ones with the <code>isc</code>, <code>fid</code>, and <code>kid</code> flags set, the library runs the Inception forward pass, handles resizing and value ranges, and computes all three metrics, the careful preprocessing the from-scratch <code>frechet_distance</code> deliberately omitted.</div>
 <p>What the from-scratch code only sketched, loading Inception-v3, extracting the correct feature layer, handling resizing and value ranges, and computing the matrix square root robustly, the library does correctly in one call, which is roughly a hundred lines of careful code you do not want to reimplement. The catch, discussed next, is that the result is only as trustworthy as the preprocessing the library standardizes.</p>
 </div>
 

@@ -74,7 +74,7 @@ Every architecture is summarized by four quantities, and confusing them is the m
 </div>
 
 <p>
-Read the table as a frontier, not a ranking. MobileNetV3-Small uses about seventy times fewer FLOPs than ConvNeXt-Base for thirteen fewer accuracy points, an excellent trade on a phone and a terrible one on a server with idle GPUs. The ResNet-50 row is bolded in your mind for a reason: it remains the field's reference point, well understood, widely supported, and with the modern weights of <a href="section-20.3.html">Section 20.3</a> still competitive. Figure 20.6.1 plots the frontier these rows trace.
+Read the table as a frontier, not a ranking. MobileNetV3-Small uses on the order of a couple hundred times fewer FLOPs than ConvNeXt-Base for about sixteen fewer accuracy points, an excellent trade on a phone and a terrible one on a server with idle GPUs. The ResNet-50 row is bolded in your mind for a reason: it remains the field's reference point, well understood, widely supported, and with the modern weights of <a href="section-20.3.html">Section 20.3</a> still competitive. Figure 20.6.1 plots the frontier these rows trace.
 </p>
 
 <figure class="diagram">
@@ -94,12 +94,12 @@ Read the table as a frontier, not a ranking. MobileNetV3-Small uses about sevent
 <text class="t5" x="365" y="305" text-anchor="middle">compute (GFLOPs, log scale) &#8594;</text>
 <!-- points: x by log flops, y by accuracy. acc 66->270, 84->30 -->
 <circle class="pt" cx="110" cy="247" r="6"/><text class="s5" x="118" y="240">MobileNetV3-S (67.7%)</text>
-<circle class="pt" cx="230" cy="120" r="6"/><text class="s5" x="160" y="108">EfficientNet-B0 (77.7%)</text>
-<circle class="pt" cx="430" cy="84" r="6"/><text class="s5" x="360" y="74">ResNet-50 (80.9%)</text>
-<circle class="pt" cx="450" cy="68" r="6"/><text class="s5" x="458" y="64">ConvNeXt-T (82.1%)</text>
-<circle class="pt" cx="600" cy="44" r="6"/><text class="s5" x="500" y="36">ConvNeXt-B (83.8%)</text>
-<circle class="dom" cx="430" cy="150" r="6"/><text class="s5" x="438" y="166" fill="#888">a dominated model</text>
-<path class="fr" d="M 110 247 Q 230 120 430 84 T 600 44"/>
+<circle class="pt" cx="230" cy="114" r="6"/><text class="s5" x="160" y="102">EfficientNet-B0 (77.7%)</text>
+<circle class="pt" cx="430" cy="71" r="6"/><text class="s5" x="360" y="61">ResNet-50 (80.9%)</text>
+<circle class="pt" cx="455" cy="55" r="6"/><text class="s5" x="463" y="51">ConvNeXt-T (82.1%)</text>
+<circle class="pt" cx="600" cy="33" r="6"/><text class="s5" x="500" y="25">ConvNeXt-B (83.8%)</text>
+<circle class="dom" cx="430" cy="145" r="6"/><text class="s5" x="438" y="161" fill="#888">a dominated model</text>
+<path class="fr" d="M 110 247 Q 230 114 430 71 T 600 33"/>
 <text class="s5" x="250" y="200" fill="#2f9e5c">efficient frontier</text>
 </svg>
 <figcaption><strong>Figure 20.6.1:</strong> The accuracy-versus-compute frontier. Models on the green frontier give the most accuracy for their compute; anything below and to the right (the gray point) is dominated, beaten on both axes by a frontier model. Architecture selection is choosing the frontier point that meets your accuracy bar at the lowest cost your budget allows.</figcaption>
@@ -111,7 +111,10 @@ Read the table as a frontier, not a ranking. MobileNetV3-Small uses about sevent
 In practice you do not implement any of this chapter's networks; you select one from a library and load pretrained weights. The <code>timm</code> library is the standard catalogue, with hundreds of backbones, benchmarked accuracy and throughput tables, and a one-line model factory. The workflow is: filter the catalogue to candidates that fit your cost budget, load each pretrained, measure latency on your hardware, and pick the cheapest that clears your accuracy target after fine-tuning.
 </p>
 
-<pre><code class="language-python">import timm, torch, time
+<pre><code class="language-python"># Benchmark candidate backbones on YOUR hardware, the number that actually
+# decides a deployment. Warm-up passes absorb one-time compile and allocation
+# costs so the timed loop reports steady-state latency, not first-call overhead.
+import timm, torch, time
 
 # 1. List candidate backbones by name pattern:
 candidates = ["mobilenetv3_large_100", "efficientnet_b0", "resnet50", "convnext_tiny"]
@@ -132,12 +135,19 @@ for name in candidates:
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     ms = (time.perf_counter() - t0) / 50 * 1000
     print(f"{name:24s} {n_params:6.1f}M params  {ms:6.2f} ms/image")</code></pre>
-<div class="code-caption">A backbone bake-off in one loop. The warm-up runs matter: the first forward pass pays one-time compilation and allocation costs, so timing it would badly overstate latency. This is how you turn the abstract frontier of Figure 20.6.1 into numbers for your actual deployment target.</div>
+<div class="code-output">mobilenetv3_large_100       5.5M params    6.41 ms/image
+efficientnet_b0             5.3M params    9.12 ms/image
+resnet50                   25.6M params   12.83 ms/image
+convnext_tiny              28.6M params   15.07 ms/image</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> A backbone bake-off in one loop, measuring <code>ms/image</code> over 50 timed forward passes after 5 warm-up runs. The warm-up runs matter: the first forward pass pays one-time compilation and allocation costs, so timing it would badly overstate latency. This is how you turn the abstract frontier of Figure 20.6.1 into numbers for your actual deployment target (the latencies shown are illustrative and vary by hardware).</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Re-Head a Backbone for Your Classes</div>
 <p>The single most common production task, taking an ImageNet backbone and adapting it to your own label set, is one argument in timm:</p>
-<pre><code class="language-python">import timm
+<pre><code class="language-python"># Adapt a pretrained ImageNet backbone to your own label set in one argument,
+# then freeze the trunk and unfreeze only the new head for linear probing. This
+# is the most common production task, done without manual layer surgery.
+import timm
 # Load a pretrained backbone but replace the 1000-class head with your own:
 model = timm.create_model("convnext_tiny", pretrained=True, num_classes=37)
 # timm swaps the classifier, keeps the pretrained trunk, ready to fine-tune.
@@ -145,6 +155,7 @@ model = timm.create_model("convnext_tiny", pretrained=True, num_classes=37)
 for p in model.parameters(): p.requires_grad = False
 for p in model.get_classifier().parameters(): p.requires_grad = True</code></pre>
 <p>The library handles re-initializing the head to the right output dimension, leaving the pretrained trunk intact, and exposing <code>get_classifier()</code> so you can freeze or train it. This replaces the error-prone manual surgery of locating the final linear layer and reshaping it, and it is the launching point for the transfer-learning workflow of <a href="../module-21-training-recipes/index.html">Chapter 21</a>.</p>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Re-heading a backbone for transfer learning with the single <code>num_classes=37</code> argument, then setting <code>requires_grad</code> to freeze the trunk and train only <code>get_classifier()</code> for linear probing. The library re-initializes the head and keeps the pretrained trunk intact internally, letting you choose linear probing or full fine-tuning rather than hand-locating the final linear layer.</div>
 </div>
 
 <h2>3. Transfer Learning Is the Default <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>

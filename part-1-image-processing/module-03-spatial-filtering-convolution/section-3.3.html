@@ -114,7 +114,10 @@ Two knobs control everything. The blur scale $\sigma$ (the "radius" slider in ph
 The implementation is three lines around a Gaussian blur, with one OpenCV idiom worth knowing: <code>cv2.addWeighted</code> computes $\beta_1 I_1 + \beta_2 I_2 + \gamma$ with saturation handling, so the whole formula $S = (1 + \alpha) I - \alpha (G_\sigma * I)$ fits in a single fused call.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Unsharp masking in two OpenCV calls: blur the image, then fuse
+# S = (1 + alpha) * img - alpha * blurred with addWeighted, which
+# saturates to [0, 255] and so avoids the uint8 subtraction wraparound bug.
+import cv2
 
 img = cv2.imread("cathedral.jpg")          # works per-channel on color too
 
@@ -128,7 +131,7 @@ sharp = cv2.addWeighted(img, 1 + alpha, blurred, -alpha, 0)
 cv2.imwrite("cathedral_sharp.jpg", sharp)
 # Visual check: edge transitions narrow from ~4 px to ~2 px;
 # flat sky regions are numerically unchanged (mask is ~0 there).</code></pre>
-<div class="code-caption">Unsharp masking in two OpenCV calls: a Gaussian blur and a fused weighted sum, with <code>addWeighted</code> handling the uint8 saturation that a naive NumPy subtraction would corrupt by wraparound.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Unsharp masking in two OpenCV calls: a <code>cv2.GaussianBlur</code> and a fused <code>cv2.addWeighted</code> sum with weights $1 + \alpha$ and $-\alpha$, where <code>addWeighted</code> handles the uint8 saturation that a naive NumPy subtraction would corrupt by wraparound.</div>
 
 <p>
 That saturation comment deserves a flag, because it is this section's most common bug in the wild. Computing <code>img - blurred</code> directly on uint8 arrays wraps negative values around to large positive ones (the dtype trap from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>), splattering bright garbage along every edge. Either use <code>addWeighted</code>, or cast to a signed or floating type before subtracting.
@@ -152,7 +155,10 @@ $$ \begin{bmatrix} 0 &amp; -1 &amp; 0 \\ -1 &amp; 5 &amp; -1 \\ 0 &amp; -1 &amp;
 The matrix being subtracted is the <strong>Laplacian</strong> kernel, the discrete second derivative that <a href="section-3.4.html">Section 3.4</a> studies in depth. Subtracting the second derivative steepens transitions; this identity, $S = I - \nabla^2 I$, is the differential-equation view of sharpening, and it explains why the sharpen kernel's weights sum to 1 (brightness preserved) while the Laplacian's sum to 0 (responds only to change). The center value 5 is not arbitrary: it is $1 + 4$, the identity plus the Laplacian's center magnitude. The identity is not just an aesthetic observation; it is checkable in four lines, and checking it is a worthwhile habit whenever two filter pipelines are claimed to be equivalent.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Verify the algebraic identity S = I - Laplacian: the center-5 sharpening
+# kernel applied in one pass must equal computing the Laplacian explicitly
+# and subtracting it. A zero max-difference confirms they are the same op.
+import cv2
 import numpy as np
 
 img = cv2.imread("cathedral.jpg", cv2.IMREAD_GRAYSCALE)
@@ -168,7 +174,7 @@ two_step = np.clip(img.astype(np.float32) - lap, 0, 255).astype(np.uint8)
 
 print(np.abs(one_pass.astype(int) - two_step.astype(int)).max())
 # Expected output: 0   (bit-identical: the kernel IS identity minus Laplacian)</code></pre>
-<div class="code-caption">Verifying the kernel identity numerically: the famous center-5 sharpening kernel applied in one <code>filter2D</code> pass produces a bit-identical result to explicitly computing the Laplacian and subtracting it from the image.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Verifying the kernel identity numerically: the famous center-5 sharpening kernel applied in one <code>cv2.filter2D</code> pass produces a bit-identical result (max difference 0) to explicitly computing <code>cv2.Laplacian</code> and subtracting it from the image.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Sharpening Creates No Information</div>
@@ -186,7 +192,7 @@ print(np.abs(one_pass.astype(int) - two_step.astype(int)).max())
 The overshoot that creates sharpness becomes a visible artifact the moment it outgrows the edge it decorates. Three failure modes account for nearly all sharpening complaints in production, and all three are predictable from the formula.
 </p>
 <p>
-<strong>Halos.</strong> The over/undershoot of Figure 3.3.1 extends roughly $\sigma$ pixels to each side of an edge. With a large radius and strong amount, dark objects against bright skies grow glowing white outlines, the signature of over-processed HDR landscapes. The fix is almost always a smaller $\sigma$, not a smaller $\alpha$: halo width is set by the radius.
+<strong>Halos.</strong> The over/undershoot of Figure 3.3.1 extends roughly $\sigma$ pixels to each side of an edge. With a large radius and strong amount, dark objects against bright skies grow glowing white outlines, the signature of over-processed high-dynamic-range (HDR) landscapes. The fix is almost always a smaller $\sigma$, not a smaller $\alpha$: halo width is set by the radius.
 </p>
 <p>
 <strong>Noise amplification.</strong> The mask $I - G_\sigma * I$ contains everything the blur removed, and <a href="section-3.2.html">Section 3.2</a> taught that high-frequency noise is the first thing any blur removes. Sharpening therefore amplifies noise preferentially, which is why camera pipelines denoise <em>before</em> sharpening, never after, and why sharpen sliders applied to high-ISO shots produce instant grain. Production implementations add a <strong>threshold</strong>: mask values with magnitude below a few gray levels are zeroed before the gain is applied, so smooth-region noise stays unamplified while real edges, whose mask values are large, pass through. The scikit-image and Photoshop implementations both expose this knob.

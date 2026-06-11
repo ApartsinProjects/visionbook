@@ -112,7 +112,10 @@ $$y = F(x, \{W_i\}) + x$$
 The term $+x$ is the <strong>identity shortcut</strong> (or skip connection): the input is carried forward, unchanged, by simple addition. Now learning the identity mapping is trivial, the optimizer just drives the weights of $F$ toward zero, which is easy. More generally, if the optimal function is close to the identity (as it often is once a network is deep enough), the block only has to learn a small perturbation, which is a far gentler optimization problem than learning the full mapping from scratch. The degradation problem evaporates: a residual network with hundreds of layers trains with lower error than its shallower counterpart, exactly the monotone improvement the plain network failed to deliver.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># The ResNet basic block: two 3x3 conv-BN layers whose output is added back
+# to the input. A 1x1 projection shortcut only appears when the block changes
+# spatial size or channel count, so the addition always has matching shapes.
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -138,8 +141,9 @@ class BasicBlock(nn.Module):
         return F.relu(out)             # ReLU AFTER the add, per the original design
 
 block = BasicBlock(64, 128, stride=2)
-print(block(torch.randn(1, 64, 56, 56)).shape)  # torch.Size([1, 128, 28, 28])</code></pre>
-<div class="code-caption">The ResNet basic block. The single line <code>out = out + self.shortcut(x)</code> is the residual connection; the $1 \times 1$ projection shortcut appears only when the block changes spatial size or channel count, matching the dimensions so the addition is valid.</div>
+print(block(torch.randn(1, 64, 56, 56)).shape)</code></pre>
+<div class="code-output">torch.Size([1, 128, 28, 28])</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The ResNet basic block. The single line <code>out = out + self.shortcut(x)</code> in <code>forward</code> is the residual connection; the $1 \times 1$ <code>self.shortcut</code> projection is created only when <code>stride != 1 or in_ch != out_ch</code>, matching the dimensions so the addition is valid. ReLU is applied after the add, keeping the skip path a clean identity.</div>
 
 <p>
 Two engineering details in the code matter. First, when a block changes the spatial size (stride $> 1$) or the channel count, the identity $x$ no longer matches the shape of $F(x)$, so a $1 \times 1$ convolution (the channel mixer of <a href="section-20.2.html">Section 20.2</a>) projects the shortcut to the right shape. Second, the ReLU is applied <em>after</em> the addition, so the skip path itself is a clean, unactivated identity. Both choices keep the shortcut as close to a pure identity as possible, which is what preserves gradient flow.
@@ -175,7 +179,10 @@ The crucial term is the $+1$. Even if $\partial F / \partial x$ becomes tiny, th
 For the deeper variants (ResNet-50, ResNet-101, ResNet-152), the basic two-convolution block becomes too expensive, so ResNet introduces the <strong>bottleneck block</strong>: a $1 \times 1$ convolution squeezes the channels down, a $3 \times 3$ convolution does the spatial work on the cheaper narrow representation, and a $1 \times 1$ convolution expands the channels back up. The $3 \times 3$ layer, the expensive one, now operates on one quarter of the channels, and the two $1 \times 1$ layers reshape cheaply, another reuse of the $1 \times 1$ bottleneck from Inception. The full ResNet is then a stem (a $7 \times 7$ convolution and a max-pool), four stages of these blocks at increasing channel counts, global average pooling, and a single linear classifier, the parameter-light head GoogLeNet pioneered.
 </p>
 
-<pre><code class="language-python">import torch.nn as nn
+<pre><code class="language-python"># The deep-ResNet bottleneck block factors the work into three steps: a 1x1
+# squeeze of the channels, a 3x3 spatial conv on the cheap narrow tensor, and
+# a 1x1 expand back up by 4x. The residual addition closes the block as before.
+import torch.nn as nn
 import torch.nn.functional as F
 
 class Bottleneck(nn.Module):
@@ -204,18 +211,23 @@ class Bottleneck(nn.Module):
         return F.relu(out + self.shortcut(x))
 
 # A ResNet-50 stacks [3, 4, 6, 3] of these blocks across four stages.
-print("expansion factor:", Bottleneck.expansion)  # 4</code></pre>
-<div class="code-caption">The bottleneck block of ResNet-50 and deeper. The $3 \times 3$ convolution works on the squeezed <code>mid_ch</code> channels, making depth affordable; the same residual addition closes the block.</div>
+print("expansion factor:", Bottleneck.expansion)</code></pre>
+<div class="code-output">expansion factor: 4</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The bottleneck block of ResNet-50 and deeper. The middle <code>conv2</code> does its $3 \times 3$ spatial work on the squeezed <code>mid_ch</code> channels while the two $1 \times 1$ layers reshape cheaply, and the <code>expansion = 4</code> factor sets how far <code>conv3</code> grows the channels back; the same residual addition closes the block.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: ResNet in One Line</div>
 <p>You will rarely hand-build a ResNet. torchvision and timm both ship the entire family with pretrained ImageNet weights, replacing the ~50 lines of block and stage assembly with one call:</p>
-<pre><code class="language-python">from torchvision.models import resnet50, ResNet50_Weights
+<pre><code class="language-python"># Load a full pretrained ResNet-50 with one call, two ways. The torchvision
+# IMAGENET1K_V2 weights bake in the modern training recipe; timm's num_classes
+# swaps the 1000-class head for your own label count in the same line.
+from torchvision.models import resnet50, ResNet50_Weights
 model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2).eval()  # 80.9% top-1
 # Or via timm, with hundreds of ResNet variants and recipes:
 import timm
 model = timm.create_model("resnet50", pretrained=True, num_classes=10)  # re-headed</code></pre>
 <p>The library handles the stem, the four-stage layout, the projection shortcuts, weight initialization, and the running batch-norm statistics. The <code>IMAGENET1K_V2</code> weights even bake in the modern training recipe of <a href="../module-21-training-recipes/index.html">Chapter 21</a>, the "ResNet strikes back" result, so you get a several-point accuracy boost over the original 2015 weights for free, and <code>timm</code>'s <code>num_classes</code> argument swaps the head for transfer learning in a single argument.</p>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The entire ResNet-50 in one line using torchvision or timm instead of the ~50 lines of <code>BasicBlock</code> and <code>Bottleneck</code> assembly above. The library handles the stem, four-stage layout, projection shortcuts, and batch-norm statistics internally; the <code>IMAGENET1K_V2</code> weights and timm's <code>num_classes=10</code> let you focus on the recipe and the new head rather than the block plumbing.</div>
 </div>
 
 <div class="callout practical-example">

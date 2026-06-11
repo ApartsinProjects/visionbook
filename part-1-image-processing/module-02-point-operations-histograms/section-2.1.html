@@ -118,7 +118,10 @@ $$g(x, y) = \alpha \cdot f(x, y) + \beta$$
 where $\alpha$ (the gain) controls contrast and $\beta$ (the bias) controls brightness. With $\alpha > 1$ the intensity range stretches and the image looks punchier; with $\alpha < 1$ it compresses and the image looks flat. Positive $\beta$ lifts everything toward white. The subtlety is not the formula but the arithmetic around it: the result $\alpha r + \beta$ routinely lands outside $[0, 255]$, and as we saw when discussing dtypes in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>, uint8 arithmetic wraps around rather than saturating. The from-scratch implementation below does it correctly: compute in float, clip, then convert back.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Affine point operation g = alpha*f + beta, done the safe way:
+# promote to float32 first so the intermediate cannot overflow,
+# clip to the displayable range, then convert back to uint8.
+import numpy as np
 import cv2
 
 img = cv2.imread("scene.jpg")          # uint8 BGR, shape (H, W, 3)
@@ -135,7 +138,7 @@ washed = adjust_brightness_contrast(img, alpha=0.6, beta=80)
 print(img[0, 0], "->", punchy[0, 0])
 # Example output for a pixel [200 180 90]:
 # [200 180 90] -> [240 214 97]   (the 200 channel hit 240 = 1.3*200 - 20)</code></pre>
-<div class="code-caption">A safe from-scratch brightness and contrast adjustment: float32 intermediate, explicit clip to [0, 255], then conversion back to uint8. Skipping the clip is the classic source of psychedelic wrap-around artifacts.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> A safe from-scratch brightness and contrast adjustment: <code>adjust_brightness_contrast</code> uses a float32 intermediate, an explicit clip to [0, 255], then conversion back to uint8. Skipping the clip is the classic source of psychedelic wrap-around artifacts, which is exactly why the spot-check prints the 200 channel landing at 240 rather than wrapping.</div>
 
 <p>
 The function above is six lines. OpenCV collapses it to one, and handles the saturation internally with optimized SIMD code. Whenever you see yourself writing the float-clip-convert dance for an affine adjustment, reach for the library instead.
@@ -166,7 +169,10 @@ $$s = r^{\gamma}$$
 With $\gamma < 1$ the curve bows upward and shadows brighten dramatically while highlights barely move (the red curve in Figure 2.1.1). With $\gamma > 1$ the curve bows downward and the image darkens, with midtones affected most (the orange curve). Because the endpoints 0 and 1 map to themselves, gamma never clips: it redistributes the tonal range instead of truncating it, which is exactly why it is preferred over a brightness shift for fixing exposure.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Gamma correction via a precomputed 256-entry lookup table:
+# evaluate s = r**gamma once for every possible uint8 input,
+# then let cv2.LUT remap millions of pixels with a single table read.
+import numpy as np
 import cv2
 
 def gamma_correct(img, gamma):
@@ -182,7 +188,7 @@ darker   = gamma_correct(img, gamma=2.0)   # gamma &gt; 1 deepens them
 # Spot-check the curve itself:
 print(int(255 * (50/255) ** 0.5))    # 112  : deep shadow 50 jumps to 112
 print(int(255 * (200/255) ** 0.5))   # 225  : highlight 200 moves only to 225</code></pre>
-<div class="code-caption">Gamma correction implemented as a lookup table: the curve is evaluated once for the 256 possible input values, then applied to millions of pixels with a single <code>cv2.LUT</code> call. The printed spot-checks show the signature behavior: shadows move a lot, highlights barely move.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Gamma correction implemented as a lookup table inside <code>gamma_correct</code>: the curve is evaluated once for the 256 possible input values, then applied to millions of pixels with a single <code>cv2.LUT</code> call. The printed spot-checks show the signature behavior: input 50 jumps to 112 while 200 only creeps to 225, so shadows move a lot and highlights barely move.</div>
 
 <p>
 Note what the code does: rather than computing <code>img ** gamma</code> over the whole array (millions of float power operations), it evaluates the curve at the 256 possible uint8 values and lets <code>cv2.LUT</code> do a table lookup per pixel. The spot-check printout confirms the asymmetry that makes gamma so useful: an input of 50 jumps to 112, while 200 only creeps to 225. If you work in PyTorch data pipelines, the equivalent is <code>torchvision.transforms.v2.functional.adjust_gamma</code>, and randomized gamma is a standard photometric augmentation we will meet again in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
@@ -206,10 +212,13 @@ Note what the code does: rather than computing <code>img ** gamma</code> over th
 <h2>4. Lookup Tables: Point Operations at Production Speed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-The gamma example quietly introduced the most important implementation idea of this section: for 8-bit data there are only 256 possible input values, so any point operation, however expensive its formula, costs exactly 256 function evaluations plus one table lookup per pixel. Better still, lookup tables compose. If you want to apply contrast, then gamma, then a tone tweak, you do not run three passes over the image; you compose the three curves into one table and run a single pass. This is precisely how camera ISPs, video pipelines, and color-grading systems work internally, and it is why colorists exchange ".cube" LUT files rather than scripts.
+The gamma example quietly introduced the most important implementation idea of this section: for 8-bit data there are only 256 possible input values, so any point operation, however expensive its formula, costs exactly 256 function evaluations plus one table lookup per pixel. That precomputed table of outputs is a lookup table (LUT), and we will use the acronym from here on. Better still, lookup tables compose. If you want to apply contrast, then gamma, then a tone tweak, you do not run three passes over the image; you compose the three curves into one table and run a single pass. This is precisely how camera ISPs, video pipelines, and color-grading systems work internally, and it is why colorists exchange ".cube" LUT files rather than scripts.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Compose a whole tone pipeline (contrast, brightness, gamma) into ONE
+# 256-entry table built before the video loop, so each frame costs a
+# single cv2.LUT pass no matter how many stages were folded in.
+import numpy as np
 import cv2
 
 def build_tone_lut(alpha=1.0, beta=0.0, gamma=1.0):
@@ -228,7 +237,7 @@ while True:
         break
     corrected = cv2.LUT(frame, lut)    # entire tone pipeline: one lookup pass
     # ... feed `corrected` to the detector ...</code></pre>
-<div class="code-caption">Composing an entire tone pipeline (contrast, brightness, gamma) into a single lookup table built once outside the video loop. Inside the loop, the whole adjustment is one <code>cv2.LUT</code> call per frame, regardless of how many stages were composed.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Composing an entire tone pipeline (contrast, brightness, gamma) into a single lookup table with <code>build_tone_lut</code>, built once outside the video loop. Inside the <code>cap.read()</code> loop the whole adjustment is one <code>cv2.LUT</code> call per frame, regardless of how many stages were composed, which is why the per-frame cost is independent of the number of curves.</div>
 
 <p>
 The pattern in this code, build the table once and reuse it for every frame, is worth internalizing. It converts per-pixel math into per-codebook math, and it scales to color: a 3D LUT tabulates a function of (R, G, B) jointly on a coarse lattice and interpolates between entries, which is how film looks and display calibration are implemented. Keep this in mind when you reach learned enhancement later: several state-of-the-art methods literally predict LUTs.
@@ -248,7 +257,10 @@ Everything so far required a human to pick $\alpha$, $\beta$, or $\gamma$. A fir
 $$g = 255 \cdot \frac{\mathrm{clip}(f,\, p_2,\, p_{98}) - p_2}{p_{98} - p_2}$$
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Pick the stretch endpoints automatically from the data: map the
+# low/high percentiles (not the raw min/max) to 0 and 255, so a single
+# dead pixel cannot dictate the contrast of the whole frame.
+import numpy as np
 
 def autocontrast(gray, low_pct=2, high_pct=98):
     """Percentile-based contrast stretch (robust to outlier pixels)."""
@@ -263,7 +275,7 @@ hazy = np.random.randint(90, 171, size=(480, 640), dtype=np.uint8)
 stretched = autocontrast(hazy)
 print(hazy.min(), hazy.max(), "->", stretched.min(), stretched.max())
 # 90 170 -> 0 255</code></pre>
-<div class="code-caption">Automatic contrast stretching driven by the 2nd and 98th percentiles of the intensity distribution. The synthetic hazy image occupies less than a third of the available range before stretching and the full range after.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> Automatic contrast stretching in <code>autocontrast</code>, driven by the 2nd and 98th percentiles of the intensity distribution rather than the raw extremes. The synthetic hazy image occupies less than a third of the available range before stretching and the full [0, 255] range after, as the printed <code>0 255</code> confirms.</div>
 
 <p>
 Notice what <code>autocontrast</code> needed in order to act: the percentiles of the intensity distribution. We computed them directly here, but the principled tool for describing that distribution is the histogram, and once you have a histogram you can do far more than stretch endpoints: you can diagnose exposure problems, compare images, and derive optimal contrast curves and thresholds. That is the subject of the next two sections, beginning with <a href="section-2.2.html">Section 2.2</a>.

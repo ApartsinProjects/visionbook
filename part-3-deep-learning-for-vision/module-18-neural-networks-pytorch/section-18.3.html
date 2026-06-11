@@ -47,7 +47,10 @@ The previous two sections were deliberately framework-free: the NumPy MLP and it
 <p>
 A PyTorch <code>Tensor</code> is a multi-dimensional array, much like a NumPy <code>ndarray</code>, with two superpowers: it can live on a GPU, and it can track the operations performed on it for automatic differentiation. Its anatomy is a shape, a dtype (usually <code>float32</code> for training), and a device (<code>cpu</code> or <code>cuda</code>). Tensors interoperate with NumPy almost transparently, which is why the transition from the last two sections is gentle. The code shows the essentials: creation, shape inspection, and the broadcasting rules that let a small tensor combine with a large one without explicit loops.
 </p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Tensor essentials: creation with a shape and dtype, broadcasting a small
+# bias across rows, the view-versus-reshape memory distinction, and the
+# zero-copy NumPy bridge that makes porting the earlier sections trivial.
+import torch
 
 x = torch.randn(4, 3)            # 4x3 tensor, float32 on CPU by default
 print(x.shape, x.dtype, x.device)   # torch.Size([4, 3]) torch.float32 cpu
@@ -66,7 +69,7 @@ print(flat.shape, img.shape)     # torch.Size([12]) torch.Size([2, 6])
 import numpy as np
 back = x.numpy(); again = torch.from_numpy(np.ones((2, 2), dtype=np.float32))
 print(type(back), again.shape)   # &lt;class 'numpy.ndarray'&gt; torch.Size([2, 2])</code></pre>
-<div class="code-caption">The tensor essentials: creation with a shape and dtype, broadcasting a bias across rows, the distinction between <code>view</code> (shares storage) and <code>reshape</code> (may copy), and the zero-copy NumPy bridge that makes porting earlier sections trivial.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The tensor essentials: <code>torch.randn</code> creates a float32 CPU tensor, a length-3 <code>bias</code> broadcasts across every row of the <code>(4, 3)</code> tensor, <code>view</code> shares storage while <code>reshape</code> may copy, and <code>.numpy()</code> / <code>torch.from_numpy</code> bridge to NumPy without copying. The printed shapes and dtypes verify each operation.</div>
 <p>
 Two subtleties bite beginners. First, the difference between an in-place operation (a trailing underscore, like <code>x.add_(1)</code>, which modifies <code>x</code>) and its out-of-place sibling (<code>x.add(1)</code>, which returns a new tensor); in-place ops save memory but can corrupt the graph autograd needs. Second, <code>view</code> requires contiguous memory and shares storage, while <code>reshape</code> falls back to a copy when it must, a distinction that matters when you flatten the spatial dimensions of an image tensor before a linear layer, as <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> will do constantly.
 </p>
@@ -74,7 +77,10 @@ Two subtleties bite beginners. First, the difference between an in-place operati
 <p>
 Set <code>requires_grad=True</code> on a tensor and PyTorch begins recording every operation that touches it into a dynamic computation graph, the same graph drawn in <a href="section-18.2.html">Figure 18.2.1</a>, built on the fly as your Python runs (this is called <em>define-by-run</em>). Calling <code>.backward()</code> on a scalar loss walks that graph in reverse, applying the chain rule node by node, and deposits the gradient of the loss with respect to each leaf tensor into its <code>.grad</code> attribute. The snippet reproduces the exact MLP backward pass we wrote out by hand in Section 18.2, now with autograd doing the six lines of derivative work for us.
 </p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Autograd reproduces Section 18.2's hand-written backward pass: we write only
+# the forward pass on leaf tensors that require grad, then a single
+# loss.backward() call computes every parameter gradient automatically.
+import torch
 
 torch.manual_seed(3)
 batch, d, H, C = 16, 20, 32, 4
@@ -97,7 +103,7 @@ loss = torch.nn.functional.cross_entropy(logits, y)
 loss.backward()                  # autograd computes EVERY gradient here
 print(round(loss.item(), 4), W1.grad.shape, W2.grad.shape)  # e.g. 1.4872 [32, 20] [4, 32]
 print(logits.grad_fn)            # &lt;AddBackward0 ...&gt; the recorded backward op</code></pre>
-<div class="code-caption">Autograd reproducing Section 18.2's hand-written backward pass: one <code>loss.backward()</code> call fills <code>W1.grad</code>, <code>W2.grad</code>, and the rest, and the <code>grad_fn</code> attribute reveals the recorded operation that autograd will invert.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Autograd reproducing Code Fragment 1 of Section 18.2 by hand: writing only the forward pass and one <code>loss.backward()</code> fills <code>W1.grad</code>, <code>W2.grad</code>, and the rest. The scale-then-<code>requires_grad_</code> ordering keeps each weight a leaf so its <code>.grad</code> is populated, and the printed <code>logits.grad_fn</code> reveals the recorded backward op.</div>
 <p>
 The <code>grad_fn</code> printed at the end is the breadcrumb autograd leaves on every tensor produced by a tracked operation; following the chain of <code>grad_fn</code> pointers from the loss backward is exactly the reverse traversal. When a gradient comes out as <code>None</code> or a backward pass throws, inspecting <code>grad_fn</code> is the first debugging move. Two control mechanisms are essential in practice: <code>with torch.no_grad():</code> disables graph recording (use it during validation and inference to save memory, since you will not call backward), and <code>tensor.detach()</code> returns a copy cut out of the graph (use it when you want a value but not its gradient history, for example when logging a metric).
 </p>
@@ -113,7 +119,10 @@ The <code>grad_fn</code> printed at the end is the breadcrumb autograd leaves on
 <p>
 Tracking loose <code>W1</code>, <code>b1</code>, <code>W2</code>, <code>b2</code> tensors does not scale. <code>nn.Module</code> is the container that solves this: you subclass it, declare your layers as attributes in <code>__init__</code>, and define the forward pass in <code>forward</code>. The module then automatically registers every parameter, so <code>model.parameters()</code> hands the whole list to your optimizer, <code>model.to(device)</code> moves them all to the GPU at once, and <code>model.state_dict()</code> serializes them for checkpointing (<a href="section-18.5.html">Section 18.5</a>). The code rebuilds the MLP as a proper module and confirms its parameter inventory.
 </p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># The MLP rebuilt as a proper nn.Module: layers declared as attributes are
+# auto-registered, so model.parameters() hands the whole list to an optimizer
+# and model.to(device) moves every weight at once. A forward pass confirms shapes.
+import torch
 import torch.nn as nn
 
 class MLP(nn.Module):
@@ -121,7 +130,7 @@ class MLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Flatten(),                 # (B, 1, 28, 28) -&gt; (B, 784)
-            nn.Linear(in_dim, hidden),    # He init applied automatically
+            nn.Linear(in_dim, hidden),    # default Kaiming-uniform init (a=sqrt(5))
             nn.ReLU(),
             nn.Linear(hidden, n_classes), # logits; no softmax here (CE does it)
         )
@@ -137,7 +146,7 @@ print(model.net[1].weight.shape, "params:", n_params)   # [128, 784] params: 101
 dummy = torch.randn(8, 1, 28, 28)
 out = model(dummy)
 print(out.shape)                                         # torch.Size([8, 10])</code></pre>
-<div class="code-caption">The MLP as an <code>nn.Module</code>: layers declared as attributes are auto-registered as parameters, <code>nn.Flatten</code> turns image tensors into vectors, and the final linear layer emits raw logits because the cross-entropy loss applies softmax internally.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The MLP as an <code>nn.Module</code>: layers declared inside <code>nn.Sequential</code> are auto-registered, so <code>sum(p.numel() ...)</code> reports the full 101,770-parameter count, <code>nn.Flatten</code> turns a <code>(8, 1, 28, 28)</code> image batch into vectors, and the final <code>nn.Linear</code> emits raw logits because cross-entropy applies softmax internally. The forward pass returns the expected <code>(8, 10)</code> logits.</div>
 <p>
 Two conventions in that code are non-negotiable house style. The final layer outputs raw <strong>logits</strong>, the learned-classifier descendant of the linear scorers that ended Part II's recognition pipelines in <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>, not probabilities, because <code>nn.CrossEntropyLoss</code> fuses the softmax and the log for numerical stability (applying softmax yourself and then cross-entropy is a classic double-softmax bug). And the model takes a 4D tensor <code>(batch, channels, height, width)</code>, the canonical PyTorch image layout, even though this MLP immediately flattens it; keeping that layout means the same data pipeline (<a href="section-18.4.html">Section 18.4</a>) feeds both this MLP and the CNNs of <a href="../module-19-convolutional-neural-networks/index.html">Chapter 19</a> unchanged. Figure 18.3.1 maps how the three abstractions fit together in a single training step.
 </p>

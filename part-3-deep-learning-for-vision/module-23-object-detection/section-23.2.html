@@ -50,7 +50,7 @@ In <a href="section-23.1.html">Section 23.1</a> we established that a detector m
 <h2>1. R-CNN: Region Proposals Meet Deep Features <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
 
 <p>
-The original R-CNN (Girshick et al., 2014) combined three off-the-shelf pieces. First, a class-agnostic region proposal algorithm called Selective Search generated roughly 2,000 candidate boxes per image by merging superpixels of similar color and texture, a purely classical grouping method in the spirit of the <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">classical segmentation</a> of Chapter 11. Second, each proposed region was cropped, warped to a fixed $224 \times 224$ size, and pushed through a CNN (an ImageNet-pretrained classifier, exactly the <a href="../module-21-training-recipes/index.html">transfer learning</a> idea of Chapter 21) to extract a feature vector. Third, a per-class linear support vector machine scored each feature vector, and a separate linear regressor refined the box coordinates.
+The original R-CNN (Girshick et al., 2014) combined three off-the-shelf pieces. First, a class-agnostic region proposal algorithm called Selective Search generated roughly 2,000 candidate boxes per image by merging superpixels of similar color and texture, a purely classical grouping method in the spirit of the <a href="../../part-2-classical-computer-vision/module-11-classical-segmentation/index.html">classical segmentation</a> of Chapter 11. Second, each proposed region was cropped, warped to the CNN's fixed input size ($227 \times 227$ for the AlexNet-style network the original used), and pushed through a CNN (an ImageNet-pretrained classifier, exactly the <a href="../module-21-training-recipes/index.html">transfer learning</a> idea of Chapter 21) to extract a feature vector. Third, a per-class linear support vector machine scored each feature vector, and a separate linear regressor refined the box coordinates.
 </p>
 
 <p>
@@ -122,11 +122,11 @@ The exponential on width and height guarantees a positive size and lets the netw
 </g>
 <rect class="acell" x="180" y="100" width="70" height="60"/>
 <circle cx="215" cy="130" r="3" fill="#d6802b"/>
-<rect class="aanc" x="190" y="115" width="50" height="30"/>
-<rect class="aanc" x="175" y="105" width="80" height="50"/>
-<rect class="aanc" x="160" y="90" width="110" height="80"/>
-<rect class="aanc2" x="200" y="100" width="30" height="60"/>
-<rect class="aanc3" x="170" y="120" width="90" height="20"/>
+<rect class="aanc" x="200" y="115" width="30" height="30"/>
+<rect class="aanc" x="190" y="105" width="50" height="50"/>
+<rect class="aanc" x="178" y="93" width="74" height="74"/>
+<rect class="aanc2" x="205" y="100" width="20" height="60"/>
+<rect class="aanc3" x="170" y="123" width="90" height="14"/>
 <text class="as" x="215" y="86" text-anchor="middle">one grid cell</text>
 <text class="al" x="420" y="100">At every feature-map cell, place</text>
 <text class="al" x="420" y="124">k anchors (here k = 9):</text>
@@ -191,7 +191,10 @@ The <strong>region proposal network</strong> (RPN) is a tiny convolutional head 
 Both stages produce many overlapping boxes per object, so both apply <strong>non-maximum suppression</strong> (NMS): sort boxes by score, keep the top box, discard every remaining box whose IoU with it exceeds a threshold (commonly $0.5$ to $0.7$), and repeat. NMS is the duplicate-killer that the evaluation rule of Section 23.1 demanded, and it is the one piece of every detector in this section and the next that is not learned. The from-scratch implementation below is worth reading, because removing this hand-tuned step is precisely what DETR achieves in <a href="section-23.5.html">Section 23.5</a>.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Greedy non-maximum suppression: repeatedly keep the highest-scoring box and
+# discard every remaining box that overlaps it more than iou_thresh.
+# This is the one hand-tuned, non-learned step in a classic detector.
+import torch
 
 def nms(boxes, scores, iou_thresh=0.5):
     """boxes: (N, 4) corner format. scores: (N,). Returns kept indices, by score."""
@@ -220,12 +223,15 @@ boxes = torch.tensor([[10, 10, 50, 50], [12, 11, 51, 49], [90, 90, 130, 130]],
 scores = torch.tensor([0.9, 0.8, 0.7])
 print(nms(boxes, scores, 0.5).tolist())   # [0, 2]  (box 1 suppressed as a duplicate of 0)
 </code></pre>
-<div class="code-caption">Non-maximum suppression from scratch. Box 1 strongly overlaps the higher-scoring box 0 and is removed; box 2 is far away and survives. Every two-stage and one-stage detector runs a step like this; only DETR avoids it.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Non-maximum suppression from scratch. The <code>nms</code> loop sorts by score, keeps the top box, and drops every remaining candidate whose IoU exceeds <code>iou_thresh</code>; box 1 overlaps the higher-scoring box 0 and is removed, while the distant box 2 survives. Every two-stage and one-stage detector runs a step like this; only DETR avoids it.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: A Pretrained Faster R-CNN in Five Lines</div>
 <p>You will rarely implement Faster R-CNN from scratch; torchvision ships it with COCO-pretrained weights and a fused, batched NMS. The whole detector, backbone, FPN, RPN, RoI Align, two-stage head, and NMS, is one call:</p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Load a COCO-pretrained Faster R-CNN from torchvision and run inference.
+# The single constructor pulls in the backbone, FPN, RPN, RoI Align, the
+# two-stage head, and a fused batched NMS; we just threshold the scores.
+import torch
 from torchvision.models.detection import (
     fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights)
 
@@ -239,6 +245,7 @@ with torch.no_grad():
 keep = out["scores"] > 0.5
 print(out["boxes"][keep].shape, out["labels"][keep].tolist())
 </code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The same two-stage detector in one constructor call using torchvision, including the NMS that Code Fragment 1 wrote by hand. The library handles anchor generation across FPN levels, proposal sampling, RoI Align, and batched class-wise NMS internally; <code>weights.transforms()</code> even carries the exact COCO preprocessing, letting you focus on thresholding the returned <code>boxes</code>, <code>labels</code>, and <code>scores</code>.</div>
 <p>Roughly 1,500 lines of detector code, plus the custom NMS above, collapse into one constructor. The library handles the anchor generation across FPN levels, the proposal sampling and balancing during training, RoI Align, the batched class-wise NMS, and the COCO label map. The <code>weights.transforms()</code> object even carries the exact preprocessing the model was trained with, so you cannot accidentally feed it the wrong normalization.</p>
 </div>
 

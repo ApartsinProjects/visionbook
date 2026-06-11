@@ -65,7 +65,10 @@ $$\mathcal{L}_{\text{Dice}} = 1 - \frac{2 \sum_i p_i g_i + \epsilon}{\sum_i p_i 
 Because Dice is a ratio of foreground quantities, it is insensitive to the number of background pixels; a tiny lesion contributes as much to the loss as a large organ. The <strong>Tversky loss</strong> generalizes Dice with two weights $\alpha$ and $\beta$ that trade off false positives against false negatives, useful when missing the object (a false negative) is costlier than over-segmenting (a false positive), as in medical screening. The <strong>focal loss</strong>, borrowed from detection, multiplies the cross-entropy of each pixel by $(1 - p_t)^\gamma$, where $p_t$ is the predicted probability of the true class, so confidently-correct easy pixels are down-weighted and the gradient concentrates on hard, often boundary or rare-class, pixels. In practice a <em>combination</em>, typically cross-entropy plus Dice, is the robust default, getting the stable gradients of cross-entropy and the imbalance-robustness of Dice. The code below implements Dice and focal so the mechanics are concrete.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Two imbalance-robust losses for dense prediction, implemented from scratch.
+# Dice optimizes class-wise overlap and is insensitive to background volume;
+# focal down-weights easy, confidently-correct pixels via a (1-pt)**gamma factor.
+import torch
 import torch.nn.functional as F
 
 def dice_loss(logits, targets, num_classes, eps=1.0):
@@ -87,7 +90,7 @@ logits  = torch.randn(2, 4, 32, 32, requires_grad=True)        # 4-class logits
 targets = torch.randint(0, 4, (2, 32, 32))
 combo = F.cross_entropy(logits, targets) + dice_loss(logits, targets, num_classes=4)
 print(f"CE+Dice: {combo.item():.3f}   focal: {focal_loss(logits, targets).item():.3f}")</code></pre>
-<div class="code-caption">Dice and focal losses for dense prediction. Dice optimizes class-wise overlap and ignores background volume; focal reweights toward hard pixels. The combined cross-entropy-plus-Dice objective on the last line is the robust default for imbalanced segmentation.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Dice and focal losses for dense prediction. <code>dice_loss</code> computes per-class intersection and area from softmax probabilities and returns one minus the mean Dice, ignoring background volume; <code>focal_loss</code> multiplies each pixel's cross-entropy by <code>(1 - pt) ** gamma</code> to reweight toward hard pixels. The combined <code>F.cross_entropy(...) + dice_loss(...)</code> objective on the last line is the robust default for imbalanced segmentation.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: The Loss Encodes What You Care About</div>
@@ -142,7 +145,10 @@ The all-background predictor scores IoU near zero on every foreground class, bec
 The IoU code below is the foundation of every semantic-segmentation evaluation, and it is the same overlap measure that powered the panoptic quality of <a href="section-24.3.html">Section 24.3</a> and the matching in <a href="../module-23-object-detection/index.html">detection from Chapter 23</a>. It accumulates per-class intersection and union across a whole dataset before dividing, which is the correct way (dataset-level), not averaging per-image IoUs.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Dataset-level mean IoU, the standard semantic-segmentation headline metric.
+# Per-class intersection and union are accumulated across every image and divided
+# once at the end; averaging per-image IoUs instead would over-weight tiny classes.
+import torch
 
 def update_iou_stats(pred, target, num_classes, inter, union, ignore=255):
     """Accumulate per-class intersection and union over a dataset.
@@ -165,7 +171,7 @@ inter, union = update_iou_stats(pred, target, num_classes, inter, union)
 per_class_iou = inter / union.clamp(min=1)                    # avoid divide-by-zero
 miou = per_class_iou[union > 0].mean()                        # average over present classes
 print(f"mean IoU: {miou.item():.3f}")</code></pre>
-<div class="code-caption">Dataset-level mean IoU. Intersection and union are accumulated per class across all images and divided once at the end; classes absent from the dataset are excluded from the average. Averaging per-image IoUs instead would over-weight images where a class occupies few pixels.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Dataset-level mean IoU. <code>update_iou_stats</code> accumulates per-class <code>inter</code> and <code>union</code> across all images (skipping the <code>ignore=255</code> pixels), and the final <code>per_class_iou[union &gt; 0].mean()</code> divides once at the end and excludes classes absent from the dataset. Averaging per-image IoUs instead would over-weight images where a class occupies few pixels.</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Fact</div>
@@ -230,7 +236,10 @@ Three traps catch nearly every first segmentation project. The first is reportin
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Losses and Metrics Off the Shelf</div>
 <p>Implement Dice and IoU once to understand them, then use battle-tested versions that handle the edge cases (empty classes, ignore indices, numerical stability) correctly:</p>
-<pre><code class="language-python"># Losses: segmentation_models.pytorch ships the whole family.
+<pre><code class="language-python"># Battle-tested losses and metrics instead of the hand-written versions above.
+# segmentation_models.pytorch ships the Dice, focal, and Tversky family, and
+# torchmetrics computes IoU with correct dataset-level accumulation built in.
+# Losses: segmentation_models.pytorch ships the whole family.
 from segmentation_models_pytorch.losses import DiceLoss, FocalLoss, TverskyLoss
 dice = DiceLoss(mode="multiclass")          # ignore_index, log-loss variants built in
 focal = FocalLoss(mode="multiclass", gamma=2.0)
@@ -241,7 +250,7 @@ miou_metric = MulticlassJaccardIndex(num_classes=21, ignore_index=255, average="
 # In the eval loop: miou_metric.update(preds, targets); then miou_metric.compute()
 
 # Panoptic quality, instance mask AP: use the COCO/panopticapi evaluators (Section 24.3).</code></pre>
-<div class="code-caption">Off-the-shelf losses and metrics: <code>segmentation_models.pytorch</code> ships the Dice, focal, and Tversky family, and <code>torchmetrics</code> computes mean and per-class IoU with correct dataset-level accumulation, ignore-index handling, and absent-class exclusion built in.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Off-the-shelf losses and metrics, replacing dozens of lines of careful loss and metric code. <code>segmentation_models.pytorch</code> ships <code>DiceLoss</code>, <code>FocalLoss</code>, and <code>TverskyLoss</code>, and <code>torchmetrics.MulticlassJaccardIndex</code> computes mean and per-class IoU with correct dataset-level accumulation, <code>ignore_index</code> handling, and absent-class exclusion built in.</div>
 <p>This replaces dozens of lines of careful loss and metric code, and crucially gets the corner cases right: torchmetrics accumulates IoU at the dataset level (the trap of subsection 3), handles the ignore index, and excludes absent classes from the mean, exactly as the hand-written version must but often does not. Reach for these in any real project.</p>
 </div>
 

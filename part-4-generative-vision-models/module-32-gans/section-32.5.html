@@ -50,7 +50,7 @@ The latent arithmetic of DCGAN in <a href="section-32.3.html">Section 32.3</a> h
 <h2>1. The Inversion Problem <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-Formally, given a fixed pretrained generator $G$ and a target image $\mathbf{x}$, inversion seeks a latent code $\mathbf{w}^{*}$ such that $G(\mathbf{w}^{*}) \approx \mathbf{x}$. The "approximately equal" is measured with a reconstruction loss that combines a pixel term and a <strong>perceptual</strong> term (the LPIPS distance, which compares deep features rather than raw pixels and is far closer to human judgment, a metric developed in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>):
+Formally, given a fixed pretrained generator $G$ and a target image $\mathbf{x}$, inversion seeks a latent code $\mathbf{w}^{*}$ such that $G(\mathbf{w}^{*}) \approx \mathbf{x}$. The "approximately equal" is measured with a reconstruction loss that combines a pixel term and a <strong>perceptual</strong> term (the Learned Perceptual Image Patch Similarity, or LPIPS, distance, which compares deep features rather than raw pixels and is far closer to human judgment, a metric developed in <a href="../module-37-evaluation-safety-data-engines/index.html">Chapter 37</a>):
 </p>
 
 <p>
@@ -65,7 +65,10 @@ There are two ways to solve this, and they trade speed against quality.
 <strong>Optimization-based inversion</strong> treats $\mathbf{w}$ as the variable and runs gradient descent on the loss above, with $G$ frozen. It is accurate but slow, hundreds to thousands of optimization steps per image, because every step is a full forward and backward pass through the generator. <strong>Encoder-based inversion</strong> trains a separate feed-forward network $E$ that maps an image directly to its latent in one pass, amortizing the optimization across a training set exactly as the VAE encoder of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> amortized inference. The pixel2style2pixel (pSp) encoder (Richardson et al., 2021) is the canonical example: a single forward pass yields a $W+$ code, milliseconds instead of minutes. The cost is accuracy, the encoder generalizes but rarely matches per-image optimization, so the best systems use the encoder for an instant initialization and a few optimization steps to refine.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Optimization-based GAN inversion: with the generator frozen, run gradient
+# descent on the latent w alone so that G(w) reconstructs a target image,
+# scoring the match with a pixel term plus the LPIPS perceptual distance.
+import torch
 import lpips   # pip install lpips; the standard perceptual metric
 
 def invert_image(G, target, w_init, steps=500, lr=0.05, device="cuda"):
@@ -78,7 +81,7 @@ def invert_image(G, target, w_init, steps=500, lr=0.05, device="cuda"):
         loss = (img - target).pow(2).mean() + perceptual(img, target).mean()
         opt.zero_grad(); loss.backward(); opt.step()    # gradient flows only into w
     return w.detach()</code></pre>
-<div class="code-caption">Optimization-based inversion against a frozen StyleGAN. The latent <code>w</code> is the only learnable tensor; the generator's weights never move. A learned encoder would replace this whole loop with one forward pass <code>w = E(target)</code>.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Optimization-based inversion against a frozen StyleGAN. The latent <code>w</code> is the only learnable tensor; the generator's weights never move. A learned encoder would replace this whole loop with one forward pass <code>w = E(target)</code>.</div>
 
 <h2>2. Which Space? Z, W, and W+ <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
@@ -119,14 +122,17 @@ For a StyleGAN, you can invert into three different spaces, and the choice domin
 <h2>3. Finding Semantic Directions</h2>
 
 <p>
-Once you can place a real image in latent space, editing reduces to finding the right direction to move. There are three families of methods. <strong>Supervised</strong> directions use attribute labels: train a linear classifier (for example "smiling versus not") on many latent-image pairs, and its normal vector is the editing direction, walk along it to add a smile. <strong>Unsupervised</strong> directions need no labels: GANSpace (Härkönen et al., 2020) runs PCA on a large sample of latent codes and finds that the top principal components correspond to interpretable changes (pose, lighting, gender), while SeFa factorizes the generator's first weight matrix to find directions in closed form. <strong>Conditional</strong> methods like StyleFlow learn nonlinear edits that respect attribute correlations.
+Once you can place a real image in latent space, editing reduces to finding the right direction to move. There are three families of methods. <strong>Supervised</strong> directions use attribute labels: train a linear classifier (for example "smiling versus not") on many latent-image pairs, and its normal vector is the editing direction, walk along it to add a smile. <strong>Unsupervised</strong> directions need no labels: GANSpace (Härkönen et al., 2020) runs principal component analysis (PCA) on a large sample of latent codes and finds that the top principal components correspond to interpretable changes (pose, lighting, gender), while SeFa factorizes the generator's first weight matrix to find directions in closed form. <strong>Conditional</strong> methods like StyleFlow learn nonlinear edits that respect attribute correlations.
 </p>
 
 <p>
 The supervised recipe is short enough to read in full. Collect a sample of latent codes, generate each image, label it with an off-the-shelf attribute classifier, fit a linear separator in latent space, and use its weight vector as the edit.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Supervised editing direction: fit a linear SVM that separates "smiling"
+# from "not smiling" latent codes in W space; its normal vector is the
+# direction to walk for more or less of the attribute.
+import numpy as np
 from sklearn.svm import LinearSVC
 
 def smile_direction(latents, attribute_scores):
@@ -140,7 +146,7 @@ def smile_direction(latents, attribute_scores):
 # editing a real image: invert it, then walk along the direction
 # w_edited = w_inverted + alpha * torch.tensor(smile_dir)   # alpha controls strength
 # G.synthesis(w_edited) now shows the same person, smiling</code></pre>
-<div class="code-caption">Discovering a supervised editing direction. A linear SVM separates "smiling" from "not smiling" latent codes; its normal vector is the direction to walk for more or less smile. Adding $\alpha$ times this vector to an inverted real image's code edits that real image.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Discovering a supervised editing direction. A linear support vector machine (SVM) separates "smiling" from "not smiling" latent codes; its normal vector is the direction to walk for more or less smile. Adding $\alpha$ times this vector to an inverted real image's code edits that real image.</div>
 
 <p>
 The remarkable fact, and the reason this works at all, is that these directions are largely <strong>global and linear</strong>: the same "age" vector ages most faces, the same "pose" vector rotates most heads, because StyleGAN's $W$ space organized the factors of variation into roughly linear, disentangled axes. This is the editability that the entangled $Z$ space and, partly, the over-flexible $W+$ space lack.

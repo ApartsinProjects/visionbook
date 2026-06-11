@@ -140,7 +140,10 @@ $$W = W_0 + \frac{\alpha}{r}\,B A.$$
 Only $A$ and $B$ are trained; $W_0$ stays frozen. With $r$ as small as 4 to 16, the adapter has orders of magnitude fewer parameters than the full matrix, so the trained file is a few megabytes rather than gigabytes. $B$ is initialized to zero (the same start-at-identity trick as ControlNet's zero convolutions in <a href="section-35.1.html">Section 35.1</a>), so the model is unchanged at the start of training. The scalar $\alpha / r$ sets the adapter's strength. In diffusion models, LoRA is applied to the attention projection matrices, the same Q, K, V, O matrices you met in the <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">attention layers of Chapter 22</a>. The code trains and then loads a LoRA.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Load a trained subject LoRA into a frozen base model and render with it.
+# The LoRA is a tiny file of low-rank A/B matrices; loading patches the
+# attention projections, set_adapters scales each adapter's contribution.
+import torch
 from diffusers import StableDiffusionPipeline
 
 # --- Inference: load a trained subject LoRA into a base model. ---
@@ -149,14 +152,14 @@ pipe = StableDiffusionPipeline.from_pretrained(
 
 # A LoRA is a small file of A/B matrices; loading it patches the attention weights.
 pipe.load_lora_weights("my_dog_lora.safetensors", adapter_name="dog")
-pipe.set_adapters(["dog"], adapter_weights=[0.8])   # the alpha/r strength dial
+pipe.set_adapters(["dog"], adapter_weights=[0.8])   # inference-time strength multiplier
 
 image = pipe(
     "a photo of sks dog wearing a tiny astronaut helmet on the moon",
     num_inference_steps=30,
 ).images[0]
 image.save("astro_dog.png")</code></pre>
-<div class="code-caption">Loading and weighting a LoRA at inference. The <code>adapter_weights</code> value scales the low-rank correction $\alpha/r \cdot BA$; lowering it toward zero fades the personalization out, raising it past one over-applies the concept. The base model file is untouched on disk.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Loading and weighting a LoRA at inference. The <code>load_lora_weights</code> call patches the attention matrices from a small <code>.safetensors</code> file, and the <code>set_adapters([...], adapter_weights=[0.8])</code> value is an inference-time multiplier on the adapter's already-scaled correction $\alpha/r \cdot BA$; lowering it toward zero fades the personalization out, raising it past one over-applies the concept. The base model file is untouched on disk.</div>
 
 <p>
 Because a LoRA is just a small additive delta to specific matrices, it has two properties that make it the default. It is <strong>shareable</strong>: a few-megabyte file rather than a multi-gigabyte checkpoint. And it is <strong>composable</strong>: you can load several at once and blend them, which subsection 6 covers. The training script (diffusers ships <code>train_dreambooth_lora.py</code>) combines DreamBooth's prior-preservation idea with LoRA's low-rank parameterization, giving subject fidelity at a fraction of the storage.
@@ -224,14 +227,17 @@ The rule of thumb: start with LoRA. It gives most of DreamBooth's fidelity at a 
 The composability of LoRA is its quiet superpower and its quiet trap. Because each LoRA is an additive delta to the same matrices, you can load several at once: a subject LoRA for your character, a style LoRA for a watercolor look, and a detail LoRA for sharper textures. diffusers exposes this directly.
 </p>
 
-<pre><code class="language-python">pipe.load_lora_weights("character.safetensors", adapter_name="char")
+<pre><code class="language-python"># Load two LoRAs at once (a subject and a style) and blend them with
+# independent weights. Both add low-rank deltas into the same attention
+# matrices, so their effects superpose and can also interfere.
+pipe.load_lora_weights("character.safetensors", adapter_name="char")
 pipe.load_lora_weights("watercolor.safetensors", adapter_name="style")
 
 # Blend two adapters with per-adapter weights; they add into the same matrices.
 pipe.set_adapters(["char", "style"], adapter_weights=[0.9, 0.6])
 
 image = pipe("a portrait of sks person, painterly", num_inference_steps=30).images[0]</code></pre>
-<div class="code-caption">Stacking a subject and a style LoRA with independent weights. Because both add deltas to the same attention matrices, their effects superpose, but conflicting concepts can interfere; the weights are the knob you tune to keep one from overwhelming the other.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Stacking a subject and a style LoRA with independent weights. The <code>set_adapters(["char", "style"], adapter_weights=[0.9, 0.6])</code> call superposes both deltas on the same attention matrices, but conflicting concepts can interfere; the per-adapter weights are the knob you tune to keep the style from overwhelming the subject's identity.</div>
 
 <p>
 The trap is interference. Two LoRAs that touch the same matrices can fight: a strong style LoRA can wash out a subject's identity, or two subject LoRAs can blend into a chimera. The weights are the first line of defense, but for serious multi-concept work the field has developed merging methods (such as orthogonal or SVD-based merges) that combine adapters with less conflict than naive addition. The practical discipline is to tune one LoRA at a time, then add the next at a low weight and raise it until it just takes effect.

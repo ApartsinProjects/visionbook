@@ -104,7 +104,6 @@ What is the score, geometrically? At every point $\mathbf{x}$ in image space, th
 <line class="sarr" x1="400" y1="230" x2="445" y2="195"/>
 <line class="sarr" x1="580" y1="90" x2="535" y2="125"/>
 <line class="sarr" x1="580" y1="230" x2="535" y2="195"/>
-<line class="sarr" x1="350" y1="120" x2="350" y2="120"/>
 <!-- a Langevin trajectory from a noise start to mode B -->
 <circle class="spt" cx="630" cy="60" r="4"/>
 <text class="ss" x="640" y="56" >start (noise)</text>
@@ -128,13 +127,12 @@ $$J(\theta) = \mathbb{E}_{p_{\text{data}}(\mathbf{x})}\left[\tfrac{1}{2}\big\|\m
 The true density never appears; only expectations over the data (which we approximate with samples) and the model's own score and Jacobian trace remain. The trace term is expensive in high dimensions, which led to two practical variants: <strong>sliced score matching</strong> (project the Jacobian onto random directions) and, far more important for vision, <strong>denoising score matching</strong>. The denoising variant adds Gaussian noise of scale $\sigma$ to the data and trains the network to predict the score of the noised distribution, which has a beautifully simple closed form: the score of a Gaussian-noised point is proportional to the noise that was added. That equivalence, learning the score equals learning to denoise, is the exact bridge to diffusion, and it is worth stating in code.
 </p>
 
-<pre><code class="language-python">import torch
-import torch.nn as nn
-
-# Denoising score matching: add noise of scale sigma, predict the score.
+<pre><code class="language-python"># Denoising score matching: add noise of scale sigma, predict the score.
 # Key fact: for x_noisy = x + sigma * eps with eps ~ N(0, I),
 #   the score of the noised density is  -(x_noisy - x) / sigma^2 = -eps / sigma.
 # So a network that predicts the score is, up to scale, predicting the noise eps.
+import torch
+import torch.nn as nn
 
 def denoising_score_matching_loss(score_net, x, sigma):
     eps = torch.randn_like(x)                       # the noise we add
@@ -154,7 +152,7 @@ def net(x, sigma):                                  # concat sigma as a feature
 x = torch.randn(256, 2)                             # toy "data" batch
 loss = denoising_score_matching_loss(net, x, sigma=0.5)
 print("DSM loss:", round(loss.item(), 4))           # DSM loss: a positive scalar to minimize</code></pre>
-<div class="code-caption">Denoising score matching in code. Adding Gaussian noise of scale $\sigma$ gives the noised distribution a closed-form score, $-\boldsymbol{\epsilon}/\sigma$, so the training target is simply (a scaling of) the noise that was added. A network minimizing this loss learns the score, and predicting the score is the same task as predicting the noise. This is precisely the objective <a href="../module-33-diffusion-models/index.html">Chapter 33</a> trains a U-Net on, across many noise levels at once.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Denoising score matching in code. Inside <code>denoising_score_matching_loss</code>, adding <code>sigma * eps</code> gives the noised point a closed-form <code>target_score</code> of <code>-eps / sigma</code>, so the regression target is simply a scaling of the noise that was added. A network minimizing the squared error against that target learns the score, and predicting the score is the same task as predicting the noise. This is precisely the objective <a href="../module-33-diffusion-models/index.html">Chapter 33</a> trains a U-Net on, across many noise levels at once.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Learning to Denoise Is Learning the Score</div>
@@ -180,7 +178,10 @@ $$\mathbf{x}_{t+1} = \mathbf{x}_t + \tfrac{\eta}{2}\,\mathbf{s}_\theta(\mathbf{x
 The score term drags the sample toward high-density regions; the noise term keeps it from collapsing onto a single point and lets it explore. As the step size $\eta$ shrinks and the number of steps grows, the distribution of $\mathbf{x}_t$ provably converges to the true $p(\mathbf{x})$. Without the noise term this would be plain gradient ascent that piles every sample onto the nearest mode (no diversity); the noise is what makes it sample rather than optimize. The toy implementation below follows the score of a known two-mode density and shows the walk converging into the modes, exactly the red trajectory of Figure 30.4.1.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Turn a known score field into samples by Langevin dynamics: from broad noise,
+# repeatedly step uphill along the score and add a calibrated dose of Gaussian noise.
+# Use a 1-D two-Gaussian mixture so the true score has a closed form to follow.
+import torch
 
 # Known toy density: mixture of two Gaussians in 1-D, so we can write the true score.
 def true_score(x):
@@ -205,7 +206,7 @@ near_a = ((samples + 2).abs() < 0.6).float().mean()
 near_b = ((samples - 2).abs() < 0.6).float().mean()
 print(f"fraction near mode -2: {near_a:.2f}, near +2: {near_b:.2f}")
 # fraction near mode -2: ~0.49, near +2: ~0.49</code></pre>
-<div class="code-caption">Langevin sampling from a known two-mode density. Starting from broad noise, each step nudges samples uphill along the score and injects Gaussian noise; after a few hundred steps the samples have settled into the two modes in roughly equal proportion. The noise term is essential: remove it and every sample collapses onto whichever mode it started nearest, destroying diversity.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Langevin sampling from a known two-mode density. The <code>langevin</code> loop starts from broad noise and, each step, nudges samples uphill along <code>true_score</code> and injects <code>(eta ** 0.5) * noise</code>; after a few hundred steps the <code>near_a</code> and <code>near_b</code> fractions show the samples settled into the two modes in roughly equal proportion. The noise term is essential: remove it and every sample collapses onto whichever mode it started nearest, destroying diversity.</div>
 
 <p>
 One practical wrinkle drove the field forward. In high dimensions the score is poorly estimated far from the data (there is almost no training data out in the empty regions of pixel space), so naive Langevin sampling mixes badly. The fix, introduced by Song and Ermon in the Noise Conditional Score Network (2019), is to estimate the score at <em>many</em> noise levels and sample by <strong>annealed Langevin dynamics</strong>: start at a high noise level where the score is easy to estimate everywhere, then gradually anneal to low noise. That annealing across noise levels is, almost exactly, the reverse process of a diffusion model, which is why this section is the direct precursor to <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.
@@ -219,7 +220,10 @@ One practical wrinkle drove the field forward. In high dimensions the score is p
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Annealed Score Sampling as a Scheduler</div>
 <p>You will almost never hand-code annealed Langevin sampling in production. In <code>diffusers</code> the entire noise-level schedule and the score-following update are packaged as a scheduler object, and sampling is a short loop over timesteps:</p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Annealed score sampling, packaged. The scheduler bundles the noise-level
+# schedule, step size, and noise injection that the hand-written langevin loop
+# spelled out; sampling is a short loop over scheduler.timesteps (high to low noise).
+import torch
 from diffusers import UNet2DModel, DDPMScheduler
 
 model = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to("cuda")   # a trained score/noise net
@@ -230,7 +234,7 @@ x = torch.randn(4, 3, 32, 32, device="cuda")                               # sta
 for t in scheduler.timesteps:                                              # high noise -> low noise
     noise_pred = model(x, t).sample                                        # the learned score/noise
     x = scheduler.step(noise_pred, t, x).prev_sample                       # one annealed update</code></pre>
-<div class="code-caption">Annealed score sampling packaged as a <code>diffusers</code> scheduler. The loop over <code>scheduler.timesteps</code> walks from high noise to low noise; each <code>step</code> call performs one annealed-Langevin update, bundling the noise-level schedule, step size, and noise injection that the from-scratch <code>langevin</code> function spelled out by hand.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Annealed score sampling packaged as a <code>diffusers</code> scheduler. The loop over <code>scheduler.timesteps</code> walks from high noise to low noise; each <code>scheduler.step</code> call performs one annealed-Langevin update on the <code>model</code>'s predicted score, bundling the noise-level schedule, step size, and noise injection that the from-scratch <code>langevin</code> function spelled out by hand.</div>
 <p>The scheduler handles the noise-level schedule, the step sizes, and the noise injection, the entire annealed-Langevin machinery of this section, in one <code>step</code> call. Hand-rolling it correctly across a thousand levels is the multi-hundred-line task that <a href="../module-33-diffusion-models/index.html">Chapter 33</a> walks through; the from-scratch toy above exists so the <code>step</code> call is not a black box.</p>
 </div>
 

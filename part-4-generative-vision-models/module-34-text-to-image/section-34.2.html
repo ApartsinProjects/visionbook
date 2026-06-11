@@ -61,6 +61,7 @@ The architecture is a pipeline, and Figure 34.2.1 is the map. Text goes into the
 .cap{font-family:Georgia,serif;font-size:10.5px;fill:#5a626c;}
 .flow{stroke:#14385c;stroke-width:1.6;fill:none;marker-end:url(#a2);}
 .cond{stroke:#7a3b14;stroke-width:1.6;fill:none;marker-end:url(#a3);stroke-dasharray:5 3;}
+.loop{stroke:#14385c;stroke-width:1.6;fill:none;marker-end:url(#a2);}
 </style>
 <defs>
 <marker id="a2" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#14385c"/></marker>
@@ -88,16 +89,16 @@ The architecture is a pipeline, and Figure 34.2.1 is the map. Text goes into the
 <path class="cond" d="M140,52 C210,70 230,150 268,190"/>
 <text class="cap" x="150" y="120">conditioning seq</text>
 <path class="flow" d="M140,222 L268,222"/>
-<path class="flow" d="M355,160 C355,120 355,300 355,295" />
+<path class="loop" d="M295,280 C295,306 375,306 375,282"/>
 <path class="flow" d="M440,222 C490,222 500,202 538,202"/>
 <text class="cap" x="455" y="216">z&#8320;</text>
 <rect class="box" x="540" y="60" width="120" height="60"/>
 <text class="txt" x="566" y="86">output image</text>
 <text class="cap" x="556" y="104">512&#215;512 px</text>
 <path class="flow" d="M600,180 L600,122"/>
-<text class="cap" x="285" y="305">T denoising steps (loop)</text>
+<text class="cap" x="400" y="300">T denoising steps (loop)</text>
 </svg>
-<figcaption><strong>Figure 34.2.1:</strong> The Stable Diffusion pipeline. The frozen text encoder (Section 34.1) produces a conditioning sequence (brown dashed) that enters the U-Net through cross-attention. The denoiser iterates $T$ times in latent space, then the VAE decoder lifts the final latent $z_0$ to pixels. The pixel image is produced exactly once, at the end.</figcaption>
+<figcaption><strong>Figure 34.2.1:</strong> The Stable Diffusion pipeline. The frozen text encoder (Section 34.1) produces a conditioning sequence (brown dashed) that enters the U-Net (or its diffusion-transformer, DiT, successor of subsection 3.1) through cross-attention. The denoiser iterates $T$ times in latent space, then the VAE decoder lifts the final latent $z_0$ to pixels. The pixel image is produced exactly once, at the end.</figcaption>
 </figure>
 
 <h2>2. The Autoencoder: Compress, Then Decode <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
@@ -115,6 +116,9 @@ from diffusers import AutoencoderKL
 from diffusers.utils import load_image
 import torchvision.transforms.functional as TF
 
+# Encode an image to the compact latent the denoiser works in, then
+# decode it back, to make the eightfold-per-side compression concrete.
+# The scaling_factor moves between VAE space and the denoiser's variance.
 vae = AutoencoderKL.from_pretrained(
     "stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="vae").eval()
 
@@ -130,7 +134,7 @@ print("pixel input:", tuple(x.shape))        # (1, 3, 512, 512)
 print("latent code:", tuple(latent.shape))   # (1, 4, 64, 64)
 print("compression (elements):",
       x.numel() // latent.numel(), "x")</code></pre>
-<div class="code-caption">Encoding an image to a latent and decoding it back. The VAE compresses 786432 pixel values to 16384 latent values, the <code>48x</code> reduction reported by the last line. The <code>scaling_factor</code> rescales the latent to the variance the denoiser was trained on; the same factor is divided out before decoding.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Encoding an image to a latent and decoding it back. The VAE compresses 786432 pixel values to 16384 latent values, the <code>48x</code> reduction reported by the last line. The <code>scaling_factor</code> rescales the latent to the variance the denoiser was trained on; the same factor is divided out before decoding.</div>
 
 <p>
 The print confirms the shapes promised in subsection 1: a $(1, 4, 64, 64)$ latent is what the denoiser actually sees. Everything in the next two subsections happens in this compact space.
@@ -162,6 +166,9 @@ Each spatial location in the latent computes an attention distribution over the 
 <pre><code class="language-python">import torch, torch.nn.functional as F
 from torch import nn
 
+# Cross-attention is where text enters the denoiser: image-latent
+# positions form the queries, the text tokens form keys and values,
+# so every spatial cell pulls in a weighted blend of word vectors.
 class CrossAttention(nn.Module):
     """Image-latent queries attend to text keys/values (single head, for clarity)."""
     def __init__(self, img_dim, txt_dim, d):
@@ -183,7 +190,7 @@ latent_tokens = torch.randn(1, 64 * 64, 320)              # flattened 64x64 late
 text_ctx = torch.randn(1, 77, 768)                        # CLIP conditioning
 out, maps = ca(latent_tokens, text_ctx)
 print("output:", tuple(out.shape), "attention maps:", tuple(maps.shape))</code></pre>
-<div class="code-caption">A minimal cross-attention block. Queries come from the image latent and keys/values from the 77-token CLIP conditioning, so every one of the 4096 spatial positions attends over the prompt. The returned <code>maps</code> of shape <code>(1, 4096, 77)</code> are the per-word spatial attention that editing tools later manipulate. Expected output: <code>output: (1, 4096, 320) attention maps: (1, 4096, 77)</code>.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> A minimal cross-attention block. Queries come from the image latent and keys/values from the 77-token CLIP conditioning, so every one of the 4096 spatial positions attends over the prompt. The returned <code>maps</code> of shape <code>(1, 4096, 77)</code> are the per-word spatial attention that editing tools later manipulate. Expected output: <code>output: (1, 4096, 320) attention maps: (1, 4096, 77)</code>.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Self-Attention Mixes Pixels, Cross-Attention Injects Text</div>
@@ -209,6 +216,9 @@ from diffusers import (StableDiffusionPipeline, UNet2DConditionModel,
                        AutoencoderKL, DDIMScheduler)
 from transformers import CLIPTokenizer, CLIPTextModel
 
+# Run the three stations by hand instead of through a pipeline, so every
+# tensor that crosses a station boundary (encoder, U-Net loop, VAE) is
+# visible. This is the version to read when a generation misbehaves.
 device, dtype = "cuda", torch.float16
 repo = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 tok = CLIPTokenizer.from_pretrained(repo, subfolder="tokenizer")
@@ -244,7 +254,7 @@ for t in sched.timesteps:
 with torch.no_grad():
     img = vae.decode(z / vae.config.scaling_factor).sample
 print("final latent:", tuple(z.shape), "-> image:", tuple(img.shape))</code></pre>
-<div class="code-caption">A complete text-to-image generation with the three stations called explicitly. Step 1 embeds the prompt and an empty prompt; step 3 runs the denoising loop with classifier-free guidance (the conditional and unconditional noise predictions are blended); step 4 decodes once. Expected output: <code>final latent: (1, 4, 64, 64) -> image: (1, 3, 512, 512)</code>.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> A complete text-to-image generation with the three stations called explicitly. Step 1 embeds the prompt and an empty prompt; step 3 runs the denoising loop with classifier-free guidance (the conditional and unconditional noise predictions are blended); step 4 decodes once. Expected output: <code>final latent: (1, 4, 64, 64) -> image: (1, 3, 512, 512)</code>.</div>
 
 <p>
 That loop is the whole system. Every named product in <a href="section-34.3.html">Section 34.3</a> is a variation on it: a different encoder feeding <code>ctx</code>, a different denoiser computing <code>eps</code>, a different scheduler stepping <code>z</code>. The classifier-free guidance blend in step 3 is the prompt-strength control that <a href="section-34.5.html">Section 34.5</a> dissects.
@@ -255,14 +265,17 @@ That loop is the whole system. Every named product in <a href="section-34.3.html
 <p>
 The 40-line manual generation above is exactly what a pipeline call performs internally. Reach for the manual version only when you need an intermediate latent, a custom guidance schedule, or to inject something into cross-attention.
 </p>
-<pre><code class="language-python">from diffusers import StableDiffusionPipeline
+<pre><code class="language-python"># The same forty lines of manual generation, packed into one call:
+# the pipeline runs the encoder, the CFG-duplicated denoising loop,
+# the scaling factor, and the VAE decode internally.
+from diffusers import StableDiffusionPipeline
 import torch
 
 pipe = StableDiffusionPipeline.from_pretrained(
     "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
 image = pipe("a red fox sitting in fresh snow, sharp focus",
              num_inference_steps=30, guidance_scale=7.5).images[0]</code></pre>
-<div class="code-caption">The pipeline collapses encoder loading, the empty-prompt embedding, the CFG duplication, the full denoising loop, the scaling factor, and the VAE decode into one call. The manual version is for surgery; this is for everything else.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> The pipeline collapses encoder loading, the empty-prompt embedding, the classifier-free guidance (CFG) duplication, the full denoising loop, the scaling factor, and the VAE decode into one call. The manual version is for surgery; this is for everything else.</div>
 </div>
 
 <div class="callout practical-example">

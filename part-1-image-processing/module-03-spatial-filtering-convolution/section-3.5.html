@@ -108,7 +108,10 @@ where $W(x)$ sums the combined weights so they normalize to one at each pixel. T
 Parameter intuition: $\sigma_s$ plays the familiar Gaussian role (how far to look), while $\sigma_r$ defines what counts as "the same region" in gray levels. Set $\sigma_r$ well below the contrast of edges you must preserve and above the noise amplitude you must remove; the filter then lives in the comfortable gap between the two. As $\sigma_r \to \infty$ the veto never fires and the bilateral degenerates into the plain Gaussian; as $\sigma_r \to 0$ it refuses to average at all.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Contrast the bilateral filter against a plain Gaussian at matched spatial
+# scale. Laplacian variance serves as an edge-energy proxy: the bilateral
+# keeps far more of it, meaning edges survive while flat-region noise is gone.
+import cv2
 
 img = cv2.imread("portrait.jpg")
 
@@ -126,7 +129,7 @@ print(f"edge energy: bilateral {edges_b:.0f} vs gaussian {edges_g:.0f}")
 # edge energy: bilateral 142 vs gaussian 61
 # The bilateral result keeps over twice the Laplacian energy:
 # noise is gone from flat regions but the edges stayed sharp.</code></pre>
-<div class="code-caption">Bilateral versus Gaussian smoothing at matched spatial scale, scored by Laplacian variance as an edge-energy proxy: the bilateral output retains the edges that the plain Gaussian averages away.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Bilateral versus Gaussian smoothing at matched spatial scale, scored by Laplacian variance as an edge-energy proxy: <code>cv2.bilateralFilter</code> retains 142 units of edge energy against the Gaussian's 61, so the edges the plain Gaussian averages away survive.</div>
 
 <p>
 Two costs come with the magic. First, speed: weights must be recomputed at every pixel, so the naive bilateral is $O(k^2)$ per pixel with no separability rescue (fast approximations exist, and OpenCV's implementation is heavily optimized, but it remains far costlier than <code>GaussianBlur</code>). Second, a signature artifact: on smooth gradients punctuated by noise, the range veto can quantize the gradient into terraces, the <em>staircasing</em> or "cartoon" look, which heavy-handed beautify filters exhibit in the wild.
@@ -149,7 +152,10 @@ $$ a_k = \frac{\operatorname{cov}_{\omega_k}(G, I)}{\operatorname{var}_{\omega_k
 Where the guide is flat (variance far below $\epsilon$), $a_k \to 0$ and the filter outputs the local mean: full smoothing. Where the guide has a strong edge (variance far above $\epsilon$), $a_k \to 1$ and the output tracks the guide: the edge passes through intact. The regularizer $\epsilon$ thus plays exactly the role $\sigma_r^2$ plays for the bilateral: the variance threshold separating "texture to smooth" from "structure to keep". Every quantity in these formulas is a local mean, computable with box filters, and <a href="section-3.6.html">Section 3.6</a> shows box filters run in $O(1)$ per pixel regardless of radius. The punchline: <em>edge-preserving smoothing whose cost does not depend on the window size at all.</em>
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># The guided filter from scratch via box filters only: per-window it fits a
+# linear model q = a*G + b to the guide, where a -> 1 on edges (pass them
+# through) and a -> 0 on flat regions (collapse to the local mean).
+import cv2
 import numpy as np
 
 def box(x, r):
@@ -170,7 +176,7 @@ img = cv2.imread("portrait.jpg", cv2.IMREAD_GRAYSCALE)
 f = img.astype(np.float32) / 255.0
 out = guided_filter(f, f, r=8, eps=0.02)             # self-guided smoothing
 cv2.imwrite("portrait_guided.png", (out * 255).astype(np.uint8))</code></pre>
-<div class="code-caption">A complete guided filter in twelve lines of NumPy and box filters, following He et al.'s closed-form solution; the coefficient <code>a</code> rises toward 1 at strong guide edges, letting them pass while flat regions collapse to their local mean.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> A complete guided filter in twelve lines of NumPy and box filters, following He et al.'s closed-form solution; the coefficient <code>a</code> rises toward 1 at strong guide edges, letting them pass while flat regions collapse to their local mean.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: cv2.ximgproc.guidedFilter in Practice</div>
@@ -179,7 +185,7 @@ cv2.imwrite("portrait_guided.png", (out * 255).astype(np.uint8))</code></pre>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: The Guide Need Not Be the Input</div>
-<p>The guided filter's deepest feature hides in its signature: the image that supplies the edges (the guide) and the image being filtered can be <em>different images</em>. Filter a noisy no-flash photo guided by its sharp flash twin; smooth a depth map guided by its RGB image; feather a binary segmentation mask guided by the photograph it segments, the trick behind one-line alpha-matting cleanup. This cross-image structure transfer has no analogue among the filters of <a href="section-3.2.html">Section 3.2</a>, and it is why the guided filter, not the bilateral, became the workhorse of computational photography pipelines and the cost-volume filtering used in the stereo matching of <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a>.</p>
+<p>The guided filter's deepest feature hides in its signature: the image that supplies the edges (the guide) and the image being filtered can be <em>different images</em>. Filter a noisy no-flash photo guided by its sharp flash twin; smooth a depth map guided by its red-green-blue (RGB) image; feather a binary segmentation mask guided by the photograph it segments, the trick behind one-line alpha-matting cleanup. This cross-image structure transfer has no analogue among the filters of <a href="section-3.2.html">Section 3.2</a>, and it is why the guided filter, not the bilateral, became the workhorse of computational photography pipelines and the cost-volume filtering used in the stereo matching of <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a>.</p>
 </div>
 
 <h2>4. Choosing an Edge-Preserving Smoother <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
@@ -202,13 +208,13 @@ Table 3.5.1 places this section's filters alongside their <a href="section-3.2.h
 </table>
 
 <p>
-A second decision that arrives immediately in practice: what to do when the noise is too strong for one pass. Iterating the bilateral filter converges toward flat cartoon regions (sometimes desired for stylization, rarely for photography); the better-behaved route for serious denoising is the patch-based and learned methods of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>, which generalize "similar pixels" to "similar neighborhoods". A third option, anisotropic diffusion (Perona and Malik, 1990), reformulates edge-aware smoothing as a PDE that diffuses heat everywhere except across edges; it is historically important and conceptually elegant, but in production pipelines the one-shot guided filter almost always wins on predictability and speed.
+A second decision that arrives immediately in practice: what to do when the noise is too strong for one pass. Iterating the bilateral filter converges toward flat cartoon regions (sometimes desired for stylization, rarely for photography); the better-behaved route for serious denoising is the patch-based and learned methods of <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>, which generalize "similar pixels" to "similar neighborhoods". A third option, anisotropic diffusion (Perona and Malik, 1990), reformulates edge-aware smoothing as a partial differential equation (PDE) that diffuses heat everywhere except across edges; it is historically important and conceptually elegant, but in production pipelines the one-shot guided filter almost always wins on predictability and speed.
 </p>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Sixty Faces Per Second on a Phone</div>
 <p><strong>Who:</strong> The camera software team at a mid-tier Android phone manufacturer, building the "natural skin smoothing" feature for the front camera.</p>
-<p><strong>Situation:</strong> Marketing required real-time beautification in the viewfinder: every frame, 30 to 60 fps, on a power-constrained mobile SoC, with explicit instructions that the result must not look "plastic" (their previous generation's Gaussian-based smoother had been mocked in reviews for erasing eyebrows).</p>
+<p><strong>Situation:</strong> Marketing required real-time beautification in the viewfinder: every frame, 30 to 60 frames per second (fps), on a power-constrained mobile system-on-chip (SoC), with explicit instructions that the result must not look "plastic" (their previous generation's Gaussian-based smoother had been mocked in reviews for erasing eyebrows).</p>
 <p><strong>Problem:</strong> The obvious upgrade, a bilateral filter at the radius needed to smooth skin texture (about 15 pixels at sensor resolution), blew the frame budget by 4x on the target chip, and its staircasing produced flat, waxy cheeks under directional lighting.</p>
 <p><strong>Decision:</strong> Switch to a self-guided guided filter ($r = 16$, $\epsilon$ tuned per skin-tone luminance band), whose radius-independent cost fit the budget at full radius. Apply it only inside a face-skin mask, blend the smoothed base with 30 percent of the original detail layer back in (the base-plus-detail decomposition from <a href="section-3.3.html">Section 3.3</a>), and leave eyes, brows, and hair untouched via the mask.</p>
 <p><strong>Result:</strong> 5.8 ms per frame on the SoC's GPU (versus 23 ms for the bilateral), no staircasing, and the detail re-blend preserved enough pore texture that the review-site complaint did not recur.</p>

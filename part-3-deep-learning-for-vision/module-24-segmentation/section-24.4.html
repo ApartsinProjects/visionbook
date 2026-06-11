@@ -40,7 +40,7 @@
 
 <div class="callout big-picture">
 <div class="callout-title">Big Picture</div>
-<p><strong>Transformer segmenters reframe segmentation from "label every pixel of a grid" to "predict a set of masks, each with a class," and that reframing lets one architecture do semantic, instance, and panoptic segmentation at once.</strong> SegFormer shows the first half of the story: a hierarchical transformer encoder, the Swin-style pyramid from <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, paired with a decoder so simple it is just a few MLPs, beats the convolutional segmenters of <a href="section-24.1.html">Section 24.1</a> on accuracy and efficiency. Mask2Former completes the story: a transformer decoder where a fixed set of learnable queries each attend to the image and emit one mask plus one class label, with masked attention that focuses each query on its own region. The grid-labeling view and the mask-set view give the same pixels, but the mask-set view is what makes the architecture universal.</p>
+<p><strong>Transformer segmenters reframe segmentation from "label every pixel of a grid" to "predict a set of masks, each with a class," and that reframing lets one architecture do semantic, instance, and panoptic segmentation at once.</strong> SegFormer shows the first half of the story: a hierarchical transformer encoder, a multi-scale pyramid of the kind you met in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, paired with a decoder so simple it is just a few multilayer perceptrons (MLPs), beats the convolutional segmenters of <a href="section-24.1.html">Section 24.1</a> on accuracy and efficiency. Mask2Former completes the story: a transformer decoder where a fixed set of learnable queries each attend to the image and emit one mask plus one class label, with masked attention that focuses each query on its own region. The grid-labeling view and the mask-set view give the same pixels, but the mask-set view is what makes the architecture universal.</p>
 </div>
 
 <p>
@@ -50,7 +50,7 @@ The attention you built in <a href="../module-22-vision-transformers/index.html"
 <h2>1. SegFormer: Hierarchical Attention, Trivial Decoder <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-SegFormer (2021) makes two clean design choices. The encoder, called Mix Transformer or MiT, is a hierarchical vision transformer: like the Swin and pyramid transformers of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, it produces feature maps at four decreasing resolutions (1/4, 1/8, 1/16, 1/32 of the input), so the segmenter naturally has the multi-scale features that <a href="section-24.1.html">Section 24.1</a> worked so hard to recover. To keep attention affordable at high resolution it uses efficient (spatial-reduction) self-attention, and, notably, it drops positional embeddings entirely, using a small depthwise convolution inside the feed-forward block to inject position instead, which makes the model robust when the test resolution differs from training. The decoder is the surprise: it simply takes the four feature maps, passes each through one MLP to a common channel width, upsamples them all to 1/4 resolution, concatenates, fuses with one more MLP, and predicts the class logits. No heavy decoder, no dilated pyramids. Figure 24.4.1 shows the asymmetry.
+SegFormer (2021) makes two clean design choices. The encoder, called Mix Transformer or MiT, is a hierarchical vision transformer: like the pyramid transformers of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, it produces feature maps at four decreasing resolutions (1/4, 1/8, 1/16, 1/32 of the input), so the segmenter naturally has the multi-scale features that <a href="section-24.1.html">Section 24.1</a> worked so hard to recover. To keep attention affordable at high resolution it uses efficient (spatial-reduction) self-attention, and, notably, it drops positional embeddings entirely, using a small depthwise convolution inside the feed-forward block to inject position instead, which makes the model robust when the test resolution differs from training. The decoder is the surprise: it simply takes the four feature maps, passes each through one MLP to a common channel width, upsamples them all to 1/4 resolution, concatenates, fuses with one more MLP, and predicts the class logits. No heavy decoder, no dilated pyramids. Figure 24.4.1 shows the asymmetry.
 </p>
 
 <figure class="diagram">
@@ -157,7 +157,10 @@ where each query $i$ emits a soft mask $m_i$ and a probability distribution $p_i
 The code below sketches the mask-classification output and the dot-product between query embeddings and a per-pixel feature map that produces masks, the operational core that distinguishes this family from grid labeling.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># The mask-classification output that distinguishes Mask2Former from grid labeling.
+# Each of N learnable queries yields one class distribution and one mask, where the
+# mask is the dot product of a learned per-query kernel with every pixel embedding.
+import torch
 import torch.nn as nn
 
 class MaskHead(nn.Module):
@@ -182,7 +185,7 @@ head = MaskHead()
 cls, masks = head(torch.randn(2, 256, 64, 64),               # pixel features
                   torch.randn(2, 100, 256))                  # refined queries
 print(cls.shape, masks.shape)   # torch.Size([2, 100, 20]) torch.Size([2, 100, 64, 64])</code></pre>
-<div class="code-caption">The mask-classification head. Each of the 100 queries yields a class distribution and a mask formed as the dot product of its learned kernel with every pixel embedding. The output is a set of (class, mask) pairs, not a per-pixel label grid.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The mask-classification head, <code>MaskHead</code>. The <code>class_head</code> maps each of the 100 queries to a distribution over classes plus a "no object" slot, and the <code>torch.einsum("bqd,bdhw-&gt;bqhw", ...)</code> forms each mask as the dot product of a learned query kernel with every pixel embedding. The output <code>(2, 100, 20)</code> and <code>(2, 100, 64, 64)</code> is a set of (class, mask) pairs, not a per-pixel label grid.</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Fact</div>
@@ -196,7 +199,10 @@ The output shapes say it all: 100 candidate masks and 100 class distributions pe
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: SegFormer and Mask2Former in a Few Lines</div>
 <p>Both architectures are non-trivial to implement well, the MiT encoder and the masked-attention decoder each take hundreds of lines, but Hugging Face Transformers ships pretrained weights behind a uniform API:</p>
-<pre><code class="language-python">from transformers import (SegformerForSemanticSegmentation, SegformerImageProcessor,
+<pre><code class="language-python"># Load pretrained SegFormer and Mask2Former from Hugging Face in a few lines.
+# The processors handle resizing and normalization; the single Mask2Former
+# checkpoint exposes semantic, instance, and panoptic post-processors.
+from transformers import (SegformerForSemanticSegmentation, SegformerImageProcessor,
                           Mask2FormerForUniversalSegmentation, AutoImageProcessor)
 import torch
 from PIL import Image
@@ -214,13 +220,13 @@ m2f = Mask2FormerForUniversalSegmentation.from_pretrained(
 out = m2f(**m2f_proc(img, return_tensors="pt"))
 panoptic = m2f_proc.post_process_panoptic_segmentation(out, target_sizes=[(512, 512)])[0]
 print(panoptic["segmentation"].shape)                    # torch.Size([512, 512])</code></pre>
-<div class="code-caption">SegFormer and Mask2Former loaded from Hugging Face in a handful of lines: the processors handle resizing and normalization, and the single Mask2Former checkpoint exposes semantic, instance, and panoptic post-processors, one model serving all three task readouts.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> SegFormer and Mask2Former loaded from Hugging Face in a handful of lines, replacing the hundreds of lines the MiT encoder and masked-attention decoder would each take. The <code>SegformerImageProcessor</code> and <code>AutoImageProcessor</code> handle resizing and normalization, and <code>post_process_panoptic_segmentation</code> converts the single Mask2Former checkpoint's mask set into a clean <code>(512, 512)</code> panoptic map, one model serving all three task readouts.</div>
 <p>This loads state-of-the-art segmenters in a handful of lines, with the processor handling resizing, normalization, and, for Mask2Former, the conversion from the mask set of subsection 2 into a clean panoptic map. The same Mask2Former checkpoint exposes <code>post_process_instance_segmentation</code> and <code>post_process_semantic_segmentation</code>, one model, three task outputs, exactly as promised.</p>
 </div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Retiring Three Models for One</div>
-<p><strong>Who:</strong> a small computer-vision team serving a smart-city analytics product, 2024. <strong>Situation:</strong> they were running three separate networks in production: a DeepLab for road-and-sidewalk semantic maps, a Mask R-CNN for counting vehicles and pedestrians, and a hand-written merge script to produce the panoptic view the dashboard showed. <strong>Problem:</strong> three models meant three training pipelines, three sets of weights to keep in sync, and roughly triple the GPU memory at inference; the merge script was a recurring source of off-by-one bugs at the thing-stuff boundaries. <strong>Decision:</strong> they replaced all three with a single Mask2Former checkpoint, reasoning from the unification argument of subsection 2 that one mask-classification model could serve all three readouts. They validated that per-task accuracy (mean IoU for semantic, mask AP for instance, PQ for panoptic) was within a point of the three specialists. <strong>Result:</strong> inference memory dropped by about two-thirds, the merge script and its bugs were deleted, and a single fine-tuning run now updates all three products at once. <strong>Lesson:</strong> the mask-set reframing is not only an accuracy story; operationally, collapsing three models into one universal segmenter is often the bigger win, fewer pipelines, less memory, no glue code. The right abstraction pays its rent in maintenance.</p>
+<p><strong>Who:</strong> a small computer-vision team serving a smart-city analytics product, 2024. <strong>Situation:</strong> they were running three separate networks in production: a DeepLab for road-and-sidewalk semantic maps, a Mask R-CNN for counting vehicles and pedestrians, and a hand-written merge script to produce the panoptic view the dashboard showed. <strong>Problem:</strong> three models meant three training pipelines, three sets of weights to keep in sync, and roughly triple the GPU memory at inference; the merge script was a recurring source of off-by-one bugs at the thing-stuff boundaries. <strong>Decision:</strong> they replaced all three with a single Mask2Former checkpoint, reasoning from the unification argument of subsection 2 that one mask-classification model could serve all three readouts. They validated that per-task accuracy (mean IoU for semantic, mask average precision for instance, panoptic quality for panoptic) was within a point of the three specialists. <strong>Result:</strong> inference memory dropped by about two-thirds, the merge script and its bugs were deleted, and a single fine-tuning run now updates all three products at once. <strong>Lesson:</strong> the mask-set reframing is not only an accuracy story; operationally, collapsing three models into one universal segmenter is often the bigger win, fewer pipelines, less memory, no glue code. The right abstraction pays its rent in maintenance.</p>
 </div>
 
 <div class="callout research-frontier">

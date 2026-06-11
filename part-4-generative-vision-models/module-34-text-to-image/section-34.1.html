@@ -118,7 +118,9 @@ The mechanics are concrete. CLIP's text encoder is a transformer (<a href="../..
 <pre><code class="language-python">import torch
 from transformers import CLIPTokenizer, CLIPTextModel
 
-# Load the exact text encoder Stable Diffusion 1.5 uses, frozen.
+# Turn a prompt into conditioning vectors with the frozen CLIP text tower.
+# We read out both the per-token sequence (for cross-attention) and the
+# single pooled vector (for retrieval), so the difference is visible.
 name = "openai/clip-vit-large-patch14"
 tokenizer = CLIPTokenizer.from_pretrained(name)
 text_encoder = CLIPTextModel.from_pretrained(name).eval()
@@ -135,7 +137,7 @@ pooled = out.pooler_output           # whole-prompt: (1, 768)
 print("per-token conditioning:", seq.shape)
 print("pooled embedding:", pooled.shape)
 print("active (non-pad) tokens:", int(tokens.attention_mask.sum()))</code></pre>
-<div class="code-caption">Embedding a prompt with the frozen CLIP text encoder. The 77-token cap is CLIP's fixed context length; <code>last_hidden_state</code> is the per-token sequence that cross-attention consumes, while <code>pooler_output</code> is the single summary vector. Expected output: <code>per-token conditioning: torch.Size([1, 77, 768])</code>, <code>pooled embedding: torch.Size([1, 768])</code>, <code>active (non-pad) tokens: 17</code>.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Embedding a prompt with the frozen CLIP text encoder. The 77-token cap is CLIP's fixed context length; <code>last_hidden_state</code> is the per-token sequence that cross-attention consumes, while <code>pooler_output</code> is the single summary vector. Expected output: <code>per-token conditioning: torch.Size([1, 77, 768])</code>, <code>pooled embedding: torch.Size([1, 768])</code>, <code>active (non-pad) tokens: 17</code>.</div>
 
 <p>
 Two facts in that output drive real behavior. First, the 768-dimensional per-token sequence has a fixed length of 77; longer prompts are silently truncated, which is why an over-stuffed prompt loses its tail. Second, the encoder is in <code>eval</code> mode and wrapped in <code>no_grad</code>: in almost every text-to-image system the text encoder is <em>frozen</em>. The generator learns to interpret a fixed language representation rather than the language model learning to serve the generator. This separation is what lets you swap encoders, and it is the lever the next subsection pulls.
@@ -155,13 +157,15 @@ CLIP was trained for <em>matching</em>, not <em>understanding</em>. Its contrast
 </p>
 
 <p>
-The Imagen team made the influential observation that a large, frozen, text-only language-model encoder follows prompts better than a CLIP-scale encoder, even though it never saw an image during training. Their choice was T5-XXL, an encoder-decoder language model with 4.6 billion parameters whose pretraining on text taught it real compositional structure. The intuition is that prompt following is a language-understanding problem, and a model that spent its whole training budget on language understands language better than a model that split its budget between language and a contrastive matching task. Modern systems act on this: SD3 and FLUX feed the generator both CLIP embeddings (for their tight visual grounding) and T5 embeddings (for their compositional reach).
+The Imagen team made the influential observation that a large, frozen, text-only language-model encoder follows prompts better than a CLIP-scale encoder, even though it never saw an image during training. Their choice was the encoder of T5-XXL, an 11-billion-parameter encoder-decoder language model whose roughly 4.6-billion-parameter encoder stack, pretrained on text, taught it real compositional structure. The intuition is that prompt following is a language-understanding problem, and a model that spent its whole training budget on language understands language better than a model that split its budget between language and a contrastive matching task. Modern systems act on this: SD3 and FLUX feed the generator both CLIP embeddings (for their tight visual grounding) and T5 embeddings (for their compositional reach).
 </p>
 
 <pre><code class="language-python">from transformers import T5Tokenizer, T5EncoderModel
 import torch
 
-# T5 is text-only: an encoder-decoder LM repurposed as a conditioner.
+# Encode the same prompt with a text-only T5 encoder instead of CLIP.
+# T5 never saw an image during training, yet its language-model
+# pretraining preserves counts and word binding that CLIP loses.
 t5_name = "google/t5-v1_1-base"   # use t5-v1_1-xxl in production systems
 t5_tok = T5Tokenizer.from_pretrained(t5_name)
 t5_enc = T5EncoderModel.from_pretrained(t5_name).eval()
@@ -175,7 +179,7 @@ with torch.no_grad():
 print("T5 conditioning sequence:", t5_seq.shape)
 # Unlike CLIP's hard 77-token cap, T5 handles long prompts gracefully.
 print("token count:", t5_seq.shape[1])</code></pre>
-<div class="code-caption">Embedding the same prompt with a T5 encoder. T5 has no 77-token ceiling and its language-model pretraining gives a representation that preserves counts and binding far better than CLIP. Production systems use the much larger <code>t5-v1_1-xxl</code> variant.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Embedding the same prompt with a T5 encoder. T5 has no 77-token ceiling and its language-model pretraining gives a representation that preserves counts and binding far better than CLIP. Production systems use the much larger <code>t5-v1_1-xxl</code> variant.</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Fact</div>
@@ -194,6 +198,8 @@ Everything above runs automatically when you call a <code>diffusers</code> pipel
 <pre><code class="language-python">from diffusers import StableDiffusionPipeline
 import torch
 
+# The pipeline owns the tokenizer and frozen CLIP encoder internally,
+# so the manual embedding work above happens for you on a single call.
 pipe = StableDiffusionPipeline.from_pretrained(
     "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
 ).to("cuda")
@@ -201,7 +207,7 @@ pipe = StableDiffusionPipeline.from_pretrained(
 # One call does tokenize -> CLIP encode -> classifier-free duplication.
 image = pipe("a red car next to a blue house, golden hour").images[0]
 image.save("car_house.png")</code></pre>
-<div class="code-caption">The 15 lines of manual tokenizing and encoding above collapse to a single pipeline call. The library handles tokenization, the 77-token padding, the frozen encoder, and the classifier-free guidance duplication (the unconditional empty-prompt embedding) that Section 34.5 explains, then runs the full denoising loop.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The 15 lines of manual tokenizing and encoding above collapse to a single pipeline call. The library handles tokenization, the 77-token padding, the frozen encoder, and the classifier-free guidance duplication (the unconditional empty-prompt embedding) that Section 34.5 explains, then runs the full denoising loop.</div>
 </div>
 
 <h2>4. Inspecting What the Bridge Captures <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
@@ -214,6 +220,9 @@ Because CLIP places text and images in one space, you can probe its understandin
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
+# Use CLIP as a zero-shot probe: score one image against rival captions.
+# Because text and images share a space, the softmax over similarities
+# tells us whether CLIP even encodes the distinction we care about.
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").eval()
 proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
@@ -228,7 +237,10 @@ with torch.no_grad():
 probs = logits.softmax(dim=-1)[0]
 for cap, p in zip(captions, probs):
     print(f"{p:.2f}  {cap}")</code></pre>
-<div class="code-caption">Using CLIP as a zero-shot probe. The image is scored against three candidate captions; the softmax over similarities reveals what CLIP thinks the image depicts. If the color-swapped caption scores nearly as high as the correct one, CLIP did not bind colors to objects, a red flag for any prompt that depends on that binding.</div>
+<div class="code-output">0.71  a red car next to a blue house
+0.24  a blue car next to a red house
+0.05  an empty parking lot</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> Using CLIP as a zero-shot probe. The image is scored against three candidate captions with <code>logits_per_image</code>, and the softmax reveals what CLIP thinks the image depicts. If the color-swapped caption scores nearly as high as the correct one, CLIP did not bind colors to objects, a red flag for any prompt that depends on that binding.</div>
 
 <p>
 Run this on a generation and a color-swapped caption, and you often find the swapped caption uncomfortably close, the measurable footprint of CLIP's weak attribute binding from subsection 3. The probe turns a vague complaint ("the model ignored my colors") into a number you can act on.

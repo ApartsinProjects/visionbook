@@ -115,7 +115,10 @@ The previous sections built the theory in the order textbooks like: models, coor
 <p>
 Our scanner's "correspondence problem" is friendlier than Section 5.5's general matching: we know the object of interest is a quadrilateral that contrasts with the background. The classical detection recipe is blur, edge detection, and contour analysis. We downscale first, both for speed and because edge detectors behave more consistently at a standard working resolution; the crucial bookkeeping is to remember the scale factor, because the final warp must run on the <em>full-resolution</em> original. Detection can be lossy; rectification must not be.
 </p>
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Stage 1 of the scanner: locate the page as the largest convex
+# quadrilateral in a downscaled edge map, then scale its corners back to
+# full-resolution coordinates so the later warp loses no detail.
+import cv2
 import numpy as np
 
 PROC_HEIGHT = 600.0          # standard working height for detection
@@ -151,7 +154,10 @@ Each ingredient earns its place. The Gaussian blur (from <a href="../module-03-s
 <p>
 The contour hands us four corners in an arbitrary cyclic order, but <code>getPerspectiveTransform</code> pairs source to destination points <em>by index</em>: if our first destination corner is "top-left", the first source corner had better actually be the page's top-left. Feed the points in a rotated or reflected order and you get a perfectly valid homography to an upside-down or mirror-imaged page. The classic ordering trick uses two scalar functions of each corner $(x, y)$: the sum $x + y$ is smallest at the top-left and largest at the bottom-right; the difference $y - x$ is smallest at the top-right and largest at the bottom-left.
 </p>
-<pre><code class="language-python">def order_corners(pts):
+<pre><code class="language-python"># Stage 2: put the four detected corners into a canonical order so that
+# getPerspectiveTransform pairs them with the right destination corners.
+# The sum x+y and difference y-x identify each corner's role.
+def order_corners(pts):
     """pts: (4, 2) array in any order -&gt; [tl, tr, br, bl]."""
     s = pts.sum(axis=1)            # x + y
     d = np.diff(pts, axis=1)[:, 0] # y - x
@@ -166,7 +172,10 @@ The contour hands us four corners in an arbitrary cyclic order, but <code>getPer
 <p>
 What size should the flattened page be? We measure the quadrilateral's edges in the photo and take the maximum of opposite sides as the output width and height. This preserves as much resolution as the photo captured and gets the aspect ratio approximately right. Only approximately: perspective foreshortening means the photographed side lengths are not the true paper proportions. Recovering the <em>exact</em> aspect ratio of a rectangle from one perspective view is possible, but it requires the camera's focal length, which belongs to the calibration story of <a href="../../part-2-classical-computer-vision/module-12-camera-models-calibration/index.html">Chapter 12</a>. Production apps either do that or simply snap to known paper ratios (A4, Letter); we take the honest approximation.
 </p>
-<pre><code class="language-python">def rectify(image_bgr, quad):
+<pre><code class="language-python"># Stage 3: size the flat output from the quad's own side lengths, then
+# solve the exact 4-point homography and inverse-warp the page to a
+# rectangle. Four pairs pin down all eight homography parameters.
+def rectify(image_bgr, quad):
     """Warp the quadrilateral region into a flat, axis-aligned scan."""
     tl, tr, br, bl = order_corners(quad)
 
@@ -189,7 +198,10 @@ Pause on <code>getPerspectiveTransform</code> for a moment, because it closes a 
 <p>
 A geometric rectangle of a photo still looks like a photo: gray paper, uneven lighting, a shadow from your hand. The "scanned document" look is a thresholding problem, and the right tool is the adaptive thresholding of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>, which computes a local threshold per neighborhood and therefore shrugs off illumination gradients that destroy any single global threshold:
 </p>
-<pre><code class="language-python">def to_scan(image_bgr):
+<pre><code class="language-python"># Stage 4 plus the main program: adaptive thresholding gives the crisp
+# black-on-white scanner look despite uneven lighting, and the bottom
+# block chains detection, rectification, and binarization end to end.
+def to_scan(image_bgr):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.adaptiveThreshold(gray, 255,
                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -220,7 +232,10 @@ And that is the entire scanner: roughly one hundred lines including comments, no
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: imutils.four_point_transform</div>
 <p>Stages 2 and 3, corner ordering, output sizing, homography, and warp, are packaged in the <strong>imutils</strong> library as a single battle-tested call:</p>
-<pre><code class="language-python">from imutils.perspective import four_point_transform
+<pre><code class="language-python"># imutils folds corner ordering, output sizing, and the perspective warp
+# (our order_corners plus rectify) into a single tested call; detection
+# and binarization stay in your hands as the per-application stages.
+from imutils.perspective import four_point_transform
 flat = four_point_transform(image, quad.reshape(4, 2))
 </code></pre>
 <div class="code-caption"><strong>Code 5.6.5:</strong> Corner ordering, output sizing, and the perspective warp delegated to imutils in a single call.</div>
@@ -229,7 +244,7 @@ flat = four_point_transform(image, quad.reshape(4, 2))
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Receipts Are Not Rectangles</div>
 <p><strong>Who:</strong> An ML engineer at an expense-management startup whose app extracts totals from photographed receipts.</p>
-<p><strong>Situation:</strong> The OCR vendor's accuracy was excellent on flatbed scans but poor on user photos. The team inserted a scanner pipeline nearly identical to this section's in front of OCR.</p>
+<p><strong>Situation:</strong> The optical character recognition (OCR) vendor's accuracy was excellent on flatbed scans but poor on user photos. The team inserted a scanner pipeline nearly identical to this section's in front of OCR.</p>
 <p><strong>Problem:</strong> Accuracy improved overall but stayed bad for a stubborn 20 percent of receipts. Inspection of the failures showed thermal-paper receipts that had been crumpled and re-flattened, or were curling off the table: their edges were detected fine, but a homography assumes a <em>plane</em>, and these were cylinders and crumple surfaces. Text lines stayed bent after rectification, and the OCR's line segmentation broke.</p>
 <p><strong>Decision:</strong> Ship the homography scanner for the 80 percent it fixed (per-receipt OCR field accuracy rose from 71 to 89 percent in their evaluation), route low-confidence OCR outputs to manual review, and prototype a learned dewarping model for the curled cases rather than stretching the geometric model past its assumptions.</p>
 <p><strong>Result:</strong> Support tickets about wrong totals dropped sharply; the dewarping prototype (based on the document-restoration models in the callout below) later recovered half of the residual failures.</p>

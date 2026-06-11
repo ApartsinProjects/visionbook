@@ -95,7 +95,10 @@
 
 <p>The standard instrument for catching resamplers misbehaving is the <strong>zone plate</strong>: concentric rings whose frequency grows linearly with radius, sweeping from zero at the center to the Nyquist limit at the edge. Any aliasing shows up as ghostly secondary ring families blooming where no rings should be. The test costs five lines:</p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Build a zone plate (rings whose frequency grows with radius) and shrink it
+# three ways: bare decimation, OpenCV's INTER_AREA, and an explicit Gaussian
+# prefilter. Only the prefiltered routes remove unrepresentable detail first.
+import numpy as np
 import cv2
 
 N = 512
@@ -124,9 +127,12 @@ prefiltered = cv2.GaussianBlur(zone, (0, 0), sigmaX=sigma)[::factor, ::factor]
 
 <h2>3. Anti-Aliasing Done Right <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
-<p>The universal recipe is <strong>prefilter, then sample</strong>: reduce the image's bandwidth to fit the new sampling rate, then decimate. For a reduction by factor $s$, the new Nyquist limit is $1/s$ of the old one, so the prefilter must suppress everything above it; for the Gaussian prefilter of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, $\sigma \approx 0.5 s$ is a serviceable rule of thumb (scikit-image's resize uses the close cousin $\sigma = (s - 1)/2$ when its anti-aliasing is enabled). What trips teams up is that common APIs distribute this responsibility unevenly. In OpenCV, <code>INTER_AREA</code> averages over the source footprint and is the correct flag for shrinking, while <code>INTER_LINEAR</code> and <code>INTER_NEAREST</code> sample only a tiny neighborhood and alias badly at large reductions (they are interpolators, designed for <em>enlarging</em>, where the considerations are different and which <a href="../module-05-geometric-transformations/index.html">Chapter 5</a> treats in depth). In PyTorch, <code>F.interpolate</code> aliases by default and antialiasing is opt-in:</p>
+<p>The universal recipe is <strong>prefilter, then sample</strong>: reduce the image's bandwidth to fit the new sampling rate, then decimate. For a reduction by factor $s$, the new Nyquist limit is $1/s$ of the old one, so the prefilter must suppress everything above it; for the Gaussian prefilter of <a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>, $\sigma \approx 0.5 s$ is a serviceable rule of thumb (scikit-image's resize uses the close cousin $\sigma = (s - 1)/2$ when its anti-aliasing is enabled). What trips teams up is that common APIs distribute this responsibility unevenly. In OpenCV, <code>INTER_AREA</code> averages over the source footprint and is the correct flag for shrinking, while <code>INTER_LINEAR</code> and <code>INTER_NEAREST</code> sample only a tiny neighborhood and alias badly at large reductions (they are interpolators, designed for <em>enlarging</em>, where the considerations are different and which <a href="../module-05-geometric-transformations/index.html">Chapter 5</a> treats in depth). In PyTorch, <code>F.interpolate</code> aliases by default and anti-aliasing is opt-in:</p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Repeat the downsampling experiment inside PyTorch to show that antialiasing
+# is opt-in: F.interpolate aliases by default, and antialias=True is the entire
+# difference between fabricated ghost rings and a correctly bandlimited result.
+import torch
 import torch.nn.functional as F
 
 t = torch.from_numpy(zone)[None, None]                  # (1, 1, 512, 512)
@@ -143,8 +149,8 @@ aa    = F.interpolate(t, scale_factor=0.25, mode="bilinear", antialias=True)
 <p>A correct hand-rolled shrink (choose the prefilter, match its bandwidth to the factor, blur, decimate, handle borders and dtypes) is about 10 lines that must be re-tuned for every scale factor. The library form is one line:</p>
 <pre><code class="language-python">from torchvision.transforms import v2
 small = v2.Resize(128, antialias=True)(t)    # antialias defaults to True in v2</code></pre>
-<div class="code-caption"><strong>Code 4.4.3:</strong> A correct, antialiased shrink in one torchvision v2 call; the kernel support scales with the reduction factor automatically.</div>
-<p>A 10-to-1 reduction, and more importantly a guarantee: torchvision's v2 transforms enable antialiasing by default (the v1 generation did not, a frequent source of train-versus-deploy quality gaps), automatically widen the resampling kernel in proportion to the scale factor, and behave consistently on tensors and PIL images. Pillow's own <code>Image.resize</code> has performed proper supersampled filtering since version 2.7, which is one reason datasets preprocessed with PIL and models served with raw <code>F.interpolate</code> can disagree.</p>
+<div class="code-caption"><strong>Code 4.4.3:</strong> A correct, anti-aliased shrink in one torchvision v2 call; the kernel support scales with the reduction factor automatically.</div>
+<p>A 10-to-1 reduction, and more importantly a guarantee: torchvision's v2 transforms enable anti-aliasing by default (the v1 generation did not, a frequent source of train-versus-deploy quality gaps), automatically widen the resampling kernel in proportion to the scale factor, and behave consistently on tensors and PIL images. Pillow's own <code>Image.resize</code> has performed proper supersampled filtering since version 2.7, which is one reason datasets preprocessed with PIL and models served with raw <code>F.interpolate</code> can disagree.</p>
 </div>
 
 <div class="callout practical-example">
@@ -152,7 +158,7 @@ small = v2.Resize(128, antialias=True)(t)    # antialias defaults to True in v2<
 <p><strong>Who:</strong> A platform engineer on the image-pipeline team of a large fashion e-commerce marketplace.</p>
 <p><strong>Situation:</strong> Sellers upload product photos at 3000 to 6000 pixels; the pipeline generates 240-pixel thumbnails for listing grids. A GPU rewrite of the pipeline had quietly replaced PIL resizing with a plain bilinear <code>F.interpolate</code>.</p>
 <p><strong>Problem:</strong> Support tickets began arriving with the subject "my photo is corrupted": fine-knit sweaters, tweed jackets, and pleated skirts rendered with garish swirling color bands in thumbnails while looking perfect at full size. An A/B dashboard showed measurably lower click-through on affected categories. Nothing was "broken" in the code, and most product photos (smooth fabrics, plain backgrounds) looked fine, so the bug had passed review and canary alike.</p>
-<p><strong>Decision:</strong> The team diagnosed moir&#233; from unfiltered 12-to-25x downsampling, switched the resize to antialiased bicubic, and added a zone-plate image (Code 4.4.1) to the pipeline's CI suite with an assertion on ghost-ring energy after every resize backend change.</p>
+<p><strong>Decision:</strong> The team diagnosed moir&#233; from unfiltered 12-to-25x downsampling, switched the resize to anti-aliased bicubic, and added a zone-plate image (Code 4.4.1) to the pipeline's CI suite with an assertion on ghost-ring energy after every resize backend change.</p>
 <p><strong>Result:</strong> The artifacts disappeared, click-through on textured categories recovered to baseline within two weeks, and six months later the CI zone plate caught an identical regression when a new "fast preview" path shipped with nearest-neighbor sampling.</p>
 <p><strong>Lesson:</strong> Resizing is sampling, and sampling is a signal-processing operation with a correctness criterion, not a cosmetic choice among interpolation flags. Encode the criterion in a test, because this bug class is content-dependent and will sneak past human review again.</p>
 </div>
@@ -163,7 +169,7 @@ small = v2.Resize(128, antialias=True)(t)    # antialias defaults to True in v2<
 
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: The Alias-Free Program, 2023-2026</div>
-<p>Anti-aliasing has become an architectural design principle rather than a preprocessing detail. The torchvision v2 transforms (2023 onward) made antialiased resizing the framework default, closing a long-standing train-versus-serve mismatch. Alias-Free Convnets (CVPR 2023) showed certified shift-equivariant classification is achievable with polynomial activations and proper resampling. In generative video, the 2024-2025 wave of systems in the Sora lineage made temporal sampling artifacts a first-class evaluation concern: wagon-wheel rotation, flickering fine textures, and frame-rate-dependent motion are temporal aliasing by another name, and the same prefilter-before-sample reasoning, applied along the time axis, guides both their critique and their fixes. The through-line from a 1949 theorem to 2025 video models is unusually direct: any system that samples, in space or in time, owes Nyquist its due.</p>
+<p>Anti-aliasing has become an architectural design principle rather than a preprocessing detail. The torchvision v2 transforms (2023 onward) made anti-aliased resizing the framework default, closing a long-standing train-versus-serve mismatch. Alias-Free Convnets (CVPR 2023) showed certified shift-equivariant classification is achievable with polynomial activations and proper resampling. In generative video, the 2024-2025 wave of systems in the Sora lineage made temporal sampling artifacts a first-class evaluation concern: wagon-wheel rotation, flickering fine textures, and frame-rate-dependent motion are temporal aliasing by another name, and the same prefilter-before-sample reasoning, applied along the time axis, guides both their critique and their fixes. The through-line from a 1949 theorem to 2025 video models is unusually direct: any system that samples, in space or in time, owes Nyquist its due.</p>
 </div>
 
 <div class="callout exercise">

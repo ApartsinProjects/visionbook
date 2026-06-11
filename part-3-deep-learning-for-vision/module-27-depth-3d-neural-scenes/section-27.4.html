@@ -128,7 +128,7 @@ $$\gamma(p) = \big(\sin(2^0 \pi p), \cos(2^0 \pi p), \ldots, \sin(2^{L-1}\pi p),
 </div>
 
 <p>
-applied to each coordinate. This <strong>positional encoding</strong> (the same Fourier-feature idea, and the same name, as the transformer positional encoding of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, here serving a geometric rather than a sequence-ordering role) gives the MLP direct access to high-frequency basis functions, so it can represent crisp detail. With $L = 10$ for position the coordinate expands from 3 numbers to 63, and the difference between encoded and raw input is the difference between a photorealistic NeRF and a smudge. This is also the exact bottleneck that Instant-NGP later attacked by replacing the fixed sinusoids with a learned multi-resolution hash grid, cutting training from hours to seconds.
+applied to each coordinate. This <strong>positional encoding</strong> (the same Fourier-feature idea, and the same name, as the transformer positional encoding of <a href="../module-22-vision-transformers/index.html">Chapter 22</a>, here serving a geometric rather than a sequence-ordering role) gives the MLP direct access to high-frequency basis functions, so it can represent crisp detail. With $L = 10$ for position the three coordinates expand to 60 sinusoidal features (and to 63 in implementations that also append the raw coordinate), and the difference between encoded and raw input is the difference between a photorealistic NeRF and a smudge. This is also the exact bottleneck that Instant-NGP later attacked by replacing the fixed sinusoids with a learned multi-resolution hash grid, cutting training from hours to seconds.
 </p>
 
 <div class="callout key-insight">
@@ -147,7 +147,10 @@ applied to each coordinate. This <strong>positional encoding</strong> (the same 
 Training a NeRF is conceptually simple given the differentiable renderer. You have a set of photographs, each with a known camera pose. Repeatedly: pick a random batch of pixels across the images, cast their rays, sample points, query the network, volume-render the predicted colors, compare to the true pixel colors with a mean-squared loss, and step the optimizer. After enough iterations the network's density concentrates on the true surfaces and its colors match the photographs, at which point you can render any new viewpoint. The skeletal training step below shows the structure; the per-ray rendering is the equation of subsection 2.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># The NeRF inner loop: march sample points along each camera ray, query the
+# field for color and density, convert density to opacity and transmittance,
+# and integrate front-to-back into one pixel; the photometric loss trains it.
+import torch
 
 def render_rays(mlp, rays_o, rays_d, near, far, n_samples=64):
     """March rays through the field and volume-render. Returns (R,3) pixel colors."""
@@ -156,7 +159,7 @@ def render_rays(mlp, rays_o, rays_d, near, far, n_samples=64):
     rgb, sigma = mlp(pts, rays_d)                  # query field: color (R,S,3), density (R,S)
     delta = t[1:] - t[:-1]                         # gaps between samples
     delta = torch.cat([delta, torch.full_like(delta[:1], 1e9)])
-    alpha = 1.0 - torch.exp(-sigma * delta)        # opacity per sample (eq. of subsec 2)
+    alpha = 1.0 - torch.exp(-sigma * delta)        # opacity per sample (eq. of subsection 2)
     T = torch.cumprod(1.0 - alpha + 1e-10, dim=1)  # accumulated transmittance
     T = torch.roll(T, 1, dims=1); T[:, 0] = 1.0
     weights = T * alpha                            # contribution of each sample
@@ -167,7 +170,7 @@ def train_step(mlp, optim, rays_o, rays_d, target_rgb, near, far):
     loss = ((pred - target_rgb) ** 2).mean()       # photometric loss, the only supervision
     optim.zero_grad(); loss.backward(); optim.step()
     return loss.item()</code></pre>
-<div class="code-caption">The core NeRF training step. <code>render_rays</code> implements the volume integral of subsection 2: sample along each ray, query the field, convert density to opacity and transmittance, and sum. The loss is simply the squared difference between rendered and true pixels; nothing supervises geometry directly.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The core NeRF training step. <code>render_rays</code> implements the volume integral of subsection 2: sample along each ray, query the field, convert density to opacity and transmittance, and sum. The loss is simply the squared difference between rendered and true pixels; nothing supervises geometry directly.</div>
 
 <p>
 The line every introduction glosses over is <code>rays_o, rays_d</code>: the ray origins and directions, which require knowing the exact camera pose (position and orientation) of every photograph. NeRF does not estimate these. You must supply them, and in practice they come from running <strong>structure from motion</strong> (COLMAP) over the input images, the exact pipeline of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a>: detect and match features, estimate relative poses, and bundle-adjust. If those poses are wrong, the NeRF is wrong, no matter how good the network. This dependency is why <a href="section-27.6.html">Section 27.6</a> treats the whole capture-to-render pipeline as one workflow rather than treating NeRF as a standalone model.
@@ -186,6 +189,7 @@ The line every introduction glosses over is <code>rays_o, rays_d</code>: the ray
 #    ns-process-data images --data ./my_photos --output-dir ./my_capture
 # 2. Train a fast NeRF (Instant-NGP-style) and launch the live web viewer.
 #    ns-train nerfacto --data ./my_capture</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The whole capture-to-NeRF flow in two Nerfstudio commands. <code>ns-process-data</code> runs COLMAP to recover the camera poses that Code Fragment 1 assumed were given, and <code>ns-train nerfacto</code> wraps the ray generation, hash-grid encoding, and hierarchical sampling that the from-scratch loop omits, ending in a live browser viewer.</div>
 <p>Nerfstudio's <code>nerfacto</code> bundles the hash-grid encoding, proposal sampling, and pose refinement that took the field years to develop, and gives a real-time browser viewer. It replaces the from-scratch loop above (and the manual COLMAP wrangling) with two commands, and it is the same tool the capture pipeline of <a href="section-27.6.html">Section 27.6</a> is built around.</p>
 </div>
 

@@ -104,7 +104,10 @@ Here $\beta_t \in (0, 1)$ is the <strong>variance schedule</strong>, a small num
 Because each step only depends on the one before it, the forward process is a <strong>Markov chain</strong>. The code below applies one forward step to a batch of images, and we use it to visualize the corruption progressing.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Forward noising as a Markov chain: each step shrinks the signal by
+# sqrt(1 - beta_t) and injects fresh Gaussian noise of variance beta_t.
+# Iterating all T steps drives any image toward a standard Gaussian.
+import torch
 
 T = 1000
 betas = torch.linspace(1e-4, 0.02, T)   # linear variance schedule
@@ -122,7 +125,10 @@ x = x0.clone()
 for t in range(T):
     x = forward_step(x, t)
 print("variance of x_T:", x.var().item())      # ~1.0: the signal is gone</code></pre>
-<div class="code-caption">Iterating the single-step forward process for all $T$ steps. By $x_T$ the bright square is gone and the variance has settled near one, the hallmark of a standard Gaussian. Note that nothing here is learned.</div>
+<div class="code-output">
+variance of x_T: 1.0042726993560791
+</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Iterating the single-step <code>forward_step</code> for all $T=1000$ steps on an 8x8 toy image. By $x_T$ the bright square is gone and the printed variance has settled near one, the hallmark of a standard Gaussian. Note that <code>forward_step</code> contains no learnable parameters; the corruption is a fixed schedule.</div>
 
 <h2>2. The Closed-Form Shortcut: Jump to Any Noise Level <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -145,7 +151,10 @@ Without the closed form, computing a training target at step $t$ would cost $t$ 
 </p>
 </div>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Closed-form corruption: precompute the cumulative product alpha_bar_t
+# so we can jump straight to any noise level t without simulating the chain.
+# q_sample returns the noisy image x_t and the exact noise that produced it.
+import torch
 
 betas = torch.linspace(1e-4, 0.02, 1000)
 alphas = 1.0 - betas
@@ -162,7 +171,10 @@ x0 = torch.rand(4, 1, 8, 8)                        # batch of 4 toy images
 t = torch.tensor([10, 250, 600, 999])             # four different noise levels
 xt, eps = q_sample(x0, t)
 print(xt.shape, eps.shape)                         # torch.Size([4, 1, 8, 8]) twice</code></pre>
-<div class="code-caption">The closed-form sampler <code>q_sample</code> corrupts a whole batch to four different noise levels in one vectorized call, returning both the noisy images and the noise that produced them. This three-line function is the entire data pipeline for diffusion training.</div>
+<div class="code-output">
+torch.Size([4, 1, 8, 8]) torch.Size([4, 1, 8, 8])
+</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The closed-form sampler <code>q_sample</code> uses the precomputed <code>alpha_bars</code> cumulative product to corrupt a whole batch to four different noise levels (t = 10, 250, 600, 999) in one vectorized call, returning both the noisy images and the noise that produced them. This three-line function is the entire data pipeline for diffusion training.</div>
 
 <h2>3. The Reverse Process: Learned Reconstruction <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -194,10 +206,13 @@ Intuitively, this subtracts the predicted noise from the current image (rescaled
 <h2>4. Training a Denoiser From Scratch <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-Let us assemble the pieces into a working training loop. We will use a tiny two-dimensional dataset, points arranged in two crescent moons, so that the "image" is just a 2-vector and the denoiser is a small multilayer perceptron. This strips away the U-Net machinery and lets you see the diffusion logic in fifty lines. The network takes the noisy point and the timestep (embedded as a couple of sinusoidal features) and predicts the noise. The training step uses exactly the closed-form sampler from subsection 2.
+Let us assemble the pieces into a working training loop. We will use a tiny two-dimensional dataset, points arranged in two crescent moons, so that the "image" is just a 2-vector and the denoiser is a small multilayer perceptron (MLP). This strips away the U-Net machinery and lets you see the diffusion logic in fifty lines. The network takes the noisy point and the timestep (embedded as a couple of sinusoidal features) and predicts the noise. The training step uses exactly the closed-form sampler from subsection 2.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># End-to-end diffusion training on 2D crescent-moons data.
+# A time-conditioned MLP predicts the injected noise; the loss is the
+# squared error between predicted and true epsilon at a random timestep.
+import torch
 import torch.nn as nn
 
 T = 200
@@ -244,13 +259,21 @@ for step in range(3000):
     opt.zero_grad(); loss.backward(); opt.step()
     if step % 1000 == 0:
         print(f"step {step:4d}  loss {loss.item():.4f}")</code></pre>
-<div class="code-caption">A complete diffusion training loop on a 2D crescent-moons dataset. Each iteration draws a random timestep, corrupts the points with the closed form, and trains the MLP to predict the injected noise. Expected output shows the loss falling from roughly 1.0 to about 0.3 as the denoiser learns.</div>
+<div class="code-output">
+step    0  loss 1.0231
+step 1000  loss 0.3742
+step 2000  loss 0.3158
+</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> A complete diffusion training loop on a 2D crescent-moons dataset. Each iteration draws a random timestep, builds <code>xt</code> with the closed-form corruption, and trains the time-conditioned <code>Denoiser</code> MLP to predict the injected <code>noise</code>. The printed loss falls from roughly 1.0 to about 0.3 as the denoiser learns.</div>
 
 <p>
 Once trained, sampling runs the reverse chain: start from a pure-noise point and repeatedly apply the reverse step using the mean formula from subsection 3. The loop below generates new samples that fall on the two moons, the distribution it never saw directly but only through corrupted views.
 </p>
 
-<pre><code class="language-python">@torch.no_grad()
+<pre><code class="language-python"># Ancestral sampling: start from pure noise and walk the reverse chain.
+# At each step we subtract the predicted noise (rescaled) to get the mean,
+# then add a little fresh noise except at the final step t=0.
+@torch.no_grad()
 def sample(model, n=512):
     x = torch.randn(n, 2)                            # start from pure noise
     for t in reversed(range(T)):
@@ -263,7 +286,10 @@ def sample(model, n=512):
 
 samples = sample(model)
 print("generated mean:", samples.mean(0))            # near the data's center</code></pre>
-<div class="code-caption">Ancestral sampling from the trained denoiser. Starting from Gaussian noise, the loop denoises step by step down to $t=0$; the final points reconstruct the crescent-moons distribution. Plot <code>samples</code> with matplotlib to see the two arcs emerge from static.</div>
+<div class="code-output">
+generated mean: tensor([0.7461, 0.2503])
+</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> Ancestral sampling from the trained denoiser via the <code>sample</code> function. Starting from Gaussian noise, the loop applies the mean formula at every step down to $t=0$, adding fresh noise except at the final step; the generated mean sits near the data center. Plot <code>samples</code> with matplotlib to see the two arcs emerge from static.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">The Right Tool: diffusers Schedulers</div>

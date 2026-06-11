@@ -87,9 +87,9 @@ The heart of RAFT is the <strong>correlation volume</strong>. For every feature 
 .rgru{fill:#fbeef0;stroke:#c0392b;stroke-width:1.4;}
 .rflow{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
 .rar{stroke:#777;stroke-width:1.5;marker-end:url(#rah);fill:none;}
-.rloop{stroke:#c0392b;stroke-width:1.5;marker-end:url(#rah);fill:none;stroke-dasharray:4 3;}
+.rloop{stroke:#c0392b;stroke-width:1.5;marker-end:url(#rahr);fill:none;stroke-dasharray:4 3;}
 </style>
-<defs><marker id="rah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<defs><marker id="rah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker><marker id="rahr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#c0392b"/></marker></defs>
 <rect class="rin" x="20" y="50" width="70" height="40"/>
 <text class="rs" x="55" y="74" text-anchor="middle">frame 1</text>
 <rect class="rin" x="20" y="110" width="70" height="40"/>
@@ -111,7 +111,7 @@ The heart of RAFT is the <strong>correlation volume</strong>. For every feature 
 <rect class="rgru" x="382" y="120" width="100" height="60"/>
 <text class="rl" x="432" y="146" text-anchor="middle">GRU update</text>
 <text class="rs" x="432" y="164" text-anchor="middle">operator</text>
-<path class="rloop" d="M432,180 C432,225 332,225 300,180"/>
+<path class="rloop" d="M432,180 C432,235 282,235 282,132"/>
 <text class="rs" x="350" y="232" text-anchor="middle" fill="#c0392b">lookup correlation at current flow, refine</text>
 <line class="rar" x1="482" y1="150" x2="528" y2="150"/>
 <rect class="rflow" x="530" y="120" width="100" height="60"/>
@@ -146,12 +146,12 @@ f1 = torch.randn(1, 64, 32, 32)                   # 1/8-resolution features
 f2 = torch.randn(1, 64, 32, 32)
 vol = correlation_volume(f1, f2)
 print("correlation volume:", vol.shape)           # correlation volume: torch.Size([1, 32, 32, 32, 32])</code></pre>
-<div class="code-caption">The all-pairs correlation volume as one scaled matrix multiplication. Every pixel of frame one is dotted against every pixel of frame two, exactly the similarity computation behind attention, giving a 4D table the update operator queries. Computing it at one-eighth resolution keeps the $H^2 W^2$ size manageable.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The all-pairs <code>correlation_volume</code> as one scaled <code>torch.matmul</code>. Every pixel of frame one is dotted against every pixel of frame two and scaled by $\sqrt{D}$, exactly the similarity computation behind attention, giving a 4D table the update operator queries. Computing it at one-eighth resolution keeps the $H^2 W^2$ size manageable.</div>
 
 <h2>3. The Recurrent Update Operator <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-RAFT's third component is what makes it accurate. Rather than predicting flow in one shot, it starts from zero flow and applies a <strong>recurrent update operator</strong>, a convolutional GRU, that refines the estimate over a fixed number of iterations. At each step the operator does three things: it looks up the correlation volume at the pixels indicated by the current flow estimate (so it reads how well the current correspondence matches), it combines that lookup with context features from the first frame, and it predicts a residual update $\Delta f$ that is added to the current flow. Crucially, all iterations share weights, so the network learns a single update rule applied repeatedly, mimicking the iterations of a classical optimizer but with a learned step. The training loss supervises every intermediate flow, with later iterations weighted more, which teaches the operator to converge.
+RAFT's third component is what makes it accurate. Rather than predicting flow in one shot, it starts from zero flow and applies a <strong>recurrent update operator</strong>, a convolutional gated recurrent unit (GRU), that refines the estimate over a fixed number of iterations. At each step the operator does three things: it looks up the correlation volume at the pixels indicated by the current flow estimate (so it reads how well the current correspondence matches), it combines that lookup with context features from the first frame, and it predicts a residual update $\Delta f$ that is added to the current flow. Crucially, all iterations share weights, so the network learns a single update rule applied repeatedly, mimicking the iterations of a classical optimizer but with a learned step. The training loss supervises every intermediate flow, with later iterations weighted more, which teaches the operator to converge.
 </p>
 
 <p>
@@ -189,7 +189,7 @@ corr_lookup = torch.randn(1, 81, 32, 32)
 context = torch.randn(1, 128, 32, 32)
 h, flow = upd(h, flow, corr_lookup, context)
 print("refined flow:", flow.shape)                             # refined flow: torch.Size([1, 2, 32, 32])</code></pre>
-<div class="code-caption">One iteration of the RAFT update operator. It reads the correlation lookup around the current flow, mixes in context features, runs a GRU cell, and predicts a residual $(du, dv)$ that is added to the flow. The same weights are reused across all iterations, so the network learns one convergent update rule rather than a fixed-depth feed-forward predictor.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> One iteration of the RAFT update operator, <code>FlowUpdate</code>. It reads the <code>corr_lookup</code> around the current flow, mixes in <code>context</code> features, runs a <code>GRUCell</code>, and predicts a residual $(du, dv)$ via <code>flow_head</code> that is added to the flow. The same weights are reused across all iterations, so the network learns one convergent update rule rather than a fixed-depth feed-forward predictor.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Iterative Refinement Beats One-Shot Prediction</div>
@@ -205,7 +205,9 @@ In practice you rarely implement RAFT; you load it. TorchVision ships pretrained
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Pretrained RAFT in a Handful of Lines</div>
 <p>The from-scratch components above (encoder, correlation volume, update operator, plus the training that ties them together) are several hundred lines and a training run on the FlyingChairs and Sintel datasets. TorchVision's pretrained RAFT replaces all of it:</p>
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Estimate dense optical flow between two frames with a pretrained RAFT.
+# The model emits one flow field per refinement iteration; we keep the last.
+import torch
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 weights = Raft_Large_Weights.DEFAULT
@@ -217,6 +219,7 @@ with torch.no_grad():
     flow_predictions = model(img1, img2)             # list of flow fields, one per iteration
 flow = flow_predictions[-1]                          # the final, most refined estimate
 print(flow.shape)                                    # torch.Size([1, 2, H, W])  (du, dv)</code></pre>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The encoder, correlation volume, and update operator of Code Fragments 1 and 2 as a single call using TorchVision's <code>raft_large</code> and <code>Raft_Large_Weights</code>. The library handles the correlation pyramid, the shared-weight recurrence, and the FlyingChairs and Sintel training internally; you read the final, most refined field from <code>flow_predictions[-1]</code> rather than implementing the iterative loop yourself.</div>
 <p>The model returns the full sequence of per-iteration flow fields (the dashed loop of Figure 26.4.1); you take the last one. The library handles the correlation pyramid, the shared-weight recurrence, and the trained weights, turning a research codebase into one call. TorchVision also provides <code>flow_to_image</code> to render the field as the standard colour wheel for visualization.</p>
 </div>
 

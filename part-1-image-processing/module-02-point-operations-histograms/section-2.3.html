@@ -117,7 +117,10 @@ Figure 2.3.1 makes the construction visual: the bars are a dark-skewed histogram
 The discrete formula translates directly into NumPy, reusing the fast histogram from <a href="section-2.2.html">Section 2.2</a> and the LUT machinery from <a href="section-2.1.html">Section 2.1</a>. The only subtlety is a normalization detail: standard implementations stretch the mapping so the darkest occupied bin lands exactly at 0.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Histogram equalization from scratch: the image's own CDF becomes the
+# transfer curve. Build the cumulative sum, rescale so the darkest
+# occupied level maps to 0 and the brightest to 255, apply as a LUT.
+import numpy as np
 import cv2
 
 def equalize(gray):
@@ -136,7 +139,7 @@ eq_opencv  = cv2.equalizeHist(gray)
 
 print(np.abs(eq_scratch.astype(int) - eq_opencv.astype(int)).max())  # 0 or 1
 print(gray.std(), "->", eq_scratch.std())   # e.g. 21.4 -> 73.8</code></pre>
-<div class="code-caption">Histogram equalization in eight lines: histogram, cumulative sum, rescale, lookup. The comparison against <code>cv2.equalizeHist</code> agrees to within one intensity level (rounding), and the standard deviation printout quantifies the contrast gain on a foggy image.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The <code>equalize</code> function in eight lines: histogram, cumulative sum, rescale anchored at <code>cdf_min</code>, lookup. The comparison against <code>cv2.equalizeHist</code> agrees to within one intensity level (rounding), and the standard deviation printout (21.4 to 73.8) quantifies the contrast gain on a foggy image.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: cv2.equalizeHist and skimage.exposure</div>
@@ -245,7 +248,10 @@ Second, the contrast limit: before each tile's CDF is computed, its histogram is
 <figcaption><strong>Figure 2.3.2</strong> The two mechanisms of CLAHE. Left: each tile's histogram is clipped at the contrast limit; the shaded excess above the line is redistributed evenly across all bins, capping the CDF slope and therefore the noise amplification. Right: to avoid tile seams, every pixel is transformed by the curves of its four neighboring tile centers and the results are blended bilinearly according to the pixel's position.</figcaption>
 </figure>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># CLAHE in two calls: build the operator once with a clip limit and a
+# tile grid, then apply it. The clip limit caps per-tile contrast (noise
+# control); the tile grid sets how locally the equalization adapts.
+import cv2
 
 gray = cv2.imread("chest_xray.png", cv2.IMREAD_GRAYSCALE)
 
@@ -256,7 +262,7 @@ enhanced = clahe.apply(gray)
 # The two parameters in plain words:
 #   clipLimit    higher -&gt; stronger local contrast, more noise risk
 #   tileGridSize finer  -&gt; more local adaptation, more noise risk</code></pre>
-<div class="code-caption">CLAHE in OpenCV: construct the operator once with a clip limit and tile grid, then apply it per image or per frame. The reference C implementation in Graphics Gems IV runs about 300 lines; these two calls replace all of it, including the histogram clipping, per-tile CDFs, and bilinear blending.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> CLAHE in OpenCV via <code>cv2.createCLAHE</code>: construct the operator once with <code>clipLimit</code> and <code>tileGridSize</code>, then call <code>.apply</code> per image or per frame. The reference C implementation in Graphics Gems IV runs about 300 lines; these two calls replace all of it, including the histogram clipping, per-tile CDFs, and bilinear blending.</div>
 
 <p>
 Parameter intuition: <code>clipLimit</code> between 1 and 4 covers most uses (2.0 is a sane default; below 1.0 the output approaches the input), and tile grids between 4x4 and 16x16 trade locality against statistical stability of each tile's histogram, the same bins-versus-samples tension we met when choosing histogram resolution in <a href="section-2.2.html">Section 2.2</a>. CLAHE remains the standard contrast front-end in medical imaging, underwater imagery, and surveillance, and very often serves as the input stage of the deep training pipelines covered in <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>, which is exactly the situation in the story below.
@@ -278,7 +284,10 @@ Parameter intuition: <code>clipLimit</code> between 1 and 4 covers most uses (2.
 Equalizing the R, G, and B channels of a color image independently is a classic mistake: the three curves differ, so the channel balance shifts and the image takes on phantom color casts. The correct recipe uses the color-space machinery from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a>: convert to a space that separates luminance from chrominance, enhance only the luminance channel, and convert back.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Color-safe enhancement: convert to LAB, run CLAHE on the lightness
+# channel only, and merge back. Enhancing R, G, B separately would shift
+# the channel balance and inject phantom color casts.
+import cv2
 
 img = cv2.imread("dim_street.jpg")                  # uint8 BGR
 
@@ -290,13 +299,16 @@ L_enhanced = clahe.apply(L)                          # enhance lightness ONLY
 
 out = cv2.cvtColor(cv2.merge([L_enhanced, a, b]), cv2.COLOR_LAB2BGR)
 cv2.imwrite("dim_street_clahe.jpg", out)</code></pre>
-<div class="code-caption">Color-safe enhancement: CLAHE applied to the lightness channel of LAB while the two chrominance channels pass through untouched, preserving the hue and saturation relationships that per-channel RGB equalization would scramble.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Color-safe enhancement: CLAHE applied to the <code>L</code> channel of LAB while the <code>a</code> and <code>b</code> chrominance channels pass through untouched, then re-merged. Confining the work to lightness preserves the hue and saturation relationships that per-channel RGB equalization would scramble.</div>
 
 <p>
 A final relative of equalization deserves a mention because it generalizes the idea: histogram matching (also called histogram specification) transforms an image so its histogram matches not the uniform distribution but the histogram of a chosen reference image. Conceptually it chains two equalizations: map the source to uniform via its CDF, then through the inverse CDF of the reference. It is the standard tool for harmonizing brightness between stereo pairs, balancing tiles in image mosaics, and reducing acquisition shift between datasets collected on different devices.
 </p>
 
-<pre><code class="language-python">from skimage import exposure
+<pre><code class="language-python"># Histogram matching (specification): remap the source so its intensity
+# distribution mimics a chosen reference image, not the uniform target.
+# The standard cure for visible exposure seams when stitching tiles.
+from skimage import exposure
 import cv2
 
 src = cv2.imread("drone_tile_03.jpg")
@@ -304,7 +316,7 @@ ref = cv2.imread("drone_tile_02.jpg")     # the look we want to match
 
 matched = exposure.match_histograms(src, ref, channel_axis=-1)
 matched = matched.astype("uint8")          # match_histograms returns float64</code></pre>
-<div class="code-caption">Histogram matching with scikit-image: one call remaps each channel of the source so its intensity distribution matches the reference tile, the standard fix for visible exposure seams when stitching aerial mosaics.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> Histogram matching with scikit-image's <code>match_histograms</code>: one call (with <code>channel_axis=-1</code> for color) remaps each channel of the source so its intensity distribution matches the reference tile, the standard fix for visible exposure seams when stitching aerial mosaics.</div>
 
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: Adaptive Enhancement After CLAHE</div>

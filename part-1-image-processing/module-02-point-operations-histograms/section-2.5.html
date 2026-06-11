@@ -53,7 +53,10 @@ With <a href="section-2.1.html">Section 2.1</a> through <a href="section-2.4.htm
 As established in <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>, images arrive as uint8 arrays, and uint8 arithmetic in NumPy is modular: it wraps around at 256 rather than stopping at 255. Adding two bright pixels yields a dark one; subtracting a larger value from a smaller one yields a bright one. OpenCV's arithmetic functions instead saturate, clamping results into $[0, 255]$. The two-line demonstration below is worth running once in your life, because the bug it represents is endemic:
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># The uint8 arithmetic trap: NumPy's +/- wrap around at 256 (modular),
+# while OpenCV's cv2.add / cv2.subtract saturate into [0, 255]. Same
+# inputs, opposite answers; cv2.absdiff sidesteps the sign issue.
+import numpy as np
 import cv2
 
 a = np.array([[200]], dtype=np.uint8)
@@ -65,7 +68,7 @@ print(cv2.add(a, b))    # [[255]]  OpenCV saturates: min(300, 255)
 print(b - a)                 # [[156]]  NumPy wraps: (100 - 200) % 256
 print(cv2.subtract(b, a))    # [[0]]    OpenCV saturates: max(-100, 0)
 print(cv2.absdiff(a, b))     # [[100]]  |200 - 100|, always safe</code></pre>
-<div class="code-caption">The uint8 wraparound demonstration: identical inputs, opposite answers. NumPy's modular arithmetic turns 200 plus 100 into 44, while OpenCV's saturating arithmetic clamps to 255. For differences, <code>cv2.absdiff</code> sidesteps the sign problem entirely.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The uint8 wraparound demonstration: identical inputs, opposite answers. NumPy's modular arithmetic turns 200 plus 100 into 44, while <code>cv2.add</code> clamps to 255 and <code>cv2.subtract</code> floors at 0. For differences, <code>cv2.absdiff</code> sidesteps the sign problem entirely, returning a clean 100.</div>
 
 <p>
 The symptoms of wraparound in real pipelines are unforgettable: brightened skies turn black in blotches, difference images light up like neon. The one-line rule to carry: never let uint8 do its own math. Either use the saturating <code>cv2.add</code>, <code>cv2.subtract</code>, <code>cv2.absdiff</code>, and <code>cv2.addWeighted</code> for uint8 work, or widen the type first (<code>astype(np.float32)</code> or <code>np.int16</code>), compute, then clip and convert back, exactly the float-clip-convert discipline from <a href="section-2.1.html">Section 2.1</a>.
@@ -88,7 +91,10 @@ $$g = \alpha f_1 + (1 - \alpha) f_2, \qquad \alpha \in [0, 1]$$
 which crossfades between the images: $\alpha = 1$ shows pure $f_1$, $\alpha = 0$ pure $f_2$, and anything between is a dissolve. One call does it with saturation handled:
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Convex-combination blending with cv2.addWeighted (saturation handled):
+# sweeping alpha from 1 to 0 dissolves one image into another, and the
+# same call with a lopsided weight stamps a translucent watermark.
+import cv2
 import numpy as np
 
 day   = cv2.imread("street_day.jpg")
@@ -103,7 +109,7 @@ for i in range(60):
 
 # Watermarking is the same operation with a high alpha:
 logo_bg = cv2.addWeighted(day, 0.92, np.full_like(day, 255), 0.08, 0.0)</code></pre>
-<div class="code-caption">Crossfading with <code>cv2.addWeighted</code>: a convex combination per frame produces a dissolve, and the same call with a lopsided weight implements translucent watermarking. The final argument is a scalar bias added after the weighted sum.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Crossfading with <code>cv2.addWeighted</code>: the per-frame convex combination (alpha sweeping 1.0 to 0.0) produces a 60-frame dissolve, and the same call with a lopsided 0.92/0.08 weight implements translucent watermarking. The final <code>0.0</code> argument is a scalar bias added after the weighted sum.</div>
 
 <p>
 Blending has a second life far from video editing: averaging $N$ aligned noisy frames divides the noise standard deviation by $\sqrt{N}$, the cheapest denoiser ever invented and a staple of astrophotography and microscopy (a theme developed properly in <a href="../module-07-restoration-enhancement/index.html">Chapter 7</a>). And in deep learning, the mixup augmentation blends pairs of training images (and their labels) with a random $\alpha$, exactly this section's formula deployed as a regularizer, which we will meet among the training recipes of <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.
@@ -115,7 +121,10 @@ Blending has a second life far from video editing: averaging $N$ aligned noisy f
 Subtracting two aligned images of the same scene isolates what changed between them. With a clean reference frame (an empty corridor, a bare conveyor belt), <code>cv2.absdiff</code> against the live frame highlights everything new, and a threshold from <a href="section-2.4.html">Section 2.4</a> turns the difference into a binary change mask. This three-line pattern is the ancestral form of motion detection and still runs in countless deployed systems:
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Frame differencing, the ancestral motion detector: absolute difference
+# against a reference frame, a binary threshold on the change magnitude,
+# and a changed-area fraction that triggers only on meaningful motion.
+import cv2
 
 background = cv2.imread("empty_corridor.png", cv2.IMREAD_GRAYSCALE)
 frame      = cv2.imread("corridor_now.png",  cv2.IMREAD_GRAYSCALE)
@@ -126,7 +135,7 @@ _, motion_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
 changed_fraction = motion_mask.mean() / 255.0
 if changed_fraction > 0.02:                        # &gt;2% of pixels changed
     print(f"motion: {changed_fraction:.1%} of frame")   # e.g. motion: 7.3%</code></pre>
-<div class="code-caption">Frame differencing in three operative lines: absolute difference against a reference frame, a binary threshold on the change magnitude, and a changed-area trigger. The threshold of 25 absorbs sensor noise; the 2 percent area rule absorbs flicker and compression artifacts.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Frame differencing in three operative lines: <code>cv2.absdiff</code> against a reference frame, a binary threshold on the change magnitude, and a <code>changed_fraction</code> trigger. The threshold of 25 absorbs sensor noise; the 2 percent area rule absorbs flicker and compression artifacts.</div>
 
 <p>
 The static-reference assumption is, predictably, the weak point: lighting drifts, trees sway, and the "empty" scene never stays empty. Production systems therefore maintain a running statistical model of the background per pixel (OpenCV ships <code>cv2.createBackgroundSubtractorMOG2</code>, a per-pixel Gaussian mixture), and the full story of motion, including optical flow that estimates where each pixel went rather than just whether it changed, belongs to <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
@@ -196,7 +205,10 @@ The structure is exactly what physical intuition demands: the foreground contrib
 The implementation below covers the overwhelmingly common case of an opaque background, where the division by $\alpha_o$ disappears. Watch the imread flag: OpenCV's default loader silently drops the alpha channel that the whole computation depends on.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Porter-Duff 'over' for the common opaque-background case: blend a BGRA
+# foreground onto a BGR background by its per-pixel alpha. Note the
+# IMREAD_UNCHANGED flag: the default loader drops the alpha this needs.
+import numpy as np
 import cv2
 
 def composite_over(fg_bgra, bg_bgr):
@@ -211,7 +223,7 @@ overlay = cv2.imread("score_banner.png", cv2.IMREAD_UNCHANGED)  # keeps alpha!
 frame   = cv2.imread("match_frame.jpg")
 print(overlay.shape)        # (H, W, 4): the 4th channel is alpha
 shown = composite_over(overlay, frame)</code></pre>
-<div class="code-caption">A from-scratch over composite for an opaque background: float arithmetic, per-pixel alpha broadcast across the color channels, one clip at the end. Note <code>cv2.IMREAD_UNCHANGED</code>: the default imread flag silently discards the alpha channel that this entire computation depends on.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> The <code>composite_over</code> function: a from-scratch over composite for an opaque background, with float arithmetic, the per-pixel <code>alpha</code> broadcast across the color channels, and one clip at the end. Note <code>cv2.IMREAD_UNCHANGED</code>: the default imread flag silently discards the alpha channel that this entire computation depends on.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Pillow's alpha_composite</div>
@@ -233,7 +245,10 @@ out = Image.alpha_composite(bg_rgba, fg_rgba)    # both in RGBA mode</code></pre
 When transparency is all-or-nothing, the binary masks produced by the thresholding of <a href="section-2.4.html">Section 2.4</a> take the place of a fractional alpha channel, and compositing reduces to bitwise logic: AND to keep pixels where the mask is set, AND with the inverted mask to punch a hole, OR to merge the pieces. OpenCV's <code>bitwise_*</code> family accepts an 8-bit mask argument that gates the operation per pixel, giving the classic hard-edged logo overlay:
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Hard-mask compositing when transparency is all-or-nothing: Otsu builds
+# the logo's binary mask, two bitwise_and operations carve the frame hole
+# and extract the logo pixels, and a saturating add welds them together.
+import cv2
 
 frame = cv2.imread("match_frame.jpg")
 logo  = cv2.imread("club_logo.png")            # opaque BGR logo on white
@@ -248,7 +263,7 @@ roi = frame[20:20 + logo.shape[0], 20:20 + logo.shape[1]]
 hole  = cv2.bitwise_and(roi, roi, mask=mask_inv)   # background minus logo area
 inked = cv2.bitwise_and(logo, logo, mask=mask)     # logo pixels only
 frame[20:20 + logo.shape[0], 20:20 + logo.shape[1]] = cv2.add(hole, inked)</code></pre>
-<div class="code-caption">Hard-mask compositing with bitwise operations: Otsu builds the logo's mask, one AND empties the logo-shaped region of the frame, another AND extracts the logo's pixels, and a saturating add welds the two together. This idiom predates the alpha channel and still runs in embedded systems with no float unit.</div>
+<div class="code-caption"><strong>Code Fragment 5:</strong> Hard-mask compositing with bitwise operations: Otsu builds the logo's <code>mask</code>, <code>cv2.bitwise_and</code> with <code>mask_inv</code> empties the logo-shaped region of the frame, another AND extracts the logo's pixels, and <code>cv2.add</code> welds the two together. This idiom predates the alpha channel and still runs in embedded systems with no float unit.</div>
 
 <p>
 This bitwise idiom is the workhorse of region-of-interest processing throughout the rest of the book: masks select which pixels an operation may touch, whether that operation is a histogram (the mask argument of <code>cv2.calcHist</code> in <a href="section-2.2.html">Section 2.2</a>), a color correction, or a generative edit. The masks themselves will get vastly smarter, produced by morphology in <a href="../module-06-morphology-binary-shape/index.html">Chapter 6</a> and by segmentation networks later, but the compositing algebra they plug into is the one on this page. Two previews of where this leads: blending with a soft mask across a seam is done far better at multiple scales with the pyramids of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, and the modern generative version of "put this object into that photo" appears in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>.

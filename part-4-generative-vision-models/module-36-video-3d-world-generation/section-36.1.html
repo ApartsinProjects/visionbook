@@ -50,7 +50,7 @@ In <a href="../module-33-diffusion-models/index.html">Chapter 33</a> you trained
 <h2>1. From Image Denoiser to Video Denoiser <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-A video is a tensor of shape $(B, F, C, H, W)$: batch, frames, channels, height, width. An image diffusion U-Net or DiT operates on $(B, C, H, W)$. The cheapest possible video model treats the frame axis as part of the batch, denoising every frame independently. This is the flicker baseline, and its failure is instructive: the denoiser has no pathway through which the pixel at $(t, x, y)$ can be influenced by the pixel at $(t-1, x, y)$. The fix is to add exactly such a pathway. Two designs dominate, and modern models use both.
+A video is a tensor of shape $(B, F, C, H, W)$: batch, frames, channels, height, width. An image diffusion U-Net or diffusion transformer (DiT) operates on $(B, C, H, W)$. The cheapest possible video model treats the frame axis as part of the batch, denoising every frame independently. This is the flicker baseline, and its failure is instructive: the denoiser has no pathway through which the pixel at $(t, x, y)$ can be influenced by the pixel at $(t-1, x, y)$. The fix is to add exactly such a pathway. Two designs dominate, and modern models use both.
 </p>
 
 <p>
@@ -107,7 +107,10 @@ A video is a tensor of shape $(B, F, C, H, W)$: batch, frames, channels, height,
 Figure 36.1.1 shows the factorized block. The code below implements a minimal version of the temporal-attention insert, the single most important component, as a module you can drop after any spatial attention layer.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Temporal-attention insert: couples the same spatial location across all
+# frames so an image denoiser becomes frame-consistent. Dropped in after each
+# spatial-attention block; the residual keeps it near-identity at init.
+import torch
 import torch.nn as nn
 from einops import rearrange
 
@@ -134,7 +137,7 @@ block = TemporalAttention(dim=320, n_heads=8)
 video = torch.randn(2 * 16, 320, 32, 32)   # batch 2, 16 frames, 320-ch latents
 out = block(video, num_frames=16)
 print(out.shape)   # torch.Size([32, 320, 32, 32]); shape preserved, frames now coupled</code></pre>
-<div class="code-caption">A standalone temporal-attention module: it regroups the frame axis into the attention sequence so each spatial location attends across all 16 frames, then restores the original layout. Inserting this after each spatial block is the core surgery that turns an image U-Net into a video U-Net.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> A standalone temporal-attention module: it regroups the frame axis into the attention sequence so each spatial location attends across all 16 frames, then restores the original layout. Inserting this after each spatial block is the core surgery that turns an image U-Net into a video U-Net.</div>
 
 <p>
 The shape gymnastics in the <code>rearrange</code> calls are the whole trick. Spatial attention treats $(H \cdot W)$ as the sequence and $F$ as batch; temporal attention swaps them, treating $F$ as the sequence and $(H \cdot W)$ as batch. The residual connection is essential: it guarantees that adding an untrained temporal layer to a pretrained image model is initially a near-identity operation, so the image model's quality is preserved while the temporal layer learns motion.
@@ -150,11 +153,11 @@ The entire difference between an image model and a video model is one <code>rear
 <h2>2. The Video VAE: Compressing Time <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-Generating a 5-second clip at 24 frames per second and 512-by-512 resolution means 120 frames of roughly 786,000 pixels each: nearly 100 million numbers. Running diffusion directly in pixel space at that scale is infeasible, which is exactly the problem latent diffusion solved for images in <a href="../module-33-diffusion-models/index.html">Chapter 33</a> by working inside a VAE's compressed latent space. Video pushes the idea further: a <strong>video VAE</strong> compresses not only each frame spatially (the usual 8-by-8 factor) but also temporally, encoding several consecutive frames into one latent frame using 3D convolutions in the encoder and decoder.
+Generating a 5-second clip at 24 frames per second and 512-by-512 resolution means 120 frames of about 786,000 color values each ($512 \times 512 \times 3 = 786{,}432$): nearly 100 million numbers. Running diffusion directly in pixel space at that scale is infeasible, which is exactly the problem latent diffusion solved for images in <a href="../module-33-diffusion-models/index.html">Chapter 33</a> by working inside a VAE's compressed latent space. Video pushes the idea further: a <strong>video VAE</strong> compresses not only each frame spatially (the usual 8-by-8 factor) but also temporally, encoding several consecutive frames into one latent frame using 3D convolutions in the encoder and decoder.
 </p>
 
 <p>
-A typical modern video VAE applies a temporal compression of 4 on top of an 8-by-8 spatial compression. A 120-frame clip becomes about 30 latent frames; the $786{,}000 \times 3$ pixels per frame become $64 \times 64 \times 4 = 16{,}384$ latent values. The total compression factor is $8 \times 8 \times 4 = 256$, and the diffusion transformer then operates entirely on these compact spacetime latents. This is the same move that the latent-space view of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> made for single images, now extended along the clock.
+A typical modern video VAE applies a temporal compression of 4 on top of an 8-by-8 spatial compression. A 120-frame clip becomes about 30 latent frames; the $786{,}432$ color values per frame become $64 \times 64 \times 4 = 16{,}384$ latent values. The total compression factor is $8 \times 8 \times 4 = 256$, and the diffusion transformer then operates entirely on these compact spacetime latents. This is the same move that the latent-space view of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> made for single images, now extended along the clock.
 </p>
 
 <div class="callout key-insight">
@@ -169,12 +172,15 @@ Temporal compression does double duty. It makes diffusion tractable, and it make
 <p>
 Building and training a 3D video VAE from scratch is hundreds of lines and weeks of GPU time. The diffusers library ships pretrained ones behind the same interface as the image VAE:
 </p>
-<pre><code class="language-python">from diffusers import AutoencoderKLTemporalDecoder
+<pre><code class="language-python"># Load a pretrained video VAE instead of building one: the same from_pretrained
+# interface as the image VAE. This particular VAE uses a temporal-aware decoder,
+# so reconstruction stays smooth across frames before diffusion does any work.
+from diffusers import AutoencoderKLTemporalDecoder
 # The temporal-decoder VAE shipped with Stable Video Diffusion.
 vae = AutoencoderKLTemporalDecoder.from_pretrained(
     "stabilityai/stable-video-diffusion-img2vid-xt", subfolder="vae")
-latents = vae.encode(frames).latent_dist.sample()   # (B, F, 4, H/8, W/8)</code></pre>
-<div class="code-caption">Loading the pretrained temporal-decoder video VAE from Stable Video Diffusion: three lines replace a full 3D-convolutional autoencoder and its training loop.</div>
+latents = vae.encode(frames).latent_dist.sample()   # 4-channel spatial latents, 8x downsampled</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Loading the pretrained temporal-decoder video VAE from Stable Video Diffusion: three lines replace a full 3D-convolutional autoencoder and its training loop.</div>
 <p>
 This replaces an entire 3D-convolutional encoder/decoder plus its adversarial and perceptual training loop, hundreds of lines and substantial compute, with a single <code>from_pretrained</code> call. The library handles the temporal decoding, the scaling factor, and the numerically stable tiled encode/decode for long clips internally.
 </p>
@@ -194,7 +200,10 @@ With architecture and VAE in place, the real engineering is fighting the failure
 A practical and widely used diagnostic borrows directly from <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>: measure consistency with optical flow. Warp each frame forward into the next frame's coordinates using the predicted flow, and measure how much the warped frame disagrees with the actual next frame. Low warping error means the content moved coherently; high error means flicker or teleportation. This <strong>warping-error</strong> metric is the workhorse quantitative check, and it formalizes the loop closed by the cross-reference map: optical flow, introduced classically in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a> and learned in Chapter 26, becomes the ruler for video generation here.
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># Quantify temporal consistency by re-deriving each frame from its predecessor:
+# warp frame t into frame t+1 via dense optical flow, then measure the residual.
+# A low score means motion is coherent; a high score flags flicker or teleportation.
+import cv2
 import numpy as np
 
 def temporal_warping_error(frames):
@@ -218,7 +227,7 @@ def temporal_warping_error(frames):
 # A perfectly consistent clip approaches the camera/codec noise floor;
 # an independently-denoised (flickering) clip scores several times higher.
 print(f"warping error: {temporal_warping_error(my_clip):.2f}")</code></pre>
-<div class="code-caption">A flow-based temporal-consistency metric: warp each frame into the next using Farneback optical flow and measure the residual. It reuses the dense-flow machinery of Chapter 15 and Chapter 26 as a quantitative ruler for generated video.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> A flow-based temporal-consistency metric: warp each frame into the next using Farneback optical flow and measure the residual. It reuses the dense-flow machinery of Chapter 15 and Chapter 26 as a quantitative ruler for generated video.</div>
 
 <p>
 The diffusers ecosystem will not compute this for you, so the snippet above is the kind of evaluation glue you write yourself; it is also the seed of the world-model evaluation in <a href="section-36.8.html">Section 36.8</a>, where physical-plausibility probes generalize this idea well beyond optical flow.
@@ -244,7 +253,7 @@ The same classifier-free guidance you met in <a href="../module-34-text-to-image
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: The Move to Spacetime Transformers (2024-2026)</div>
 <p>
-The factorized U-Net of this section is being displaced by pure transformer backbones operating on spacetime patches, the architecture behind OpenAI's Sora (Brooks et al., 2024) and the open Stable Video Diffusion line (Blattmann et al., 2023). Three threads define the current frontier. First, <strong>full 3D attention</strong>: rather than factorizing space and time into separate layers, models such as the open-source CogVideoX and Mochi-1 (2024) attend jointly over all spacetime tokens, which improves long-range consistency at quadratic cost, met by aggressive latent compression. Second, <strong>longer horizons</strong>: autoregressive and rolling-window schemes (e.g. the diffusion-forcing line) generate minutes of video by conditioning each new window on the last, which is precisely the world-model framing of <a href="section-36.6.html">Section 36.6</a>. Third, <strong>flow-matching objectives</strong> (the score-and-flow arc you met in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>) are replacing the DDPM noise objective for faster, more stable video training. The throughline: video generation is converging architecturally with world simulation, and the line between them is blurring on purpose.
+The factorized U-Net of this section is being displaced by pure transformer backbones operating on spacetime patches, the architecture behind OpenAI's Sora (Brooks et al., 2024) and the open Stable Video Diffusion line (Blattmann et al., 2023). Three threads define the current frontier. First, <strong>full 3D attention</strong>: rather than factorizing space and time into separate layers, models such as the open-source CogVideoX and Mochi-1 (2024) attend jointly over all spacetime tokens, which improves long-range consistency at quadratic cost, met by aggressive latent compression. Second, <strong>longer horizons</strong>: autoregressive and rolling-window schemes (e.g. the diffusion-forcing line) generate minutes of video by conditioning each new window on the last, which is precisely the world-model framing of <a href="section-36.6.html">Section 36.6</a>. Third, <strong>flow-matching objectives</strong> (the score-and-flow arc you met in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>) are replacing the denoising diffusion probabilistic model (DDPM) noise objective for faster, more stable video training. The throughline: video generation is converging architecturally with world simulation, and the line between them is blurring on purpose.
 </p>
 </div>
 

@@ -89,7 +89,10 @@ A standard convolution with kernel size $K$, $C_{in}$ input channels, and $C_{ou
 The cost ratio of separable to standard is $\frac{K^2 C_{in} + C_{in} C_{out}}{K^2 C_{in} C_{out}} = \frac{1}{C_{out}} + \frac{1}{K^2}$. With a typical $K = 3$ and a few hundred output channels, the second term dominates and the reduction is about $1/9$, an order-of-magnitude saving for a small accuracy cost. In PyTorch, a depthwise convolution is simply a <code>Conv2d</code> with <code>groups</code> equal to the channel count.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># MobileNet's core unit splits a standard convolution into two cheap steps:
+# a depthwise 3x3 (one filter per channel, groups=in_ch) does the spatial work,
+# then a pointwise 1x1 mixes channels. Together they cost about 1/9 of the dense op.
+import torch
 import torch.nn as nn
 
 class DepthwiseSeparable(nn.Module):
@@ -113,9 +116,9 @@ dw = DepthwiseSeparable(64, 128)
 std = nn.Conv2d(64, 128, 3, padding=1)
 n_dw = sum(p.numel() for p in dw.parameters())
 n_std = sum(p.numel() for p in std.parameters())
-print(f"separable: {n_dw:,} params, standard: {n_std:,} params")
-# Expected: separable: 9,152 params, standard: 73,856 params  (~8x fewer)</code></pre>
-<div class="code-caption">Depthwise-separable convolution via <code>groups=in_ch</code>. The roughly eightfold parameter reduction against a standard $3 \times 3$ convolution is the entire reason MobileNet runs on phones.</div>
+print(f"separable: {n_dw:,} params, standard: {n_std:,} params")</code></pre>
+<div class="code-output">separable: 9,152 params, standard: 73,856 params</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Depthwise-separable convolution via <code>groups=in_ch</code> in the depthwise <code>Conv2d</code>, followed by a $1 \times 1$ pointwise conv. The roughly eightfold drop from 73,856 to 9,152 parameters against a standard $3 \times 3$ convolution on the same 64-to-128 channel change is the entire reason MobileNet runs on phones.</div>
 
 <p>
 MobileNetV2 added a twist called the <strong>inverted residual</strong>. A normal ResNet bottleneck squeezes channels, works, then expands. The inverted residual does the opposite: it expands to a wide intermediate representation, applies the cheap depthwise convolution there, then projects back down, and the residual skip connects the two <em>narrow</em> ends. Doing the spatial work in the wide space preserves information, while keeping the skip-connected tensors thin saves memory, a clever rearrangement of the same parts.
@@ -132,7 +135,10 @@ MobileNetV2 added a twist called the <strong>inverted residual</strong>. A norma
 ShuffleNet pushes the cost-cutting further with <strong>grouped convolutions</strong>, where the input channels are split into $g$ groups and each group is convolved independently, cutting the $1 \times 1$ pointwise cost by a factor of $g$. The danger is that if every layer groups the same way, information never crosses between groups and the network fragments into $g$ independent sub-networks. ShuffleNet's fix is a parameter-free <strong>channel shuffle</strong>: after a grouped convolution, permute the channels so that the next group draws from all previous groups. Information flows across the whole width at zero extra cost, the same "cheap operation that restores a property an optimization broke" pattern you saw in ResNet's skip.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Channel shuffle is a parameter-free reshape-transpose-reshape that interleaves
+# the channels of g groups. After a grouped convolution it lets the next grouped
+# conv draw from every previous group, restoring cross-group information flow.
+import torch
 
 def channel_shuffle(x, groups: int):
     """Permute channels so the next grouped conv mixes across all groups."""
@@ -142,9 +148,11 @@ def channel_shuffle(x, groups: int):
     return x.view(b, c, h, w)                 # flatten back, now interleaved
 
 x = torch.arange(8).view(1, 8, 1, 1).float()
-print(x.flatten().tolist())                   # [0, 1, 2, 3, 4, 5, 6, 7]
-print(channel_shuffle(x, groups=4).flatten().tolist())  # [0, 2, 4, 6, 1, 3, 5, 7]</code></pre>
-<div class="code-caption">Channel shuffle as three reshape and transpose operations. The output ordering interleaves the four groups, so a following grouped convolution sees a channel from every original group, restoring cross-group information flow.</div>
+print(x.flatten().tolist())
+print(channel_shuffle(x, groups=4).flatten().tolist())</code></pre>
+<div class="code-output">[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+[0.0, 2.0, 4.0, 6.0, 1.0, 3.0, 5.0, 7.0]</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Channel shuffle as a <code>view</code>, <code>transpose</code>, and <code>view</code> back. The output ordering <code>[0, 2, 4, 6, 1, 3, 5, 7]</code> interleaves the four groups, so a following grouped convolution sees a channel from every original group, restoring the cross-group information flow that grouping otherwise breaks.</div>
 
 <h2>3. Squeeze-and-Excitation: Cheap Attention on Channels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
@@ -174,13 +182,18 @@ The constraint keeps the total compute growing by roughly $2^\phi$ as $\phi$ inc
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Efficient Backbones, Pretrained</div>
 <p>MobileNet, ShuffleNet, and the EfficientNet family all ship pretrained, so the blocks above become a single call:</p>
-<pre><code class="language-python">import timm
+<pre><code class="language-python"># Load the efficient backbones pretrained on ImageNet, picking by their
+# accuracy-latency tradeoff. The depthwise grouping, inverted-residual and SE
+# blocks, and channel-multiplier settings of this section are all inside timm.
+import timm
 # Pick a model by its accuracy-latency tradeoff, all pretrained on ImageNet:
 mbv3 = timm.create_model("mobilenetv3_large_100", pretrained=True)  # ~5.5M params
 effb0 = timm.create_model("efficientnet_b0", pretrained=True)       # ~5.3M params
 # timm exposes FLOP and parameter stats for ranking candidates:
-print(sum(p.numel() for p in effb0.parameters()))  # ~5,288,548</code></pre>
+print(sum(p.numel() for p in effb0.parameters()))</code></pre>
+<div class="code-output">5288548</div>
 <p>The library handles the depthwise grouping, the inverted-residual and SE blocks, the exact channel-multiplier and resolution settings, and the pretrained weights, replacing a few hundred lines of careful block plumbing. <code>timm</code> also publishes a benchmarked results table so you can pick a model by measured accuracy and latency rather than guessing, exactly the selection process of <a href="section-20.6.html">Section 20.6</a>.</p>
+<div class="code-caption"><strong>Code Fragment 3:</strong> MobileNetV3 and EfficientNet-B0 in one <code>timm.create_model</code> call each instead of the hand-built <code>DepthwiseSeparable</code> and shuffle blocks above. The library handles the depthwise grouping, inverted-residual and squeeze-and-excitation blocks, and channel-multiplier settings internally; the 5,288,548-parameter count confirms EfficientNet-B0's compact size, letting you focus on choosing a backbone by its cost-accuracy tradeoff.</div>
 </div>
 
 <div class="callout practical-example">

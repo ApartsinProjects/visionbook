@@ -103,22 +103,31 @@ Everything so far in this chapter operated on sparse keypoints: a few hundred ma
     <text x="640" y="64" text-anchor="middle" font-weight="bold" fill="#c0392b">X</text>
     <line x1="540" y1="250" x2="640" y2="80" stroke="#c0392b" stroke-width="1.3"/>
     <line x1="740" y1="250" x2="640" y2="80" stroke="#c0392b" stroke-width="1.3"/>
-    <!-- projections sharing the row -->
-    <circle cx="599" cy="166" r="4" fill="#c0392b"/>
-    <circle cx="681" cy="166" r="4" fill="#c0392b"/>
-    <text x="595" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_L</text>
-    <text x="686" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_R</text>
-    <text x="640" y="278" text-anchor="middle" fill="#5a626c">same row; disparity d = x_L &#8722; x_R along it</text>
+    <!-- per-image column origins (left edge of each rectified image plane) -->
+    <line x1="495" y1="170" x2="495" y2="200" stroke="#5a626c" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="695" y1="170" x2="695" y2="200" stroke="#5a626c" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="495" y="212" text-anchor="middle" fill="#5a626c" font-size="11">col 0</text>
+    <text x="695" y="212" text-anchor="middle" fill="#5a626c" font-size="11">col 0</text>
+    <!-- projections sharing the row, each drawn ON its own image plane -->
+    <circle cx="580" cy="166" r="4" fill="#c0392b"/>
+    <circle cx="704" cy="166" r="4" fill="#c0392b"/>
+    <text x="580" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_L</text>
+    <text x="704" y="155" text-anchor="middle" fill="#c0392b" font-size="12">x_R</text>
+    <text x="640" y="266" text-anchor="middle" fill="#5a626c">same row; each point's column measured from its own image's col 0</text>
+    <text x="640" y="282" text-anchor="middle" fill="#5a626c">disparity d = x_L &#8722; x_R &#8805; 0 (here 85 &#8722; 9 = 76 px)</text>
   </g>
 </svg>
 <figcaption><strong>Figure 13.4.1</strong> Rectification in one picture. Left: a real (verged) rig produces slanted epipolar lines that cross image rows. Right: virtually rotating each camera about its own optical center makes both image planes coplanar and parallel to the baseline, so every epipolar line becomes a shared row, and correspondence reduces to a horizontal shift, the disparity.</figcaption>
 </figure>
 
 <p>
-With calibration from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> (intrinsics of both cameras plus the rig's $R, T$ from stereo calibration), OpenCV computes the rectifying rotations and the new projection matrices in one call, and the warps in two more. These maps are computed once per rig and reused for every frame:
+With calibration from <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> (intrinsics of both cameras plus the rig's rotation and translation <code>R</code>, <code>T</code> from stereo calibration), OpenCV computes the rectifying rotations and the new projection matrices in one call, and the warps in two more. These maps are computed once per rig and reused for every frame:
 </p>
 
-<pre><code class="language-python">import cv2
+<pre><code class="language-python"># One-time rectification setup for a calibrated stereo rig: turn the rig's
+# intrinsics and relative pose into per-pixel warp maps, then verify the
+# warp by checking that matched features land on nearly the same row.
+import cv2
 import numpy as np
 
 # K1, dist1, K2, dist2, R, T come from cv2.stereoCalibrate (Chapter 12)
@@ -141,7 +150,7 @@ mm = [m for m, n in cv2.BFMatcher(cv2.NORM_L2).knnMatch(dL, dR, k=2)
       if m.distance &lt; 0.7 * n.distance]
 dy = [abs(kL[m.queryIdx].pt[1] - kR[m.trainIdx].pt[1]) for m in mm]
 print(f"mean |row difference|: {np.mean(dy):.2f} px")   # e.g. 0.31 px</code></pre>
-<div class="code-caption">One-time rectification setup: <code>cv2.stereoRectify</code> returns the virtual rotations <code>R1, R2</code>, new projections <code>P1, P2</code>, and the reprojection matrix <code>Q</code> (saved for Section 13.5), while <code>initUndistortRectifyMap</code> bakes undistortion and rectification into lookup maps that <code>cv2.remap</code> applies to every incoming frame.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> One-time rectification setup: <code>cv2.stereoRectify</code> returns the virtual rotations <code>R1, R2</code>, new projections <code>P1, P2</code>, and the reprojection matrix <code>Q</code> (saved for Section 13.5), while <code>initUndistortRectifyMap</code> bakes undistortion and rectification into lookup maps that <code>cv2.remap</code> applies to every frame. The SIFT row-difference check at the end is the rectification's acceptance test: a mean below 0.5 px (here 0.31) means epipolar lines are now scanlines.</div>
 
 <p>
 Two practical notes. The <code>alpha</code> parameter trades field of view against black borders: 0 crops to fully valid pixels, 1 keeps everything. And the returned $Q$ matrix is not rectification's business at all; it is the disparity-to-depth reprojection that <a href="section-13.5.html">Section 13.5</a> runs on, so keep it. For pairs <em>without</em> calibration, <code>cv2.stereoRectifyUncalibrated</code> computes rectifying homographies from a fundamental matrix (<a href="section-13.2.html">Section 13.2</a>), good enough for visualization though not for metric depth.
@@ -176,7 +185,10 @@ Semi-global matching (SGM, Hirschm&#252;ller 2008) keeps a per-pixel matching co
 OpenCV's <code>StereoSGBM</code> ("semi-global block matching") implements a practical variant whose handful of parameters do real work, annotated below. The non-obvious convention: <code>compute</code> returns disparities as 16-bit integers scaled by 16, so divide before use.
 </p>
 
-<pre><code class="language-python">block = 5
+<pre><code class="language-python"># Configure semi-global block matching: each parameter encodes a piece of
+# the SGM theory (the P1/P2 smoothness penalties, the uniqueness and
+# left-right checks), and compute() returns disparity as int16 scaled by 16.
+block = 5
 stereo = cv2.StereoSGBM_create(
     minDisparity=0,
     numDisparities=128,            # search range; MUST be divisible by 16.
@@ -196,7 +208,7 @@ valid = disp &gt; 0                   # negative/zero = no reliable match
 print(f"valid: {100 * valid.mean():.1f}%, "
       f"range: {disp[valid].min():.1f} to {disp[valid].max():.1f} px")
 # valid: 91.3%, range: 4.2 to 97.8 px</code></pre>
-<div class="code-caption">A production-grade SGBM configuration with the reasoning attached to each parameter: the P1/P2 pair encodes the piecewise-smooth world assumption, uniqueness and left-right checks discard ambiguous pixels rather than guessing, and the final division by 16 converts OpenCV's fixed-point output into float disparities.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> A production-grade <code>StereoSGBM_create</code> configuration with the reasoning attached to each parameter: <code>P1</code> and <code>P2</code> encode the piecewise-smooth world assumption, <code>uniquenessRatio</code> and <code>disp12MaxDiff</code> discard ambiguous pixels rather than guessing, and the final <code>/ 16.0</code> converts OpenCV's fixed-point output into float disparities. The printed valid fraction (91.3%) and range expose how many pixels survived the quality gates.</div>
 
 <p>
 The quality-control parameters deserve emphasis because they implement the failure analysis of subsection 2. <code>uniquenessRatio</code> attacks repetitive structure: if the runner-up disparity scores nearly as well as the winner, the pixel is marked invalid instead of guessed. <code>disp12MaxDiff</code> enforces <strong>left-right consistency</strong>: matching right-to-left as well, and invalidating pixels whose two answers disagree, which catches most occluded pixels (their two matches land on different surfaces). The speckle filter removes small floating islands of disparity, usually mismatches in low texture. A mature pipeline often adds a weighted-least-squares smoothing pass (<code>cv2.ximgproc.createDisparityWLSFilter</code> in opencv-contrib) that fills the invalidated holes from confident neighbors, guided by the image edges, a direct cousin of the edge-aware filtering in <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>.
@@ -225,7 +237,7 @@ Visualize <code>disp</code> with a colormap and inspect it against the failure c
 
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: Stereo Matching Became a Foundation-Model Problem</div>
-<p>Learned stereo replaced the cost-aggregation heart of this section while keeping its rectified-epipolar skeleton. RAFT-Stereo (3DV 2021) made recurrent refinement over a correlation volume the standard template; IGEV-Stereo (CVPR 2023) and its successors fused geometry-encoding volumes into the recurrence; Selective-IGEV (CVPR 2024) routes information adaptively between frequency branches. The 2025 inflection is generalization: FoundationStereo (CVPR 2025), trained on a million-pair synthetic dataset with a vision-foundation-model backbone, matches or beats per-dataset fine-tuned networks <em>zero-shot</em> across Middlebury, KITTI, and ETH3D, and DEFOM-Stereo (CVPR 2025) bootstraps the recurrent estimator with a monocular depth foundation model (the Depth Anything lineage of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>), fusing learned single-image priors with two-view geometry. Notice what survived every revolution: rectification, the disparity parameterization, left-right consistency as a confidence signal, and the benchmarks. The classical scaffolding of this section is the fixed coordinate system in which the learning happens.</p>
+<p>Learned stereo replaced the cost-aggregation heart of this section while keeping its rectified-epipolar skeleton. RAFT-Stereo (3DV 2021) made recurrent refinement over a correlation volume the standard template; IGEV-Stereo (CVPR 2023) and its successors fused geometry-encoding volumes into the recurrence; Selective-IGEV (CVPR 2024) routes information adaptively between frequency branches. The 2025 inflection is generalization: FoundationStereo (CVPR 2025), trained on a large synthetic dataset with a vision-foundation-model backbone, reports strong <em>zero-shot</em> generalization across benchmarks such as Middlebury, KITTI, and ETH3D, rivaling per-dataset fine-tuned networks, and DEFOM-Stereo (CVPR 2025) bootstraps the recurrent estimator with a monocular depth foundation model (the Depth Anything lineage of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>), fusing learned single-image priors with two-view geometry. Notice what survived every revolution: rectification, the disparity parameterization, left-right consistency as a confidence signal, and the benchmarks. The classical scaffolding of this section is the fixed coordinate system in which the learning happens.</p>
 </div>
 
 <div class="callout exercise">

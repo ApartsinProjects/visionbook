@@ -71,9 +71,11 @@ where $\odot$ is elementwise multiplication. The masked area keeps the model's e
 .bm{fill:#f3eafe;stroke:#7d4fc4;stroke-width:1.5;}
 .bz{fill:#e9f5ee;stroke:#2f9e5c;stroke-width:1.5;}
 .fa{stroke:#444;stroke-width:1.6;marker-end:url(#ma);fill:none;}
+.fb{stroke:#7d4fc4;stroke-width:1.6;marker-end:url(#mb);fill:none;stroke-dasharray:5 3;}
 </style>
 <defs>
 <marker id="ma" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444"/></marker>
+<marker id="mb" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#7d4fc4"/></marker>
 </defs>
 <rect class="bb" x="40" y="40" width="130" height="44"/><text class="m2" x="105" y="60" text-anchor="middle">model reverse step</text>
 <text class="m2" x="105" y="76" text-anchor="middle">output latent z_t</text>
@@ -86,8 +88,8 @@ where $\odot$ is elementwise multiplication. The masked area keeps the model's e
 <path class="fa" d="M170,62 C 230,62 240,110 288,114"/>
 <path class="fa" d="M170,182 C 230,182 240,134 288,130"/>
 <line class="fa" x1="410" y1="122" x2="538" y2="122"/>
-<path class="fa" d="M610,144 C 610,225 105,225 105,86"/>
-<text class="m2" x="350" y="220" text-anchor="middle">repeat each denoising step</text>
+<path class="fb" d="M610,144 L610,232 L18,232 L18,62 L38,62"/>
+<text class="m2" x="350" y="226" text-anchor="middle" fill="#7d4fc4">repeat each denoising step (feedback loop)</text>
 </svg>
 <figcaption><strong>Figure 35.3.1:</strong> Blended latent inpainting. After each reverse-diffusion step the model's output is kept only inside the mask $m$; outside the mask the original image's latent (noised to the current step) is restored. Looping this for every step lets the masked region generate freely while the rest stays locked to the original.</figcaption>
 </figure>
@@ -102,7 +104,10 @@ Blended latent diffusion has a weakness: the model inside the mask does not <em>
 With these extra channels the model sees, at every step and every layer, exactly which region it must fill and what surrounds it. It can match texture, continue lines across the boundary, and place content that fits the scene. The cost is a model trained specifically for inpainting (Stable Diffusion ships an <code>sd-v1-5-inpainting</code> checkpoint). The code below runs a proper inpainting pipeline.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Run a dedicated inpainting checkpoint: the U-Net takes the mask and the
+# masked image as extra channels, so it paints inside the white region with
+# full awareness of the surrounding room rather than from scratch.
+import torch
 from diffusers import StableDiffusionInpaintPipeline
 from diffusers.utils import load_image
 
@@ -120,7 +125,7 @@ result = pipe(
     strength=0.99,                       # how much to change inside the mask
 ).images[0]
 result.save("edited_room.png")</code></pre>
-<div class="code-caption">A dedicated inpainting pipeline. Unlike blended latent diffusion, this checkpoint receives the mask and masked image as extra U-Net channels, so it generates the plant with full awareness of the surrounding room, matching the light and continuing the floor under the pot.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> A dedicated inpainting pipeline. Unlike blended latent diffusion, the <code>stable-diffusion-inpainting</code> checkpoint receives <code>mask_image</code> and the masked image as extra U-Net channels, so it generates the plant with full awareness of the surrounding room, matching the light and continuing the floor under the pot. The <code>strength=0.99</code> value sets how completely the masked region is repainted.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: The Difference Between "Where" and "What Surrounds"</div>
@@ -135,7 +140,10 @@ Both blended latent diffusion and an inpainting U-Net know <em>where</em> to pai
 Even with an inpainting model, the boundary between generated and original pixels can show a visible seam: a faint edge, a color or sharpness mismatch, a lighting discontinuity. Three techniques, often combined, soften it. <strong>Mask feathering</strong> blurs the mask edge so the blend transitions gradually rather than at a hard pixel line. <strong>Context expansion</strong> gives the model a generous margin of original pixels around the masked region (crop a box larger than the mask, inpaint, paste back) so it has enough surroundings to match. And <strong>VAE round-trip awareness</strong>: because editing happens in latent space, encoding and decoding through the VAE of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> slightly alters even unmasked pixels, so high-quality pipelines paste the original unmasked pixels back at full resolution after decoding rather than trusting the decoded version everywhere.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># Post-decode seam fix: paste the generated region back onto the original
+# full-resolution pixels through a Gaussian-blurred (feathered) mask, so the
+# boundary fades gradually and VAE round-trip drift outside the mask is undone.
+import numpy as np
 from PIL import Image, ImageFilter
 
 def composite_with_feather(original, generated, mask, feather_px=12):
@@ -150,7 +158,7 @@ def composite_with_feather(original, generated, mask, feather_px=12):
 
 # original unmasked pixels are restored everywhere the mask is black,
 # and the transition across the boundary is smoothed over `feather_px`.</code></pre>
-<div class="code-caption">A post-decode feathered composite. Pasting the generated region back onto the original full-resolution pixels with a Gaussian-blurred mask removes the hard seam and the VAE round-trip drift in the unmasked area, the single most common fix for "the edit looks pasted on."</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> A post-decode feathered composite. The <code>composite_with_feather</code> function blurs the mask edge by <code>feather_px</code> pixels and blends <code>soft * g + (1 - soft) * o</code>, pasting the generated region back onto the original full-resolution pixels so the hard seam and the VAE round-trip drift in the unmasked area both disappear, the single most common fix for "the edit looks pasted on."</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Fact</div>
@@ -169,7 +177,10 @@ Outpainting is inpainting with the mask placed outside the original image. To ex
 The most useful editing primitive in practice is replacing one object with another: swap the sedan for an SUV, the coffee cup for a wine glass, the cloudy sky for a sunset. This is inpainting where the mask is a precise object segmentation and the prompt names the replacement. The mask precision is what matters most, and this is where the <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">promptable segmentation of Chapter 24</a> pays off: Segment Anything (SAM) produces a tight mask from a single click or box, far better than a hand-drawn blob. The pipeline is: segment the object with SAM, dilate the mask slightly so the new object can occupy a touch more room, then inpaint with the replacement prompt.
 </p>
 
-<pre><code class="language-python">import numpy as np, cv2, torch
+<pre><code class="language-python"># Object replacement = precise segmentation mask + replacement prompt.
+# SAM turns one click into a tight mask, a dilation gives the new object
+# breathing room, then the inpainting model paints the replacement in place.
+import numpy as np, cv2, torch
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 from diffusers import StableDiffusionInpaintPipeline
@@ -194,7 +205,7 @@ pipe = StableDiffusionInpaintPipeline.from_pretrained(
 out = pipe(prompt="a red double-decker bus", image=Image.fromarray(img),
            mask_image=Image.fromarray(mask_u8), num_inference_steps=30).images[0]
 out.save("replaced.png")</code></pre>
-<div class="code-caption">Object replacement: SAM produces a tight mask from one click, a dilation gives the replacement room to breathe, and the inpainting model paints a bus where the car was. The tightness of the SAM mask is what keeps the edit from bleeding onto the road or the building behind.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Object replacement. <code>SamPredictor.predict</code> produces a tight mask from one click point, <code>cv2.dilate</code> with a 15x15 kernel gives the replacement room to breathe, and the inpainting model paints a bus where the car was. The tightness of the SAM mask is what keeps the edit from bleeding onto the road or the building behind.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">The Right Tool: Grounded-SAM for Text-Driven Masks</div>

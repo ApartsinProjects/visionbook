@@ -67,9 +67,9 @@ The cost matrix is where every tracker's design lives. The simplest cost is spat
 .mmatch{fill:#e7f5ec;stroke:#2f9e5c;stroke-width:1.4;}
 .mupd{fill:#f3e8fb;stroke:#8e44ad;stroke-width:1.4;}
 .mar{stroke:#777;stroke-width:1.5;marker-end:url(#mah);fill:none;}
-.mloop{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#mah);fill:none;stroke-dasharray:4 3;}
+.mloop{stroke:#8e44ad;stroke-width:1.5;marker-end:url(#mahp);fill:none;stroke-dasharray:4 3;}
 </style>
-<defs><marker id="mah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker></defs>
+<defs><marker id="mah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#777"/></marker><marker id="mahp" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8e44ad"/></marker></defs>
 <rect class="mdet" x="20" y="100" width="110" height="56"/>
 <text class="ml" x="75" y="124" text-anchor="middle">detect frame</text>
 <text class="ms" x="75" y="142" text-anchor="middle">boxes + scores</text>
@@ -94,7 +94,9 @@ The cost matrix is where every tracker's design lives. The simplest cost is spat
 <figcaption><strong>Figure 26.5.1:</strong> The tracking-by-detection loop. Each frame is detected independently; existing tracks are predicted forward (by a Kalman motion model and, in DeepSORT, an appearance feature); a cost matrix links tracks to detections; the Hungarian algorithm finds the optimal one-to-one match; tracks are updated, created, or retired. The dashed loop carries tracks into the next frame, giving objects identity over time.</figcaption>
 </figure>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># One frame of tracking-by-detection assignment: build a 1 - IoU cost matrix
+# between tracks and detections, then solve the optimal one-to-one match.
+import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 def iou(box_a, box_b):
@@ -120,7 +122,7 @@ tracks = [[10, 10, 50, 50], [100, 100, 140, 140]]
 detections = [[102, 98, 142, 138], [12, 11, 52, 51]]    # same objects, slightly moved
 print("matches (track -> detection):", assign(tracks, detections))
 # matches (track -> detection): [(0, 1), (1, 0)]</code></pre>
-<div class="code-caption">One frame of IoU-based assignment with the Hungarian algorithm. The cost is $1 - \text{IoU}$, so the optimal assignment maximizes total overlap; the printed result correctly links each track to its slightly-moved detection even though the detections arrived in a different order.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> One frame of IoU-based assignment with the Hungarian algorithm via <code>assign</code> and SciPy's <code>linear_sum_assignment</code>. The cost is $1 - \text{IoU}$, so the optimal assignment maximizes total overlap; the printed result correctly links each track to its slightly-moved detection even though the detections arrived in a different order.</div>
 
 <h2>2. SORT: Kalman Prediction Meets Hungarian Matching <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -132,7 +134,9 @@ IoU matching alone fails the moment an object moves far between frames or a dete
 The skeleton below shows the per-track Kalman predict-and-update wrapped around the assignment of subsection 1. It uses a constant-velocity motion model, the standard choice for SORT, and only the state-transition structure is shown; the full filter is the one from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># A SORT-style track: hold box center and velocity in a Kalman state, predict
+# the next box from velocity, then correct the state with the matched detection.
+import numpy as np
 
 class KalmanBoxTrack:
     """Constant-velocity Kalman track on box center (cx, cy, scale, ratio)."""
@@ -166,7 +170,7 @@ class KalmanBoxTrack:
 t = KalmanBoxTrack([10, 10, 50, 50], track_id=1)
 t.predict(); t.update([12, 11, 52, 51])
 print("track 1 center:", t.x[:2])    # track 1 center: [32. 31.]</code></pre>
-<div class="code-caption">A SORT-style Kalman box track. <code>predict</code> advances the box by its estimated velocity (the motion model), and <code>update</code> corrects the state with the matched detection. Tracking IoU against the prediction, not the last seen box, is what lets SORT follow fast motion; the full Kalman gain is the recursive estimator from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> A SORT-style <code>KalmanBoxTrack</code>. <code>predict</code> advances the box by its estimated velocity (the motion model), and <code>update</code> corrects the state with the matched detection. Tracking IoU against the prediction, not the last seen box, is what lets SORT follow fast motion; the full Kalman gain is the recursive estimator from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Tracking Is Recursive State Estimation Plus Bookkeeping</div>
@@ -183,7 +187,9 @@ The Kalman motion model fails under occlusion and crossing. When two people pass
 The combined cost mixes a motion term (the Mahalanobis or IoU distance from the Kalman prediction) with an appearance term (cosine distance between the detection's embedding and the track's gallery of past embeddings). The code below builds that gated cost matrix.
 </p>
 
-<pre><code class="language-python">import numpy as np
+<pre><code class="language-python"># DeepSORT's gated cost: rule out geometrically impossible track-detection pairs
+# with a motion gate, then score the survivors by appearance (cosine distance).
+import numpy as np
 
 def cosine_distance(a, b):
     """Cosine distance between L2-normalized embeddings, in [0, 2]."""
@@ -213,7 +219,7 @@ gate = np.ones((2, 2), dtype=bool)
 print(np.round(deepsort_cost(track_feats, det_feats, gate), 3))
 # [[0.7   0.004]
 #  [0.    0.623]]   -> appearance correctly prefers track0->det1, track1->det0</code></pre>
-<div class="code-caption">The DeepSORT gated cost matrix. A motion gate first rules out matches that are geometrically impossible, then the appearance cosine distance scores the survivors. The printed costs show appearance correctly linking each track to the detection that looks like it, even when motion alone would be ambiguous, which is how DeepSORT survives crossings.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The DeepSORT gated cost matrix built by <code>deepsort_cost</code>. The <code>motion_gate</code> first rules out matches that are geometrically impossible, then <code>cosine_distance</code> scores the survivors by appearance. The printed costs show appearance correctly linking each track to the detection that looks like it, even when motion alone would be ambiguous, which is how DeepSORT survives crossings.</div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Re-Identification Fixed a Retail Counter</div>
@@ -231,7 +237,9 @@ ByteTrack made a deceptively simple observation. Most trackers discard low-confi
 <p>For years the community treated a low detection score as the detector politely saying "ignore me, I am probably nothing", and trackers obediently threw those boxes in the bin. ByteTrack's contribution was, in effect, to stop trusting that politeness: a faint box is often not a phantom but a real object that is half hidden behind another one, whispering rather than shouting. The whole method is a few dozen lines that amount to "before you delete the quiet detections, give them one more chance to claim an orphaned track". It is a useful reminder that in tracking, as in life, the thing too shy to announce itself loudly is sometimes exactly the one you were looking for.</p>
 </div>
 
-<pre><code class="language-python">def bytetrack_associate(tracks, dets_high, dets_low, assign_fn):
+<pre><code class="language-python"># ByteTrack's two-pass association: match confident detections first, then give
+# still-unmatched tracks a second chance against the low-confidence boxes.
+def bytetrack_associate(tracks, dets_high, dets_low, assign_fn):
     """Two-pass association: high-confidence first, then low-confidence recovery."""
     # Pass 1: match tracks to confident detections.
     m1 = assign_fn(tracks, dets_high)
@@ -246,12 +254,14 @@ ByteTrack made a deceptively simple observation. Most trackers discard low-confi
 
 # With a strong detector, dets_high holds clear objects and dets_low holds the
 # occluded, low-score boxes that pass 2 uses to keep a track alive through occlusion.</code></pre>
-<div class="code-caption">The ByteTrack two-pass association. Pass one matches confident detections; pass two rescues tracks that pass one left unmatched by linking them to the low-confidence boxes other trackers discard. The low-confidence pass is the whole contribution, and it requires no extra network, only the willingness to keep dim detections around.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> The ByteTrack two-pass association in <code>bytetrack_associate</code>. Pass one (<code>m1</code>) matches confident detections; pass two (<code>m2</code>) rescues the still-<code>remaining</code> tracks by linking them to the low-confidence boxes other trackers discard. The low-confidence pass is the whole contribution, and it requires no extra network, only the willingness to keep dim detections around.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Detection and Tracking in One Call</div>
 <p>The from-scratch tracker above (Kalman filter, Hungarian assignment, two-pass association, optional re-identification) is several hundred lines. Ultralytics fuses a YOLO detector with ByteTrack or BoT-SORT into a single streaming call, so tracking a video is two lines:</p>
-<pre><code class="language-python">from ultralytics import YOLO
+<pre><code class="language-python"># Detect and track in one streaming call: YOLO finds boxes, the named tracker
+# maintains identities, and each result carries a stable id per box per frame.
+from ultralytics import YOLO
 
 model = YOLO("yolo11n.pt")                       # detector from Chapter 23
 # persist=True carries track identities across frames; tracker selects the algorithm
@@ -260,6 +270,7 @@ results = model.track(source="street.mp4", tracker="bytetrack.yaml",
 for frame_result in results:
     ids = frame_result.boxes.id                  # stable track ID per box, or None
     boxes = frame_result.boxes.xyxy              # the detection boxes this frame</code></pre>
+<div class="code-caption"><strong>Code Fragment 5:</strong> The full Kalman, Hungarian, and two-pass tracker of Code Fragments 1 through 4 as two lines using Ultralytics <code>YOLO.track</code> with <code>tracker="bytetrack.yaml"</code>. The library runs detection, the Kalman tracks, the assignment, and ByteTrack's recovery pass internally, exposing a stable <code>boxes.id</code> per object; switching to <code>"botsort.yaml"</code> adds the DeepSORT-style appearance model.</div>
 <p>The wrapper runs detection, maintains the Kalman tracks, solves the assignment, and applies ByteTrack's two-pass recovery, exposing a stable <code>id</code> per object per frame. Swapping <code>tracker="botsort.yaml"</code> adds the re-identification appearance model of DeepSORT. This is the production form of everything in this section.</p>
 </div>
 

@@ -157,7 +157,10 @@ RoIAlign removes both roundings. It keeps the region coordinates as floating-poi
 The effect was large: in the original paper, switching RoIPool to RoIAlign improved mask accuracy by around ten points of mask average precision on the hardest, strict-overlap criteria, and it helped box detection too. The lesson generalized far beyond Mask R-CNN, RoIAlign is now the default region-cropping operator across detection and segmentation. The code below runs it on a feature map to show the shape contract.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># RoIAlign on a feature map, showing its shape contract.
+# Given fractional-coordinate regions, it keeps the coordinates exact and reads
+# feature values by bilinear sampling, producing a fixed-size crop per region.
+import torch
 from torchvision.ops import roi_align
 
 # A single feature map (1 image, 256 channels, 50x50 spatial).
@@ -172,7 +175,7 @@ pooled = roi_align(feat, boxes, output_size=(7, 7),  # fixed-size crop per regio
                    spatial_scale=1.0,                 # boxes already in feature coords
                    sampling_ratio=2)                  # 2x2 bilinear samples per bin
 print(pooled.shape)   # torch.Size([2, 256, 7, 7]) -> one 7x7 feature crop per region</code></pre>
-<div class="code-caption">torchvision's <code>roi_align</code> turns any number of fractional-coordinate regions into uniform 7x7 feature crops via bilinear sampling, the operation that replaced lossy RoIPool. The mask branch uses a larger 14x14 crop to predict its 28x28 mask.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> torchvision's <code>roi_align</code> turns the two fractional-coordinate <code>boxes</code> into uniform 7x7 feature crops via bilinear sampling, with <code>sampling_ratio=2</code> placing 2x2 sample points per bin, the operation that replaced lossy RoIPool. The output shape <code>(2, 256, 7, 7)</code> is one crop per region; the mask branch uses a larger 14x14 crop to predict its 28x28 mask.</div>
 
 <div class="callout fun-note">
 <div class="callout-title">Fun Fact</div>
@@ -185,7 +188,10 @@ print(pooled.shape)   # torch.Size([2, 256, 7, 7]) -> one 7x7 feature crop per r
 With the pieces in place, the full model is straightforward to run. torchvision provides Mask R-CNN with a ResNet-50-FPN backbone and COCO-pretrained weights. The model takes a list of image tensors and returns, per image, a dictionary of boxes, labels, confidence scores, and per-instance masks. The code below loads it, runs inference, and filters by confidence, the typical inference recipe.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># Run a COCO-pretrained Mask R-CNN end to end and filter by confidence.
+# The model takes a LIST of image tensors and returns, per image, a dict of
+# boxes, labels, scores, and per-instance soft masks at full resolution.
+import torch
 from torchvision.models.detection import (maskrcnn_resnet50_fpn,
                                           MaskRCNN_ResNet50_FPN_Weights)
 
@@ -207,7 +213,7 @@ masks  = output["masks"][keep]                        # (N, 1, H, W) soft masks 
 print(f"{keep.sum().item()} confident instances")
 binary_masks = masks.squeeze(1) > 0.5                # threshold to hard masks
 print(binary_masks.shape)                            # (N, 480, 640)</code></pre>
-<div class="code-caption">Mask R-CNN inference in torchvision. The model returns soft per-instance masks at full image resolution; thresholding at 0.5 yields the binary mask for each detected object. Each mask is paired with its own box, class label, and score.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> Mask R-CNN inference in torchvision. The <code>scores &gt; 0.7</code> mask keeps only confident detections, and the model returns soft per-instance masks of shape <code>(N, 1, H, W)</code> at full image resolution; thresholding at 0.5 yields a hard binary mask for each detected object. Each mask is paired with its own box, class label, and score.</div>
 
 <p>
 The output shape <code>(N, 1, H, W)</code> deserves a comment: there are $N$ confident instances, each carrying a single-channel soft mask at full image resolution. Internally the network predicted a small $28 \times 28$ mask in the box's coordinate frame and resized it to the box; torchvision pastes it into a full-frame canvas for you. To visualize, overlay each binary mask in a distinct color, the standard instance-segmentation display where every car gets its own hue rather than one shared "car" color.
@@ -221,7 +227,10 @@ The output shape <code>(N, 1, H, W)</code> deserves a comment: there are $N$ con
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Fine-Tuning on Your Own Classes</div>
 <p>Adapting Mask R-CNN to new classes does not mean rebuilding the RPN, RoIAlign, and three heads from scratch. torchvision lets you swap just the final predictors and keep everything else pretrained:</p>
-<pre><code class="language-python">import torchvision
+<pre><code class="language-python"># Retarget a pretrained Mask R-CNN to new classes by swapping only the heads.
+# The box and mask predictors are replaced for the new class count, while the
+# backbone, FPN, RPN, and RoIAlign keep their expensive pretrained weights.
+import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
@@ -236,7 +245,7 @@ model.roi_heads.box_predictor = FastRCNNPredictor(in_feat, num_classes)
 in_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
 model.roi_heads.mask_predictor = MaskRCNNPredictor(in_mask, 256, num_classes)
 # Now train as usual; the backbone, FPN, and RPN keep their pretrained weights.</code></pre>
-<div class="code-caption">Retargeting Mask R-CNN to new classes: only the box and mask predictor heads are replaced, while the pretrained backbone, FPN, RPN, and RoIAlign are kept, so fine-tuning needs only a few hundred annotated images rather than COCO-scale data.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Retargeting Mask R-CNN to new classes in about ten lines using torchvision, instead of reimplementing the two-stage detector and mask branch. Only <code>box_predictor</code> and <code>mask_predictor</code> are swapped for the new <code>num_classes</code>, while the pretrained backbone, FPN, RPN, and RoIAlign are kept, so fine-tuning needs only a few hundred annotated images rather than COCO-scale data.</div>
 <p>This is roughly ten lines versus reimplementing the entire two-stage detector plus mask branch, and it preserves the expensive-to-learn backbone and region machinery while retargeting only the class-specific output layers. The library owns RoIAlign, the FPN, anchor generation, and the loss combination of subsection 1.</p>
 </div>
 

@@ -135,7 +135,7 @@ embed = TubeletEmbed(dim=768, patch=16, tubelet=2)
 tokens, grid = embed(torch.randn(1, 3, 32, 224, 224))
 print("tokens:", tokens.shape, "grid (t,h,w):", grid)
 # tokens: torch.Size([1, 3136, 768]) grid (t,h,w): (16, 14, 14)</code></pre>
-<div class="code-caption">Tubelet embedding as one strided <code>Conv3d</code>. A 32-frame clip becomes 3136 tokens of dimension 768; the returned $(t, h, w)$ grid is what factorized attention needs to reshape tokens back into separate temporal and spatial groups.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> Tubelet embedding as one strided <code>Conv3d</code> inside <code>TubeletEmbed</code>, where kernel and stride both equal the tubelet size. A 32-frame clip becomes 3136 tokens of dimension 768; the returned $(t, h, w)$ grid is what factorized attention needs to reshape tokens back into separate temporal and spatial groups.</div>
 
 <h2>2. The Quadratic Wall, Again <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -209,12 +209,14 @@ class DividedSpaceTimeBlock(nn.Module):
 block = DividedSpaceTimeBlock(dim=768, heads=12)
 x = torch.randn(1, 16 * 14 * 14, 768)           # the 3136 tokens from subsection 1
 print("block out:", block(x, t=16, h=14, w=14).shape)  # block out: torch.Size([1, 3136, 768])</code></pre>
-<div class="code-caption">A divided space-time transformer block. Temporal attention reshapes tokens so each spatial location attends across all frames; spatial attention reshapes so each frame attends within itself. The attention modules are standard; only the token layout changes between the two sub-layers, which is what makes the factorization cheap to implement.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The <code>DividedSpaceTimeBlock</code>. The <code>attn_t</code> sub-layer reshapes tokens so each spatial location attends across all frames; <code>attn_s</code> reshapes so each frame attends within itself. The <code>nn.MultiheadAttention</code> modules are standard; only the <code>view</code>/<code>permute</code>/<code>reshape</code> token layout changes between the two sub-layers, which is what makes the factorization cheap to implement.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: A Pretrained Video Transformer From Hugging Face</div>
 <p>Implementing the block teaches the factorization; in production you load a pretrained model. Hugging Face Transformers ships TimeSformer and VideoMAE with their processors, so classifying a clip is a few lines, and the model already carries Kinetics-scale features:</p>
-<pre><code class="language-python">from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
+<pre><code class="language-python"># Classify a clip with a Kinetics-finetuned VideoMAE from the Hugging Face hub.
+# The processor and id2label map remove the tokenizing and label-decoding boilerplate.
+from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
 import torch
 
 proc = VideoMAEImageProcessor.from_pretrained("MCG-NJU/videomae-base-finetuned-kinetics")
@@ -225,6 +227,7 @@ inputs = proc(list(video_frames), return_tensors="pt")   # handles resize + norm
 with torch.no_grad():
     logits = model(**inputs).logits
 print(model.config.id2label[logits.argmax(-1).item()])    # e.g. "playing guitar"</code></pre>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The tubelet embedding and factorized blocks of Code Fragments 1 and 2 as a pretrained model in four lines using Hugging Face's <code>VideoMAEImageProcessor</code> and <code>VideoMAEForVideoClassification</code>. The library handles the frame sampling, resize, normalization, and the Kinetics-scale weights internally, and <code>config.id2label</code> maps the predicted index straight to an action name.</div>
 <p>The processor applies the exact frame count, resize, and normalization the model was trained with, and <code>id2label</code> maps the predicted index to a Kinetics class name. This replaces the tubelet embedding, the factorized blocks, the training loop, and the dataset with four lines and a download.</p>
 </div>
 
@@ -255,7 +258,7 @@ keep = tube_mask(t, h, w, mask_ratio=0.9)
 print("total tubelet tokens:", keep.numel())   # total tubelet tokens: 1568
 print("tokens seen by encoder:", keep.sum().item())  # tokens seen by encoder: 152
 print("fraction processed: {:.0%}".format(keep.float().mean().item()))  # fraction processed: 10%</code></pre>
-<div class="code-caption">Tube masking for VideoMAE: the same spatial positions are dropped in every frame so the model cannot copy motion from an adjacent unmasked frame. At a 90 percent ratio the encoder sees only about 152 of 1568 tokens, making self-supervised video pretraining roughly ten times cheaper per clip while staying a hard reconstruction task.</div>
+<div class="code-caption"><strong>Code Fragment 4:</strong> Tube masking for VideoMAE via <code>tube_mask</code>: the same <code>keep_spatial</code> positions are dropped in every frame so the model cannot copy motion from an adjacent unmasked frame. At <code>mask_ratio=0.9</code> the encoder sees only about 152 of 1568 tokens, making self-supervised video pretraining roughly ten times cheaper per clip while staying a hard reconstruction task.</div>
 
 <p>
 VideoMAE and its successors (VideoMAE V2, and the video branch of the joint image-video foundation models) are the modern recipe for pretraining a video transformer without a labeled Kinetics-scale dataset, and they connect directly to the self-supervision arc of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. The pretrained backbone is then fine-tuned for action recognition exactly as the R(2+1)D backbone was in <a href="section-26.2.html">Section 26.2</a>.
@@ -268,7 +271,7 @@ VideoMAE and its successors (VideoMAE V2, and the video branch of the joint imag
 
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: Video Foundation Models and Long-Context Attention</div>
-<p>The 2023 to 2026 trajectory has been toward general video foundation models. InternVideo and VideoMAE V2 scale masked pretraining to billions of parameters and hundreds of millions of clips; the video-language models that pair a video encoder with a language model (the video branch of CLIP-style and the open VideoLLaMA-style systems) enable zero-shot action recognition and video question answering from text prompts, the temporal extension of the CLIP embeddings you will meet in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. A separate frontier attacks the remaining quadratic cost for long videos directly: memory-augmented and state-space video models (the video applications of the Mamba family noted in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>) aim for linear-cost temporal modeling so a model can attend over minutes rather than seconds. How to give a model genuine long-term temporal memory, rather than the few-second window every architecture in this chapter assumes, is one of the defining open problems of video understanding.</p>
+<p>The 2023 to 2026 trajectory has been toward general video foundation models. VideoMAE V2 and the InternVideo family scale masked pretraining to roughly billion-parameter encoders, with the InternVid corpus reaching hundreds of millions of clips; the video-language models that pair a video encoder with a language model (the video branch of CLIP-style and the open VideoLLaMA-style systems) enable zero-shot action recognition and video question answering from text prompts, the temporal extension of the CLIP embeddings you will meet in <a href="../../part-4-generative-vision-models/module-34-text-to-image/index.html">Chapter 34</a>. A separate frontier attacks the remaining quadratic cost for long videos directly: memory-augmented and state-space video models (the video applications of the Mamba family noted in <a href="../module-22-vision-transformers/index.html">Chapter 22</a>) aim for linear-cost temporal modeling so a model can attend over minutes rather than seconds. How to give a model genuine long-term temporal memory, rather than the few-second window every architecture in this chapter assumes, is one of the defining open problems of video understanding.</p>
 </div>
 
 <div class="callout exercise">

@@ -126,7 +126,7 @@ Read this as a classification problem with $2N - 1$ candidates: among all the ot
 <h2>2. SimCLR: Augmentation Is the Architecture <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-SimCLR (Chen et al., 2020) is the cleanest contrastive framework: a shared encoder, a small projection head (a two-layer MLP that maps features to the space where the loss is computed and is discarded afterward), and the InfoNCE loss over a large batch. Its most important and most surprising finding is that the <strong>composition of data augmentations is the real design decision</strong>. The single most valuable augmentation pair is random cropping combined with random color distortion. Cropping alone lets the network cheat by matching color histograms between the two views; color distortion alone lets it cheat by matching spatial layout. Only together do they force the network onto content. The augmentation pipeline you learned in <a href="../module-21-training-recipes/index.html">Chapter 21</a> is here promoted from a regularizer to the heart of the method.
+SimCLR (Chen et al., 2020) is the cleanest contrastive framework: a shared encoder, a small projection head (a two-layer multilayer perceptron, or MLP, that maps features to the space where the loss is computed and is discarded afterward), and the InfoNCE loss over a large batch. Its most important and most surprising finding is that the <strong>composition of data augmentations is the real design decision</strong>. The single most valuable augmentation pair is random cropping combined with random color distortion. Cropping alone lets the network cheat by matching color histograms between the two views; color distortion alone lets it cheat by matching spatial layout. Only together do they force the network onto content. The augmentation pipeline you learned in <a href="../module-21-training-recipes/index.html">Chapter 21</a> is here promoted from a regularizer to the heart of the method.
 </p>
 
 <p>
@@ -153,7 +153,7 @@ torch.manual_seed(0)
 z = torch.randn(8, 128)                              # 4 images x 2 views, 128-d embeddings
 print("SimCLR loss:", round(simclr_loss(z).item(), 4))
 # SimCLR loss: 2.0794   (near log(2N-1)=log7 for random embeddings, as expected)</code></pre>
-<div class="code-caption">The SimCLR NT-Xent loss in a dozen lines. The <code>(targets + N) % N2</code> trick names each row's positive partner; <code>fill_diagonal_</code> removes the trivial self-match. The printed loss near $\log 7$ confirms random embeddings score at chance over the seven candidates.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> The SimCLR NT-Xent loss in a dozen lines. The <code>(targets + N) % N2</code> trick names each row's positive partner; <code>fill_diagonal_</code> removes the trivial self-match. The printed loss near $\log 7$ confirms random embeddings score at chance over the seven candidates.</div>
 
 <p>
 This is correct but expensive in one specific way: the similarity matrix is $2N \times 2N$, and the quality depends on $N$ being large. SimCLR's published results used batch sizes up to 4096, which requires many accelerators working in concert simply to hold one step in memory. That hardware requirement is precisely the problem MoCo solves.
@@ -235,8 +235,8 @@ def momentum_update(query_enc, key_enc, m=0.999):
 
 def moco_loss(q, k, queue, temperature=0.07):
     """q, k: (N, d) query and positive-key embeddings; queue: (K, d) negative keys."""
-    q, k = F.normalize(q, 1), F.normalize(k, 1)
-    queue = F.normalize(queue, 1)
+    q, k = F.normalize(q, dim=1), F.normalize(k, dim=1)   # L2-normalize for cosine sim
+    queue = F.normalize(queue, dim=1)
     l_pos = (q * k).sum(1, keepdim=True)            # (N, 1) positive similarity per query
     l_neg = q @ queue.t()                           # (N, K) similarity to every queued key
     logits = torch.cat([l_pos, l_neg], dim=1) / temperature   # positive is column 0
@@ -246,7 +246,7 @@ def moco_loss(q, k, queue, temperature=0.07):
 q = torch.randn(4, 128); k = torch.randn(4, 128); queue = torch.randn(4096, 128)
 print("MoCo loss:", round(moco_loss(q, k, queue).item(), 4))
 # MoCo loss: 8.3...  (near log(4097) for random embeddings: many negatives, harder task)</code></pre>
-<div class="code-caption">MoCo's loss and momentum update. The positive key sits in column 0 of the logits and the 4096 queued keys are the negatives, so the target is always class 0. <code>momentum_update</code> runs under <code>no_grad</code> because the key encoder is never trained directly.</div>
+<div class="code-caption"><strong>Code Fragment 2:</strong> MoCo's loss and momentum update. The positive key sits in column 0 of the logits and the 4096 queued keys are the negatives, so the target is always class 0. <code>momentum_update</code> runs under <code>no_grad</code> because the key encoder is never trained directly.</div>
 
 <p>
 After each step the current batch's keys are enqueued and the oldest keys dequeued, keeping a rolling window of recent, mutually-consistent negatives. MoCo v2 later adopted SimCLR's MLP projection head and stronger augmentation, and the two lines of work effectively merged. The practical lesson, though, is durable, and worth memorizing as a one-line mental model: <strong>contrastive learning needs negatives, not a giant batch; a queue buys negatives when you cannot buy GPUs.</strong>
@@ -265,12 +265,15 @@ After each step the current batch's keys are enqueued and the oldest keys dequeu
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Contrastive Pretraining With Lightly</div>
 <p>The loss, momentum encoder, queue, and augmentation pipeline above are all provided by self-supervised libraries. With <code>lightly</code>, a full MoCo training step is a few lines:</p>
-<pre><code class="language-python">from lightly.loss import NTXentLoss
+<pre><code class="language-python"># Assemble a full MoCo step from prebuilt parts: the validated augmentation,
+# the InfoNCE loss, and the memory-bank queue that holds the negatives.
+from lightly.loss import NTXentLoss
 from lightly.transforms import MoCoV2Transform
 # The crop+color-jitter+blur augmentation SimCLR identified, prebuilt:
 transform = MoCoV2Transform(input_size=224)
 criterion = NTXentLoss(temperature=0.1, memory_bank_size=(65536, 128))  # queue built in
 # loss = criterion(query_embeddings, key_embeddings)</code></pre>
+<div class="code-caption"><strong>Code Fragment 3:</strong> The same MoCo machinery in a few lines using <code>lightly</code>. <code>MoCoV2Transform</code> supplies the crop-plus-color-jitter augmentation, and <code>NTXentLoss</code> with <code>memory_bank_size=(65536, 128)</code> rolls the InfoNCE math and the 65,536-entry queue of Code Fragment 2 into one object. The hand-written loss and momentum update become a configuration choice.</div>
 <p>The library supplies the validated augmentation recipe (replacing roughly twenty lines of <code>torchvision.transforms</code> tuning), the memory-bank queue, and the InfoNCE math, and ships matching implementations of SimCLR, MoCo, BYOL, and DINO behind one interface. What you hand-wrote across this section becomes a configuration choice; the from-scratch code exists so the configuration is not a mystery.</p>
 </div>
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<meta content="Section 35.5: Real-Image Inversion and Faithful Editing. Why editing a real photograph requires recovering the noise that would generate it, DDIM inversion to walk the deterministic trajectory backward, the guidance gap that null-text optimization fixes, and prompt-to-prompt cross-attention control that edits content while preserving structure." name="description"/>
+<meta content="Section 35.5: Real-Image Inversion and Faithful Editing. Why editing a real photograph requires recovering the noise that would generate it, DDIM inversion to walk the deterministic trajectory backward, the guidance gap that null-text optimization fixes, and Prompt-to-Prompt cross-attention control that edits content while preserving structure." name="description"/>
 <title>Section 35.5: Real-Image Inversion &amp; Faithful Editing | Building Vision AI</title>
 <link href="../../styles/book.css" rel="stylesheet"/>
 <link href="../../styles/pygments.css" rel="stylesheet"/>
@@ -40,7 +40,7 @@
 
 <div class="callout big-picture">
 <div class="callout-title">Big Picture</div>
-<p><strong>A diffusion model can only edit images it can generate, so editing a real photograph first requires inversion: finding the initial noise and conditioning that, run forward through the model, reproduce that exact photo.</strong> The deterministic DDIM sampler of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> can be run backward to recover an approximate noise trajectory, but classifier-free guidance breaks the approximation, so the naive inversion reconstructs poorly and edits unfaithfully. Null-text inversion repairs this by optimizing the unconditional embedding at each timestep so the guided trajectory matches the unguided one that was inverted. With a faithful inversion in hand, prompt-to-prompt attention control performs the actual edit by reusing the original image's cross-attention maps while swapping only the words that should change, so structure is preserved and only the named content moves.</p>
+<p><strong>A diffusion model can only edit images it can generate, so editing a real photograph first requires inversion: finding the initial noise and conditioning that, run forward through the model, reproduce that exact photo.</strong> The deterministic DDIM sampler of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> can be run backward to recover an approximate noise trajectory, but classifier-free guidance breaks the approximation, so the naive inversion reconstructs poorly and edits unfaithfully. Null-text inversion repairs this by optimizing the unconditional embedding at each timestep so the guided trajectory matches the unguided one that was inverted. With a faithful inversion in hand, Prompt-to-Prompt attention control performs the actual edit by reusing the original image's cross-attention maps while swapping only the words that should change, so structure is preserved and only the named content moves.</p>
 </div>
 
 <p>
@@ -90,10 +90,13 @@ Recovering that specific noise is <strong>inversion</strong>. The key enabling f
 <h2>2. DDIM Inversion <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
 <p>
-The DDIM forward (denoising) step predicts the clean image $\hat{z}_0$ from $z_t$ using the network's noise estimate, then takes a deterministic step to $z_{t-1}$. Inversion reverses this: it assumes the noise prediction at $z_{t-1}$ is approximately the same as at $z_t$ (true in the limit of small steps) and solves for $z_t$ given $z_{t-1}$, marching from $t=0$ (the clean encoded image) up to $t=T$ (the recovered noise). The update, with $\bar\alpha_t$ the cumulative product from <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, is the DDIM step read in the increasing-$t$ direction.
+The DDIM forward (denoising) step predicts the clean image $\hat{z}_0$ from $z_t$ using the network's noise estimate, then takes a deterministic step to $z_{t-1}$. Inversion reverses this: it assumes the noise prediction at $z_{t-1}$ is approximately the same as at $z_t$ (true in the limit of small steps) and solves for $z_t$ given $z_{t-1}$, marching from $t=0$ (the clean encoded image) up to $t=T$ (the recovered noise). The update, with $\bar\alpha_t$ the cumulative product from <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, is the DDIM step read in the increasing-$t$ direction. The function below implements exactly that march.
 </p>
 
-<pre><code class="language-python">import torch
+<pre><code class="language-python"># DDIM inversion: recover the noise latent z_T that, denoised deterministically,
+# regenerates a given clean latent z0. It runs the DDIM step in the increasing-t
+# direction, reusing the same noise prediction the local-linearity assumption allows.
+import torch
 
 @torch.no_grad()
 def ddim_invert(z0, model, scheduler, prompt_embeds, num_steps=50):
@@ -110,7 +113,7 @@ def ddim_invert(z0, model, scheduler, prompt_embeds, num_steps=50):
         z0_pred = (z - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
         z = ab_next.sqrt() * z0_pred + (1 - ab_next).sqrt() * eps
     return z                                            # approx. latent noise z_T</code></pre>
-<div class="code-caption">DDIM inversion in its essential form: at each step predict the noise, recover the implied clean latent, then re-noise to the next higher timestep. Run with the empty or descriptive prompt embedding, the returned <code>z</code> regenerates the input image closely when denoised <em>without</em> classifier-free guidance.</div>
+<div class="code-caption"><strong>Code Fragment 1:</strong> DDIM inversion in its essential form. The <code>ddim_invert</code> loop marches over <code>reversed(scheduler.timesteps)</code>, at each step predicting the noise, recovering the implied <code>z0_pred</code>, then re-noising to the next higher timestep. Run with the empty or descriptive prompt embedding, the returned <code>z</code> regenerates the input image closely when denoised <em>without</em> classifier-free guidance.</div>
 
 <p>
 This inversion is accurate when generation uses no guidance. But practical editing wants a guidance scale well above 1, and there the inversion breaks: the noise prediction used during inversion (computed without strong guidance) no longer matches the guided prediction used during generation, so the trajectories diverge and the reconstruction drifts. This <strong>guidance gap</strong> is the central obstacle to faithful real-image editing, and it is what the next method exists to close.
@@ -119,7 +122,7 @@ This inversion is accurate when generation uses no guidance. But practical editi
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Inversion Assumes Local Linearity</div>
 <p>
-DDIM inversion works by assuming the noise prediction barely changes between adjacent timesteps, so the deterministic step can be inverted by reusing the same prediction. That assumption holds when steps are small and guidance is mild, and fails when guidance is strong, because guidance amplifies the difference between conditional and unconditional predictions, breaking the local-linearity premise. Most inversion failures trace to this single approximation; the fixes either shrink the gap (null-text optimization) or change the editing mechanism so it tolerates an imperfect inversion (prompt-to-prompt).
+DDIM inversion works by assuming the noise prediction barely changes between adjacent timesteps, so the deterministic step can be inverted by reusing the same prediction. That assumption holds when steps are small and guidance is mild, and fails when guidance is strong, because guidance amplifies the difference between conditional and unconditional predictions, breaking the local-linearity premise. Most inversion failures trace to this single approximation; the fixes either shrink the gap (null-text optimization) or change the editing mechanism so it tolerates an imperfect inversion (Prompt-to-Prompt).
 </p>
 </div>
 
@@ -153,7 +156,7 @@ So to turn "a photo of a cat" into "a photo of a dog," you keep the attention ma
 </p>
 
 <figure class="diagram">
-<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Prompt-to-prompt reuses the shared words' attention maps and lets only the changed word compute new attention">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Prompt-to-Prompt reuses the shared words' attention maps and lets only the changed word compute new attention">
 <style>
 .p1{font:12px sans-serif;fill:#1a1a1a;}
 .p2{font:10px sans-serif;fill:#555;}
@@ -187,7 +190,7 @@ So to turn "a photo of a cat" into "a photo of a dog," you keep the attention ma
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: A Photo App Adds "Change the Season"</div>
-<p><strong>Who:</strong> the imaging team at a consumer photo-editing app, 2024. <strong>Situation:</strong> users wanted one-tap edits on their own photos ("make this summer shot look like autumn," "swap my blue car for red") that kept the photo recognizably theirs. <strong>Problem:</strong> their first version used lossy image-to-image, and users complained that faces and license plates changed, the photo no longer looked like their photo. <strong>Decision:</strong> they replaced the round trip with DDIM inversion plus null-text optimization to get a faithful reconstruction, then applied edits through prompt-to-prompt attention control so only the named concept (the season, the car color) moved. They capped the null-text optimization at a fixed time budget to keep edits responsive. <strong>Result:</strong> edits that preserved identity and unmentioned detail, with the inversion cost hidden behind a brief progress spinner. <strong>Lesson:</strong> for editing <em>users' own</em> images, faithful inversion is not a nicety, it is the difference between "this is still my photo" and "this is a different photo that vaguely resembles mine."</p>
+<p><strong>Who:</strong> the imaging team at a consumer photo-editing app, 2024. <strong>Situation:</strong> users wanted one-tap edits on their own photos ("make this summer shot look like autumn," "swap my blue car for red") that kept the photo recognizably theirs. <strong>Problem:</strong> their first version used lossy image-to-image, and users complained that faces and license plates changed, the photo no longer looked like their photo. <strong>Decision:</strong> they replaced the round trip with DDIM inversion plus null-text optimization to get a faithful reconstruction, then applied edits through Prompt-to-Prompt attention control so only the named concept (the season, the car color) moved. They capped the null-text optimization at a fixed time budget to keep edits responsive. <strong>Result:</strong> edits that preserved identity and unmentioned detail, with the inversion cost hidden behind a brief progress spinner. <strong>Lesson:</strong> for editing <em>users' own</em> images, faithful inversion is not a nicety, it is the difference between "this is still my photo" and "this is a different photo that vaguely resembles mine."</p>
 </div>
 
 <div class="callout research-frontier">
@@ -207,7 +210,7 @@ So to turn "a photo of a cat" into "a photo of a dog," you keep the attention ma
 
 <div class="callout exercise">
 <div class="callout-title">Exercise 35.5.3: Design an Edit Pipeline <span class="exercise-type analysis">Analysis</span></div>
-<p>You must build a feature that lets users change the breed of a dog in their own photos while keeping the pose, background, and the rest of the image identical. Lay out the full pipeline using this section's tools: VAE encode, DDIM inversion, null-text optimization, and prompt-to-prompt word replacement. For each stage, state what would go wrong if you skipped it, and explain why prompt-to-prompt's attention injection is what guarantees the pose is preserved even though no mask was drawn.</p>
+<p>You must build a feature that lets users change the breed of a dog in their own photos while keeping the pose, background, and the rest of the image identical. Lay out the full pipeline using this section's tools: VAE encode, DDIM inversion, null-text optimization, and Prompt-to-Prompt word replacement. For each stage, state what would go wrong if you skipped it, and explain why Prompt-to-Prompt's attention injection is what guarantees the pose is preserved even though no mask was drawn.</p>
 </div>
 
 <nav class="chapter-nav">
