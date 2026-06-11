@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.6: Contours, Moments &amp; Shape Descriptors. Border following and contour hierarchies, perimeter and area from Green's theorem, the moment invariance chain to Hu's seven invariants, and a complete rule-based shape classifier." name="description"/>
+<title>Section 6.6: Contours, Moments &amp; Shape Descriptors | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Image Processing</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a></div>
+<h1>Contours, Moments &amp; Shape Descriptors</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Translate me, rotate me, shrink me to a thumbnail: my seven numbers will not budge. Hold me up to a mirror, though, and exactly one of them changes its mind."</p>
+<cite>A Defiantly Invariant Hu Moment</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>A blob's boundary carries nearly everything worth knowing about its shape, and this section compresses that boundary, step by deliberate step, into a handful of numbers that do not change when the object slides, turns, or shrinks, so that recognizing a shape becomes comparing two short vectors.</strong> The pipeline runs: trace the boundary into a polygon with a hierarchy of holes, measure the polygon (perimeter, area, vertices, convexity), then distill it through the moment invariance chain into descriptors. At the end we assemble the chapter's promised payoff: a complete, auditable shape classifier in a page of code.</p>
+</div>
+
+<p>
+<a href="section-6.5.html">Section 6.5</a> collapsed shapes onto their centerlines; this final section walks their edges. We have met boundaries twice already: the morphological gradient of <a href="section-6.3.html">Section 6.3</a> produced a rim of boundary <em>pixels</em>, and <a href="section-6.4.html">Section 6.4</a>'s <code>regionprops</code> quietly consumed boundaries to report perimeters and orientations it did not explain. Both left the boundary as an unordered set. The upgrade in this section is <em>order</em>: a contour is the boundary traced in sequence, a closed polygon you can walk, simplify, integrate over, and compare. Order is what turns a rim into geometry, and geometry into recognition, completing the journey this chapter began when a threshold from <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> first split the world into foreground and background.
+</p>
+
+<h2>1. From Pixel Sets to Boundaries: Border Following <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The standard tracing algorithm is Suzuki and Abe's <strong>border following</strong> (1985), the engine inside <code>cv2.findContours</code>. It raster-scans the binary image for a foreground pixel whose left neighbor is background (a border start), then walks counterclockwise around the component, keeping foreground on one side, until it returns to the start. Crucially, it does this for <em>every</em> border in the image, outer boundaries and hole boundaries alike, and records who surrounds whom. The connectivity conventions of <a href="section-6.1.html">Section 6.1</a> are baked in exactly as Rosenfeld prescribed: 8-connected foreground borders, 4-connected holes, which is why a diagonal chain of pixels traces as one contour rather than many.
+</p>
+<p>
+The "who surrounds whom" record is the <strong>contour hierarchy</strong>, and choosing how much of it to keep is the first API decision. <code>cv2.RETR_EXTERNAL</code> keeps only outermost boundaries (fastest, blind to holes); <code>cv2.RETR_LIST</code> returns every contour with no structure; <code>cv2.RETR_CCOMP</code> arranges them into exactly two levels, outer boundaries and their holes, which is the workhorse mode for parts on a tray; and <code>cv2.RETR_TREE</code> keeps the full nesting tree, which a washer lying inside a larger ring genuinely needs. The companion flag <code>cv2.CHAIN_APPROX_SIMPLE</code> compresses straight runs of boundary pixels to their endpoints (a rectangle becomes 4 points instead of hundreds) while <code>cv2.CHAIN_APPROX_NONE</code> keeps every boundary pixel. Figure 6.6.1 shows a three-deep scene and the tree that <code>RETR_TREE</code> builds from it, including the four-integer record <code>[next, previous, first_child, parent]</code> that OpenCV returns per contour.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left: a plate with a hole containing a small island, plus a separate disc, with contours labeled C0 through C3. Right: the corresponding hierarchy tree with child and sibling arrows and the four-integer hierarchy records">
+  <text x="200" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">One scene, four borders</text>
+  <rect x="25" y="42" width="350" height="250" fill="#fdfefe" stroke="#bdc3c7"/>
+  <!-- plate with hole and island -->
+  <rect x="55" y="75" width="200" height="185" rx="14" fill="#aed6f1" stroke="#2e86c1" stroke-width="2.5"/>
+  <circle cx="125" cy="165" r="46" fill="#fdfefe" stroke="#c0392b" stroke-width="2.5"/>
+  <circle cx="125" cy="165" r="17" fill="#aed6f1" stroke="#2e86c1" stroke-width="2.5"/>
+  <!-- separate disc -->
+  <circle cx="320" cy="165" r="38" fill="#aed6f1" stroke="#2e86c1" stroke-width="2.5"/>
+  <text x="160" y="65" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276">C0 outer</text>
+  <text x="168" y="135" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#c0392b">C1 hole</text>
+  <text x="125" y="225" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276">C2 island</text>
+  <text x="320" y="118" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276" text-anchor="middle">C3 outer</text>
+  <text x="200" y="312" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">even nesting depth = object border, odd = hole border</text>
+
+  <text x="580" y="28" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">RETR_TREE hierarchy</text>
+  <rect x="420" y="42" width="340" height="250" fill="#fdfefe" stroke="#bdc3c7"/>
+  <!-- depth 0 row -->
+  <rect x="445" y="62" width="120" height="46" rx="6" fill="#d6eaf8" stroke="#2e86c1" stroke-width="2"/>
+  <text x="505" y="81" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276" text-anchor="middle">C0</text>
+  <text x="505" y="98" font-family="monospace" font-size="10.5" fill="#34495e" text-anchor="middle">[3,-1, 1,-1]</text>
+  <rect x="615" y="62" width="120" height="46" rx="6" fill="#d6eaf8" stroke="#2e86c1" stroke-width="2"/>
+  <text x="675" y="81" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276" text-anchor="middle">C3</text>
+  <text x="675" y="98" font-family="monospace" font-size="10.5" fill="#34495e" text-anchor="middle">[-1, 0,-1,-1]</text>
+  <line x1="565" y1="85" x2="608" y2="85" stroke="#7f8c8d" stroke-width="2" marker-end="url(#arrowg)"/>
+  <text x="586" y="76" font-family="sans-serif" font-size="10.5" fill="#7f8c8d" text-anchor="middle">next</text>
+  <!-- depth 1 -->
+  <rect x="445" y="140" width="120" height="46" rx="6" fill="#fdebd0" stroke="#c0392b" stroke-width="2"/>
+  <text x="505" y="159" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#c0392b" text-anchor="middle">C1 (hole)</text>
+  <text x="505" y="176" font-family="monospace" font-size="10.5" fill="#34495e" text-anchor="middle">[-1,-1, 2, 0]</text>
+  <line x1="505" y1="108" x2="505" y2="133" stroke="#2e86c1" stroke-width="2" marker-end="url(#arrowb)"/>
+  <text x="529" y="125" font-family="sans-serif" font-size="10.5" fill="#2e86c1">child</text>
+  <!-- depth 2 -->
+  <rect x="445" y="218" width="120" height="46" rx="6" fill="#d6eaf8" stroke="#2e86c1" stroke-width="2"/>
+  <text x="505" y="237" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#1a5276" text-anchor="middle">C2</text>
+  <text x="505" y="254" font-family="monospace" font-size="10.5" fill="#34495e" text-anchor="middle">[-1,-1,-1, 1]</text>
+  <line x1="505" y1="186" x2="505" y2="211" stroke="#2e86c1" stroke-width="2" marker-end="url(#arrowb)"/>
+  <text x="529" y="203" font-family="sans-serif" font-size="10.5" fill="#2e86c1">child</text>
+  <text x="650" y="240" font-family="monospace" font-size="10.5" fill="#5a626c" text-anchor="middle">[next, prev,</text>
+  <text x="650" y="256" font-family="monospace" font-size="10.5" fill="#5a626c" text-anchor="middle"> child, parent]</text>
+  <defs>
+    <marker id="arrowg" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#7f8c8d"/></marker>
+    <marker id="arrowb" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#2e86c1"/></marker>
+  </defs>
+</svg>
+<figcaption><strong>Figure 6.6.1</strong> Border following finds every boundary and records the nesting. Left: a plate (C0) with a hole (C1) containing an island (C2), beside a separate disc (C3). Right: the <code>RETR_TREE</code> hierarchy as OpenCV encodes it, one <code>[next, previous, first_child, parent]</code> quadruple per contour; C0 and C3 are siblings at depth 0, C1 is C0's child, C2 is C1's child. Nesting depth parity tells you instantly whether a contour bounds an object or a hole.</figcaption>
+</figure>
+
+<p>
+The code below traces the scene of Figure 6.6.1 and walks the hierarchy, computing each contour's depth by following <code>parent</code> pointers. Depth parity then classifies every contour without any geometry at all, an idea <a href="section-6.4.html">Section 6.4</a>'s Euler number expressed as a single global count and the hierarchy now itemizes:
+</p>
+
+<pre><code class="language-python">import cv2
+
+bw = cv2.imread("plate_scene.png", cv2.IMREAD_GRAYSCALE)
+contours, hierarchy = cv2.findContours(bw, cv2.RETR_TREE,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+print(f"{len(contours)} contours found")
+for i, (nxt, prev, child, parent) in enumerate(hierarchy[0]):
+    depth, p = 0, parent
+    while p != -1:                      # climb parent links to the root
+        depth += 1
+        p = hierarchy[0][p][3]
+    kind = "object border" if depth % 2 == 0 else "hole border"
+    print(f"C{i}: depth {depth} ({kind:13s}) "
+          f"{len(contours[i]):4d} pts  child={child:2d} parent={parent:2d}")
+# Output:
+# 4 contours found
+# C0: depth 0 (object border )  482 pts  child= 1 parent=-1
+# C1: depth 1 (hole border   )  168 pts  child= 2 parent= 0
+# C2: depth 2 (object border )   62 pts  child=-1 parent= 1
+# C3: depth 0 (object border )  139 pts  child=-1 parent=-1</code></pre>
+<div class="code-caption">Walking the <code>RETR_TREE</code> hierarchy of Figure 6.6.1's scene: each contour's nesting depth is recovered by climbing <code>parent</code> pointers, and depth parity alone separates object borders (even) from hole borders (odd), no pixel geometry required.</div>
+
+<h2>2. Contour Geometry: Perimeter, Area &amp; Polygon Simplification <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Once a boundary is an ordered polygon, classical geometry applies verbatim. <code>cv2.contourArea</code> evaluates the shoelace formula (Green's theorem specialized to polygons):
+</p>
+<p>
+$$ A \;=\; \frac{1}{2} \,\Bigl|\, \sum_{i=0}^{n-1} \bigl( x_i\, y_{i+1} - x_{i+1}\, y_i \bigr) \Bigr|, $$
+</p>
+<p>
+which is why its answer differs slightly from the pixel count <a href="section-6.4.html">Section 6.4</a> reported as <code>area</code>: one integrates a polygon threaded through pixel centers, the other counts squares. The discrepancy is worth a digit of caution on small blobs and nothing more. Perimeter via <code>cv2.arcLength</code> deserves more caution: summing pixel steps along a staircase systematically <em>overestimates</em> the smooth boundary length (a digital diagonal line of length $L$ measures up to about 8 percent long), so any spec written in millimeters of perimeter should be calibrated against parts of known size rather than trusted absolutely. Derived ratios inherit the bias; we return to this in Exercise 6.6.3.
+</p>
+<p>
+The third primitive is simplification. The Douglas-Peucker algorithm inside <code>cv2.approxPolyDP</code> recursively keeps only vertices that deviate from a straight chord by more than a tolerance $\varepsilon$, typically set as a fraction of the perimeter. It converts a noisy 400-point boundary into the 4-point quadrilateral that the document scanner of <a href="../module-05-geometric-transformations/index.html">Chapter 5</a> hunted for, or the 6-point hexagon that will identify a nut in Section 5 below. Together with the convex hull (<code>cv2.convexHull</code>) these produce the working measurements of contour analysis:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+c = max(contours, key=cv2.contourArea)            # largest object
+
+area  = cv2.contourArea(c)                        # shoelace / Green's theorem
+perim = cv2.arcLength(c, closed=True)
+approx = cv2.approxPolyDP(c, 0.02 * perim, closed=True)
+hull   = cv2.convexHull(c)
+
+print(f"area {area:.0f} px^2, perimeter {perim:.1f} px")
+print(f"vertices after Douglas-Peucker: {len(approx)}")
+print(f"circularity {4*np.pi*area/perim**2:.3f}, "
+      f"solidity {area/cv2.contourArea(hull):.3f}")
+# Representative output for a slightly dog-eared rectangular label:
+# area 50412 px^2, perimeter 916.4 px
+# vertices after Douglas-Peucker: 4
+# circularity 0.754, solidity 0.988</code></pre>
+<div class="code-caption">The contour-geometry starter kit on one object: shoelace area, staircase perimeter, Douglas-Peucker simplification at 2 percent of perimeter (recovering the label's 4 corners despite boundary noise), and two first descriptors, circularity and solidity, computed from the same ingredients.</div>
+
+<h2>3. Moments &amp; the Invariance Chain <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Geometry measures a shape <em>as placed</em>; recognition needs numbers that survive placement. The instrument is the family of <strong>image moments</strong>, borrowed directly from mechanics: treat the foreground as a sheet of unit mass and compute
+</p>
+<p>
+$$ m_{pq} \;=\; \sum_{(x,\,y) \in A} x^p\, y^q . $$
+</p>
+<p>
+The zeroth moment $m_{00}$ is the area; the first moments give the <strong>centroid</strong> $\bar x = m_{10}/m_{00}$, $\bar y = m_{01}/m_{00}$, the formula <a href="section-6.4.html">Section 6.4</a> promised we would derive. Second moments describe how mass spreads around the centroid, and from them comes the orientation that <code>regionprops</code> reports: the major axis of the best-fit ellipse sits at
+</p>
+<p>
+$$ \theta \;=\; \tfrac{1}{2}\, \operatorname{atan2}\!\bigl( 2\mu_{11},\; \mu_{20} - \mu_{02} \bigr), $$
+</p>
+<p>
+where the $\mu_{pq}$ are the <strong>central moments</strong>, the same sums computed about the centroid, $\mu_{pq} = \sum (x - \bar x)^p (y - \bar y)^q$. Centering is the first rung of a ladder that Figure 6.6.2 lays out in full. Central moments do not change when the object translates. Dividing by the right power of area, $\eta_{pq} = \mu_{pq} / m_{00}^{\,1 + (p+q)/2}$, yields <strong>normalized central moments</strong> that also ignore scale. The final rung is Hu's 1962 construction: seven polynomial combinations of the $\eta_{pq}$ up to third order that are additionally unchanged by rotation. The first two are
+</p>
+<p>
+$$ \phi_1 = \eta_{20} + \eta_{02}, \qquad \phi_2 = (\eta_{20} - \eta_{02})^2 + 4\eta_{11}^2, $$
+</p>
+<p>
+and five more follow in the same spirit. The seventh is special: it is a <em>skew</em> invariant whose magnitude survives reflection but whose <strong>sign flips</strong> when the shape is mirrored, because mirroring negates every central moment with an odd power of one coordinate, and $\phi_7$ alone is built from an odd combination. One bit of asymmetry survives all that quotienting, and Section 5's practical example will spend exactly that bit.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 880 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Pipeline of four boxes: raw moments, central moments, normalized central moments, Hu invariants, with arrows labeled by the operation applied and notes on which nuisance each stage removes">
+  <defs>
+    <marker id="arrowc" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 Z" fill="#2e86c1"/></marker>
+  </defs>
+  <text x="440" y="26" font-family="sans-serif" font-size="15" font-weight="bold" fill="#2c3e50" text-anchor="middle">The invariance chain: each stage forgets one nuisance</text>
+  <!-- box 1 -->
+  <rect x="20" y="60" width="180" height="84" rx="8" fill="#fdfefe" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="110" y="88" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">raw moments</text>
+  <text x="110" y="108" font-family="monospace" font-size="13" fill="#1a5276" text-anchor="middle">m_pq</text>
+  <text x="110" y="130" font-family="sans-serif" font-size="11" fill="#5a626c" text-anchor="middle">everything matters</text>
+  <!-- arrow 1 -->
+  <line x1="200" y1="102" x2="243" y2="102" stroke="#2e86c1" stroke-width="2.5" marker-end="url(#arrowc)"/>
+  <text x="222" y="86" font-family="sans-serif" font-size="10.5" fill="#2e86c1" text-anchor="middle">subtract</text>
+  <text x="222" y="98" font-family="sans-serif" font-size="10.5" fill="#2e86c1" text-anchor="middle">centroid</text>
+  <!-- box 2 -->
+  <rect x="248" y="60" width="180" height="84" rx="8" fill="#fdfefe" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="338" y="88" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">central</text>
+  <text x="338" y="108" font-family="monospace" font-size="13" fill="#1a5276" text-anchor="middle">&#956;_pq</text>
+  <text x="338" y="130" font-family="sans-serif" font-size="11" fill="#117a65" text-anchor="middle">translation forgotten</text>
+  <!-- arrow 2 -->
+  <line x1="428" y1="102" x2="471" y2="102" stroke="#2e86c1" stroke-width="2.5" marker-end="url(#arrowc)"/>
+  <text x="450" y="86" font-family="sans-serif" font-size="10.5" fill="#2e86c1" text-anchor="middle">divide by</text>
+  <text x="450" y="98" font-family="monospace" font-size="10" fill="#2e86c1" text-anchor="middle">m00^(1+(p+q)/2)</text>
+  <!-- box 3 -->
+  <rect x="476" y="60" width="180" height="84" rx="8" fill="#fdfefe" stroke="#7f8c8d" stroke-width="2"/>
+  <text x="566" y="88" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50" text-anchor="middle">normalized</text>
+  <text x="566" y="108" font-family="monospace" font-size="13" fill="#1a5276" text-anchor="middle">&#951;_pq</text>
+  <text x="566" y="130" font-family="sans-serif" font-size="11" fill="#117a65" text-anchor="middle">+ scale forgotten</text>
+  <!-- arrow 3 -->
+  <line x1="656" y1="102" x2="699" y2="102" stroke="#2e86c1" stroke-width="2.5" marker-end="url(#arrowc)"/>
+  <text x="678" y="86" font-family="sans-serif" font-size="10.5" fill="#2e86c1" text-anchor="middle">7 polynomial</text>
+  <text x="678" y="98" font-family="sans-serif" font-size="10.5" fill="#2e86c1" text-anchor="middle">combinations</text>
+  <!-- box 4 -->
+  <rect x="704" y="60" width="156" height="84" rx="8" fill="#d6eaf8" stroke="#2e86c1" stroke-width="2.5"/>
+  <text x="782" y="88" font-family="sans-serif" font-size="14" font-weight="bold" fill="#1a5276" text-anchor="middle">Hu invariants</text>
+  <text x="782" y="108" font-family="monospace" font-size="13" fill="#1a5276" text-anchor="middle">&#966;_1 .. &#966;_7</text>
+  <text x="782" y="130" font-family="sans-serif" font-size="11" fill="#117a65" text-anchor="middle">+ rotation forgotten</text>
+  <text x="440" y="180" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">what survives: pure shape, plus one bit of handedness, the sign of &#966;_7, which flips under mirroring</text>
+  <text x="440" y="202" font-family="sans-serif" font-size="12" fill="#5a626c" text-anchor="middle">read &#952; (orientation) and the centroid off the earlier stages before the chain forgets them</text>
+</svg>
+<figcaption><strong>Figure 6.6.2</strong> The moment invariance chain. Raw moments depend on position, scale, and rotation; subtracting the centroid forgets translation, normalizing by a power of area forgets scale, and Hu's seven polynomial combinations forget rotation. Each stage discards a nuisance variable on purpose, and quantities you still need (the centroid as a pick-point, $\theta$ as a grasp angle) must be read off before the stage that destroys them.</figcaption>
+</figure>
+
+<p>
+Hu invariants have a wide dynamic range ($\phi_1$ might be $10^{-3}$ while $\phi_7$ is $10^{-21}$), so in practice everyone compares them on a signed log scale, $h_i = -\operatorname{sign}(\phi_i)\,\log_{10}\lvert\phi_i\rvert$. The demonstration below puts the whole chain to the test: a wrench mask is rotated 37 degrees and shrunk to 60 percent, then mirrored, and the log-scale invariants are printed for all three. Watch the last column:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def log_hu(mask):
+    """Seven Hu invariants on a signed log10 scale."""
+    hu = cv2.HuMoments(cv2.moments(mask, binaryImage=True)).flatten()
+    return -np.sign(hu) * np.log10(np.abs(hu) + 1e-30)
+
+mask = cv2.imread("wrench_mask.png", cv2.IMREAD_GRAYSCALE)
+h, w = mask.shape
+M = cv2.getRotationMatrix2D((w/2, h/2), angle=37, scale=0.6)
+moved    = cv2.warpAffine(mask, M, (w, h))    # rotated + scaled copy
+mirrored = cv2.flip(mask, 1)                  # left-right reflection
+
+for name, m in [("original", mask), ("rot 37, scale 0.6", moved),
+                ("mirrored", mirrored)]:
+    print(f"{name:18s}", np.round(log_hu(m), 2))
+# Representative output (phi_1 .. phi_7, log scale):
+# original           [ 2.95  6.61  9.69 10.31 20.43 13.66 -20.65]
+# rot 37, scale 0.6  [ 2.95  6.60  9.70 10.33 20.47 13.66 -20.70]
+# mirrored           [ 2.95  6.61  9.69 10.31 20.43 13.66  20.65]</code></pre>
+<div class="code-caption">The invariance chain verified experimentally: rotating and rescaling the wrench perturbs the seven log-scale Hu values only in the second decimal (discretization noise from resampling), while mirroring leaves six of them untouched and flips precisely the sign of $\phi_7$, the one skew invariant that remembers handedness.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Invariance Is a Budget You Spend Deliberately</div>
+<p>Every rung of the chain in Figure 6.6.2 <em>destroys information</em>, and that is its job: position, scale, and orientation are nuisances when classifying, so you quotient them out. But they are the <em>answer</em> when gripping or aligning, so a real pipeline reads the centroid and $\theta$ off the early rungs, then climbs the rest of the ladder for recognition. And sometimes an invariance is a bug: a classifier built on $\phi_1$ through $\phi_6$ (or on <code>matchShapes</code>, which compares magnitudes) is constitutionally incapable of telling a part from its mirror image. Choose which transformations your numbers should forget; do not let the library choose for you.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact</div>
+<p>Hu published his seven invariants in 1962, and for decades they were taught, implemented, and shipped as a canonical set. It took until 2000 for Jan Flusser to prove the set is neither independent ($\phi_3$ is expressible from the others) nor complete. Thirty-eight years of production use before anyone audited the algebra; the fix (Flusser's complete invariant systems) exists, but the seven originals remain the default in every library, a monument to "good enough, shipped first."</p>
+</div>
+
+<h2>4. A Descriptor Vector for Every Blob <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+Moments are one family of shape numbers; the geometry of Section 2 supplies the rest. In practice a small, interpretable descriptor vector covers an enormous range of industrial decisions. <strong>Circularity</strong>, $4\pi A / P^2$, is 1 for a perfect disk and falls as the boundary wrinkles or elongates. <strong>Aspect ratio</strong> from <code>cv2.minAreaRect</code> captures elongation without caring about orientation. <strong>Extent</strong> (area over bounding-box area) separates crosses from blobs; <strong>solidity</strong> (area over convex-hull area) drops the moment a bite, crack, or concavity appears; the Douglas-Peucker <strong>vertex count</strong> reads off polygonal class directly (4 means quadrilateral, 6 means hexagon); and the hierarchy's <strong>hole count</strong> from Section 1 is the topological feature no amount of boundary noise can fake. Each is one or two lines on top of code we have already written, and each has a failure mode you can state in a sentence, which is exactly what makes the vector auditable.
+</p>
+<p>
+When classes are too subtle for thresholds on individual descriptors, the next step up is comparing whole invariant vectors against labeled templates, which is nearest-neighbor classification in descriptor space and the conceptual ancestor of everything in <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>. OpenCV ships the comparison ready-made:
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: <code>cv2.matchShapes</code> Is a Shape Metric in One Line</div>
+<p>Hand-rolling template comparison means computing moments, building Hu vectors, applying the signed log map, guarding against zero moments, and choosing a distance: about 30 lines of fussy code. <code>cv2.matchShapes(c1, c2, cv2.CONTOURS_MATCH_I1, 0)</code> is one line, a 30-to-1 reduction, and handles all of it internally: it forms $m_i = \operatorname{sign}(\phi_i) \log_{10} \lvert \phi_i \rvert$ for both shapes and returns $\sum_i \lvert 1/m_i^A - 1/m_i^B \rvert$ (methods <code>I2</code> and <code>I3</code> are alternative formulas on the same ingredients). Near-zero is a match. It accepts contours or whole grayscale images, and because it compares magnitudes only, it is mirror-blind by design; when handedness matters, check the sign of $\phi_7$ yourself as in Section 3.</p>
+</div>
+
+<h2>5. The Complete Shape Classifier <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Now the payoff the chapter overview promised: a complete shape classifier in a page of code, every stage of which this chapter built. Threshold with Otsu (<a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>), clean with an opening (<a href="section-6.3.html">Section 6.3</a>), trace with hierarchy (Section 1), describe (Sections 2 to 4), and decide with rules a quality auditor can read aloud. The parts tray contains screws, washers, and hex nuts; topology and three descriptors are enough to tell them apart:
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def describe(c):
+    """Descriptor vector for one outer contour."""
+    area  = cv2.contourArea(c)
+    perim = cv2.arcLength(c, True)
+    circularity = 4 * np.pi * area / perim**2 if perim > 0 else 0.0
+    solidity = area / cv2.contourArea(cv2.convexHull(c))
+    (w, h) = cv2.minAreaRect(c)[1]                  # oriented box sides
+    aspect = max(w, h) / max(min(w, h), 1e-6)
+    verts  = len(cv2.approxPolyDP(c, 0.02 * perim, True))
+    return dict(area=area, circularity=circularity,
+                solidity=solidity, aspect=aspect, vertices=verts)
+
+def classify(d, has_hole):
+    if has_hole and d["circularity"] > 0.80:        # round ring
+        return "washer"
+    if has_hole and 5 <= d["vertices"] <= 7:        # hexagonal ring
+        return "nut"
+    if not has_hole and d["aspect"] > 2.5:          # long and solid
+        return "screw"
+    return "reject"                                 # fail loud, not plausible
+
+img = cv2.imread("tray.png", cv2.IMREAD_GRAYSCALE)
+_, bw = cv2.threshold(img, 0, 255,
+                      cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, se)       # de-speckle first
+
+contours, hier = cv2.findContours(bw, cv2.RETR_CCOMP,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+counts = {}
+for i, c in enumerate(contours):
+    if hier[0][i][3] != -1:          # skip hole borders themselves
+        continue
+    if cv2.contourArea(c) < 200:     # dust gate
+        continue
+    has_hole = hier[0][i][2] != -1   # any child contour means a hole
+    label = classify(describe(c), has_hole)
+    counts[label] = counts.get(label, 0) + 1
+print(counts)
+# Representative output on a 24-piece kit tray:
+# {'screw': 12, 'washer': 8, 'nut': 4}</code></pre>
+<div class="code-caption">The chapter's capstone in one page: Otsu threshold, morphological opening, two-level contour retrieval, a five-number descriptor per outer contour, and four readable rules that sort a fastener tray into screws, washers, and nuts, with topology (the hole) doing the heaviest lifting and an explicit reject class for everything else.</div>
+
+<p>
+Three habits in this code repay study. The reject class exists because a rule-based system should fail loudly on the unexpected, never shrug a foreign object into the nearest class. The hole feature comes from the hierarchy, not from any intensity heuristic, so grease stains cannot fake it. And every threshold (0.80, 2.5, 200) traces to a measurable property of golden samples, so recalibrating for a new part is a measurement session, not a retraining run. When classes finally overlap in every descriptor you can write down, that is the boundary of this method and the on-ramp to the learned features of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> and the classifiers of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Two Brackets That Were the Same Shape</div>
+<p><strong>Who:</strong> A vision engineer at a furniture-hardware supplier whose kitting line packs door-hinge sets: screws, washers, and a left-hand and a right-hand mounting bracket per kit.</p>
+<p><strong>Situation:</strong> A camera over a backlit tray verified each kit before sealing, using a descriptor classifier much like this section's. Screws and washers sorted perfectly. The two brackets did not: kits kept shipping with two left brackets, and the resulting installer complaints were the warranty department's top line item.</p>
+<p><strong>Problem:</strong> The brackets are exact mirror images. Area, perimeter, circularity, solidity, aspect ratio, vertex count, $\phi_1$ through $\phi_6$, and <code>cv2.matchShapes</code> are all reflection-blind by construction, so every number the system computed was identical for both parts. The team's first instinct, training a small CNN, stalled on explainability requirements and a 5 ms cycle budget.</p>
+<p><strong>Decision:</strong> Use the one reflection-sensitive number in the standard toolkit: the sign of $\phi_7$. They verified on 2,000 golden samples that $\lvert\phi_7\rvert$ for this bracket sits far from zero (the shape is strongly chiral), then added a single rule: positive sign means right-hand, negative means left-hand, magnitude below a guard threshold means reject for manual inspection.</p>
+<p><strong>Result:</strong> Left/right separation went to 100 percent on a 50,000-part audit at no measurable cycle-time cost, the guard threshold caught a handful of bent (and therefore nearly symmetric) brackets as a free bonus, and the auditors signed off on a decision rule that fits in one sentence.</p>
+<p><strong>Lesson:</strong> Invariances are design choices. The team did not need a richer model; they needed one number that deliberately <em>kept</em> the asymmetry every other number had been engineered to forget.</p>
+</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Contours and Topology Inside the Learning Loop</div>
+<p>This section's objects are thriving inside modern pipelines. SAM 2 (Ravi et al., 2024, arXiv:2408.00714) made promptable segmentation a commodity, and the masks it emits are post-processed in production with exactly this section's toolkit: <code>findContours</code>, hole-aware hierarchies, polygon simplification for annotation formats, and descriptor gates to reject implausible masks; the measurement layer of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>'s models is this chapter. Topology is becoming a training signal too: Betti-matching losses (Stucki et al., ICML 2023, with an efficient 3D extension in 2024) penalize a segmentation for predicting the wrong number of holes or components, differentiating the very quantities our hierarchy walk counted. And orientation-from-moments has a learned descendant: oriented-bounding-box heads in Ultralytics YOLO11 (2024) regress per-object angles end to end for aerial and industrial imagery, while the broader handcrafted-descriptor program of this section is carried forward by the learned representations of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>, which trade auditability for breadth.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.6.1: One Bit of Handedness <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Show algebraically why mirroring an image about the $y$ axis negates every central moment $\mu_{pq}$ with odd $p$ and leaves the rest unchanged, and use this to argue that $\phi_1$ through $\phi_6$ are reflection-invariant while $\phi_7$ flips sign. Then explain why <code>cv2.matchShapes</code> cannot distinguish a part from its mirror image, and describe two industrial situations from this chapter's examples where that blindness is harmless and one where it ships the wrong part.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.6.2: An Alphabet Retrieval Engine <span class="exercise-type coding">Coding</span></div>
+<p>Render the 26 uppercase letters as binary masks with <code>cv2.putText</code> at a large font size. Build a template library of log-scale Hu vectors, then query it with rotated (random angles) and rescaled (0.5x to 2x) versions of each letter using nearest neighbor on the Hu vectors, and separately with <code>cv2.matchShapes</code>. Report the confusion matrix for each method. Which letter pairs collapse under rotation invariance (consider N and Z, M and W under mirroring), and which descriptor from Section 4 would you add to break each tie?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 6.6.3: The Circularity Ceiling <span class="exercise-type analysis">Analysis</span></div>
+<p>Rasterize perfect disks of radius 2 to 200 pixels and plot measured circularity $4\pi A / P^2$ using <code>cv2.contourArea</code> and <code>cv2.arcLength</code> against radius. Explain the curve's small-radius behavior and its large-radius asymptote (it does not reach 1.0; quantify the gap and attribute it to the staircase perimeter bias of Section 2). Repeat with <code>skimage.measure.perimeter_crofton</code>, which estimates perimeter by the Crofton intersection formula, and recommend, with numbers, a minimum part diameter in pixels below which a circularity-based accept/reject gate should not be trusted.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.5.html">&#8592; Section 6.5: Distance Transforms &amp; Skeletonization</a>
+<a href="index.html">Chapter 6</a>
+<a class="next" href="../module-07-restoration-enhancement/index.html">Chapter 7: Image Restoration &amp; Enhancement &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

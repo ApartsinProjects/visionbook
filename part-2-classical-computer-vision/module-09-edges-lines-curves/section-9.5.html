@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.5: Worked Example: Lane-Marking Detection. The whole chapter assembled into a working pipeline: gradient and color thresholding, a bird's-eye perspective warp, sliding-window lane-pixel search, robust polynomial fits, curvature in meters, and a sober comparison with learned lane detectors." name="description"/>
+<title>Section 9.5: Worked Example: Lane-Marking Detection | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Edges, Lines &amp; Curves</a></div>
+<h1>Worked Example: Lane-Marking Detection</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The lane was clearly marked for two hundred kilometers. Then it rained, the sun came back out, and I learned that I had spent my entire career detecting dry weather."</p>
+<cite>A Recently Humbled Lane Detector</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>This section assembles every tool the chapter has built into one working machine: a lane-marking detector that turns a raw dashcam frame into two polynomials, a curvature radius in meters, and a lateral offset a steering controller can act on.</strong> The architecture is the one that shipped in early lane-keep-assist systems: threshold gradients and colors into evidence (<a href="section-9.1.html">Section 9.1</a> and <a href="section-9.2.html">Section 9.2</a>), warp the road into a bird's-eye view with the homography machinery of <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, localize lane pixels with a voting search in the spirit of <a href="section-9.3.html">Section 9.3</a>, and fit robust quadratics with the discipline of <a href="section-9.4.html">Section 9.4</a>. Every stage is a hand-written prior about how roads behave, which makes the pipeline fast, debuggable, and exactly as fragile as its assumptions.</p>
+</div>
+
+<p>
+The previous section closed the chapter's toolbox: we can detect structure by voting and measure it by fitting, even when most of the evidence is contaminated. What remains is the engineering question this chapter has been promising since its first page: do the pieces actually compose into a system that does something useful? Lane-marking detection is the canonical test because it needs every piece at once, and because its output is not a prettier image but three numbers (left-lane geometry, right-lane geometry, vehicle offset) consumed by a controller fifty times per second. It is also a system whose every failure mode is instructive; we will catalogue them deliberately at the end, because they are the best argument anyone has ever made for Part III.
+</p>
+
+<h2>1. The Assignment: From Dashcam Frame to Steering Geometry <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+The input is a forward-facing camera frame, say $1280 \times 720$ pixels at 30 frames per second. The output a lane-keeping controller wants is compact: the geometry of the lane's two boundary markings expressed in road coordinates, the <strong>radius of curvature</strong> of the lane ahead in meters, and the car's <strong>lateral offset</strong> from the lane center in meters. Note what is being asked: not "which pixels are paint" but "where is the lane, as a measurable curve in the world." That is precisely the pixels-to-geometry trajectory this chapter has been walking, pushed one step further into physical units.
+</p>
+<p>
+Figure 9.5.1 shows the pipeline. One precondition is handled offstage: the frame must be undistorted, because consumer lenses bend straight lane lines into gentle arcs near the image border, and a curve fitter cannot tell optical bending from road curvature. <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> builds the calibration that removes lens distortion; here we assume it has been applied. Everything else in the figure is this chapter, plus one homography from <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Six-box pipeline from dashcam frame through thresholding, bird's-eye warp, sliding-window search, robust polynomial fit, to curvature offset and overlay, with arrows flowing left to right">
+  <defs>
+    <marker id="arrow951" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+  </defs>
+  <!-- box 1: input -->
+  <rect x="10" y="45" width="112" height="60" rx="6" fill="#eef2f5" stroke="#90a4ae" stroke-width="1.5"/>
+  <text x="66" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#2c3e50">dashcam frame</text>
+  <text x="66" y="84" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">undistorted</text>
+  <text x="66" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">(Chapter 12)</text>
+  <!-- box 2 -->
+  <rect x="140" y="45" width="112" height="60" rx="6" fill="#ffffff" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="196" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#2c3e50">threshold</text>
+  <text x="196" y="84" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">gradient + color</text>
+  <text x="196" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">&#167;9.1 + &#167;9.2</text>
+  <!-- box 3 -->
+  <rect x="270" y="45" width="112" height="60" rx="6" fill="#ffffff" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="326" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#2c3e50">bird's-eye warp</text>
+  <text x="326" y="84" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">homography</text>
+  <text x="326" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">(Chapter 5)</text>
+  <!-- box 4 -->
+  <rect x="400" y="45" width="112" height="60" rx="6" fill="#ffffff" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="456" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#2c3e50">window search</text>
+  <text x="456" y="84" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">histogram votes</text>
+  <text x="456" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">&#167;9.3 in spirit</text>
+  <!-- box 5 -->
+  <rect x="530" y="45" width="112" height="60" rx="6" fill="#ffffff" stroke="#2c3e50" stroke-width="1.5"/>
+  <text x="586" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#2c3e50">robust fit</text>
+  <text x="586" y="84" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">x = Ay&#178; + By + C</text>
+  <text x="586" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a626c">&#167;9.4</text>
+  <!-- box 6: output -->
+  <rect x="660" y="45" width="112" height="60" rx="6" fill="#e8f6ee" stroke="#1e8449" stroke-width="1.5"/>
+  <text x="716" y="68" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#145a32">curvature,</text>
+  <text x="716" y="84" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="bold" fill="#145a32">offset, overlay</text>
+  <text x="716" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1e8449">meters out</text>
+  <!-- arrows: each from one box's right edge to the next box's left edge -->
+  <line x1="122" y1="75" x2="136" y2="75" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow951)"/>
+  <line x1="252" y1="75" x2="266" y2="75" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow951)"/>
+  <line x1="382" y1="75" x2="396" y2="75" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow951)"/>
+  <line x1="512" y1="75" x2="526" y2="75" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow951)"/>
+  <line x1="642" y1="75" x2="656" y2="75" stroke="#2c3e50" stroke-width="2" marker-end="url(#arrow951)"/>
+</svg>
+<figcaption><strong>Figure 9.5.1</strong> The five-stage lane-detection pipeline. Each stage consumes the previous stage's output and exercises one part of this chapter: thresholding builds the evidence (Sections 9.1 and 9.2), the homography of Chapter 5 removes perspective, a voting search localizes lane pixels (the spirit of Section 9.3), and robust fitting measures them (Section 9.4).</figcaption>
+</figure>
+
+<p>
+A word on budget before we build. At 30 frames per second the pipeline has 33 milliseconds per frame, shared with everything else the vehicle computer does. Every operation below is a thresholded filter, a single warp, a histogram, or a small linear solve; on one CPU core the whole pipeline runs in a few milliseconds, which is why <a href="section-9.1.html">Section 9.1</a> made a point of the libraries running their kernels separably in optimized C. Classical lane detection earned its production deployments substantially because of this arithmetic.
+</p>
+
+<h2>2. Stage 1: Thresholding for Evidence <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The first stage converts the frame into a binary mask: 1 where a pixel plausibly belongs to lane paint, 0 elsewhere. We combine two independent kinds of evidence, because each one alone has a famous failure mode.
+</p>
+<p>
+<strong>Gradient evidence.</strong> Lane markings in a forward-facing camera run roughly toward the vanishing point, so they are close to vertical in the image and their intensity changes are close to horizontal. An $x$-direction Sobel filter, exactly the instrument calibrated in <a href="section-9.1.html">Section 9.1</a>, responds to lane edges while staying quiet on horizontal structure like shadow lines cast across the road. But recall the ridge profile from Section 9.1: a paint stripe is a thin bright line, so the gradient fires on <em>both flanks</em> and returns every marking as a double line. This is the annoyance Section 9.1 promised this section would deal with directly, and the fix is the second evidence channel.
+</p>
+<p>
+<strong>Color evidence.</strong> Lane paint is engineered to be visible, which in color terms means saturated white or yellow. The S channel of the HLS representation from <a href="../../part-1-image-processing/module-01-digital-image-fundamentals/index.html">Chapter 1</a> captures exactly this: paint stays high-saturation as overall brightness drops into shade, where raw RGB thresholds collapse. A simple fixed threshold on S, chosen with the histogram-reading skills of <a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>, lights up the <em>body</em> of each stripe, not just its flanks. The union of the two channels therefore turns every marking into one solid blob: gradient supplies crisp boundaries where paint is faded, color fills the interior and dissolves the double-line problem, and a single morphological opening from <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> deletes the isolated speckles both channels produce. The function below implements the whole stage.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def lane_evidence(bgr):
+    """Binary mask of likely lane-paint pixels: gradient OR color."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)     # x-gradient only
+    sx = np.uint8(255 * np.abs(sx) / (np.abs(sx).max() + 1e-12))
+    grad = sx &gt;= 35                       # fires on both flanks of a stripe
+    hls = cv2.cvtColor(bgr, cv2.COLOR_BGR2HLS)
+    color = hls[:, :, 2] &gt;= 120           # S channel: paint stays saturated
+    mask = (grad | color).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)    # one opening pass kills speckle
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+frame = cv2.imread("highway_frame.jpg")   # 1280 x 720, lens-undistorted
+mask = lane_evidence(frame)
+print(f"evidence pixels: {(mask &gt; 0).mean():.1%} of the frame")
+# Representative output:
+# evidence pixels: 3.4% of the frame</code></pre>
+<div class="code-caption">Gradient and color evidence united: the x-direction Sobel fires on both flanks of each paint stripe while the HLS saturation channel fills its body, so their union turns every marking into one solid blob; a single morphological opening then deletes isolated speckles before any geometry runs.</div>
+
+<p>
+Notice what we did <em>not</em> use: the full Canny detector of <a href="section-9.2.html">Section 9.2</a>. Canny's non-maximum suppression thins edges to one pixel, which is ideal when edges are the product but counterproductive here, where we want fat blobs of paint pixels for the histogram search to count. Choosing which tool a stage actually needs, rather than the most sophisticated tool available, is most of pipeline engineering.
+</p>
+
+<h2>3. Stage 2: The Bird's-Eye Warp <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+In the camera view, perspective entangles everything: parallel lane lines converge, lane width shrinks with distance, and a constant-curvature arc projects to a curve whose shape depends on where it sits in the frame. Fitting and measuring in that view means undoing perspective inside the model. The classical move is to undo it in the image instead: warp the road plane to a synthetic overhead view, after which lane lines are near-vertical and parallel, lane width is constant in pixels, and a quadratic $x = Ay^2 + By + C$ is an excellent local model of real road geometry (highways are built from clothoid arcs, and over a 30-meter window a quadratic tracks a clothoid closely).
+</p>
+<p>
+The warp is a planar homography, exactly the $3 \times 3$ machinery built in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>: the road is (assumed) flat, so four point correspondences determine the mapping. Calibration is a one-time manual act: on a frame where the road is known to be straight, mark a trapezoid whose sides lie on the two lane lines, and declare that it should map to a rectangle. The code below performs the warp; Figure 9.5.2 (in the next stage) shows it visually.
+</p>
+
+<pre><code class="language-python">h, w = mask.shape
+# source trapezoid: marked once on a straight-road frame, reused forever
+src = np.float32([[w * 0.43, h * 0.65], [w * 0.57, h * 0.65],
+                  [w * 0.90, h * 0.96], [w * 0.10, h * 0.96]])
+dst = np.float32([[w * 0.25, 0], [w * 0.75, 0],
+                  [w * 0.75, h], [w * 0.25, h]])
+M    = cv2.getPerspectiveTransform(src, dst)   # 3x3 homography
+Minv = cv2.getPerspectiveTransform(dst, src)   # for painting results back
+birds = cv2.warpPerspective(mask, M, (w, h),
+                            flags=cv2.INTER_NEAREST)  # keep mask binary</code></pre>
+<div class="code-caption">The bird's-eye warp in four lines of OpenCV: a source trapezoid marked once on a straight-road frame maps to a rectangle, nearest-neighbor interpolation keeps the mask strictly binary, and the inverse matrix is computed up front because the final overlay must travel back to the camera view.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Four Correspondences, One Call</div>
+<p>Solving a homography from four point pairs by hand means building the $8 \times 8$ direct linear transform system and back-substituting, roughly 30 lines of NumPy as constructed in <a href="../../part-1-image-processing/module-05-geometric-transformations/index.html">Chapter 5</a>, plus an inverse-mapping resampling loop of similar size. <code>cv2.getPerspectiveTransform(src, dst)</code> and <code>cv2.warpPerspective</code> replace all of it with two calls: a 30-to-1 reduction. Internally OpenCV solves the linear system with a stable decomposition, walks the <em>output</em> grid through the inverse homography so no holes appear, and interpolates with your choice of kernel; we pass <code>INTER_NEAREST</code> precisely because averaging a binary mask would manufacture gray pixels that are neither evidence nor background.</p>
+</div>
+
+<p>
+Two practical warnings. First, the flat-road assumption is real: crests, dips, and hard braking (which pitches the car nose-down) all tilt the true road plane away from the calibrated one, and the warp responds by bending straight lanes into phantom curves. Production systems estimate pitch online or fuse with inertial sensors. Second, the warp resamples aggressively near the top of the trapezoid, where one source pixel can smear across many destination pixels; this is why we threshold <em>before</em> warping rather than after, a choice Exercise 9.5.1 asks you to defend.
+</p>
+
+<h2>4. Stage 3: Sliding-Window Search <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The warped mask contains lane blobs plus leftover clutter: shadow fragments, asphalt seams, the occasional vehicle. The next stage must decide which evidence pixels belong to the left marking, which to the right, and which to neither. The classical answer begins with a wonderfully cheap idea: sum the mask's columns over the bottom half of the image. Each lane marking, being near-vertical, piles its pixels into a narrow range of columns, so the histogram shows two dominant peaks, and the peak positions are the lanes' base locations at the car's bumper. From each base, a stack of fixed-size windows climbs the image; each window collects the evidence pixels inside it, and if it caught enough, the next window above recenters on their mean $x$. The stack tracks the marking as it curves, as Figure 9.5.2 illustrates.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel shows a camera view with converging lane markings and a calibrated source trapezoid; an arrow labeled homography points to the right panel showing the bird's-eye view with near-vertical lane curves, stacked search windows climbing the left marking, and a column-sum histogram with two peaks below">
+  <defs>
+    <marker id="arrow952" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L8,4.5 L0,9 z" fill="#2c3e50"/>
+    </marker>
+  </defs>
+  <!-- LEFT PANEL: camera view -->
+  <text x="180" y="22" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">camera view</text>
+  <rect x="20" y="30" width="320" height="240" fill="#ffffff" stroke="#d1d4d8"/>
+  <!-- horizon -->
+  <line x1="20" y1="100" x2="340" y2="100" stroke="#d1d4d8" stroke-width="1"/>
+  <!-- source trapezoid -->
+  <polygon points="140,130 220,130 305,258 55,258" fill="#3498db" fill-opacity="0.12" stroke="#2980b9" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <!-- lane markings: converging -->
+  <line x1="78" y1="258" x2="155" y2="132" stroke="#e67e22" stroke-width="4"/>
+  <line x1="282" y1="258" x2="205" y2="132" stroke="#e67e22" stroke-width="4" stroke-dasharray="14,10"/>
+  <text x="180" y="290" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#5a626c">calibrated source trapezoid (dashed blue)</text>
+  <!-- ARROW between panels -->
+  <text x="390" y="135" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#2c3e50">homography</text>
+  <line x1="352" y1="150" x2="428" y2="150" stroke="#2c3e50" stroke-width="2.5" marker-end="url(#arrow952)"/>
+  <text x="390" y="172" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#5a626c">(Chapter 5)</text>
+  <!-- RIGHT PANEL: bird's-eye view -->
+  <text x="600" y="22" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#2c3e50">bird's-eye view</text>
+  <rect x="440" y="30" width="320" height="240" fill="#ffffff" stroke="#d1d4d8"/>
+  <!-- lane curves, near-vertical -->
+  <path d="M 520,270 C 514,200 522,120 538,46" fill="none" stroke="#e67e22" stroke-width="4"/>
+  <path d="M 688,270 C 682,200 690,120 706,46" fill="none" stroke="#e67e22" stroke-width="4" stroke-dasharray="14,10"/>
+  <!-- sliding windows climbing the left marking, recentering with the curve -->
+  <g fill="none" stroke="#1e8449" stroke-width="2">
+    <rect x="497" y="234" width="44" height="36"/>
+    <rect x="495" y="198" width="44" height="36"/>
+    <rect x="496" y="162" width="44" height="36"/>
+    <rect x="499" y="126" width="44" height="36"/>
+    <rect x="504" y="90"  width="44" height="36"/>
+    <rect x="510" y="54"  width="44" height="36"/>
+  </g>
+  <!-- label pointing at one window -->
+  <text x="620" y="148" font-family="sans-serif" font-size="12" fill="#1e8449">search windows</text>
+  <line x1="616" y1="144" x2="548" y2="144" stroke="#1e8449" stroke-width="1.5" marker-end="url(#arrow952)"/>
+  <!-- histogram strip under right panel -->
+  <path d="M 440,310 L 498,310 Q 519,282 540,310 L 666,310 Q 687,284 708,310 L 760,310" fill="#3498db" fill-opacity="0.35" stroke="#2980b9" stroke-width="1.5"/>
+  <text x="519" y="324" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#2c3e50">left base</text>
+  <text x="687" y="324" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#2c3e50">right base</text>
+  <text x="452" y="296" font-family="sans-serif" font-size="11" fill="#5a626c">column sums</text>
+</svg>
+<figcaption><strong>Figure 9.5.2</strong> Left: the camera view with the calibrated source trapezoid; the lane markings converge toward the horizon. Right: after the homography, the same markings are near-vertical and parallel; bottom-half column sums (the strip below) peak at the two lane bases, and stacked windows climb the left marking, recentering on the captured pixels' mean as the curve drifts.</figcaption>
+</figure>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Histogram Is a One-Dimensional Hough Transform</div>
+<p>The column-sum histogram is not merely a heuristic; it is the voting principle of <a href="section-9.3.html">Section 9.3</a> in its smallest possible form. Fix the line family to "vertical lines $x = b$" and the Hough parameter space collapses from $(\rho, \theta)$ to the single parameter $b$: every evidence pixel casts one vote for its own column, the accumulator <em>is</em> the histogram, and the two peaks are consensus winners exactly as Hough peaks are. The sliding windows then relax the model from "vertical line" to "vertical-ish curve" one band at a time. Recognizing a cheap histogram trick as a degenerate case of a principled transform is more than aesthetics: it tells you when the trick will fail (whenever a marking is far from vertical, votes smear across columns and the peak dissolves), and it tells you what to do about it (restore the missing parameter, or warp the geometry until the degenerate model is true, which is half of what the bird's-eye warp is for).</p>
+</div>
+
+<p>
+The implementation below returns the raw pixel coordinates assigned to each marking, ready for fitting. It is deliberately plain NumPy: one histogram, one <code>nonzero</code>, and a short loop over windows.
+</p>
+
+<pre><code class="language-python">def sliding_window_search(birds, n_windows=9, margin=80, minpix=50):
+    """Collect lane pixels by climbing windows from two histogram peaks."""
+    hist = birds[birds.shape[0] // 2:, :].sum(axis=0)   # bottom-half votes
+    mid = hist.shape[0] // 2
+    bases = [int(np.argmax(hist[:mid])), int(np.argmax(hist[mid:])) + mid]
+    nz_y, nz_x = birds.nonzero()                        # all evidence pixels
+    win_h = birds.shape[0] // n_windows
+    keep = [[], []]                                     # left, right masks
+    for k in range(n_windows):
+        y_hi = birds.shape[0] - k * win_h               # window bottom
+        y_lo = y_hi - win_h                             # window top
+        for side, x0 in enumerate(bases):
+            sel = ((nz_y &gt;= y_lo) &amp; (nz_y &lt; y_hi) &amp;
+                   (np.abs(nz_x - x0) &lt; margin))
+            keep[side].append(sel)
+            if sel.sum() &gt; minpix:                      # recenter on the mean
+                bases[side] = int(nz_x[sel].mean())
+    out = []
+    for side in (0, 1):
+        sel = np.logical_or.reduce(keep[side])
+        out.append((nz_x[sel], nz_y[sel]))
+    return out                                          # [(xl, yl), (xr, yr)]</code></pre>
+<div class="code-caption">The sliding-window search: bottom-half column sums nominate two base positions, nine stacked windows climb each marking, and every window recenters on the mean x of its captured pixels so the stack tracks the curve; the function returns raw pixel coordinates ready for the polynomial fit.</div>
+
+<p>
+The <code>minpix</code> gate matters more than it looks: a window over a gap in a dashed marking catches almost nothing, and recentering on the mean of three noise pixels would fling the stack sideways. By refusing to recenter on thin evidence, the stack coasts straight through dashes, which is the correct prior for road paint. On video, there is a further shortcut: once a frame has produced a good fit, the next frame skips the histogram and windows entirely and simply harvests evidence pixels within a margin of the previous polynomial. Exercise 9.5.2 builds that fast path, along with the sanity gates that decide when to fall back to the full search.
+</p>
+
+<h2>5. Stage 4: Polynomials, Curvature, and Meters <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Now the measurement step. We fit each marking with the quadratic that <a href="section-9.4.html">Section 9.4</a> promised, in the lane-friendly orientation $x = Ay^2 + By + C$: $x$ as a function of $y$, because the markings are near-vertical and a $y$-on-$x$ fit would hit exactly the steep-line pathology that Section 9.4 dissected (a near-vertical point set makes vertical residuals explode and the fitted slope collapse). Orienting the model along the data is the cheapest robustness trick in this entire pipeline.
+</p>
+<p>
+The fit happens twice: once in pixel units for drawing the overlay, and once in metric units for the controller. The unit conversion is a calibration fact about the warp: our destination rectangle places the lane edges $0.5\,w = 640$ pixels apart, and a standard highway lane is $3.7$ meters wide, so one warped pixel is $3.7/640$ meters in $x$; the trapezoid was marked to cover roughly 30 meters of road, so one pixel is $30/720$ meters in $y$. With metric coefficients in hand, the radius of curvature of $x(y)$ at the bumper line $y_0$ is the standard formula from calculus:
+</p>
+<p>
+$$ R \;=\; \frac{\bigl(1 + (2Ay_0 + B)^2\bigr)^{3/2}}{\lvert 2A \rvert}, $$
+</p>
+<p>
+and the lateral offset is the difference between the image center (where the camera, and approximately the car, sits) and the midpoint of the two fitted curves at the bumper, scaled to meters. The code below completes the pipeline.
+</p>
+
+<pre><code class="language-python">XM = 3.7 / 640    # meters per warped pixel in x: lane width 3.7 m = 640 px
+YM = 30.0 / 720   # meters per warped pixel in y: warp covers ~30 m of road
+
+(xl, yl), (xr, yr) = sliding_window_search(birds)
+left_px  = np.polyfit(yl, xl, 2)          # x = A y^2 + B y + C, in pixels
+right_px = np.polyfit(yr, xr, 2)
+left_m   = np.polyfit(yl * YM, xl * XM, 2)        # same fit, metric units
+
+A, B, _ = left_m
+y_car = (h - 1) * YM                       # evaluate at the bumper line
+radius = (1 + (2 * A * y_car + B) ** 2) ** 1.5 / abs(2 * A)
+
+lane_mid = (np.polyval(left_px, h - 1) + np.polyval(right_px, h - 1)) / 2
+offset = (w / 2 - lane_mid) * XM           # + means car is right of center
+print(f"radius of curvature {radius:7.0f} m   lateral offset {offset:+.2f} m")
+# Representative output:
+# radius of curvature     886 m   lateral offset -0.12 m</code></pre>
+<div class="code-caption">From pixels to steering geometry: the same quadratic is fit twice (pixel units for drawing, metric units for measurement), the curvature radius comes from the analytic formula evaluated at the bumper line, and the lateral offset compares image center with lane center under the meters-per-pixel calibration.</div>
+
+<p>
+On a clean frame, plain least squares is the right fitter here, because the sliding windows have already done the robustness work: they are a membership filter, admitting only pixels that sit inside a corridor that tracked the marking. This is the two-step recipe of <a href="section-9.4.html">Section 9.4</a> wearing different clothes: a consensus-style selection first, a precise fit on the selected set second. On a bad frame, the corridor itself can be captured: Section 9.4 warned that in lane images most thresholded pixels can belong to shadows and asphalt texture rather than paint, and when a shadow band runs alongside a marking, the histogram peak or a window stack can lock onto it. Production pipelines therefore wrap this stage in defenses: <strong>sanity gates</strong> that reject a frame whose two fits are not roughly parallel, whose implied lane width is wrong at any of three heights, or whose curvature disagrees wildly between left and right; <strong>temporal smoothing</strong> that blends each accepted fit with recent history and coasts on the last good fit through rejected frames, a job done properly by the Kalman filters of <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>; and on the worst frames, a RANSAC line-or-quadratic fit over the window centroids, exactly as built in <a href="section-9.4.html">Section 9.4</a>.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Most-Reimplemented Pipeline in Vision Education</div>
+<p>This exact architecture (threshold, warp, histogram, windows, polyfit, curvature) was an assignment in Udacity's self-driving-car program in 2017, and GitHub now hosts thousands of repositories named some variation of "advanced lane finding," most with the same trapezoid coordinates inherited from the starter code. The pipeline's pedagogical durability is no accident: it is one of the few systems where every intermediate product is an image you can look at, which makes every bug visible. Few debugging experiences in vision are as satisfying as watching your window stack march confidently up a guardrail.</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Yellow Tape, Skylights, and a Fleet of Forklifts</div>
+<p><strong>Who:</strong> A robotics engineer at a warehouse-automation company whose autonomous tow tractors follow yellow floor tape between picking stations.</p>
+<p><strong>Situation:</strong> The guidance stack was this section's pipeline almost verbatim: HSV color thresholding for the tape, a fixed bird's-eye homography from the forward camera (the floor is genuinely flat, so the warp's core assumption holds better than on any road), sliding windows, and a quadratic fit feeding a pure-pursuit controller at 20 Hz on an embedded ARM board with no GPU.</p>
+<p><strong>Problem:</strong> Two failure clusters dominated the incident log. Under midday skylights, specular glare on the polished concrete fired the color threshold in broad streaks, and the window stack occasionally abandoned the tape to follow a glare ribbon. In high-traffic aisles, the tape itself was scuffed gray in patches, and the histogram peak vanished, so the search seeded on clutter.</p>
+<p><strong>Decision:</strong> Three changes, all from this chapter's toolbox. The threshold became a union of saturation and an x-direction gradient channel, so scuffed tape with intact edges still produced evidence. The frame-level fit gained sanity gates (tape width within tolerance at three heights, curvature below the physical minimum turn radius) with rejected frames coasting on the previous fit. And the seeding histogram was restricted to a corridor around the previous frame's polynomial rather than the full image width.</p>
+<p><strong>Result:</strong> Guidance interventions fell from roughly one per vehicle-shift to one per week across the fleet, with no hardware change and a processing budget that stayed under 8 milliseconds per frame. The team later evaluated a small segmentation network and found it more accurate on worn tape but unable to meet the latency budget on the existing boards; the classical pipeline kept the job.</p>
+<p><strong>Lesson:</strong> The pipeline's stage-by-stage transparency was the operational asset: every incident could be replayed and attributed to a specific stage (threshold, seed, gate), and every fix was a targeted change to that stage. A monolithic learned model would have offered better ceiling accuracy and far worse attributability on a fleet that needed Tuesday's bug fixed by Thursday.</p>
+</div>
+
+<h2>6. When It Breaks, and What Replaced It <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Run this pipeline on a sunny highway and it looks unreasonably good. Run it on the full diversity of real driving and its failure taxonomy emerges with great clarity, because each failure is a violated assumption you can name:
+</p>
+<ul>
+<li><strong>Shadows and glare</strong> violate the threshold stage: a tree line casts high-contrast edges that out-vote faded paint, and wet asphalt mirrors the sky into the saturation channel.</li>
+<li><strong>Worn, occluded, or absent paint</strong> violates the evidence assumption outright; no threshold can recover markings that are not there, while human drivers infer the lane from curbs, traffic, and habit.</li>
+<li><strong>Hills and braking pitch</strong> violate the flat-road homography, bending straight lanes into phantom curves.</li>
+<li><strong>Lane changes and merges</strong> violate the two-peak histogram model precisely when geometry matters most.</li>
+<li><strong>Unusual markings</strong> (double yellows, botts' dots, temporary construction lines painted over old ones) violate the one-stripe-per-side prior.</li>
+</ul>
+<p>
+The CULane benchmark formalizes exactly this taxonomy, with test categories for shadow, glare, night, no-line, and curve frames; classical pipelines score respectably on the clean categories and collapse on the rest. That gap is the empirical case for learning the evidence rather than hand-coding it, and it is the bridge to Part III: the convolutional networks of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> learn their own thresholds from data (and, as we will see, their first layers rediscover oriented gradient filters on their own), while the segmentation machinery of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> replaces the threshold-and-search stages with a per-pixel classifier trained on tens of thousands of annotated frames. What deep models did <em>not</em> discard is the geometry: outputs are still fit with curve models, evaluated in curvature and lateral offset, and increasingly computed in an explicit bird's-eye representation. The vocabulary this pipeline defined became the field's evaluation language.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Lane Detection in 2024-2026</div>
+<p>Learned lane detection has split into two threads. The perception thread keeps refining frame-level detectors: CLRerNet (Honda and Uchida, WACV 2024, arXiv:2305.08366) tops CULane with a cross-layer-refinement architecture and a LaneIoU loss that aligns training with how lane quality is actually scored, and row-anchor designs descended from Ultra-Fast Lane Detection remain the budget option at hundreds of frames per second. The mapping thread absorbs lane detection into online HD-map construction: LaneSegNet (Li et al., ICLR 2024, arXiv:2312.16108) predicts lane <em>segments</em> with topology on the OpenLane-V2 benchmark, and MapTRv2 (Liao et al., IJCV 2024, arXiv:2308.05736) regresses vectorized lane polylines directly in a bird's-eye-view representation produced by learned view transformation rather than a calibrated homography. Look closely at that last clause: the warp survived. Modern BEV transformers learn the camera-to-overhead mapping that this section computed with four hand-marked points, because reasoning about road geometry is still easiest in the overhead frame. The pipeline's stages were replaced one by one; its coordinate system won.</p>
+</div>
+
+<p>
+This closes the chapter's arc. We began with a philosophical question (what is an edge?) and ended with a machine that converts two million pixels into a curvature radius a controller can steer by. Along the way, every major idea earned its place in a working system: gradients as instruments, Canny's discipline about what to keep, voting as detection, consensus as robustness, and fitting as measurement. The next chapter changes strategy: instead of long anonymous contours grouped by strong geometric priors, <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> finds compact, distinctive, <em>recognizable</em> points and gives each a fingerprint, the move that makes two different photographs of the same scene comparable, and the RANSAC you now know travels there immediately.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.5.1: Name the Priors <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Every stage of Figure 9.5.1 encodes at least one assumption about the world. (a) List one prior per stage and, for each, a concrete driving situation that violates it (Section 6 contains several; find at least two not listed there). (b) The pipeline thresholds <em>before</em> warping. Explain what would go wrong if the order were reversed, considering both interpolation (what does <code>warpPerspective</code> do to gray edge ramps near the top of the trapezoid?) and the Sobel response to perspective-stretched pixels. (c) The histogram seeding assumes exactly two peaks; propose a modification that handles a three-lane view where the car straddles a lane change, and state what new ambiguity your modification introduces.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.5.2: The Fast Path and Its Safety Net <span class="exercise-type coding">Coding</span></div>
+<p>Extend the pipeline for video. (a) Implement search-from-prior: given the previous frame's <code>left_px</code> and <code>right_px</code>, select evidence pixels within &#177;80 pixels of each polynomial and refit, skipping the histogram and windows entirely. (b) Add sanity gates: reject a frame if the lane width at $y \in \{h-1, h/2, 0\}$ leaves the range 500 to 780 warped pixels, or if the left and right quadratic coefficients $A$ differ by more than a factor of 3 when both magnitudes exceed a small floor. On rejection, reuse the last accepted fit; after three consecutive rejections, fall back to the full sliding-window search. (c) Run both paths on a short driving clip (any dashcam video works after you mark a trapezoid) and report the speedup of the fast path and the number of fallback events. Where in the clip do they cluster?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 9.5.3: How Trustworthy Is the Curvature Number? <span class="exercise-type analysis">Analysis</span></div>
+<p>The radius formula divides by $\lvert 2A \rvert$, and on a straight road $A \to 0$. (a) Propagate a small perturbation $\delta A$ through the formula to show that the <em>relative</em> error of $R$ blows up as the road straightens, and explain why production systems report curvature $\kappa = 1/R$ instead of radius. (b) Verify empirically: bootstrap the fit by resampling the window centroids 1,000 times on a gently curved synthetic lane ($R = 1{,}000$ m) and on a nearly straight one ($R = 20{,}000$ m), and report the spread of $R$ and of $\kappa$ for both. (c) Connect the result to <a href="section-9.4.html">Section 9.4</a>: which is the better-conditioned quantity to feed a Kalman filter in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>, and why?</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-9.4.html">&#8592; Section 9.4: Fitting Curves: Least Squares &amp; Robust Alternatives</a>
+<a href="index.html">Chapter 9</a>
+<a class="next" href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

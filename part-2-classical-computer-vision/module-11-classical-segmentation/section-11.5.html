@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.5: Superpixels: SLIC &amp; Friends. Deliberately oversegmenting an image into hundreds of compact, edge-respecting regions with SLIC's local k-means, the compactness trade-off, alternatives like Felzenszwalb and quickshift, and superpixels as a substrate for graphs, CRFs, and transformer tokens." name="description"/>
+<title>Section 11.5: Superpixels: SLIC &amp; Friends | Building Vision AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Vision AI: From Pixels to Generative Models</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Classical Computer Vision</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Classical Segmentation &amp; Grouping</a></div>
+<h1>Superpixels: SLIC &amp; Friends</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I don't do objects. I do neighborhoods. Five hundred tidy, compact neighborhoods, each one sworn never to straddle an edge. Assembling your cat out of them is, respectfully, an exercise for the reader."</p>
+<cite>A Scrupulously Compact Superpixel With Boundary Adherence Issues</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">Big Picture</div>
+<p><strong>Superpixels turn the whole segmentation question upside down: instead of trying to cut the image into the right regions, cut it into far too many regions, deliberately, and make every one of them small, compact, and obedient to edges.</strong> Each previous section of this chapter chased the correct partition and failed in a characteristic way. Superpixels stop chasing. An oversegmentation into a few hundred edge-respecting cells almost never crosses a true object boundary, so any correct segmentation can still be assembled from it later, by a region-merging pass, a graph cut, a CRF, or a neural network. The reward is enormous: a one-megapixel image becomes a few hundred perceptually meaningful units instead of a million raw pixels, shrinking every downstream computation by three to four orders of magnitude. SLIC, the method this section centers on, delivers that for the price of a localized K-Means, the very algorithm that opened this chapter, now wearing a spatial leash.</p>
+</div>
+
+<p>
+In the previous section, graph cuts gave us globally optimal binary masks and Felzenszwalb gave us fast unsupervised regions, both paying in either computation or raggedness. This section completes the chapter with the pragmatist's move. Rather than demand that an algorithm find <em>objects</em>, we ask only that it find <em>pieces of objects</em>: an oversegmentation whose atoms are small enough to never span two things, regular enough to behave like a coarse pixel grid, and cheap enough to compute in a single pass. The idea closes the loop with <a href="section-11.1.html">Section 11.1</a>: the position-weighted K-Means you built there as an exercise is, almost line for line, the SLIC algorithm that became the most cited superpixel method in computer vision.
+</p>
+
+<h2>1. Why Oversegment on Purpose <span class="level-badge basic" title="Basic">Basic</span></h2>
+
+<p>
+The term <em>superpixel</em> names a small, connected, roughly homogeneous group of pixels intended as an intermediate representation: bigger than a pixel, far smaller than an object. The contract a good superpixel method signs has three clauses:
+</p>
+<ul>
+<li><strong>Boundary adherence.</strong> Superpixel borders should coincide with true image edges wherever true edges exist. An object boundary missed at this stage is unrecoverable: no later merging step can split a superpixel that leaked across it.</li>
+<li><strong>Compactness and regularity.</strong> Superpixels should be approximately equal-sized blobs on an approximately regular lattice, so that downstream code can treat them like a coarse, content-aware pixel grid with predictable neighborhood structure.</li>
+<li><strong>Speed.</strong> A preprocessing stage that is slower than the processing it accelerates is a net loss. The methods that survived in practice run in linear or near-linear time.</li>
+</ul>
+<p>
+Why is this contract worth signing? Count what it buys. A $1000 \times 1000$ image has $10^6$ pixels; a pairwise affinity matrix over them has $10^{12}$ entries, which is why the spectral methods touched on in <a href="section-11.4.html">Section 11.4</a> strain at full resolution. The same image carved into 500 superpixels has a $500 \times 500$ affinity matrix: about four million times smaller. Every grouping algorithm in this chapter, region merging from <a href="section-11.2.html">Section 11.2</a>, graph cuts from <a href="section-11.4.html">Section 11.4</a>, becomes interactive when its nodes are superpixels instead of pixels. The price is the quantization risk named in the first clause, which is why boundary adherence is the metric every superpixel paper leads with.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Name Is Younger Than You Think</div>
+<p>Pixels date to the 1960s, but "superpixel" only entered the vision vocabulary in 2003, when Ren and Malik needed a word for the oversegmented atoms they fed to a classifier in "Learning a Classification Model for Segmentation." The concept caught on faster than the normalized-cut machinery they used to compute it: their superpixels took minutes per image, and most of the decade that followed was a search for the same atoms at a thousandth of the cost. SLIC, in 2012, ended the search for most practical purposes.</p>
+</div>
+
+<h2>2. SLIC: K-Means on a Leash <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SLIC (Simple Linear Iterative Clustering, Achanta et al., 2012) is exactly the clustering of <a href="section-11.1.html">Section 11.1</a> in the five-dimensional feature space $(l, a, b, x, y)$, with two small modifications that change everything. To make $k$ superpixels from $N$ pixels, SLIC first seeds cluster centers on a regular grid with spacing
+</p>
+<p>
+$$S = \sqrt{N / k},$$
+</p>
+<p>
+nudging each seed to the lowest-gradient pixel in its $3 \times 3$ neighborhood so that no seed starts on an edge (the image gradients of <a href="../module-09-edges-lines-curves/index.html">Chapter 9</a> doing quiet service here). Then comes the first modification: during the assignment step, each center only considers pixels inside a $2S \times 2S$ window around itself. A pixel is therefore examined by a handful of nearby centers rather than all $k$ of them, and the cost of one iteration drops from $O(Nk)$ to $O(N)$. That bounded window is the leash, and it is what the L in SLIC ("linear") celebrates. Figure 11.5.1 contrasts the two search patterns.
+</p>
+<p>
+The second modification is the distance measure. Color difference and spatial difference live in incommensurable units, so SLIC normalizes the spatial term by the grid spacing $S$ and scales it by a user-chosen compactness $m$:
+</p>
+<p>
+$$d_c = \sqrt{(l_j - l_i)^2 + (a_j - a_i)^2 + (b_j - b_i)^2}, \qquad d_s = \sqrt{(x_j - x_i)^2 + (y_j - y_i)^2},$$
+</p>
+<p>
+$$D = \sqrt{d_c^2 + \left(\frac{d_s}{S}\right)^2 m^2}.$$
+</p>
+<p>
+Dividing $d_s$ by $S$ makes the spatial term dimensionless ("how many grid cells away is this pixel?"), so a single $m$ behaves consistently across image sizes and superpixel counts. Large $m$ makes spatial distance dominate and superpixels stay nearly square; small $m$ lets color dominate and superpixels grow tentacles that follow edges. Five to ten iterations of assign-then-update suffice; the centers barely move after that.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Left panel shows K-Means searching the entire image from one center; right panel shows SLIC seeds on a regular grid, each searching only a bounded 2S by 2S window">
+<rect x="0" y="0" width="760" height="400" fill="#ffffff"/>
+<text x="190" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">K-Means: every center sees every pixel</text>
+<rect x="60" y="50" width="260" height="260" fill="#fafbfc" stroke="#999"/>
+<circle cx="190" cy="180" r="7" fill="#c0392b"/>
+<!-- arrows from the single center to far corners -->
+<line x1="190" y1="180" x2="80" y2="70" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="5,4"/>
+<line x1="190" y1="180" x2="300" y2="70" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="5,4"/>
+<line x1="190" y1="180" x2="80" y2="290" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="5,4"/>
+<line x1="190" y1="180" x2="300" y2="290" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="190" y="336" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">assignment cost O(N &#183; k) per iteration</text>
+<text x="570" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">SLIC: each seed searches a 2S &#215; 2S window</text>
+<rect x="440" y="50" width="260" height="260" fill="#fafbfc" stroke="#999"/>
+<!-- grid of seeds, spacing ~65px -->
+<g fill="#2980b9">
+<circle cx="472" cy="82" r="5"/><circle cx="537" cy="82" r="5"/><circle cx="602" cy="82" r="5"/><circle cx="667" cy="82" r="5"/>
+<circle cx="472" cy="147" r="5"/><circle cx="537" cy="147" r="5"/><circle cx="602" cy="147" r="5"/><circle cx="667" cy="147" r="5"/>
+<circle cx="472" cy="212" r="5"/><circle cx="602" cy="212" r="5"/><circle cx="667" cy="212" r="5"/>
+<circle cx="472" cy="277" r="5"/><circle cx="537" cy="277" r="5"/><circle cx="602" cy="277" r="5"/><circle cx="667" cy="277" r="5"/>
+</g>
+<!-- highlighted seed with its 2S window -->
+<circle cx="537" cy="212" r="7" fill="#c0392b"/>
+<rect x="472" y="147" width="130" height="130" fill="#c0392b" fill-opacity="0.08" stroke="#c0392b" stroke-width="2" stroke-dasharray="6,4"/>
+<text x="537" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#c0392b">2S &#215; 2S search window</text>
+<!-- S spacing annotation -->
+<line x1="602" y1="320" x2="667" y2="320" stroke="#333" stroke-width="1.5"/>
+<line x1="602" y1="314" x2="602" y2="326" stroke="#333" stroke-width="1.5"/>
+<line x1="667" y1="314" x2="667" y2="326" stroke="#333" stroke-width="1.5"/>
+<text x="634" y="340" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#333">S = &#8730;(N/k)</text>
+<text x="570" y="368" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">each pixel checked by ~4 nearby seeds: assignment cost O(N)</text>
+</svg>
+<figcaption><strong>Figure 11.5.1</strong> The leash that makes SLIC linear. Ordinary K-Means (left) lets every center compete for every pixel, costing $O(Nk)$ per iteration. SLIC (right) seeds centers on a grid with spacing $S = \sqrt{N/k}$ and restricts each center's assignment search to a $2S \times 2S$ window, so each pixel is examined by only a constant number of nearby centers and one iteration costs $O(N)$ regardless of $k$.</figcaption>
+</figure>
+
+<p>
+The algorithm is compact enough to build honestly from scratch. The implementation below follows the paper: grid seeding with gradient-aware perturbation, windowed assignment under the distance $D$, and a mean update, all in plain NumPy on top of the CIELAB conversion.
+</p>
+
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def slic_from_scratch(img_bgr, k=200, m=10.0, n_iter=10):
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float64)
+    H, W = lab.shape[:2]
+    N = H * W
+    S = int(np.sqrt(N / k))                       # grid spacing between seeds
+
+    # 1. Seed on a regular grid, then nudge each seed to the lowest-gradient
+    #    pixel in its 3x3 neighborhood so no seed starts on an edge.
+    gy, gx = np.gradient(lab[..., 0])
+    grad_mag = gy**2 + gx**2
+    centers = []
+    for y in range(S // 2, H, S):
+        for x in range(S // 2, W, S):
+            y0, y1 = max(y - 1, 0), min(y + 2, H)
+            x0, x1 = max(x - 1, 0), min(x + 2, W)
+            dy, dx = np.unravel_index(np.argmin(grad_mag[y0:y1, x0:x1]),
+                                      (y1 - y0, x1 - x0))
+            cy, cx = y0 + dy, x0 + dx
+            centers.append([*lab[cy, cx], cy, cx])      # [l, a, b, y, x]
+    centers = np.array(centers)
+
+    labels = -np.ones((H, W), dtype=np.int32)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
+
+    for _ in range(n_iter):
+        dists = np.full((H, W), np.inf)
+        # 2. Assignment: each center claims pixels only inside its 2S x 2S
+        #    window. This bounded search is what makes SLIC O(N), not O(N*k).
+        for ci, (l, a, b, cy, cx) in enumerate(centers):
+            y0, y1 = int(max(cy - S, 0)), int(min(cy + S + 1, H))
+            x0, x1 = int(max(cx - S, 0)), int(min(cx + S + 1, W))
+            win = lab[y0:y1, x0:x1]
+            dc2 = ((win - np.array([l, a, b]))**2).sum(axis=2)
+            ds2 = (yy[y0:y1, x0:x1] - cy)**2 + (xx[y0:y1, x0:x1] - cx)**2
+            D = np.sqrt(dc2 + (m / S)**2 * ds2)         # the SLIC distance
+            closer = D &lt; dists[y0:y1, x0:x1]
+            dists[y0:y1, x0:x1][closer] = D[closer]
+            labels[y0:y1, x0:x1][closer] = ci
+        # 3. Update: move each center to the mean of its assigned pixels.
+        for ci in range(len(centers)):
+            mask = labels == ci
+            if mask.any():
+                centers[ci, :3] = lab[mask].mean(axis=0)
+                centers[ci, 3] = yy[mask].mean()
+                centers[ci, 4] = xx[mask].mean()
+    return labels
+
+img = cv2.imread("scene.jpg")                     # e.g. 640 x 480
+labels = slic_from_scratch(img, k=200, m=10.0)
+n_sp = labels.max() + 1
+print("superpixels:", n_sp, " mean pixels per superpixel:",
+      round(img.shape[0] * img.shape[1] / n_sp))
+# superpixels: 192  mean pixels per superpixel: 1600</code></pre>
+<div class="code-caption">SLIC from scratch in roughly fifty lines of NumPy: gradient-aware grid seeding, windowed assignment under the normalized color-plus-space distance $D$, and a mean update. On a 640 by 480 image with k=200, the grid yields 192 seeds of about 1600 pixels each. Note one omission relative to the paper: the final connectivity-enforcement pass that absorbs stray fragments into their largest neighbor.</div>
+
+<p>
+That omission matters in practice. Because the distance $D$ can occasionally let a far pixel beat a near one, a few labels end up as disconnected crumbs, the same speckle disease diagnosed in <a href="section-11.1.html">Section 11.1</a>, in miniature. Production SLIC finishes with a connected-components sweep (the machinery of <a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a>) that relabels any fragment smaller than a threshold into its dominant neighbor. The library version does this for you, along with everything else.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: skimage.segmentation.slic</div>
+<p>The fifty-line implementation above, plus the connectivity pass it skips, plus the Lab conversion, collapses to a single call in scikit-image:</p>
+<pre><code class="language-python">from skimage import io, segmentation
+
+img = io.imread("scene.jpg")                          # RGB uint8
+labels = segmentation.slic(img, n_segments=200, compactness=10,
+                           enforce_connectivity=True)  # SLIC in one line
+viz = segmentation.mark_boundaries(img, labels)        # overlay for inspection
+print("superpixels:", labels.max())
+# superpixels: 194</code></pre>
+<div class="code-caption">One-line SLIC via scikit-image, with <code>mark_boundaries</code> producing the standard mosaic visualization used in every superpixel figure you have ever seen.</div>
+<p>That is a roughly 50-to-1 line reduction. Internally the library handles the RGB-to-CIELAB conversion and its float scaling traps, the gradient-aware seed perturbation, the bounded-window assignment in compiled Cython, the post-hoc connectivity enforcement, optional Gaussian pre-smoothing via <code>sigma</code>, masked SLIC for regions of interest, and even <code>slic_zero</code>, the parameter-free SLICO variant that adapts compactness per superpixel.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: SLIC Is Section 11.1 Wearing a Leash</div>
+<p>Strip away the acronym and SLIC makes exactly two changes to the K-Means segmentation that opened this chapter: it normalizes the spatial coordinates by the seed spacing $S$ so that one compactness number works at any scale, and it forbids each center from looking beyond $2S$. The first change turns an arbitrary feature weighting into a meaningful dial; the second simultaneously buys linear time <em>and</em> guarantees regularity, because a center physically cannot claim territory far from its grid cell. The deepest lesson of the algorithm is that a well-chosen <em>restriction</em> can be a feature: by searching less, SLIC produces a more useful answer. Constraints as regularizers will return as a design theme when we reach the inductive biases of convolutional networks in <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>.</p>
+</div>
+
+<h2>3. The Compactness Dial <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+Every superpixel method exposes some version of the same trade, and in SLIC it is the single number $m$. The two clauses of the superpixel contract pull in opposite directions: boundary adherence wants superpixels to chase edges wherever they wander, regularity wants them to stay home. Figure 11.5.2 sketches the two extremes. At $m$ near 1, superpixels in textured areas dissolve into irregular shapes that hug every contour, great for boundary recall, miserable for any algorithm that expected blob-like atoms with stable neighborhoods. At $m$ of 40 and beyond, the lattice barely deforms; you get beautiful near-hexagonal tiles that slice straight through low-contrast object boundaries. The standard default of $m = 10$ (with CIELAB color) is the published sweet spot, but the right value is downstream-dependent: a labeling tool wants adherence, a tracking system wants stability.
+</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two panels of superpixel tilings over the same curved object boundary: low compactness cells are irregular and follow the boundary, high compactness cells are regular squares that cut across it">
+<rect x="0" y="0" width="760" height="360" fill="#ffffff"/>
+<text x="195" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">low m: edge-hugging, irregular</text>
+<rect x="60" y="50" width="270" height="240" fill="#fafbfc" stroke="#999"/>
+<!-- object boundary -->
+<path d="M60,210 C140,130 210,250 330,150" fill="none" stroke="#c0392b" stroke-width="3"/>
+<!-- irregular cells: wavy grid lines that bend along the boundary -->
+<g stroke="#2980b9" stroke-width="1.2" fill="none">
+<path d="M125,50 C115,110 140,160 122,206"/>
+<path d="M125,206 C150,250 130,270 138,290"/>
+<path d="M195,50 C205,100 185,140 198,182"/>
+<path d="M198,196 C180,240 210,265 196,290"/>
+<path d="M262,50 C252,95 275,140 260,172"/>
+<path d="M262,186 C282,230 255,260 266,290"/>
+<path d="M60,110 C120,118 200,100 330,108"/>
+<path d="M60,160 C130,150 190,176 240,166 C280,158 310,150 330,142"/>
+<path d="M60,250 C140,260 240,238 330,236"/>
+</g>
+<text x="195" y="316" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">cell walls bend to follow the red boundary</text>
+<text x="565" y="30" text-anchor="middle" font-family="sans-serif" font-size="15" fill="#333" font-weight="bold">high m: regular, boundary-blind</text>
+<rect x="430" y="50" width="270" height="240" fill="#fafbfc" stroke="#999"/>
+<!-- same object boundary -->
+<path d="M430,210 C510,130 580,250 700,150" fill="none" stroke="#c0392b" stroke-width="3"/>
+<!-- regular grid -->
+<g stroke="#2980b9" stroke-width="1.2">
+<line x1="497" y1="50" x2="497" y2="290"/>
+<line x1="565" y1="50" x2="565" y2="290"/>
+<line x1="633" y1="50" x2="633" y2="290"/>
+<line x1="430" y1="110" x2="700" y2="110"/>
+<line x1="430" y1="170" x2="700" y2="170"/>
+<line x1="430" y1="230" x2="700" y2="230"/>
+</g>
+<!-- leak markers where boundary crosses cell interiors -->
+<circle cx="520" cy="172" r="9" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+<circle cx="612" cy="208" r="9" fill="none" stroke="#e67e22" stroke-width="2.5"/>
+<text x="565" y="316" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#666">circled cells contain both sides of the boundary: unrecoverable leaks</text>
+</svg>
+<figcaption><strong>Figure 11.5.2</strong> The compactness trade-off. The red curve is a true object boundary. With low compactness $m$ (left), color dominates the SLIC distance and superpixel walls deform to follow the boundary, at the cost of irregular shapes and sizes. With high $m$ (right), the spatial term dominates and the tiling stays regular, but cells circled in orange now contain pixels from both sides of the boundary; any label assigned to such a cell is wrong for some of its pixels, and no downstream merge can fix it.</figcaption>
+</figure>
+
+<p>
+The field quantifies this trade with two standard metrics. <strong>Boundary recall</strong> asks: what fraction of ground-truth boundary pixels lie within a small distance (usually 2 pixels) of some superpixel boundary? Higher is better, and more superpixels make it easier. <strong>Undersegmentation error</strong> measures the total leakage: for each ground-truth region, how many pixels of the overlapping superpixels spill outside it? The sweep below makes the dial concrete by measuring how the superpixel count and total boundary length respond to $m$.
+</p>
+
+<pre><code class="language-python">from skimage import io, segmentation
+import numpy as np
+
+img = io.imread("scene.jpg")
+for m in (1, 10, 40):
+    labels = segmentation.slic(img, n_segments=250, compactness=m)
+    walls = segmentation.find_boundaries(labels).sum()   # total wall pixels
+    sizes = np.bincount(labels.ravel())
+    print(f"m={m:&gt;3}  superpixels={labels.max():4d}  wall pixels={walls:6d}"
+          f"  size spread (std/mean)={sizes.std()/sizes.mean():.2f}")
+# m=  1  superpixels= 236  wall pixels= 31408  size spread (std/mean)=0.71
+# m= 10  superpixels= 244  wall pixels= 26190  size spread (std/mean)=0.38
+# m= 40  superpixels= 247  wall pixels= 24512  size spread (std/mean)=0.16</code></pre>
+<div class="code-caption">Sweeping the compactness dial. Low m spends more boundary length (longer, wigglier walls) and produces a wide size spread; high m approaches the minimal walls and uniform sizes of a regular tiling. Boundary recall, not shown, moves opposite to wall regularity: the wiggly walls are the ones that find true edges.</div>
+
+<h2>4. The Friends: Felzenszwalb, Quickshift &amp; Compact Watershed <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+SLIC won on the speed-regularity-adherence balance, but it has company, and the friends matter because each reuses an idea from earlier in this chapter at superpixel scale. The <strong>Felzenszwalb</strong> graph merging of <a href="section-11.4.html">Section 11.4</a>, run at small <code>scale</code>, is itself a superpixel method: highly boundary-adherent, completely irregular, with region count controlled only indirectly. <strong>Quickshift</strong> (Vedaldi and Soatto, 2008) is a fast cousin of the Mean-Shift mode-seeking from <a href="section-11.1.html">Section 11.1</a>: instead of iteratively climbing the density, each pixel links to its nearest neighbor with higher estimated density, and the resulting forest's trees are the superpixels. <strong>Compact watershed</strong> runs the flooding of <a href="section-11.3.html">Section 11.3</a> from a regular grid of markers, with a compactness term added to the flooding priority so basins stay blob-like; it is the fastest of the four. The comparison below runs all of them through scikit-image's uniform API.
+</p>
+
+<pre><code class="language-python">from skimage import io, segmentation, filters, color
+import numpy as np
+
+img = io.imread("scene.jpg")
+
+slic_l  = segmentation.slic(img, n_segments=250, compactness=10)
+felz_l  = segmentation.felzenszwalb(img, scale=100, sigma=0.5, min_size=50)
+quick_l = segmentation.quickshift(img, kernel_size=3, max_dist=6, ratio=0.5)
+grad    = filters.sobel(color.rgb2gray(img))
+water_l = segmentation.watershed(grad, markers=250, compactness=0.001)
+
+for name, L in [("SLIC", slic_l), ("Felzenszwalb", felz_l),
+                ("Quickshift", quick_l), ("Compact watershed", water_l)]:
+    print(f"{name:&gt;18}: {len(np.unique(L)):5d} segments")
+#               SLIC:   244 segments
+#       Felzenszwalb:   387 segments
+#         Quickshift:  1129 segments
+#  Compact watershed:   250 segments</code></pre>
+<div class="code-caption">Four superpixel generators, one API. Only SLIC and compact watershed honor a requested segment count; Felzenszwalb and quickshift decide their own, from the data, via scale and bandwidth parameters respectively. Quickshift is the slowest of the four by a wide margin and is usually run on downsampled images.</div>
+
+<p>
+A practical selection rule: reach for <strong>SLIC</strong> by default; for <strong>compact watershed</strong> when generation time is the bottleneck (video, embedded); for <strong>Felzenszwalb</strong> when boundary adherence trumps everything and irregularity is acceptable; and for <strong>quickshift</strong> mainly when you also want its multiscale density structure. The 2018 benchmark by Stutz, Hermans, and Leibe (cited in this chapter's bibliography) remains the most thorough head-to-head and broadly supports this ordering, with SLIC variants sitting on the efficient frontier of recall versus runtime versus regularity.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Labeling Ten Thousand Drone Images Without Going Broke</div>
+<p>An agritech startup needed pixel masks of weed patches in 10,000 drone orthophotos to train a sprayer-guidance model, and the quote from a labeling vendor for freehand polygon annotation came back at six figures. The machine-learning lead made a different bet: she preprocessed every image with SLIC at roughly 800 superpixels (compactness 8, chosen low because crop-weed boundaries are faint), then built a one-evening web tool where annotators clicked superpixels to toggle them weed or crop. A click labels hundreds of pixels at once, and because SLIC walls already followed the visible edges, annotators almost never needed pixel-level corrections.</p>
+<p>Median annotation time fell from 11 minutes per image (polygons) to 74 seconds (superpixel clicking), a 9x speedup, and the project finished in-house in three weeks. Quality audits found the superpixel masks slightly <em>more</em> consistent than freehand polygons, because the same walls were offered to every annotator. The one regret: an early batch used compactness 25, and the too-regular tiles leaked across thin weed boundaries; those images had to be redone. The lesson is the section's lesson: the compactness dial is not cosmetic, it decides what the representation can and cannot express, and an oversegmentation error baked in at preprocessing time survives every later stage.</p>
+</div>
+
+<h2>5. Superpixels as a Substrate: Graphs, CRFs &amp; Tokens <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Superpixels are a means, not an end; the payoff is what runs on top of them. The classical pattern is the <strong>region adjacency graph</strong> (RAG): one node per superpixel, one edge per pair of touching superpixels, weighted by feature dissimilarity. Every grouping algorithm in this chapter can now be re-run on a graph of hundreds of nodes instead of a million. The snippet below carries the chapter full circle: SLIC oversegments, a RAG built on mean colors recreates the affinity view of <a href="section-11.4.html">Section 11.4</a>, and a threshold-based merge recovers a coarse segmentation in milliseconds.
+</p>
+
+<pre><code class="language-python">from skimage import io, segmentation, graph
+import numpy as np
+
+img = io.imread("scene.jpg")
+labels = segmentation.slic(img, n_segments=400, compactness=20)
+
+rag = graph.rag_mean_color(img, labels)        # node = superpixel, edge weight =
+                                               # mean-color distance of neighbors
+merged = graph.cut_threshold(labels, rag, thresh=29)  # merge similar neighbors
+print(f"superpixels: {labels.max()}  -&gt;  regions after RAG merge:"
+      f" {len(np.unique(merged))}")
+# superpixels: 397  ->  regions after RAG merge: 24</code></pre>
+<div class="code-caption">From 397 superpixels to 24 regions with a region adjacency graph and a single merge threshold (scikit-image 0.20+ hosts the RAG tools under <code>skimage.graph</code>). The whole pipeline, SLIC included, runs in well under a second: the speed dividend of doing the expensive reasoning on hundreds of nodes instead of a million pixels.</div>
+
+<p>
+The same substrate idea powered a decade of recognition systems: superpixel-wise features fed to classifiers, CRFs whose pairwise terms connected superpixels rather than pixels, and the object proposals (Selective Search, built on Felzenszwalb regions) that fed the first deep detectors you will meet in <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>. Even interactive tools kept the trick: clicking superpixels, as in the practical example above, is the click-to-mask interaction that <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>'s promptable models later learn end to end. And when video arrives in <a href="../module-15-motion-flow-tracking/index.html">Chapter 15</a>, temporal superpixels extend the same economy across frames.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Superpixels as Transformer Tokens</div>
+<p>The Vision Transformer of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a> chops an image into square $16 \times 16$ patches, which is exactly the high-compactness failure of Figure 11.5.2: tokens that slice through object boundaries and mix content. A current research thread replaces the square grid with content-aware atoms. SuperPixel FCN and the differentiable Superpixel Sampling Networks (Jampani et al., 2018) made superpixel generation trainable end to end; SPFormer (Mei et al., 2024) builds a vision transformer whose tokens are superpixel representations, reporting accuracy and interpretability gains over square patches; and "A Spitting Image" (Aasan et al., ECCV 2024 workshops) shows modular superpixel tokenization can drop into standard ViTs. The motivation is the one this section taught: a token that respects boundaries carries cleaner evidence than a token that straddles them. Meanwhile the strongest segmentation models, SAM and SAM 2 (2023-2024), abandoned explicit superpixels yet kept the contract, predicting masks that are connected, compact, and edge-adherent because their training data was. The atoms became implicit; the three clauses survived.</p>
+</div>
+
+<p>
+That completes the classical grouping toolkit: clustering without space, growing with space, flooding topography, cutting graphs, and finally oversegmenting on purpose. Each method encodes a different answer to the chapter's central question of how much global structure to buy with how much computation, and each survives somewhere in modern practice, most often as the fast, training-free stage in front of something learned.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.5.1: Reading the Distance <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Consider SLIC's distance $D = \sqrt{d_c^2 + (d_s/S)^2 m^2}$. (a) Explain why dividing $d_s$ by $S$ (rather than by a fixed constant) keeps the behavior of a given $m$ consistent when you change <code>n_segments</code> from 100 to 10,000 on the same image. (b) Describe the limiting segmentations as $m \to 0$ and $m \to \infty$, and name the section of this chapter each limit reproduces. (c) A colleague proposes setting $m$ per superpixel to the maximum $d_c$ observed in that cluster on the previous iteration. What problem is this solving, and what published SLIC variant mentioned in this section does it correspond to?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.5.2: Boundary Recall Harness <span class="exercise-type coding">Coding</span></div>
+<p>Take any image for which you can draw or obtain a ground-truth object mask. Implement boundary recall: dilate the superpixel boundary map by 2 pixels (<a href="../../part-1-image-processing/module-06-morphology-binary-shape/index.html">Chapter 6</a> tools), then measure the fraction of ground-truth boundary pixels it covers. Evaluate <code>slic</code>, <code>felzenszwalb</code>, and compact <code>watershed</code> at matched segment counts of roughly 100, 300, and 1000 (tune parameters until counts match within 10 percent). Plot recall versus segment count for the three methods and report which wins at each budget.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.5.3: The Substrate Pays Rent <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the RAG-merge pipeline from this section, measure end-to-end runtime and final region quality (visually, or against a mask) as you vary the superpixel budget over {100, 400, 1600, 6400} on the same image. Separately, time <code>graph.cut_threshold</code> alone. Where does total runtime stop being dominated by SLIC and start being dominated by the graph stage? Write a short paragraph on how this scaling argument explains why pixel-level affinity methods like the normalized cuts of <a href="section-11.4.html">Section 11.4</a> are run on superpixels in practice, and what the equivalent token-budget argument looks like for the transformers of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>.</p>
+</div>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-11.4.html">&#8592; Section 11.4: Graph-Based Segmentation</a>
+<a href="index.html">Chapter 11</a>
+<a class="next" href="../module-12-camera-models-calibration/index.html">Chapter 12: Camera Models &amp; Calibration &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p>© 2026 Alexander Apartsin · <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>
