@@ -10,28 +10,42 @@ ROOT = Path(__file__).resolve().parent.parent
 SKIP = {"vendor", "templates", "node_modules", ".git", "pagefind", "scripts"}
 
 DISPLAY = re.compile(r"\$\$(.+?)\$\$", re.S)
+SENT = "\x00DISPLAYMATH\x00"
+# inline $...$ on a single line; guarded below to TeX-looking content only
+INLINE = re.compile(r"\$([^$\n]+?)\$")
+TEX_HINT = re.compile(r"[\\_^{}]")
+
+def _escape(inner):
+    fixed = inner.replace("&lt;", "<").replace("&gt;", ">")  # normalize (idempotent)
+    return fixed.replace("<", "&lt;").replace(">", "&gt;")
 
 def fix_span(m):
+    # a $$...$$ math span contains no real HTML tags
+    return "$$" + _escape(m.group(1)) + "$$"
+
+def fix_inline(m):
     inner = m.group(1)
-    # normalize first (idempotent), then escape every bare < and >;
-    # a $$...$$ math span contains no real HTML tags.
-    fixed = inner.replace("&lt;", "<").replace("&gt;", ">")
-    fixed = fixed.replace("<", "&lt;").replace(">", "&gt;")
-    return "$$" + fixed + "$$"
+    # only treat as math (and only act) when it looks like TeX and has < or >;
+    # this skips currency like "$5" / "$10" which have no TeX hint.
+    if ("<" in inner or ">" in inner) and TEX_HINT.search(inner):
+        return "$" + _escape(inner) + "$"
+    return m.group(0)
 
 n_files = n_spans = 0
 for f in ROOT.rglob("*.html"):
     if any(s in f.relative_to(ROOT).parts for s in SKIP):
         continue
     html = f.read_text(encoding="utf-8", errors="replace")
-    spans = DISPLAY.findall(html)
-    if not spans:
-        continue
+    # display $$...$$ first, then mask them so inline $...$ does not cross $$
     new = DISPLAY.sub(fix_span, html)
+    masked = DISPLAY.sub(lambda m: SENT, new)
+    masked = INLINE.sub(fix_inline, masked)
+    # restore display spans in order
+    disp = DISPLAY.findall(new)
+    it = iter(disp)
+    new = re.sub(re.escape(SENT), lambda m: "$$" + next(it) + "$$", masked)
     if new != html:
-        before = sum(("<" in s or ">" in s) for s in spans)
         f.write_text(new, encoding="utf-8")
         n_files += 1
-        n_spans += before
-        print(f"fixed {f.relative_to(ROOT)} ({before} math spans had </> )")
+        print(f"fixed {f.relative_to(ROOT)}")
 print(f"\nfixed {n_files} files")
