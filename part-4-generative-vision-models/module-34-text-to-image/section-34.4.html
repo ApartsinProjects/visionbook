@@ -97,7 +97,7 @@ The enabling trick is the vector-quantized autoencoder (VQ-VAE / VQGAN), a discr
 </figure>
 
 <p>
-Figure 34.4.1 makes the conversion concrete: a continuous image becomes a small grid of integers drawn from a fixed vocabulary. From here, generating an image is generating that grid of integers, and the entire generative problem reduces to a familiar sequence-modeling problem. The straight-through gradient estimator that lets the non-differentiable codebook lookup train end to end is the one piece of machinery beyond the ordinary VAE; the rest is the autoencoder you already know.
+Figure 34.4.1 makes the conversion concrete: a continuous image becomes a small grid of integers drawn from a fixed vocabulary. From here, generating an image is generating that grid of integers, and the entire generative problem reduces to a familiar sequence-modeling problem. The "snap to nearest codebook entry" step is a hard lookup with no usable gradient, so ordinary backpropagation cannot train through it. The straight-through gradient estimator is the fix: on the backward pass it simply copies the gradient from the quantized vector back to the encoder as if the lookup were the identity. That one trick lets the codebook lookup train end to end and is the only piece of machinery beyond the ordinary VAE; the rest is the autoencoder you already know.
 </p>
 
 <pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
@@ -127,6 +127,13 @@ print("quantized features:", tuple(zq.shape))
 print("token grid:", tuple(token_grid.shape),
       "-> sequence length:", token_grid.numel())</code></pre>
 <div class="code-caption"><strong>Code Fragment 1:</strong> The vector-quantization step that turns continuous features into discrete tokens. Each of the 256 spatial cells is mapped to one of 8192 codebook indices by the nearest-neighbor <code>argmin</code> over squared distances; the straight-through estimator <code>z + (zq - z).detach()</code> copies gradients past the non-differentiable lookup. Expected output: <code>quantized features: (1, 256, 16, 16)</code>, <code>token grid: (1, 16, 16) -> sequence length: 256</code>.</div>
+
+<div class="callout note">
+<div class="callout-title">Common Misconception: A Token Is Not a Pixel, and the Codebook Is Not a Vocabulary of Meanings</div>
+<p>
+Two confusions follow from the word "token". First, the $16 \times 16$ token grid is not a $16 \times 16$ image: each token is a compressed code for an $8 \times 8$ or $16 \times 16$ pixel patch, so the decoder still produces a full-resolution picture, and adding tokens raises detail, not a one-for-one pixel count. Second, an image token does not carry a fixed human meaning the way a word does. Codebook entry 91 is not "sky"; it is whatever recurring local texture the autoencoder found useful to compress, and the same index means different things in different spatial contexts. Treating image tokens as a dictionary of nameable objects, by analogy to language tokens, sets you up to misread what the generator is actually predicting: patches of appearance, not labeled parts.
+</p>
+</div>
 
 <h2>2. Generating the Tokens, Left to Right: Parti <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
@@ -209,7 +216,7 @@ Diffusion appeared to win the text-to-image race by 2023, so why does the token 
 <div class="callout-title">Practical Example: The Latency Budget That Killed Autoregression</div>
 <p><strong>Who:</strong> A team building an in-app avatar generator that had to return a 512-pixel image in under two seconds on a single mid-range GPU.</p>
 <p><strong>Situation:</strong> They prototyped with a clean autoregressive token model because it integrated neatly with their existing text-model serving stack and the team already understood the next-token loop.</p>
-<p><strong>Problem:</strong> A 512-pixel image at their tokenizer's compression needed 1024 tokens, and 1024 sequential transformer forward passes blew the two-second budget by a wide margin even with a KV cache. The serial-per-token cost of subsection 2 was the wall.</p>
+<p><strong>Problem:</strong> A 512-pixel image at their tokenizer's compression needed 1024 tokens, and 1024 sequential transformer forward passes blew the two-second budget by a wide margin even with a KV cache (the standard trick of storing each token's already-computed attention keys and values so later steps do not recompute them). The serial-per-token cost of subsection 2 was the wall.</p>
 <p><strong>Decision:</strong> They switched the generator to a MUSE-style masked model with the same VQ tokenizer, so the tokenizer and decoder were unchanged and only the generation order changed. The parallel unmasking of subsection 3 brought 1024 tokens down to about 16 rounds.</p>
 <p><strong>Result:</strong> Latency dropped from roughly nine seconds to under one, comfortably inside budget, with a small quality cost they recovered by adding rounds where latency allowed. The tokenizer investment was preserved.</p>
 <p><strong>Lesson:</strong> Generation order is a swappable knob once the image is tokenized. If autoregression's per-token latency is the problem, masked parallel decoding often fixes it without touching the tokenizer or decoder, the same separation-of-concerns that the three-station view of Section 34.2 rewards.</p>
