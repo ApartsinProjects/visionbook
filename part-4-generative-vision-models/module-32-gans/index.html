@@ -106,9 +106,326 @@ You should have read <a href="../module-30-generative-foundations/index.html">Ch
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>
-The GAN bought its sharpness with instability: a single adversarial game, balanced on a knife edge, that can collapse without warning. <a href="../module-33-diffusion-models/index.html">Chapter 33: Diffusion Models</a> takes the opposite bargain. Instead of a two-player game, a diffusion model trains a single network with a stable regression loss to reverse a gradual noising process, trading the GAN's one-shot generation for many small, reliable denoising steps. You will recognize the destination immediately: the iterative denoising that defines diffusion is the learned, scaled-up descendant of the denoising autoencoder you built in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> and the classical denoising of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>. The adversarial loss does not disappear; it reappears as a tool inside diffusion's autoencoder and inside the distillation tricks that make diffusion fast. And the latent-space editing you learn here returns in <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>, where the same find-the-code-then-edit-it idea drives diffusion-based image editing. The game ends; its lessons do not.
+The GAN bought its sharpness with instability: a single adversarial game, balanced on a knife edge, that can collapse without warning. <a href="../module-33-diffusion-models/index.html">Chapter 33: Diffusion Models</a> takes the opposite bargain. Instead of a two-player game, a diffusion model trains a single network with a stable regression loss to reverse a gradual noising process, trading the GAN's one-shot generation for many small, reliable denoising steps. You will recognize the destination immediately: the iterative denoising that defines diffusion is the learned, scaled-up descendant of the denoising autoencoder you built in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> and the classical denoising of <a href="../../part-1-image-processing/module-07-restoration-enhancement/index.html">Chapter 7</a>. The adversarial loss does not disappear; it reappears as a tool inside diffusion's autoencoder and inside the distillation tricks that make diffusion fast. And the latent-space editing you learn here returns in <a href="../module-35-controllable-generation-editing/index.html">Chapter 35</a>, where the same find-the-code-then-edit-it idea drives diffusion-based image editing. The game ends; its lessons do not. Before moving on, make the whole chapter concrete in the Hands-On Lab below, where the adversarial game of <a href="section-32.1.html">Section 32.1</a>, the non-saturating loss, the DCGAN recipe of <a href="section-32.3.html">Section 32.3</a>, and the mode-collapse and balance diagnostics of <a href="section-32.2.html">Section 32.2</a> come together as one small conditional GAN you train, watch, and sample from yourself.
 </p>
 </div>
+
+<section class="lab" id="lab-32">
+<h2>Hands-On Lab: A Conditional GAN You Can Train, Diagnose, and Sample</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a complete conditional DCGAN that learns to draw Fashion-MNIST garments on demand, then instrument it so you can read its health while it trains. You will write the two-player game of <a href="section-32.1.html">Section 32.1</a> by hand, stabilize it with the convolutional recipe of <a href="section-32.3.html">Section 32.3</a>, and add the two diagnostics that <a href="section-32.2.html">Section 32.2</a> argues matter most: the discriminator's accuracy on real versus fake batches as a balance gauge, and a per-class coverage count that catches mode collapse the moment it starts. The dataset is small and the network is tiny, so the run finishes on a CPU in well under an hour and every quantity that defines a healthy GAN, the loss tension, the balance, and the diversity, stays visible on one screen.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Implementing the generator and discriminator and the non-saturating adversarial loss of <a href="section-32.1.html">Section 32.1</a>, where the generator maximizes $\log D(G(z))$ rather than minimizing $\log(1 - D(G(z)))$ to avoid the vanishing gradient.</li>
+<li>Applying the DCGAN architectural recipe of <a href="section-32.3.html">Section 32.3</a>: transposed convolutions in the generator, strided convolutions in the discriminator, batch normalization, and no fully connected layers.</li>
+<li>Conditioning both networks on a class label so you can ask the trained generator for a specific garment, the conditional GAN of <a href="section-32.4.html">Section 32.4</a>.</li>
+<li>Reading discriminator accuracy as the balance diagnostic of <a href="section-32.2.html">Section 32.2</a>: near 100 percent means the discriminator has won and the generator gradient is dying; near 50 percent is the healthy equilibrium.</li>
+<li>Detecting mode collapse with a cheap diversity metric, the failure mode that <a href="section-32.2.html">Section 32.2</a> warns is invisible in the loss curves alone.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One scientific-Python stack and one small automatic download; <code>torchvision</code> fetches Fashion-MNIST (about 30 MB) on first run. Everything trains on CPU in roughly ten to twenty minutes for the few epochs the lab needs. Install with:</p>
+<pre><code class="language-bash">pip install torch torchvision matplotlib</code></pre>
+<p>The whole lab is one short script. Both networks are deliberately small DCGANs so the focus stays on the adversarial loop and its diagnostics rather than on architecture tuning.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load the data and fix the conditioning</h4>
+<p>Fetch Fashion-MNIST and scale every pixel to the range $[-1, 1]$ so it matches the $\tanh$ output of the generator you build next. Ten clothing classes give you something concrete to condition on and, later, a way to measure diversity: a healthy generator should be able to produce all ten, a collapsed one will favour a few.</p>
+<pre><code class="language-python">import torch
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+n_classes, z_dim = 10, 64
+
+tfm = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5]),            # map [0,1] pixels to [-1,1]
+])
+# TODO: build a DataLoader over datasets.FashionMNIST(root=".", train=True,
+# download=True, transform=tfm) with batch_size=128, shuffle=True.
+# The [-1,1] range must match the generator's tanh output in Step 2.
+loader = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>ds = datasets.FashionMNIST(root=".", train=True, download=True, transform=tfm)</code> then <code>loader = DataLoader(ds, batch_size=128, shuffle=True, drop_last=True)</code>. Use <code>drop_last=True</code> so every batch is full size, which keeps the batch-norm statistics in Step 2 stable.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build a conditional DCGAN generator</h4>
+<p>The generator maps a noise vector plus a class embedding to a 28 by 28 image through transposed convolutions, the upsampling recipe of <a href="section-32.3.html">Section 32.3</a>. Batch normalization after each layer and a final $\tanh$ are the DCGAN defaults that first made this kind of network train without diverging. Concatenating a learned label embedding onto the noise is what makes the generator conditional.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(n_classes, n_classes)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim + n_classes, 128, 7, 1, 0), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU(True),  # 7 -> 14
+            nn.ConvTranspose2d(64, 1, 4, 2, 1), nn.Tanh(),                            # 14 -> 28
+        )
+
+    def forward(self, z, y):
+        # TODO: concatenate z (B, z_dim) with self.label_emb(y) (B, n_classes)
+        # along dim=1, reshape to (B, z_dim + n_classes, 1, 1), and pass through
+        # self.net. The reshape turns the vector into a 1x1 "image" the
+        # transposed convolutions can grow.
+        x = ...
+        return self.net(x)
+
+G = Generator().to(device)</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>x = torch.cat([z, self.label_emb(y)], dim=1).view(z.size(0), -1, 1, 1)</code> then <code>return self.net(x)</code>. Check the output shape is <code>(B, 1, 28, 28)</code> with values in $[-1, 1]$; if it is 27 or 29 pixels wide, the kernel, stride, and padding triple on one layer is off.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Build the matching discriminator</h4>
+<p>The discriminator mirrors the generator: strided convolutions shrink the image to a single real-versus-fake score, with the label broadcast as an extra input channel so the critic judges whether the image matches its claimed class. LeakyReLU and the absence of batch norm on the first layer are the DCGAN discriminator conventions of <a href="section-32.3.html">Section 32.3</a>.</p>
+<pre><code class="language-python">class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(n_classes, 28 * 28)
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 64, 4, 2, 1), nn.LeakyReLU(0.2, True),                       # 28 -> 14
+            nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2, True),# 14 -> 7
+            nn.Conv2d(128, 1, 7, 1, 0),                                               # 7 -> 1
+        )
+
+    def forward(self, img, y):
+        lab = self.label_emb(y).view(-1, 1, 28, 28)    # label as an image channel
+        x = torch.cat([img, lab], dim=1)               # (B, 2, 28, 28)
+        # TODO: pass x through self.net and return the logit reshaped to (B,).
+        # Return the raw logit (no sigmoid); the loss in Step 4 applies it.
+        return ...
+
+D = Discriminator().to(device)</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return self.net(x).view(-1)</code>. Returning the raw logit lets you use <code>BCEWithLogitsLoss</code> in Step 4, which is numerically safer than a separate sigmoid followed by <code>BCELoss</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Write the two-player training loop</h4>
+<p>This is the adversarial game of <a href="section-32.1.html">Section 32.1</a> made runnable. Each step updates the discriminator to label reals as 1 and fakes as 0, then updates the generator using the non-saturating objective: it asks the discriminator to call its fakes real. Using real labels of 1 for the generator update is exactly the $\log D(G(z))$ trick that keeps the generator gradient strong early in training.</p>
+<pre><code class="language-python">opt_G = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_D = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+bce = nn.BCEWithLogitsLoss()
+
+def step(real, y):
+    b = real.size(0)
+    ones, zeros = torch.ones(b, device=device), torch.zeros(b, device=device)
+    z = torch.randn(b, z_dim, device=device)
+    fake = G(z, y)
+
+    # Discriminator: reals -> 1, fakes -> 0 (detach so G is not updated here).
+    opt_D.zero_grad()
+    loss_D = bce(D(real, y), ones) + bce(D(fake.detach(), y), zeros)
+    loss_D.backward(); opt_D.step()
+
+    # TODO: generator update. Recompute D(fake, y) (do NOT detach this time)
+    # and push it toward `ones` with bce, the non-saturating loss. Then
+    # zero_grad, backward, and step opt_G. Returning the two losses lets
+    # Step 5 plot the tension between them.
+    opt_G.zero_grad()
+    loss_G = ...
+    return loss_D.item(), loss_G.item()</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>loss_G = bce(D(fake, y), ones)</code> then <code>loss_G.backward(); opt_G.step()</code> and <code>return loss_D.item(), loss_G.item()</code>. Pushing the fakes toward <code>ones</code> (not <code>zeros</code>) is the whole point: the generator is rewarded for fooling the discriminator, the non-saturating form of the loss derived in <a href="section-32.1.html">Section 32.1</a>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Add the balance diagnostic and train</h4>
+<p>A GAN has no single loss to watch fall, so <a href="section-32.2.html">Section 32.2</a> tells you to watch the balance instead. After each epoch, measure the discriminator's accuracy on a batch of reals and a batch of fakes. Accuracy stuck near 1.0 means the discriminator has crushed the generator and the gradient is vanishing; accuracy hovering near 0.5 is the healthy tension you want.</p>
+<pre><code class="language-python">@torch.no_grad()
+def d_accuracy(real, y):
+    z = torch.randn(real.size(0), z_dim, device=device)
+    fake = G(z, y)
+    # TODO: count a real as correct when D(real, y) > 0 and a fake as correct
+    # when D(fake, y) < 0 (the logit's sign is the decision boundary). Return
+    # the mean of both correctness masks as a single accuracy in [0, 1].
+    correct = ...
+    return correct
+
+for epoch in range(8):
+    for real, y in loader:
+        real, y = real.to(device), y.to(device)
+        ld, lg = step(real, y)
+    acc = d_accuracy(real, y)
+    print(f"epoch {epoch}  loss_D {ld:.3f}  loss_G {lg:.3f}  D_acc {acc:.2f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>real_ok = (D(real, y) &gt; 0).float(); fake_ok = (D(fake, y) &lt; 0).float(); correct = torch.cat([real_ok, fake_ok]).mean().item()</code>. A healthy run drifts toward roughly 0.6 to 0.8 and stays there; a value pinned at 1.0 for several epochs is the warning sign of <a href="section-32.2.html">Section 32.2</a> that the discriminator has won.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Sample every class and detect mode collapse</h4>
+<p>Ask the trained generator for several samples of each of the ten classes, save the grid, then put a number on diversity. A cheap mode-collapse detector is the mean pairwise pixel distance within a class: a generator that has collapsed produces near-identical images, so that distance falls toward zero, the diversity failure that <a href="section-32.2.html">Section 32.2</a> says the loss curves hide.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
+
+G.eval()
+labels = torch.arange(n_classes, device=device).repeat_interleave(8)  # 8 per class
+z = torch.randn(labels.size(0), z_dim, device=device)
+with torch.no_grad():
+    grid = make_grid((G(z, labels) + 1) / 2, nrow=8)                  # back to [0,1]
+plt.imshow(grid.permute(1, 2, 0).cpu()); plt.axis("off")
+plt.savefig("cgan_samples.png", dpi=120)
+
+with torch.no_grad():
+    imgs = G(z, labels).view(n_classes, 8, -1)
+# TODO: for each class, compute the mean pairwise L2 distance between its 8
+# samples (torch.pdist on imgs[c] then .mean()), and report the average over
+# all classes. A value near zero means the generator is producing copies.
+diversity = ...
+print(f"mean within-class diversity: {diversity:.3f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>diversity = torch.stack([torch.pdist(imgs[c]).mean() for c in range(n_classes)]).mean().item()</code>. With samples normalized to $[-1, 1]$ a healthy generator scores a clearly positive number (often above 5 for these 784-pixel vectors); a collapsed one trends toward zero because every sample in a class is nearly the same picture.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Two artifacts. First, <code>cgan_samples.png</code>, a ten-row grid where each row holds eight recognizable but distinct examples of one garment class (sneakers, trousers, coats), the visible payoff of the conditioning. Second, a printed per-epoch line where <code>D_acc</code> settles into the healthy 0.6 to 0.8 band rather than pinning at 1.0, and a final within-class diversity comfortably above zero. Exact numbers vary with seed and epoch count; what should hold is legible class-conditional samples, a discriminator accuracy that does not run away to 1.0, and a positive diversity score that confirms the generator did not collapse onto one image per class.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Induce mode collapse on purpose: raise the generator learning rate to <code>2e-3</code> or update the generator several times per discriminator step, then watch <code>D_acc</code> swing and the diversity score crash, the instability of <a href="section-32.2.html">Section 32.2</a> reproduced in your own run.</li>
+<li>Swap the binary cross-entropy game for the Wasserstein critic of <a href="section-32.2.html">Section 32.2</a>: drop the sigmoid framing, train the discriminator to maximize the gap between real and fake scores, add a gradient penalty, and compare how much steadier the loss curve becomes.</li>
+<li>Reuse the trained generator for inversion, the technique of <a href="section-32.5.html">Section 32.5</a>: freeze <code>G</code>, pick a real image, and optimize a latent <code>z</code> to reconstruct it, then nudge the class embedding to morph the garment into a neighbouring category.</li>
+</ul>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Reach for a Reference Implementation at Scale</div>
+<p>The script above is roughly a hundred lines and exposes the loss, the balance check, and the diversity metric on purpose. When you move from 28 by 28 garments to real photographs, you reach for the maintained authors' implementations in the bibliography instead: the <code>pytorch-CycleGAN-and-pix2pix</code> repository wraps the conditional and image-to-image games of <a href="section-32.4.html">Section 32.4</a> behind a single configurable <code>train.py</code>, and the NVIDIA <code>stylegan3</code> code supplies the progressive, style-based generator of <a href="section-32.3.html">Section 32.3</a> with pretrained weights, so a high-resolution face generator is a clone-and-run rather than a hundred lines of training loop. Build the adversarial loop once by hand to understand the game and its diagnostics; reach for those repositories when the data becomes high-resolution images.</p>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid
+
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+n_classes, z_dim = 10, 64
+
+# Step 1: data scaled to [-1, 1] to match the generator's tanh output.
+tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+ds = datasets.FashionMNIST(root=".", train=True, download=True, transform=tfm)
+loader = DataLoader(ds, batch_size=128, shuffle=True, drop_last=True)
+
+# Step 2: conditional DCGAN generator.
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(n_classes, n_classes)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(z_dim + n_classes, 128, 7, 1, 0), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.ConvTranspose2d(64, 1, 4, 2, 1), nn.Tanh(),
+        )
+
+    def forward(self, z, y):
+        x = torch.cat([z, self.label_emb(y)], dim=1).view(z.size(0), -1, 1, 1)
+        return self.net(x)
+
+# Step 3: matching discriminator with the label as an extra channel.
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(n_classes, 28 * 28)
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 64, 4, 2, 1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(128, 1, 7, 1, 0),
+        )
+
+    def forward(self, img, y):
+        lab = self.label_emb(y).view(-1, 1, 28, 28)
+        x = torch.cat([img, lab], dim=1)
+        return self.net(x).view(-1)
+
+G, D = Generator().to(device), Discriminator().to(device)
+
+# Step 4: the two-player loop with the non-saturating generator loss.
+opt_G = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_D = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+bce = nn.BCEWithLogitsLoss()
+
+def step(real, y):
+    b = real.size(0)
+    ones, zeros = torch.ones(b, device=device), torch.zeros(b, device=device)
+    z = torch.randn(b, z_dim, device=device)
+    fake = G(z, y)
+    opt_D.zero_grad()
+    loss_D = bce(D(real, y), ones) + bce(D(fake.detach(), y), zeros)
+    loss_D.backward(); opt_D.step()
+    opt_G.zero_grad()
+    loss_G = bce(D(fake, y), ones)           # non-saturating: fool the critic
+    loss_G.backward(); opt_G.step()
+    return loss_D.item(), loss_G.item()
+
+# Step 5: balance diagnostic and training.
+@torch.no_grad()
+def d_accuracy(real, y):
+    z = torch.randn(real.size(0), z_dim, device=device)
+    fake = G(z, y)
+    real_ok = (D(real, y) > 0).float()
+    fake_ok = (D(fake, y) < 0).float()
+    return torch.cat([real_ok, fake_ok]).mean().item()
+
+for epoch in range(8):
+    for real, y in loader:
+        real, y = real.to(device), y.to(device)
+        ld, lg = step(real, y)
+    acc = d_accuracy(real, y)
+    print(f"epoch {epoch}  loss_D {ld:.3f}  loss_G {lg:.3f}  D_acc {acc:.2f}")
+
+# Step 6: sample every class and measure within-class diversity.
+G.eval()
+labels = torch.arange(n_classes, device=device).repeat_interleave(8)
+z = torch.randn(labels.size(0), z_dim, device=device)
+with torch.no_grad():
+    grid = make_grid((G(z, labels) + 1) / 2, nrow=8)
+    imgs = G(z, labels).view(n_classes, 8, -1)
+plt.imshow(grid.permute(1, 2, 0).cpu()); plt.axis("off")
+plt.savefig("cgan_samples.png", dpi=120)
+diversity = torch.stack([torch.pdist(imgs[c]).mean() for c in range(n_classes)]).mean().item()
+print(f"mean within-class diversity: {diversity:.3f}")</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

@@ -94,6 +94,11 @@
 
 <p>Two of the five boxes are routinely skipped by beginners and never by professionals: <em>validate</em> (the contract checks of <a href="section-0.4.html">Section 0.4</a>) and <em>measure</em>. Measurement is what turns "the output looks fine" into "mean brightness 131.4, foreground coverage 23.7 percent, PSNR versus original 31.2 dB", numbers that can be logged, compared across versions, and alarmed on. Pipelines fail at the seams, and numbers at the seams are how you notice.</p>
 
+<div class="callout key-takeaway">
+<div class="callout-title">The Vision Pipeline in Five Verbs</div>
+<p>Compress the whole chapter into a single line you can recite at a whiteboard: <strong>Load, Validate, Transform, Measure, Save</strong>. The two verbs beginners drop are the two in the middle of that list, Validate and Measure, which is exactly why the line is worth memorizing as five and not three. Every system in this book, from an Otsu threshold to a diffusion sampler, is these five verbs with smarter boxes.</p>
+</div>
+
 <h2>2. The Pipeline, Top to Bottom <span class="level-badge basic" title="Beginner">Beginner</span></h2>
 
 <p>We build the system in three fragments: helpers, metrics, and the orchestrating <code>main</code>. Together they form one runnable script of about ninety lines. The task: convert to grayscale, suppress sensor noise with a light Gaussian blur, segment the bright foreground with Otsu's automatic threshold (previewing <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a>), and report what happened. Otsu's method picks the cutoff brightness that best separates dark pixels from bright ones by inspecting the image's own histogram, which is why the code passes a threshold of <code>0</code>: that value is ignored, and OpenCV computes the real one for you. So that the script runs anywhere, it synthesizes a test scene if no input path is given; with an argument, it processes your photo instead.</p>
@@ -248,6 +253,8 @@ s = structural_similarity(gray, blurred)                    # full SSIM machiner
 
 <p>You can describe any image by shape, dtype, range, and channel order; choose the right library for a job and convert at boundaries; move images in and out of files without losing bits you meant to keep; recognize the four convention clashes on sight; and assemble the five-stage skeleton with measurement built in. That is the entire foundation this book asks for. <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> now rewinds to the moment before <code>imread</code>: how light becomes the array in the first place, and why its values, resolution, and colors are what they are.</p>
 
+<p>Before turning the page, put every habit of this chapter to work at once in the Hands-On Lab below: you will package the five-stage skeleton into a small command-line tool that profiles any image you point it at, runs the pipeline, and writes an auditable report folder you could hand to a colleague.</p>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 0.5.1: Where the Asserts Go <span class="exercise-type conceptual" title="Conceptual">Conceptual</span></div>
 <p>List every seam in the pipeline of this section (there are at least four: after load, after grayscale, after blur, after threshold) and state, for each, one contract property worth asserting and one metric worth logging. Then identify which single seam, if corrupted silently, would take the longest to notice from the existing <code>run.json</code> alone, and propose the one extra logged number that would close that gap.</p>
@@ -262,6 +269,245 @@ s = structural_similarity(gray, blurred)                    # full SSIM machiner
 <div class="callout-title">Exercise 0.5.3: The Sigma Study <span class="exercise-type analysis" title="Analysis">Analysis</span></div>
 <p>Run the pipeline on the synthetic scene with Gaussian sigma values 0.5, 1, 2, 4, and 8 (adjust the kernel size to about $6\sigma$, rounded up to odd). Tabulate PSNR, the Otsu threshold, and foreground fraction against sigma. Explain the trends: why does PSNR fall monotonically, why is the foreground fraction stable for small sigma and then degraded for large, and at what sigma does the blur stop being "denoising" and start being "destruction"? Support the last claim with the mask images themselves.</p>
 </div>
+
+<section class="lab" id="lab-0.5">
+<h2>Hands-On Lab: Build an Image Profiler and Pipeline Report Tool</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 minutes</span>
+<span class="lab-difficulty">Beginner</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build <code>imgreport.py</code>, a single self-contained command-line tool that takes any image file (or a synthetic fallback), prints a one-screen profile of its array contract, runs the load-validate-transform-measure-save pipeline, and writes an auditable report folder containing the processed images, a metrics JSON sidecar, and a contact-sheet PNG. This is the chapter's five competences (array model, library map, I/O boundary, conventions, pipeline) assembled into one tool you would actually keep.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Reading an image and reporting its shape, dtype, value range, and channel order (Sections <a href="section-0.1.html">0.1</a> and <a href="section-0.4.html">0.4</a>).</li>
+<li>Converting between OpenCV BGR and the RGB order Matplotlib expects at the display boundary (Sections <a href="section-0.3.html">0.3</a> and <a href="section-0.4.html">0.4</a>).</li>
+<li>Surviving OpenCV's silent <code>None</code> on a bad path and asserting the data contract before processing (Section <a href="section-0.3.html">0.3</a>).</li>
+<li>Implementing the five-stage skeleton with measurement at the seams (this section).</li>
+<li>Persisting lossless pixels plus a reproducibility sidecar of metrics, parameters, and library versions.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install numpy opencv-python matplotlib</code></pre>
+<p>No dataset is required: the tool synthesizes a test scene when you give it no path, so every step runs on a fresh machine. Point it at one of your own photos once the synthetic run works.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Profile the array contract</h4>
+<p>Before any processing, a good tool tells you exactly what it loaded. Write a function that turns an image array into the four facts that decide what its numbers mean. You can reuse the <code>load_validated</code> and <code>synthesize_scene</code> functions from this section verbatim as the loader.</p>
+<pre><code class="language-python">import numpy as np
+import cv2
+
+def profile(img: np.ndarray) -&gt; dict:
+    """Report the array contract: shape, dtype, range, channel order."""
+    # TODO: return a dict with keys "shape", "dtype", "min", "max", and
+    #       "channels" (the size of the last axis, or 1 if img.ndim == 2).
+    # Hint: img.shape, str(img.dtype), int(img.min()), int(img.max()).
+    ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Channel count is <code>img.shape[2]</code> when <code>img.ndim == 3</code>, otherwise <code>1</code>. Cast NumPy scalars with <code>int(...)</code> so the dict is JSON-serializable later. There is no reliable way to read channel <em>order</em> (BGR versus RGB) from the array alone; that is exactly the convention you must track by hand, so just record that <code>cv2.imread</code> returns BGR.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Run the pipeline transform and measure stages</h4>
+<p>Reuse <code>transform_and_measure</code> from Code Fragment 2 above. It already returns an <code>images</code> dict (gray, blurred, mask) and a <code>metrics</code> dict. Your job in this step is only to call it and confirm the products are what the profile predicted.</p>
+<pre><code class="language-python"># TODO: call transform_and_measure(bgr) and assert that images["mask"]
+#       is uint8 and has the same height and width as the input.
+# Hint: images["mask"].shape == bgr.shape[:2]
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The mask is single-channel, so its shape is <code>(H, W)</code> while the BGR input is <code>(H, W, 3)</code>. Compare <code>bgr.shape[:2]</code> against <code>images["mask"].shape</code>, not the full shapes.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Build a contact sheet at the display boundary</h4>
+<p>Assemble a single PNG that shows the original, grayscale, blurred, and mask side by side. This is where the BGR-versus-RGB pitfall bites: Matplotlib expects RGB, OpenCV gave you BGR, so you must convert exactly once, at this boundary.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+
+def contact_sheet(bgr, images, outpath):
+    fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+    # TODO: show bgr in the first axis CONVERTED to RGB, then gray, blurred,
+    #       and mask (the last three are single-channel, use cmap="gray").
+    # Hint: cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) for the color panel only.
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=110)
+    plt.close(fig)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Only the color panel needs <code>COLOR_BGR2RGB</code>. The grayscale, blurred, and mask panels are 2D arrays; pass <code>cmap="gray"</code> and do not convert them. Forgetting the conversion is the exact bug from the chapter-opening Practical Example, now visible as blue-tinted skin tones in your sheet.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Persist an auditable report folder</h4>
+<p>Reuse <code>save_results</code> for the pixels and sidecar, then extend the sidecar to also embed the Step 1 profile, so the report folder records both what came in and what went out.</p>
+<pre><code class="language-python"># TODO: after save_results writes run.json, load it, add a "profile" key
+#       holding the Step 1 profile dict, and write it back. Also call
+#       contact_sheet(...) to drop contact_sheet.png into the same folder.
+# Hint: json.loads((out / "run.json").read_text()) round-trips the sidecar.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Rather than re-open the file, it is cleaner to pass the profile into a small wrapper that builds the sidecar dict in one place. Either approach is fine as long as <code>run.json</code> ends up with both <code>metrics</code> and <code>profile</code> keys.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Wire the command-line entry point</h4>
+<p>Make the tool usable from a shell: with no argument it profiles and processes the synthetic scene; with one argument it processes that file. Print the profile and metrics, then the report location.</p>
+<pre><code class="language-python">import sys, json
+
+if __name__ == "__main__":
+    src = sys.argv[1] if len(sys.argv) &gt; 1 else None
+    # TODO: load_validated(src) -&gt; profile -&gt; transform_and_measure
+    #       -&gt; save the report folder -&gt; print profile, metrics, and path.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Keep <code>main</code> thin: it should be five function calls and two <code>print</code> statements. All the real work lives in the helpers you wrote in Steps 1 to 4, which is itself the lesson of this chapter.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Running <code>python imgreport.py</code> with no arguments prints a profile block (shape <code>(480, 640, 3)</code>, dtype <code>uint8</code>, range roughly 0 to 255, 3 channels, BGR) followed by the metrics block from this section (mean brightness near 79, an Otsu threshold around 120, foreground fraction near 0.14, blur PSNR in the mid-30s of decibels). The exact numbers vary slightly per platform. On disk you get a <code>results/</code> folder containing <code>gray.png</code>, <code>blurred.png</code>, <code>mask.png</code>, <code>contact_sheet.png</code>, and a <code>run.json</code> whose top level now holds both a <code>metrics</code> object and a <code>profile</code> object. The contact sheet shows the synthetic scene's bright blobs cleanly separated from the dark background in the rightmost mask panel.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li><strong>Library Shortcut.</strong> Replace the hand-rolled <code>psnr</code> with <code>skimage.metrics.peak_signal_noise_ratio</code> and add <code>structural_similarity</code> to the metrics dict (see the Library Shortcut callout above). About 45 lines of would-be code collapse to 2, and you gain a dtype-aware, perceptually motivated second metric for free.</li>
+<li><strong>Round-trip safety check.</strong> Read back each PNG you wrote and assert it is bit-identical to the array you saved, proving your output is lossless; then save one panel as JPEG at quality 90 and report the PSNR drop versus the PNG, making the lossy-versus-lossless trade-off of <a href="section-0.3.html">Section 0.3</a> a number rather than a claim.</li>
+<li><strong>Batch and summarize.</strong> Extend the entry point to accept a directory, process every <code>.jpg</code> and <code>.png</code> inside it with non-fatal error handling, and write a top-level <code>summary.csv</code> with one row per image, connecting this lab directly to Exercise 0.5.2.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">"""imgreport.py: profile an image, run the pipeline, write an audit report."""
+from pathlib import Path
+import json, sys, time
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+def synthesize_scene(h=480, w=640, seed=0) -&gt; np.ndarray:
+    rng = np.random.default_rng(seed)
+    img = np.full((h, w), 60, np.float32)
+    for _ in range(6):
+        cy, cx = rng.integers(60, h - 60), rng.integers(80, w - 80)
+        axes = (int(rng.integers(25, 70)), int(rng.integers(20, 50)))
+        cv2.ellipse(img, (cx, cy), axes, float(rng.uniform(0, 180)),
+                    0, 360, float(rng.uniform(170, 230)), -1)
+    img += rng.normal(0, 10, (h, w)).astype(np.float32)
+    return cv2.cvtColor(img.clip(0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+def load_validated(path: str | None) -&gt; np.ndarray:
+    if path is None:
+        img = synthesize_scene()
+    else:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)        # silent None on failure
+        if img is None:
+            raise ValueError(f"Could not read image: {path}")
+    assert img.ndim == 3 and img.dtype == np.uint8, (img.shape, img.dtype)
+    return img
+
+def profile(img: np.ndarray) -&gt; dict:
+    """Step 1: the four facts that decide what the numbers mean."""
+    channels = img.shape[2] if img.ndim == 3 else 1
+    return {
+        "shape": list(img.shape),
+        "dtype": str(img.dtype),
+        "min": int(img.min()),
+        "max": int(img.max()),
+        "channels": channels,
+        "channel_order": "BGR (cv2.imread convention)",
+    }
+
+def psnr(a: np.ndarray, b: np.ndarray) -&gt; float:
+    mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+    return float("inf") if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+
+def transform_and_measure(bgr: np.ndarray) -&gt; tuple[dict, dict]:
+    """Steps 2: grayscale, denoise, Otsu segment; measure every product."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    t, mask = cv2.threshold(blurred, 0, 255,
+                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    assert mask.dtype == np.uint8 and mask.shape == bgr.shape[:2]
+    images = {"gray": gray, "blurred": blurred, "mask": mask}
+    metrics = {
+        "mean_brightness": round(float(gray.mean()), 2),
+        "std_brightness": round(float(gray.std()), 2),
+        "otsu_threshold": float(t),
+        "foreground_frac": round(float((mask &gt; 0).mean()), 4),
+        "psnr_blur_db": round(psnr(gray, blurred), 2),
+    }
+    return images, metrics
+
+def contact_sheet(bgr, images, outpath):
+    """Step 3: convert BGR to RGB exactly once, at the display boundary."""
+    panels = [("original", cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), None),
+              ("gray", images["gray"], "gray"),
+              ("blurred", images["blurred"], "gray"),
+              ("mask", images["mask"], "gray")]
+    fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+    for ax, (title, im, cmap) in zip(axes, panels):
+        ax.imshow(im, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=110)
+    plt.close(fig)
+
+def save_report(images, metrics, prof, bgr, outdir="results") -&gt; Path:
+    """Step 4: lossless pixels, contact sheet, and a profile-aware sidecar."""
+    out = Path(outdir); out.mkdir(exist_ok=True)
+    for name, img in images.items():
+        assert cv2.imwrite(str(out / f"{name}.png"), img), name
+    contact_sheet(bgr, images, out / "contact_sheet.png")
+    sidecar = {
+        "profile": prof,
+        "metrics": metrics,
+        "params": {"blur_ksize": 5, "blur_sigma": 1.2, "method": "otsu"},
+        "env": {"opencv": cv2.__version__, "numpy": np.__version__},
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    (out / "run.json").write_text(json.dumps(sidecar, indent=2))
+    return out
+
+if __name__ == "__main__":                              # Step 5
+    src = sys.argv[1] if len(sys.argv) &gt; 1 else None
+    bgr = load_validated(src)
+    prof = profile(bgr)
+    images, metrics = transform_and_measure(bgr)
+    where = save_report(images, metrics, prof, bgr)
+    print("PROFILE:", json.dumps(prof, indent=2))
+    print("METRICS:", json.dumps(metrics, indent=2))
+    print("report saved to:", where.resolve())
+</code></pre>
+<div class="code-caption"><strong>Lab Solution:</strong> The complete <code>imgreport.py</code>, assembling Steps 1 to 5 into one runnable tool: profile the contract, run the five-stage pipeline, convert color order only at the display boundary, and persist a report folder with pixels, a contact sheet, and a profile-aware JSON sidecar.</div>
+</details>
+</section>
 
 <nav class="chapter-nav">
 <a class="prev" href="section-0.4.html">&#8592; Section 0.4: Conventions &amp; Pitfalls</a>

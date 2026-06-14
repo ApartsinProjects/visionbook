@@ -43,6 +43,11 @@
 <p><strong>This chapter solves the correspondence problem: find the same physical point in two different photographs, and most of geometric vision follows as a consequence.</strong> Panorama stitching, camera calibration, stereo depth, structure from motion, visual SLAM, and image retrieval all begin with the same four-stage pipeline built here: detect repeatable points, describe their neighborhoods as vectors, match the vectors between images, and verify the matches with a geometric model. The pipeline is classical, but it is no museum piece: it runs today inside <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s COLMAP reconstructions that feed the neural radiance fields of <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>, and its design choices echo through the learned representations of <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
 </div>
 
+<div class="callout key-takeaway">
+<div class="callout-title">Remember Four Words: Detect, Describe, Match, Verify</div>
+<p>If you forget everything else in this chapter, keep these four words in order. <strong>Detect</strong> (Section 10.1 to 10.2) finds points you can locate again; <strong>Describe</strong> (Sections 10.3 to 10.4) turns each neighborhood into a comparable vector; <strong>Match</strong> (Section 10.5) pairs the vectors across images; <strong>Verify</strong> (Section 10.6) keeps only the pairs a single geometry endorses. Each stage exists to cover the previous one's blind spot, and the same four words name the grammar of every geometric-vision system in the rest of Part II. The sections that follow are each one word of this sentence, expanded.</p>
+</div>
+
 <div class="overview">
 <h2>Chapter Overview</h2>
 <p>
@@ -103,9 +108,237 @@ This chapter leans directly on image gradients and the Sobel operator from <a hr
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>
-Keypoints answer "where is the same point?" but stay silent about regions: which pixels belong together as one object or surface? <a href="../module-11-classical-segmentation/index.html">Chapter 11: Classical Segmentation &amp; Grouping</a> takes up that question with clustering, region growing, watersheds, graph cuts, and superpixels: the classical toolkit for carving an image into meaningful pieces. The two chapters are complementary halves of classical scene understanding: this one finds sparse, precise anchors for geometry, the next finds dense, coherent groupings for content. Both threads converge later, when <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> begins the geometric arc that consumes this chapter's correspondences.
+Keypoints answer "where is the same point?" but stay silent about regions: which pixels belong together as one object or surface? <a href="../module-11-classical-segmentation/index.html">Chapter 11: Classical Segmentation &amp; Grouping</a> takes up that question with clustering, region growing, watersheds, graph cuts, and superpixels: the classical toolkit for carving an image into meaningful pieces. The two chapters are complementary halves of classical scene understanding: this one finds sparse, precise anchors for geometry, the next finds dense, coherent groupings for content. Both threads converge later, when <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> begins the geometric arc that consumes this chapter's correspondences. Before moving on, assemble all four verbs into one runnable tool in the Hands-On Lab below, where detect, describe, match, and verify combine into a two-photo panorama stitcher.
 </p>
 </div>
+
+<section class="lab" id="lab-10">
+<h2>Hands-On Lab: Build a Two-Photo Panorama Stitcher</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Assemble the four verbs of this chapter (detect, describe, match, verify) into one runnable program: a panorama stitcher that takes two overlapping photographs, finds keypoints in each, matches their descriptors, filters the matches with the ratio test, verifies them with a RANSAC homography, and warps one image onto the other to produce a single wide composite. The script synthesizes its own overlapping pair by cropping two windows from any image, so it always produces a panorama even without a curated dataset.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Detecting and describing keypoints with SIFT, the gradient-histogram descriptor of <a href="section-10.3.html">Section 10.3</a>.</li>
+<li>Matching descriptors with brute-force k-nearest-neighbor search and Lowe's ratio test from <a href="section-10.5.html">Section 10.5</a>.</li>
+<li>Estimating a homography from contaminated matches with RANSAC and reading its inlier mask, the robust fitting of <a href="section-10.6.html">Section 10.6</a>.</li>
+<li>Gating on the inlier count so the tool refuses pairs that do not actually overlap.</li>
+<li>Warping and compositing two views into one panorama, the geometric payoff that the full detect-describe-match-verify pipeline unlocks.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>Two libraries and no curated dataset required; the script splits any single image into an overlapping left and right pair if you do not supply two of your own. Install with:</p>
+<pre><code class="language-bash">pip install opencv-python numpy</code></pre>
+<p>To stitch your own photos, drop two overlapping shots named <code>left.jpg</code> and <code>right.jpg</code> beside the script; the loader falls back to splitting a built-in test image when those files are absent.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load an overlapping pair, or synthesize one</h4>
+<p>Build a loader that returns two overlapping color images. When <code>left.jpg</code> and <code>right.jpg</code> are present it uses them; otherwise it crops two horizontally shifted windows from OpenCV's bundled test image so the two crops share a middle strip to match on.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def load_pair():
+    """Return (left, right) overlapping BGR images."""
+    a = cv2.imread("left.jpg")
+    b = cv2.imread("right.jpg")
+    if a is not None and b is not None:
+        return a, b
+    # Fallback: crop two overlapping windows from a built-in sample.
+    full = cv2.imread(cv2.samples.findFile("lena.jpg"))
+    if full is None:                                 # last resort: synthetic texture
+        full = np.random.default_rng(0).integers(0, 256, (512, 512, 3), np.uint8)
+    h, w = full.shape[:2]
+    # TODO: return two crops that share an overlap. Take the left crop as
+    # columns 0 to int(0.65*w) and the right crop as columns int(0.35*w) to w,
+    # so the two windows share the middle 30 percent of the image.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return full[:, :int(0.65*w)].copy(), full[:, int(0.35*w):].copy()</code>. The shared middle band is what the matcher latches onto; widen the overlap if too few inliers survive Step 4.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Detect and describe keypoints in each image</h4>
+<p>Run SIFT on the grayscale version of each image to obtain keypoints and their 128-dimensional descriptors. SIFT detection survives the moderate scale and viewpoint change between two handheld shots, which is exactly why <a href="section-10.3.html">Section 10.3</a> built it.</p>
+<pre><code class="language-python">def detect_describe(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create(nfeatures=4000)
+    # TODO: call sift.detectAndCompute(gray, None) and return the
+    # (keypoints, descriptors) tuple it produces.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return sift.detectAndCompute(gray, None)</code>. If you hit an attribute error, your OpenCV is old: <code>pip install --upgrade opencv-python</code> brings SIFT into the main package (it left the contrib-only days after the patent expired in 2020).</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Match descriptors and apply the ratio test</h4>
+<p>Use a brute-force L2 matcher to find the two nearest neighbors of every left descriptor among the right descriptors, then keep a match only when the best neighbor is clearly closer than the second-best. This is Lowe's ratio test from <a href="section-10.5.html">Section 10.5</a>, the cheapest high-value filter in the pipeline.</p>
+<pre><code class="language-python">def ratio_match(d1, d2, ratio=0.75):
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    pairs = bf.knnMatch(d1, d2, k=2)                 # best two neighbors each
+    # TODO: keep match m from each (m, n) pair only when
+    # m.distance &lt; ratio * n.distance. Return the list of survivors.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return [m for m, n in pairs if m.distance &lt; ratio * n.distance]</code>. Tightening <code>ratio</code> toward 0.6 yields fewer but cleaner matches; loosening toward 0.8 keeps more candidates for RANSAC to sort out in Step 4.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Verify with a RANSAC homography</h4>
+<p>Collect the matched point coordinates and fit a homography with <code>cv2.findHomography</code> under the <code>cv2.RANSAC</code> flag. The returned inlier mask is half the product: it labels each ratio-test survivor as geometrically consistent or not, the verification step of <a href="section-10.6.html">Section 10.6</a>. Gate on the inlier count so a non-overlapping pair is refused rather than warped into garbage.</p>
+<pre><code class="language-python">def estimate_homography(k1, k2, good, min_inliers=20):
+    if len(good) &lt; 4:                                # need 4 pairs for a homography
+        return None, None
+    src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    # TODO: call cv2.findHomography(src, dst, cv2.RANSAC,
+    # ransacReprojThreshold=3.0). If the inlier mask sums to fewer than
+    # min_inliers, return (None, None) to refuse the pair; else return (H, mask).
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)</code>; then <code>if H is None or int(mask.sum()) &lt; min_inliers: return None, None</code> else <code>return H, mask</code>. The gate is the lesson of Section 10.6's orthomosaic story: a robust estimator that can say "no" beats one that always returns a matrix.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Warp and composite into one panorama</h4>
+<p>Map the right image into the left image's coordinate frame with the homography, allocate a canvas wide enough for both, and paste the left image on top of the warped right. The seam will be visible; that is fine, the point is that the geometry lines up.</p>
+<pre><code class="language-python">def stitch(left, right, H):
+    h1, w1 = left.shape[:2]
+    h2, w2 = right.shape[:2]
+    canvas_w = w1 + w2                               # room for both side by side
+    warped = cv2.warpPerspective(right, H, (canvas_w, max(h1, h2)))
+    # TODO: copy `left` into the top-left region of `warped`
+    # (rows 0:h1, cols 0:w1), then return the composited canvas.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>warped[0:h1, 0:w1] = left</code> then <code>return warped</code>. Pasting the un-warped left image last lets it overwrite the warped right in the overlap region, hiding the empty border the warp introduces.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Run the full pipeline and report the attrition</h4>
+<p>Chain the five stages and print the match attrition at each step, the same shrinking funnel <a href="section-10.6.html">Section 10.6</a> traced: raw keypoints, ratio-test survivors, geometric inliers. Write the panorama as the artifact you keep.</p>
+<pre><code class="language-python">left, right = load_pair()
+(k1, d1) = detect_describe(left)
+(k2, d2) = detect_describe(right)
+good = ratio_match(d1, d2)
+H, mask = estimate_homography(k1, k2, good)
+
+if H is None:
+    print(f"Refused: only {len(good)} ratio survivors, too few inliers to trust.")
+else:
+    n_in = int(mask.sum())
+    print(f"keypoints {len(k1)}/{len(k2)} -&gt; ratio {len(good)} -&gt; inliers {n_in}")
+    pano = stitch(left, right, H)
+    cv2.imwrite("panorama.jpg", pano)
+    print("wrote panorama.jpg")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>If the stitch looks torn, your overlap is too small or the wrong image is being warped. Confirm the inlier count is comfortably above the gate (a healthy overlapping pair gives well over a hundred), and remember the homography maps <code>right</code> into <code>left</code>'s frame, matching the <code>src</code>/<code>dst</code> order in Step 4.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>One image file, <code>panorama.jpg</code>, wider than either input, with the two views aligned across their shared region so straight edges (a window frame, a horizon, the bookshelf in the test image) continue unbroken across the seam. The console prints the attrition funnel, for example <code>keypoints 3200/3150 -&gt; ratio 540 -&gt; inliers 410</code>, the chapter's whole story in one line: thousands of keypoints, hundreds of ratio survivors, a geometrically consistent core. If you feed it two non-overlapping photos, it prints the <code>Refused</code> line and writes nothing, which is the correct behavior, not a bug.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Swap SIFT for ORB (<code>cv2.ORB_create</code>) and the matcher norm to <code>cv2.NORM_HAMMING</code>, the binary-descriptor path of <a href="section-10.4.html">Section 10.4</a>; time both and compare inlier counts to feel the speed-versus-distinctiveness trade.</li>
+<li>Replace <code>cv2.RANSAC</code> with <code>cv2.USAC_MAGSAC</code> in Step 4 and stitch the same pair both ways; report how the inlier count and seam alignment change, exercising the modern estimator family of <a href="section-10.6.html">Section 10.6</a>.</li>
+<li>Blend the seam instead of overwriting it: feather the overlap with a linear alpha ramp so the join is invisible, the first step toward the multi-band blending real panorama tools use.</li>
+</ul>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: cv2.Stitcher Does the Whole Lab in Three Lines</div>
+<p>The pipeline above is roughly seventy lines and exposes every stage on purpose. OpenCV bundles the same detect-describe-match-verify-warp chain, plus exposure compensation and multi-band blending the lab skips, behind one class: <code>stitcher = cv2.Stitcher_create()</code> then <code>status, pano = stitcher.stitch([left, right])</code> and <code>if status == cv2.Stitcher_OK: cv2.imwrite("panorama.jpg", pano)</code>. That is a 70-to-3 reduction, and the result has seamless blending the from-scratch version lacks. Build it once by hand to understand what the three lines hide; reach for the library every time after.</p>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+def load_pair():
+    a = cv2.imread("left.jpg")
+    b = cv2.imread("right.jpg")
+    if a is not None and b is not None:
+        return a, b
+    full = cv2.imread(cv2.samples.findFile("lena.jpg"))
+    if full is None:
+        full = np.random.default_rng(0).integers(0, 256, (512, 512, 3), np.uint8)
+    h, w = full.shape[:2]
+    return full[:, :int(0.65 * w)].copy(), full[:, int(0.35 * w):].copy()
+
+def detect_describe(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create(nfeatures=4000)
+    return sift.detectAndCompute(gray, None)
+
+def ratio_match(d1, d2, ratio=0.75):
+    bf = cv2.BFMatcher(cv2.NORM_L2)
+    pairs = bf.knnMatch(d1, d2, k=2)
+    return [m for m, n in pairs if m.distance &lt; ratio * n.distance]
+
+def estimate_homography(k1, k2, good, min_inliers=20):
+    if len(good) &lt; 4:
+        return None, None
+    src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if H is None or int(mask.sum()) &lt; min_inliers:
+        return None, None
+    return H, mask
+
+def stitch(left, right, H):
+    h1, w1 = left.shape[:2]
+    h2, w2 = right.shape[:2]
+    canvas_w = w1 + w2
+    warped = cv2.warpPerspective(right, H, (canvas_w, max(h1, h2)))
+    warped[0:h1, 0:w1] = left
+    return warped
+
+if __name__ == "__main__":
+    left, right = load_pair()
+    k1, d1 = detect_describe(left)
+    k2, d2 = detect_describe(right)
+    good = ratio_match(d1, d2)
+    H, mask = estimate_homography(k1, k2, good)
+    if H is None:
+        print(f"Refused: only {len(good)} ratio survivors, too few inliers to trust.")
+    else:
+        n_in = int(mask.sum())
+        print(f"keypoints {len(k1)}/{len(k2)} -&gt; ratio {len(good)} -&gt; inliers {n_in}")
+        cv2.imwrite("panorama.jpg", stitch(left, right, H))
+        print("wrote panorama.jpg")</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

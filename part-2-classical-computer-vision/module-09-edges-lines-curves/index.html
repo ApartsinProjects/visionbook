@@ -59,6 +59,11 @@ One more reason to take this chapter seriously, even in 2026: edges refuse to re
 </p>
 </div>
 
+<div class="callout key-insight">
+<div class="callout-title">The Chapter's Spine: Measure, Decide, Vote, Fit</div>
+<p>Four verbs carry the whole chapter, each owning one section's idea. <strong>Measure</strong> the gradient as evidence (Section 9.1); <strong>decide</strong> which evidence is an edge, the leap that Canny makes with context rather than a single threshold (Section 9.2); <strong>vote</strong> to group anonymous edge pixels into shapes, the Hough transform's election (Section 9.3); and <strong>fit</strong> to turn a coarse winner into a precise curve, robustly (Section 9.4). The lane detector of Section 9.5 runs all four in sequence on a real frame. Hold the four verbs and you hold the chapter; the recurring refrain underneath them, "detect coarsely by voting, then measure precisely by fitting", is the design pattern that returns in every geometric pipeline from Chapter 10 onward.</p>
+</div>
+
 <div class="prereqs">
 <h3>Prerequisites</h3>
 <p>
@@ -98,9 +103,320 @@ This chapter leans directly on the derivative filters (Sobel, Scharr, Laplacian)
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>
-Edges describe where the image changes, but they are anonymous: one stretch of contour looks much like another, which is why this chapter could group them only with strong geometric priors (lines, circles, polynomials). <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a> takes the complementary path: instead of long anonymous curves, it finds compact distinctive points (corners and blobs) and equips each with a fingerprint descriptor so it can be recognized again in a different photograph. That single capability, finding the same point in two images, unlocks panorama stitching, camera calibration, stereo depth, and ultimately the 3D reconstruction pipelines of Chapters 12 through 14. The RANSAC estimator you meet in Section 9.4 travels there with you; it is the standard tool for separating correct matches from false ones.
+Edges describe where the image changes, but they are anonymous: one stretch of contour looks much like another, which is why this chapter could group them only with strong geometric priors (lines, circles, polynomials). <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10: Keypoints, Descriptors &amp; Matching</a> takes the complementary path: instead of long anonymous curves, it finds compact distinctive points (corners and blobs) and equips each with a fingerprint descriptor so it can be recognized again in a different photograph. That single capability, finding the same point in two images, unlocks panorama stitching, camera calibration, stereo depth, and ultimately the 3D reconstruction pipelines of Chapters 12 through 14. The RANSAC estimator you meet in Section 9.4 travels there with you; it is the standard tool for separating correct matches from false ones. Before moving on, put the whole chapter to work in the Hands-On Lab below, where you assemble measure, decide, vote, and fit into a runnable lane-departure warning tool.
 </p>
 </div>
+
+<section class="lab" id="lab-9">
+<h2>Hands-On Lab: Build a Lane-Departure Warning Tool</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 75 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Assemble the four verbs of this chapter (measure, decide, vote, fit) into a single runnable program: a lane-departure warning tool that reads a forward-facing driving clip frame by frame, finds the two lane markings with the gradient-to-geometry pipeline of Sections 9.1 through 9.4, fits a robust polynomial to each, computes how far the vehicle has drifted from lane center, and writes an annotated output video that flashes a warning when the drift crosses a threshold. The finished tool runs on a synthetic clip the script generates itself, so it always produces a result even without a dataset.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Turning a gradient magnitude map into a binary edge decision with thresholding and Canny (Sections 9.1 and 9.2).</li>
+<li>Grouping edge pixels into line candidates with the probabilistic Hough transform <code>cv2.HoughLinesP</code> (Section 9.3).</li>
+<li>Separating the left and right markings by line slope and fitting each with a robust polynomial that survives stray votes (Section 9.4).</li>
+<li>Converting a pair of fitted lanes into a single departure metric (offset from lane center) and acting on it.</li>
+<li>Chaining the whole detector across video frames into a deployable tool with an annotated output, the architecture Section 9.5 traces to real driver-assistance systems.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>Two libraries and no dataset required; the script synthesizes its own driving clip if you do not supply one. Install with:</p>
+<pre><code class="language-bash">pip install opencv-python numpy</code></pre>
+<p>To run on real footage instead, drop a short forward-facing clip named <code>drive.mp4</code> beside the script; the loader falls back to a generated curved-lane animation when no file is found.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Open a clip, or synthesize one</h4>
+<p>Build a frame source that yields BGR frames from <code>drive.mp4</code> when present, and otherwise paints a moving pair of curved lane lines on a gray road so the lab always has something to detect.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+W, H = 640, 360
+
+def synth_frame(t):
+    """One synthetic dashcam frame at phase t in [0, 1)."""
+    img = np.full((H, W, 3), 60, np.uint8)          # gray road
+    drift = int(40 * np.sin(2 * np.pi * t))         # car drifts side to side
+    for y in range(H // 2, H):
+        z = (y - H // 2) / (H // 2)                  # 0 near horizon, 1 at bumper
+        half = int(40 + 180 * z)                     # lane widens toward camera
+        cx = W // 2 + drift + int(60 * z * z)        # gentle right curve
+        cv2.circle(img, (cx - half, y), 2, (255, 255, 255), -1)
+        cv2.circle(img, (cx + half, y), 2, (255, 255, 255), -1)
+    return img
+
+def frames(path="drive.mp4", n=120):
+    cap = cv2.VideoCapture(path)
+    if cap.isOpened():
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            yield cv2.resize(f, (W, H))
+        cap.release()
+        return
+    # TODO: no file found. Yield n synthetic frames by calling synth_frame
+    # with t stepping evenly from 0 to 1 across the n frames.
+    raise NotImplementedError</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For the fallback, loop <code>for i in range(n): yield synth_frame(i / n)</code>. Stepping <code>t</code> from 0 to 1 makes the synthetic car drift left then right, which is exactly what your warning logic needs to react to.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Reduce a frame to lane-edge evidence</h4>
+<p>Restrict attention to the road with a triangular region of interest, then run Canny (Section 9.2) on the masked grayscale image. The mask removes sky and clutter so the Hough vote later sees only road markings.</p>
+<pre><code class="language-python">def edge_map(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)        # tame noise before differentiating
+    edges = cv2.Canny(blur, 60, 180)                # low and high hysteresis thresholds
+    roi = np.zeros_like(edges)
+    poly = np.array([[(0, H), (W, H), (W // 2, H // 2)]])   # bottom triangle
+    # TODO: fill poly white on roi with cv2.fillPoly, then return
+    # the bitwise AND of edges and roi so only road edges survive.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cv2.fillPoly(roi, poly, 255)</code> paints the triangle, then <code>return cv2.bitwise_and(edges, roi)</code>. If you lose the markings, widen the triangle or lower the high Canny threshold from 180.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Vote for line segments with the Hough transform</h4>
+<p>Apply the probabilistic Hough transform of Section 9.3 to the edge map. It returns concrete segment endpoints rather than infinite lines, which is what you want for fitting.</p>
+<pre><code class="language-python">def hough_segments(edges):
+    # TODO: call cv2.HoughLinesP on edges with rho=2, theta=np.pi/180,
+    # threshold=40, minLineLength=20, maxLineGap=100. Return the array
+    # of segments, or an empty list if it returns None.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>lines = cv2.HoughLinesP(edges, 2, np.pi/180, 40, minLineLength=20, maxLineGap=100)</code>; then <code>return lines if lines is not None else []</code>. A higher <code>threshold</code> demands more votes per line and returns fewer, cleaner segments.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Split segments into left and right by slope</h4>
+<p>A left marking rises toward the image center with negative slope (in image coordinates where y grows downward), a right marking with positive slope. Sort the Hough segments into two buckets and discard near-horizontal noise.</p>
+<pre><code class="language-python">def split_by_slope(segments):
+    left, right = [], []
+    for seg in segments:
+        x1, y1, x2, y2 = seg[0]
+        if x2 == x1:
+            continue                                # skip vertical, undefined slope
+        slope = (y2 - y1) / (x2 - x1)
+        if abs(slope) &lt; 0.3:
+            continue                                # skip near-horizontal clutter
+        # TODO: append the point pairs (x1, y1) and (x2, y2) to `left`
+        # if slope &lt; 0, otherwise to `right`.
+        ...
+    return np.array(left), np.array(right)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Inside the loop, build <code>pts = [[x1, y1], [x2, y2]]</code> and do <code>(left if slope &lt; 0 else right).extend(pts)</code>. Collecting endpoints, not slopes, gives the next step raw coordinates to fit.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Fit each lane with a polynomial</h4>
+<p>Fit a line (degree-1 polynomial) to each bucket with <code>np.polyfit</code>, treating y as the independent variable so a near-vertical lane is still a function. This is the least-squares fit of Section 9.4; the slope filter in Step 4 already removed the worst outliers.</p>
+<pre><code class="language-python">def fit_lane(points):
+    if len(points) &lt; 2:
+        return None
+    xs, ys = points[:, 0], points[:, 1]
+    # TODO: fit x as a function of y, x = a*y + b, with np.polyfit(ys, xs, 1).
+    # Return a callable that maps a y value to its fitted x.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>a, b = np.polyfit(ys, xs, 1)</code> then <code>return lambda y: a * y + b</code>. Fitting x as a function of y (not the reverse) avoids the infinite-slope problem for vertical lanes, the same reasoning Section 9.5 uses with its quadratic fit.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Turn two lanes into a departure metric</h4>
+<p>Evaluate both fitted lanes at the bumper line (the bottom row), take the midpoint as the lane center, and compare it with the image center. A large signed gap means the vehicle has drifted out of the middle of its lane.</p>
+<pre><code class="language-python">def departure_offset(left_fn, right_fn):
+    if left_fn is None or right_fn is None:
+        return None
+    y = H - 1                                       # bumper line
+    lane_center = (left_fn(y) + right_fn(y)) / 2
+    # TODO: return the signed offset of the image center (W/2) from the
+    # lane center, in pixels. Positive means the car sits right of center.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return (W / 2) - lane_center</code>. A positive value means the camera (vehicle) is to the right of the lane midpoint and should warn the driver to steer left.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Annotate every frame and write the output video</h4>
+<p>Draw the two fitted lanes, print the offset, and flash a warning banner when the absolute offset exceeds a threshold. Write the annotated frames to <code>lane_warning.mp4</code>, the artifact you keep.</p>
+<pre><code class="language-python">def annotate(frame, left_fn, right_fn, offset, threshold=35):
+    out = frame.copy()
+    for fn, color in [(left_fn, (0, 255, 0)), (right_fn, (0, 255, 0))]:
+        if fn is None:
+            continue
+        ys = np.arange(H // 2, H, 5)
+        pts = np.array([[int(fn(y)), int(y)] for y in ys])
+        cv2.polylines(out, [pts], False, color, 3)
+    if offset is not None:
+        cv2.putText(out, f"offset {offset:+.0f}px", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # TODO: if abs(offset) &gt; threshold, draw a red "LANE DEPARTURE" banner
+        # near the top of the frame with cv2.putText.
+        ...
+    return out
+
+writer = cv2.VideoWriter("lane_warning.mp4",
+                         cv2.VideoWriter_fourcc(*"mp4v"), 20, (W, H))
+for frame in frames():
+    edges = edge_map(frame)
+    left, right = split_by_slope(hough_segments(edges))
+    lf, rf = fit_lane(left), fit_lane(right)
+    off = departure_offset(lf, rf)
+    writer.write(annotate(frame, lf, rf, off))
+writer.release()
+print("wrote lane_warning.mp4")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For the banner: <code>if abs(offset) &gt; threshold: cv2.putText(out, "LANE DEPARTURE", (W//2 - 140, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)</code>. On the synthetic clip the banner should appear at the extremes of the side-to-side drift.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>One video file, <code>lane_warning.mp4</code>, roughly six seconds long at 20 frames per second. Each frame shows the two detected lane markings traced in green with a live <code>offset</code> readout in the corner; on the synthetic clip the car drifts left and right, so a red <code>LANE DEPARTURE</code> banner appears at the extremes of the swing and disappears as it returns to center. The console prints a single line, <code>wrote lane_warning.mp4</code>. If you supply a real <code>drive.mp4</code>, the green traces should hug the painted lane lines on straight road and the offset should stay near zero while you hold the lane.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Replace the degree-1 fit in Step 5 with a degree-2 polynomial (<code>np.polyfit(ys, xs, 2)</code>) and add the curvature-radius formula of Section 9.4 to the on-screen readout, so the tool reports turn sharpness as well as departure.</li>
+<li>Make the fit robust: before <code>np.polyfit</code>, run a small RANSAC loop (Section 9.4) that samples two points, scores inliers within a pixel band, and keeps the best consensus set. Compare the trace stability against the plain least-squares version on a clip with dashed markings.</li>
+<li>Library shortcut, the Right Tool principle in action: swap your hand-built thresholding and Hough stack for a single call to the bird's-eye and sliding-window approach of <a href="section-9.5.html">Section 9.5</a>, then contrast both with a learned detector such as CLRerNet (see the chapter bibliography). State which pipeline you would ship and why.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+W, H = 640, 360
+
+def synth_frame(t):
+    img = np.full((H, W, 3), 60, np.uint8)
+    drift = int(40 * np.sin(2 * np.pi * t))
+    for y in range(H // 2, H):
+        z = (y - H // 2) / (H // 2)
+        half = int(40 + 180 * z)
+        cx = W // 2 + drift + int(60 * z * z)
+        cv2.circle(img, (cx - half, y), 2, (255, 255, 255), -1)
+        cv2.circle(img, (cx + half, y), 2, (255, 255, 255), -1)
+    return img
+
+def frames(path="drive.mp4", n=120):
+    cap = cv2.VideoCapture(path)
+    if cap.isOpened():
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            yield cv2.resize(f, (W, H))
+        cap.release()
+        return
+    for i in range(n):
+        yield synth_frame(i / n)
+
+def edge_map(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 180)
+    roi = np.zeros_like(edges)
+    poly = np.array([[(0, H), (W, H), (W // 2, H // 2)]])
+    cv2.fillPoly(roi, poly, 255)
+    return cv2.bitwise_and(edges, roi)
+
+def hough_segments(edges):
+    lines = cv2.HoughLinesP(edges, 2, np.pi / 180, 40,
+                            minLineLength=20, maxLineGap=100)
+    return lines if lines is not None else []
+
+def split_by_slope(segments):
+    left, right = [], []
+    for seg in segments:
+        x1, y1, x2, y2 = seg[0]
+        if x2 == x1:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        if abs(slope) &lt; 0.3:
+            continue
+        pts = [[x1, y1], [x2, y2]]
+        (left if slope &lt; 0 else right).extend(pts)
+    return np.array(left), np.array(right)
+
+def fit_lane(points):
+    if len(points) &lt; 2:
+        return None
+    xs, ys = points[:, 0], points[:, 1]
+    a, b = np.polyfit(ys, xs, 1)
+    return lambda y: a * y + b
+
+def departure_offset(left_fn, right_fn):
+    if left_fn is None or right_fn is None:
+        return None
+    y = H - 1
+    lane_center = (left_fn(y) + right_fn(y)) / 2
+    return (W / 2) - lane_center
+
+def annotate(frame, left_fn, right_fn, offset, threshold=35):
+    out = frame.copy()
+    for fn in (left_fn, right_fn):
+        if fn is None:
+            continue
+        ys = np.arange(H // 2, H, 5)
+        pts = np.array([[int(fn(y)), int(y)] for y in ys])
+        cv2.polylines(out, [pts], False, (0, 255, 0), 3)
+    if offset is not None:
+        cv2.putText(out, f"offset {offset:+.0f}px", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        if abs(offset) &gt; threshold:
+            cv2.putText(out, "LANE DEPARTURE", (W // 2 - 140, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+    return out
+
+if __name__ == "__main__":
+    writer = cv2.VideoWriter("lane_warning.mp4",
+                             cv2.VideoWriter_fourcc(*"mp4v"), 20, (W, H))
+    for frame in frames():
+        edges = edge_map(frame)
+        left, right = split_by_slope(hough_segments(edges))
+        lf, rf = fit_lane(left), fit_lane(right)
+        off = departure_offset(lf, rf)
+        writer.write(annotate(frame, lf, rf, off))
+    writer.release()
+    print("wrote lane_warning.mp4")</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

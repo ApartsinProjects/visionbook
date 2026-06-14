@@ -239,8 +239,291 @@ Grad-CAM is the standard production tool for "why did the model say that?", beca
 </div>
 
 <p>
-This closes Chapter 19. You can now derive the convolutional layer from first principles, configure it with channels, stride, padding, and dilation, reason about its receptive field and feature hierarchy, stabilize a deep stack with normalization, train a complete network end to end, and open the trained model to see what it learned. The chapter's arc, from the hand-designed kernels of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> to filters that rediscover them, is complete. <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> takes the conv-BN-ReLU block you built here and shows the great architectures assembled from it, from LeNet to ResNet to ConvNeXt, and the design decisions that separate a good network from a state-of-the-art one.
+This closes Chapter 19. You can now derive the convolutional layer from first principles, configure it with channels, stride, padding, and dilation, reason about its receptive field and feature hierarchy, stabilize a deep stack with normalization, train a complete network end to end, and open the trained model to see what it learned. The chapter's arc, from the hand-designed kernels of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a> to filters that rediscover them, is complete. The hands-on lab below pulls every thread of the chapter into one artifact you build and run; after it, <a href="../module-20-cnn-architectures/index.html">Chapter 20</a> takes the conv-BN-ReLU block you assembled here and shows the great architectures built from it, from LeNet to ResNet to ConvNeXt, and the design decisions that separate a good network from a state-of-the-art one.
 </p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: A CNN Interpretability Report Card</div>
+
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 75 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<p><strong>Objective.</strong> Build, train, and then open a small convolutional network on CIFAR-10, producing a single shareable figure (a "report card") that places, side by side, the network's first-layer filters, a feature-map activation, a saliency map, and a Grad-CAM heatmap for the same test image. The artifact ties the whole chapter together: the layer of Sections 19.2 to 19.4, the training of Section 19.5, and the four visualization techniques of this section.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Assembling the conv-BN-ReLU block (Sections 19.2 and 19.4) into a trainable network with global average pooling (Section 19.3).</li>
+<li>Running a complete CIFAR-10 training loop with augmentation and a learning-rate schedule (Section 19.5).</li>
+<li>Reading first-layer filters as learned edge and color-opponent kernels that echo Chapter 3.</li>
+<li>Capturing an intermediate feature map with a forward hook and a class-evidence map with Grad-CAM (this section).</li>
+<li>Composing the four views into one labeled figure you can put in a portfolio.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>Runs in Colab or any machine with PyTorch. A GPU trains in a few minutes; CPU works but is slower, so reduce the epoch count if you have no GPU.</p>
+<pre><code class="language-bash">pip install torch torchvision matplotlib</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Reuse the network and train it</h4>
+<p>Bring over the <code>conv_block</code> helper and <code>SmallCNN</code> from <a href="section-19.5.html">Section 19.5</a> and run the training loop until the network is past 75 percent test accuracy. You only need a trained model and the test set here, so keep this short.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torchvision, torchvision.transforms as T
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# TODO: paste conv_block and SmallCNN from Section 19.5, then train for ~20 epochs.
+# Hint: the only outputs this lab needs are the trained `model` (in eval mode)
+#       and a `test_loader` over un-normalized-friendly CIFAR-10 test images.
+model = ...        # trained SmallCNN().to(device)
+model.eval()
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>If you saved a checkpoint in Section 19.5, just load it with <code>model.load_state_dict(torch.load("smallcnn.pt"))</code> and skip retraining. Keep the normalization mean and std you trained with; you will need them to invert the normalization for display.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Pick one image and run a forward pass</h4>
+<p>Choose a correctly classified test image. You will reuse this single image for all four views so the report card tells one coherent story.</p>
+<pre><code class="language-python">import torchvision.transforms.functional as TF
+
+CLASSES = ["plane","car","bird","cat","deer","dog","frog","horse","ship","truck"]
+img, label = next(iter(test_loader))          # take a batch
+x = img[0:1].to(device)                        # keep batch dim: shape (1, 3, 32, 32)
+
+# TODO: run the model on x, confirm the prediction matches label[0],
+#       and store the predicted class index in `pred`.
+pred = ...
+print("true:", CLASSES[label[0]], "| pred:", CLASSES[pred])
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>logits = model(x); pred = logits.argmax(1).item()</code>. If the first image is misclassified, loop until you find one where <code>pred == label[0]</code>; a clean prediction makes the saliency and Grad-CAM maps easier to interpret.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: View 1, the first-layer filters</h4>
+<p>Read the weights of the very first <code>Conv2d</code> and tile them into a grid. Trained on color photographs, several should resemble oriented edges and color-opponent blobs, the learned cousins of the Sobel and Gabor kernels of <a href="../../part-1-image-processing/module-03-spatial-filtering-convolution/index.html">Chapter 3</a>.</p>
+<pre><code class="language-python"># TODO: grab the first conv layer's weight tensor (shape: out_ch, 3, 3, 3),
+#       normalize each filter to [0, 1] for display, and build a tile grid.
+first_conv = ...           # the first nn.Conv2d module in the model
+W = first_conv.weight.detach().cpu()
+# Hint: per-filter min-max normalize, then torchvision.utils.make_grid(W, nrow=8)
+filter_grid = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Find the layer with <code>next(m for m in model.modules() if isinstance(m, nn.Conv2d))</code>. Normalize with <code>W = (W - W.amin((1,2,3),keepdim=True)) / (W.amax((1,2,3),keepdim=True) - W.amin((1,2,3),keepdim=True) + 1e-8)</code>, then <code>make_grid(W, nrow=8, padding=1)</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: View 2, an intermediate feature map</h4>
+<p>Register a forward hook on a mid-network conv layer to capture its activation for your image, then display one channel. Bright regions show where that learned feature fired.</p>
+<pre><code class="language-python">activation = {}
+def hook(module, inp, out):
+    activation["feat"] = out.detach()
+
+# TODO: register the hook on a middle conv layer, run the forward pass again,
+#       then select one channel of activation["feat"][0] to display.
+handle = ...               # target_layer.register_forward_hook(hook)
+_ = model(x)
+handle.remove()
+feat_channel = ...         # e.g. activation["feat"][0, 0].cpu()
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Pick a layer from the second or third stage so the feature is more abstract than a raw edge. After the forward pass, <code>activation["feat"]</code> has shape <code>(1, C, H, W)</code>; <code>activation["feat"][0].mean(0)</code> averages all channels into one summary map if a single channel looks empty.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: View 3, a vanilla saliency map</h4>
+<p>Backpropagate the predicted-class score to the input pixels. The per-pixel gradient magnitude is the saliency map: it shows which pixels, if nudged, would most change the score.</p>
+<pre><code class="language-python">x_in = x.clone().requires_grad_(True)
+score = model(x_in)[0, pred]
+# TODO: backprop `score`, then reduce x_in.grad over the color channels
+#       (max of absolute value) to a single-channel saliency map.
+score.backward()
+saliency = ...             # shape (32, 32)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>saliency = x_in.grad.abs()[0].amax(0).cpu()</code>. Normalize it to [0, 1] before display so the colormap uses its full range.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: View 4, a Grad-CAM heatmap</h4>
+<p>Grad-CAM weights the last convolutional feature map by the gradient of the class score, giving a coarse but class-discriminative heatmap. Reuse the hooked feature from Step 4 if it is your last conv stage, or hook the final conv layer here.</p>
+<pre><code class="language-python"># TODO: capture the last conv layer's activations AND their gradients,
+#       compute channel weights = global-average-pooled gradients,
+#       form cam = ReLU(sum_c weight_c * activation_c), upsample to 32x32.
+cam = ...                  # shape (32, 32), normalized to [0, 1]
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Register both a forward hook (store <code>out</code>) and a full backward hook (store <code>grad_output[0]</code>) on the final conv layer, run the forward and a <code>backward()</code> on the class score, then <code>weights = grads.mean((2,3), keepdim=True); cam = (weights * acts).sum(1).relu()[0]</code>. Upsample with <code>torch.nn.functional.interpolate(cam[None,None], size=(32,32), mode="bilinear")</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Compose the report card</h4>
+<p>Lay the four views out with matplotlib: the input image, the filter grid, the feature map, and the saliency and Grad-CAM overlays. Title it with the true and predicted classes and save it.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+# TODO: build a 2x3 grid of subplots: input, first-layer filters, feature map,
+#       saliency overlay, Grad-CAM overlay. Add a suptitle with true/pred labels.
+#       Save with plt.savefig("cnn_report_card.png", dpi=150, bbox_inches="tight").
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>To overlay a heatmap on the image, first invert the training normalization to recover a displayable RGB image, show it with <code>imshow</code>, then overlay the map with <code>imshow(map, cmap="jet", alpha=0.5)</code>.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>A single saved PNG, <code>cnn_report_card.png</code>, with six panels for one CIFAR-10 image. The first-layer filter grid should show several recognizable oriented edges and a few color-opponent (red/green, blue/yellow) filters. The saliency and Grad-CAM panels should both concentrate evidence on the object rather than the background for a confidently and correctly classified image; if they land on the background, you have likely found a dataset shortcut. A typical run reaches roughly 80 to 85 percent test accuracy for the trained <code>SmallCNN</code> before you generate the figure.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li><strong>Library shortcut (the "Right Tool").</strong> Replace your hand-written Grad-CAM (Steps 6) with three lines from <code>pytorch-grad-cam</code>: <code>from pytorch_grad_cam import GradCAM; cam = GradCAM(model, target_layers=[last_conv]); heatmap = cam(input_tensor=x)[0]</code>. Confirm it matches your from-scratch map, then note how much hook bookkeeping it removed.</li>
+<li><strong>Misclassification study.</strong> Regenerate the report card for an image the network gets wrong and contrast where the evidence falls; connect it to Exercise 19.6.3.</li>
+<li><strong>Sanity check.</strong> Re-run saliency on a randomly initialized (untrained) copy of the network. If the map still looks structured, you have reproduced the Adebayo et al. critique from the Research Frontier above: a saliency method that ignores the weights is not explaining the model.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision, torchvision.transforms as T
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+MEAN = (0.4914, 0.4822, 0.4465); STD = (0.2470, 0.2435, 0.2616)
+CLASSES = ["plane","car","bird","cat","deer","dog","frog","horse","ship","truck"]
+
+# ---- Step 1: network (conv-BN-ReLU block + SmallCNN) and a short training run ----
+def conv_block(in_ch, out_ch, stride=1):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True))
+
+class SmallCNN(nn.Module):
+    def __init__(self, n=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            conv_block(3, 32),  conv_block(32, 32, stride=2),    # 32x32 -> 16x16
+            conv_block(32, 64), conv_block(64, 64, stride=2),    # 16x16 -> 8x8
+            conv_block(64,128), conv_block(128,128, stride=2))   # 8x8 -> 4x4
+        self.head = nn.Linear(128, n)
+    def forward(self, x):
+        x = self.features(x)
+        x = F.adaptive_avg_pool2d(x, 1).flatten(1)               # global average pool
+        return self.head(x)
+
+train_tf = T.Compose([T.RandomCrop(32, padding=4), T.RandomHorizontalFlip(),
+                      T.ToTensor(), T.Normalize(MEAN, STD)])
+test_tf  = T.Compose([T.ToTensor(), T.Normalize(MEAN, STD)])
+train_set = torchvision.datasets.CIFAR10("./data", train=True,  download=True, transform=train_tf)
+test_set  = torchvision.datasets.CIFAR10("./data", train=False, download=True, transform=test_tf)
+train_loader = torch.utils.data.DataLoader(train_set, 128, shuffle=True,  num_workers=2)
+test_loader  = torch.utils.data.DataLoader(test_set,  256, shuffle=False, num_workers=2)
+
+model = SmallCNN().to(device)
+opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+EPOCHS = 20
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
+for epoch in range(EPOCHS):
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        opt.zero_grad()
+        F.cross_entropy(model(xb), yb).backward()
+        opt.step()
+    sched.step()
+model.eval()
+
+# ---- Step 2: pick one correctly classified image ----
+imgs, labels = next(iter(test_loader))
+idx = 0
+for i in range(imgs.size(0)):
+    xi = imgs[i:i+1].to(device)
+    if model(xi).argmax(1).item() == labels[i].item():
+        idx = i; break
+x = imgs[idx:idx+1].to(device)
+label = labels[idx].item()
+pred  = model(x).argmax(1).item()
+print("true:", CLASSES[label], "| pred:", CLASSES[pred])
+
+def denorm(t):  # invert normalization for display, returns HxWx3 in [0,1]
+    t = t.detach().cpu()[0].clone()
+    for c in range(3): t[c] = t[c]*STD[c] + MEAN[c]
+    return t.clamp(0,1).permute(1,2,0).numpy()
+
+# ---- Step 3: first-layer filters ----
+first_conv = next(m for m in model.modules() if isinstance(m, nn.Conv2d))
+W = first_conv.weight.detach().cpu()
+W = (W - W.amin((1,2,3),keepdim=True)) / (W.amax((1,2,3),keepdim=True) - W.amin((1,2,3),keepdim=True) + 1e-8)
+filter_grid = make_grid(W, nrow=8, padding=1).permute(1,2,0).numpy()
+
+# ---- Step 4: a mid-network feature map ----
+convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
+mid_layer  = convs[len(convs)//2]
+last_conv  = convs[-1]
+acts, grads = {}, {}
+h1 = mid_layer.register_forward_hook(lambda m,i,o: acts.__setitem__("mid", o.detach()))
+h2 = last_conv.register_forward_hook(lambda m,i,o: acts.__setitem__("last", o))
+h3 = last_conv.register_full_backward_hook(lambda m,gi,go: grads.__setitem__("last", go[0].detach()))
+
+# ---- Step 5 + 6: saliency and Grad-CAM in one forward/backward ----
+x_in = x.clone().requires_grad_(True)
+logits = model(x_in)
+score = logits[0, pred]
+model.zero_grad(); score.backward()
+saliency = x_in.grad.abs()[0].amax(0).cpu()
+saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+feat_channel = acts["mid"][0].mean(0).cpu()                      # averaged feature map
+weights = grads["last"].mean((2,3), keepdim=True)               # global-average-pooled grads
+cam = (weights * acts["last"]).sum(1).relu()[0]                 # ReLU(weighted sum)
+cam = F.interpolate(cam[None,None], size=(32,32), mode="bilinear", align_corners=False)[0,0]
+cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+cam = cam.detach().cpu()
+for h in (h1, h2, h3): h.remove()
+
+# ---- Step 7: compose and save the report card ----
+rgb = denorm(x)
+fig, ax = plt.subplots(2, 3, figsize=(11, 7))
+ax[0,0].imshow(rgb);                         ax[0,0].set_title("input")
+ax[0,1].imshow(filter_grid);                 ax[0,1].set_title("first-layer filters")
+ax[0,2].imshow(feat_channel, cmap="viridis");ax[0,2].set_title("mid feature map")
+ax[1,0].imshow(saliency, cmap="hot");        ax[1,0].set_title("saliency")
+ax[1,1].imshow(rgb); ax[1,1].imshow(saliency, cmap="jet", alpha=0.5); ax[1,1].set_title("saliency overlay")
+ax[1,2].imshow(rgb); ax[1,2].imshow(cam, cmap="jet", alpha=0.5);      ax[1,2].set_title("Grad-CAM")
+for a in ax.ravel(): a.axis("off")
+fig.suptitle(f"CNN report card  |  true: {CLASSES[label]}   pred: {CLASSES[pred]}", fontsize=13)
+plt.tight_layout()
+plt.savefig("cnn_report_card.png", dpi=150, bbox_inches="tight")
+print("saved cnn_report_card.png")
+</code></pre>
+</details>
+</div>
 
 <div class="callout exercise">
 <div class="callout-title">Exercise 19.6.1: Predict the First Layer <span class="exercise-type conceptual">Conceptual</span></div>

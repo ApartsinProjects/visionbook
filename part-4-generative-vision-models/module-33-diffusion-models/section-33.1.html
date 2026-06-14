@@ -304,7 +304,7 @@ generated mean: tensor([0.7461, 0.2503])
 <h2>5. Why Many Small Steps Beat One Big Step <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
 <p>
-A natural objection is: if the network can predict the noise, why not predict all of it at once and jump straight from $x_T$ to $x_0$? The answer is that the noise-prediction task is only easy <em>locally</em>. At high noise levels the network can recover the coarse layout of an image (is it a face or a landscape) but cannot resolve fine detail, because the detail has been destroyed. At low noise levels the coarse structure is already present and the network only needs to sharpen edges and textures. By taking many steps, the model solves a sequence of easy problems, coarse structure first, then progressively finer detail, rather than one impossibly hard one. This coarse-to-fine emergence is the same multi-scale logic as the <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">image pyramids of Chapter 4</a>, now unrolled over time instead of resolution.
+A natural objection is: if the network can predict the noise, why not predict all of it at once and jump straight from $x_T$ to $x_0$? The answer is that the noise-prediction task is only easy <em>locally</em>. At high noise levels the network can recover the coarse layout of an image (is it a face or a landscape) but cannot resolve fine detail, because the detail has been destroyed. At low noise levels the coarse structure is already present and the network only needs to sharpen edges and textures. By taking many steps, the model solves a sequence of easy problems, coarse structure first, then progressively finer detail, rather than one impossibly hard one. The slogan to remember is <strong>many easy steps, not one hard leap</strong>: diffusion trades a single impossible prediction for a long chain of trivial ones. This coarse-to-fine emergence is the same multi-scale logic as the <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">image pyramids of Chapter 4</a>, now unrolled over time instead of resolution. You can watch this happen on real images in the Hands-On Lab at the end of this section, where the toy denoiser of subsection 4 grows into a full image-generating diffusion model and ties together the forward process, the noise-prediction loss, and fast sampling that the rest of the chapter develops.
 </p>
 
 <div class="callout practical-example">
@@ -315,6 +315,306 @@ A natural objection is: if the network can predict the noise, why not predict al
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: How Few Steps Can You Get Away With?</div>
 <p>The "many small steps" argument explains why early diffusion models used hundreds to a thousand sampling steps, which is slow. The entire arc of <a href="section-33.4.html">Section 33.4</a> and <a href="section-33.5.html">Section 33.5</a> is about beating that. DDIM (Song et al., 2021) cut steps to roughly 20 to 50 by making the reverse deterministic; consistency models (Song et al., 2023, arXiv:2303.01469) pushed toward a single step by training the network to jump directly to the endpoint of a trajectory. By 2024, distillation methods such as Latent Consistency Models and the adversarial-distillation SDXL-Turbo and SD3-Turbo families produced near-real-time generation in one to four steps, and the rectified-flow training in Stable Diffusion 3 (Esser et al., 2024, arXiv:2403.03206) straightened the path so that fewer steps lose less quality. The frame to keep is that the many-steps formulation here is the pedagogically clean starting point; production systems aggressively compress it.</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Train Your Own Image Diffusion Model</div>
+
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 75 to 90 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<p><strong>Objective.</strong> Promote the two-dimensional toy denoiser of subsection 4 into a real generative model: train a small noise-predicting U-Net on FashionMNIST with the closed-form forward process and the simple noise-prediction loss, then sample a grid of brand-new clothing images from pure static. The finished artifact is a single PNG of generated samples plus a denoising filmstrip that shows static resolving into garments, the coarse-to-fine emergence of subsection 5 made visible on real images.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Implementing the closed-form forward corruption $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ as a batched <code>q_sample</code> (subsection 2).</li>
+<li>Writing the noise-prediction training loop with a uniformly sampled timestep and mean-squared error on the predicted noise (subsection 4, formalized in <a href="section-33.2.html">Section 33.2</a>).</li>
+<li>Building a compact time-conditioned U-Net denoiser with a sinusoidal timestep embedding.</li>
+<li>Running ancestral DDPM sampling from noise back to an image, and a faster deterministic skip-step sampler that previews the DDIM idea of <a href="section-33.4.html">Section 33.4</a>.</li>
+<li>Reaching the same result with the Hugging Face <code>diffusers</code> scheduler, the "Right Tool" payoff promised in the library-shortcut callout above.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>Runs in Colab or any machine with PyTorch. A GPU trains in a few minutes; CPU works but is slow, so cut the epoch count if you have no GPU. FashionMNIST downloads automatically (about 30 MB).</p>
+<pre><code class="language-bash">pip install torch torchvision matplotlib diffusers</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Build the noise schedule and the forward process</h4>
+<p>Precompute the linear $\beta_t$ schedule and the cumulative $\bar\alpha_t$ buffers once, then write <code>q_sample</code>, the closed-form jump that corrupts a clean batch to any timestep in a single call. This is the parameter-free half of diffusion.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+T = 300                                   # fewer steps than 1000 keeps the lab fast
+betas = torch.linspace(1e-4, 0.02, T, device=device)
+alphas = 1.0 - betas
+abar = torch.cumprod(alphas, dim=0)       # cumulative product = alpha-bar_t
+
+def q_sample(x0, t, noise):
+    # TODO: return sqrt(abar[t]) * x0 + sqrt(1 - abar[t]) * noise,
+    #       broadcasting the per-sample scalars over the image dimensions.
+    # Hint: index abar with t (shape [B]) then reshape to [B, 1, 1, 1].
+    ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>a = abar[t].view(-1, 1, 1, 1)</code> gives one scalar per image; then <code>return a.sqrt() * x0 + (1 - a).sqrt() * noise</code>. Keep <code>t</code> as a <code>long</code> tensor of shape <code>[B]</code> so the indexing is per-sample.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Define a small time-conditioned U-Net denoiser</h4>
+<p>The denoiser must know <em>which</em> noise level it is undoing, so feed the timestep through a sinusoidal embedding (the same positional-encoding trick as the transformers of <a href="../../part-3-deep-learning-for-vision/module-22-vision-transformers/index.html">Chapter 22</a>) and add it into the convolutional features. A two-level U-Net is plenty for 28x28 images.</p>
+<pre><code class="language-python">def timestep_embedding(t, dim=64):
+    half = dim // 2
+    freqs = torch.exp(-torch.arange(half, device=t.device) * (10000 ** (1 / half)).log())
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)   # shape [B, dim]
+
+class TinyUNet(nn.Module):
+    def __init__(self, ch=64):
+        super().__init__()
+        self.temb = nn.Sequential(nn.Linear(64, ch), nn.SiLU(), nn.Linear(ch, ch))
+        self.down = nn.Conv2d(1, ch, 3, padding=1)
+        self.mid  = nn.Conv2d(ch, ch, 3, padding=1)
+        self.up   = nn.Conv2d(ch, 1, 3, padding=1)
+    def forward(self, x, t):
+        h = F.silu(self.down(x))
+        # TODO: add the timestep embedding into h (broadcast over H and W),
+        #       pass through self.mid + SiLU, then return self.up(h).
+        ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Project the embedding with <code>e = self.temb(timestep_embedding(t))[:, :, None, None]</code> so it broadcasts over the spatial dimensions, then <code>h = F.silu(self.mid(h + e)); return self.up(h)</code>. The network output has the same shape as the input: it predicts the noise, not the image.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Train with the noise-prediction loss</h4>
+<p>Each step: draw a clean batch, sample a random timestep per image, corrupt it with <code>q_sample</code>, and train the network to predict the exact noise you added. The loss is a plain mean-squared error, the "simple" objective subsection 4 used and <a href="section-33.2.html">Section 33.2</a> derives from the variational bound.</p>
+<pre><code class="language-python">import torchvision, torchvision.transforms as TT
+
+tf = TT.Compose([TT.ToTensor(), TT.Normalize((0.5,), (0.5,))])   # scale to [-1, 1]
+ds = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
+loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=True, num_workers=2)
+
+model = TinyUNet().to(device)
+opt = torch.optim.Adam(model.parameters(), lr=2e-4)
+
+for epoch in range(8):
+    for x0, _ in loader:
+        x0 = x0.to(device)
+        t = torch.randint(0, T, (x0.size(0),), device=device)
+        noise = torch.randn_like(x0)
+        xt = q_sample(x0, t, noise)
+        # TODO: predict the noise from (xt, t) and compute the MSE against `noise`.
+        loss = ...
+        opt.zero_grad(); loss.backward(); opt.step()
+    print(f"epoch {epoch}  loss {loss.item():.4f}")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>pred = model(xt, t); loss = F.mse_loss(pred, noise)</code>. The target is the noise tensor, never the clean image. Loss should fall from roughly 1.0 toward 0.04 to 0.06 over the eight epochs.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Sample new images with ancestral DDPM</h4>
+<p>Run the reverse process: start from pure Gaussian noise and apply the reverse-step mean formula of subsection 3 at every timestep, adding fresh noise except at the final step. This is the slow but faithful sampler.</p>
+<pre><code class="language-python">@torch.no_grad()
+def ddpm_sample(model, n=64):
+    x = torch.randn(n, 1, 28, 28, device=device)
+    for i in reversed(range(T)):
+        t = torch.full((n,), i, device=device, dtype=torch.long)
+        eps = model(x, t)
+        a, ab, b = alphas[i], abar[i], betas[i]
+        # TODO: form the posterior mean
+        #   mean = (x - b / sqrt(1 - ab) * eps) / sqrt(a)
+        # then add sqrt(b) * fresh_noise when i > 0 (no noise at i == 0).
+        ...
+    return x.clamp(-1, 1)
+
+grid = ddpm_sample(model)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>mean = (x - b / (1 - ab).sqrt() * eps) / a.sqrt()</code>, then <code>x = mean + (b.sqrt() * torch.randn_like(x) if i &gt; 0 else 0)</code>. Rescale to [0, 1] for display with <code>(grid + 1) / 2</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Make a faster deterministic sampler</h4>
+<p>Sample again, but visit only every $k$-th timestep with a deterministic update that drops the added noise. This is a first taste of the DDIM idea of <a href="section-33.4.html">Section 33.4</a>: skip steps cleanly instead of naively, as Exercise 33.1.3 warns against.</p>
+<pre><code class="language-python">@torch.no_grad()
+def fast_sample(model, n=64, k=10):
+    x = torch.randn(n, 1, 28, 28, device=device)
+    steps = list(reversed(range(0, T, k)))
+    for j, i in enumerate(steps):
+        t = torch.full((n,), i, device=device, dtype=torch.long)
+        eps = model(x, t)
+        ab = abar[i]
+        x0_pred = (x - (1 - ab).sqrt() * eps) / ab.sqrt()      # predict clean image
+        # TODO: jump to the next, lower noise level i_next with the closed form:
+        #   x = sqrt(abar[i_next]) * x0_pred + sqrt(1 - abar[i_next]) * eps
+        # using i_next = steps[j + 1], or stop at x0_pred on the last step.
+        ...
+    return x.clamp(-1, 1)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>On the last index return <code>x0_pred.clamp(-1, 1)</code>; otherwise <code>i_next = steps[j + 1]; an = abar[i_next]; x = an.sqrt() * x0_pred + (1 - an).sqrt() * eps</code>. With <code>k = 10</code> you take 30 steps instead of 300 and the garments stay recognizable.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Save the sample grid and a denoising filmstrip</h4>
+<p>Tile the generated samples into one image, and separately save a row of snapshots from a single ancestral run so you can see static resolve into a garment, coarse shape first, then texture.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
+
+# TODO: make_grid the DDPM samples (nrow=8), save as "diffusion_samples.png".
+# TODO: re-run ancestral sampling for a SINGLE image, stashing x at
+#       t in {299, 200, 120, 60, 20, 0}, and save the row as "denoising_filmstrip.png".
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>g = make_grid((grid + 1) / 2, nrow=8); plt.imsave("diffusion_samples.png", g.permute(1,2,0).cpu().numpy())</code>. For the filmstrip, add an <code>if i in keep:</code> snapshot list inside a one-image copy of <code>ddpm_sample</code> and lay the snapshots out with <code>plt.subplots(1, len(keep))</code>.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Two saved PNGs. <code>diffusion_samples.png</code> is an 8x8 grid of generated FashionMNIST garments: after eight epochs they are clearly recognizable as shirts, trousers, bags, and shoes, though softer than real photos (a small model trained briefly will not be crisp). <code>denoising_filmstrip.png</code> shows one sample at six noise levels, beginning as pure static and resolving into a single garment, the coarse silhouette appearing well before the fine texture. The fast sampler of Step 5 produces visibly similar garments in 30 steps rather than 300, which is the payoff that motivates all of <a href="section-33.4.html">Section 33.4</a>. Training loss should settle around 0.04 to 0.06.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li><strong>Library shortcut (the "Right Tool").</strong> Replace your hand-written schedule and samplers with the <code>diffusers</code> scheduler from the callout above: <code>from diffusers import DDPMScheduler; sch = DDPMScheduler(num_train_timesteps=T)</code>, then use <code>sch.add_noise(x0, noise, t)</code> in training and <code>sch.step(model(x, t), t, x).prev_sample</code> in the loop. Confirm the samples match, and note how many lines of $\bar\alpha_t$ bookkeeping it removed. Swap in <code>DDIMScheduler</code> for the fast path and compare against your Step 5 sampler.</li>
+<li><strong>Class-conditional generation.</strong> Add the FashionMNIST label as an embedding summed into the timestep embedding, so you can ask the model for a specific garment. This is the conditioning that <a href="section-33.6.html">Section 33.6</a> turns into classifier-free guidance.</li>
+<li><strong>Cosine schedule.</strong> Replace the linear $\beta_t$ with the cosine $\bar\alpha_t$ schedule of <a href="section-33.2.html">Section 33.2</a> and compare sample quality at a fixed epoch budget.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision, torchvision.transforms as TT
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---- Step 1: schedule and forward process ----
+T = 300
+betas = torch.linspace(1e-4, 0.02, T, device=device)
+alphas = 1.0 - betas
+abar = torch.cumprod(alphas, dim=0)
+
+def q_sample(x0, t, noise):
+    a = abar[t].view(-1, 1, 1, 1)
+    return a.sqrt() * x0 + (1 - a).sqrt() * noise
+
+# ---- Step 2: time-conditioned U-Net ----
+def timestep_embedding(t, dim=64):
+    half = dim // 2
+    freqs = torch.exp(-torch.arange(half, device=t.device) * (10000 ** (1 / half)).log())
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+class TinyUNet(nn.Module):
+    def __init__(self, ch=64):
+        super().__init__()
+        self.temb = nn.Sequential(nn.Linear(64, ch), nn.SiLU(), nn.Linear(ch, ch))
+        self.down = nn.Conv2d(1, ch, 3, padding=1)
+        self.mid  = nn.Conv2d(ch, ch, 3, padding=1)
+        self.up   = nn.Conv2d(ch, 1, 3, padding=1)
+    def forward(self, x, t):
+        h = F.silu(self.down(x))
+        e = self.temb(timestep_embedding(t))[:, :, None, None]
+        h = F.silu(self.mid(h + e))
+        return self.up(h)
+
+# ---- Step 3: train ----
+tf = TT.Compose([TT.ToTensor(), TT.Normalize((0.5,), (0.5,))])
+ds = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
+loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=True, num_workers=2)
+
+model = TinyUNet().to(device)
+opt = torch.optim.Adam(model.parameters(), lr=2e-4)
+for epoch in range(8):
+    for x0, _ in loader:
+        x0 = x0.to(device)
+        t = torch.randint(0, T, (x0.size(0),), device=device)
+        noise = torch.randn_like(x0)
+        xt = q_sample(x0, t, noise)
+        loss = F.mse_loss(model(xt, t), noise)
+        opt.zero_grad(); loss.backward(); opt.step()
+    print(f"epoch {epoch}  loss {loss.item():.4f}")
+model.eval()
+
+# ---- Step 4: ancestral DDPM sampling (optionally stash a filmstrip) ----
+@torch.no_grad()
+def ddpm_sample(model, n=64, keep=None):
+    x = torch.randn(n, 1, 28, 28, device=device)
+    snaps = []
+    for i in reversed(range(T)):
+        t = torch.full((n,), i, device=device, dtype=torch.long)
+        eps = model(x, t)
+        a, ab, b = alphas[i], abar[i], betas[i]
+        mean = (x - b / (1 - ab).sqrt() * eps) / a.sqrt()
+        x = mean + (b.sqrt() * torch.randn_like(x) if i > 0 else 0)
+        if keep is not None and i in keep:
+            snaps.append(x[0, 0].clamp(-1, 1).cpu())
+    return (x.clamp(-1, 1), snaps) if keep is not None else x.clamp(-1, 1)
+
+grid = ddpm_sample(model, n=64)
+
+# ---- Step 5: faster deterministic skip-step sampler (DDIM-style) ----
+@torch.no_grad()
+def fast_sample(model, n=64, k=10):
+    x = torch.randn(n, 1, 28, 28, device=device)
+    steps = list(reversed(range(0, T, k)))
+    for j, i in enumerate(steps):
+        t = torch.full((n,), i, device=device, dtype=torch.long)
+        eps = model(x, t)
+        ab = abar[i]
+        x0_pred = (x - (1 - ab).sqrt() * eps) / ab.sqrt()
+        if j == len(steps) - 1:
+            return x0_pred.clamp(-1, 1)
+        an = abar[steps[j + 1]]
+        x = an.sqrt() * x0_pred + (1 - an).sqrt() * eps
+    return x.clamp(-1, 1)
+
+fast_grid = fast_sample(model, n=64, k=10)
+
+# ---- Step 6: save the sample grid and the denoising filmstrip ----
+g = make_grid((grid + 1) / 2, nrow=8)
+plt.imsave("diffusion_samples.png", g.permute(1, 2, 0).cpu().numpy())
+
+keep = [299, 200, 120, 60, 20, 0]
+_, snaps = ddpm_sample(model, n=1, keep=set(keep))
+order = sorted(range(len(keep)), key=lambda j: -keep[j])    # high noise -> low noise
+fig, ax = plt.subplots(1, len(snaps), figsize=(2 * len(snaps), 2.2))
+for col, s in enumerate(snaps):
+    ax[col].imshow((s + 1) / 2, cmap="gray"); ax[col].axis("off")
+fig.suptitle("denoising: static (left) to garment (right)")
+plt.tight_layout(); plt.savefig("denoising_filmstrip.png", dpi=150, bbox_inches="tight")
+print("saved diffusion_samples.png and denoising_filmstrip.png")
+</code></pre>
+</details>
 </div>
 
 <div class="callout exercise">

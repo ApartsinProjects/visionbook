@@ -57,6 +57,26 @@ The five sections move from the most assumption-free method to the most structur
 <p>
 A thread runs through all five sections: the tension between local evidence and global consistency. A pixel's own color is local evidence; whether it joins its neighbor is a question about consistency across the image. Clustering ignores spatial consistency entirely and pays for it with speckle. Region growing enforces local consistency greedily and pays for it with seed sensitivity. Graph cuts optimize a global energy and pay for it in compute. Reading the chapter as a sequence of answers to "how much global structure can I afford?" makes the design choices legible. The same trade reappears, with the unary and pairwise terms now learned, when <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a> bolts a Conditional Random Field onto a fully convolutional network, and when promptable models like SAM let a user click instead of seed.
 </p>
+<p>
+The five methods are easiest to remember as five points along that single axis, from no spatial structure at all to a global optimum. Table 11.1 is the chapter on one card: read it top to bottom as the price of global structure rising, and keep it as the mental model the rest of the chapter fills in.
+</p>
+<table class="complex-table">
+<caption><strong>Table 11.1</strong> The chapter as a spectrum. Each classical method is one answer to "how much global structure can I afford?", paying a characteristic price for the structure it buys.</caption>
+<thead>
+<tr><th>Method (Section)</th><th>Spatial structure used</th><th>Decision scope</th><th>Signature failure</th></tr>
+</thead>
+<tbody>
+<tr><td>Clustering, K-Means / Mean-Shift (11.1)</td><td>None: feature space only</td><td>Each pixel alone</td><td>Speckle; distant same-color regions merge</td></tr>
+<tr><td>Region growing / split-merge (11.2)</td><td>Local adjacency</td><td>Greedy, local</td><td>Leakage across faint edges; seed-sensitive</td></tr>
+<tr><td>Watershed (11.3)</td><td>Surface topography</td><td>Local commitment at ridges</td><td>Oversegmentation from noise minima</td></tr>
+<tr><td>Graph cuts / GrabCut (11.4)</td><td>Global energy</td><td>Global optimum (two labels)</td><td>Optimal for a color-only model, not for objects</td></tr>
+<tr><td>Superpixels, SLIC (11.5)</td><td>Local grid leash</td><td>Shrink the problem, defer the decision</td><td>Compactness too high leaks across boundaries</td></tr>
+</tbody>
+</table>
+<div class="callout key-takeaway">
+<div class="callout-title">Remember This: Group, then Govern by Geometry</div>
+<p>If one line survives a week after this chapter, make it this: <strong>every classical segmenter groups pixels by similarity, then governs that grouping with geometry, and the methods differ only in how much geometry they can afford.</strong> Clustering buys none and gets speckle; region growing buys local adjacency; watershed buys surface shape; graph cuts buy a global optimum; superpixels buy a cheap grid and defer the rest. The same two-part recipe, similarity for the data term and geometry for the smoothness term, is exactly what returns, now learned, in the CRF-on-a-network of <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>. The feature space changed; the recipe did not.</p>
+</div>
 </div>
 
 <div class="prereqs">
@@ -100,7 +120,266 @@ This chapter builds directly on the color spaces and intensity statistics of <a 
 <p>
 Segmentation carved the image into regions; the next chapters ask where those regions sit in three dimensions. <a href="../module-12-camera-models-calibration/index.html">Chapter 12: Camera Models &amp; Calibration</a> opens the geometric arc of Part II by formalizing how a 3D world projects onto the 2D grid we have been segmenting, and how calibration recovers the precise mapping. The grouping instinct developed here does not disappear: it returns, learned end to end, in <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24: Segmentation</a>, where fully convolutional networks predict per-pixel labels and promptable models like SAM turn a click into a mask. And the masks themselves become controllers in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35: Controllable Generation &amp; Image Editing</a>, where a region selected here decides what a diffusion model is allowed to repaint.
 </p>
+<p>
+Before moving on, put the whole chapter into practice. The Hands-On Lab below builds a single segmentation workbench that runs all five methods of Table 11.1 on one image, so you can see for yourself how the price of global structure trades against the kind of mistake each method makes.
+</p>
 </div>
+
+<section class="lab" id="lab-11">
+<h2>Hands-On Lab: Build a Five-Method Segmentation Workbench</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 80 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a single script that runs all five classical segmenters of this chapter, K-Means clustering, marker-controlled watershed, GrabCut, Felzenszwalb graph segmentation, and SLIC superpixels, on one image, then writes a labeled comparison grid to disk so you can read Table 11.1's "price of global structure" spectrum straight off your own result.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Clustering pixels in a color feature space with K-Means and mapping labels back to an image (Section 11.1).</li>
+<li>Driving a marker-controlled watershed from a distance transform to split touching blobs (Section 11.3).</li>
+<li>Extracting a foreground with GrabCut from a single bounding box (Section 11.4).</li>
+<li>Running the Felzenszwalb efficient graph segmentation and reasoning about its scale parameter (Section 11.4).</li>
+<li>Oversegmenting into SLIC superpixels and overlaying their boundaries (Section 11.5).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>Two libraries cover every method in this chapter. Install with:</p>
+<pre><code class="language-bash">pip install opencv-python scikit-image numpy</code></pre>
+<p>Save any color photo as <code>input.jpg</code> in the working folder. If no file is found the script falls back to a synthetic image of overlapping colored disks, which exercises every method (the disks touch, so watershed has work to do, and they sit on a flat background, so GrabCut has a clean foreground to find).</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load a color image with a synthetic fallback</h4>
+<p>Read the image in color (BGR, OpenCV's default) and provide a fallback so the lab always runs. The fallback paints three overlapping disks of different colors on a gray background.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage.segmentation import felzenszwalb, slic, mark_boundaries
+
+def load_image(path="input.jpg"):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+    canvas = np.full((300, 400, 3), 200, np.uint8)  # gray background
+    # TODO: draw three filled, overlapping circles in distinct BGR colors
+    # using cv2.circle(canvas, center, radius, color, thickness=-1).
+    # Place their centers close enough that at least two disks touch.
+    raise NotImplementedError
+
+img = load_image()
+print("loaded", img.shape, img.dtype)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Three calls such as <code>cv2.circle(canvas, (150, 150), 60, (200, 80, 60), -1)</code>, <code>cv2.circle(canvas, (230, 160), 60, (60, 160, 200), -1)</code>, and <code>cv2.circle(canvas, (190, 220), 55, (80, 200, 120), -1)</code> give you touching, differently colored blobs.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Segment by clustering with K-Means</h4>
+<p>This is Section 11.1 in code. Reshape the image to a list of color vectors, cluster them, then recolor each pixel with its cluster's mean color. No spatial term means speckle is expected.</p>
+<pre><code class="language-python">def kmeans_segment(img, k=4):
+    Z = img.reshape(-1, 3).astype(np.float32)        # one row per pixel
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    # TODO: call cv2.kmeans(Z, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    # It returns (compactness, labels, centers). Rebuild the image by indexing
+    # centers (cast to uint8) with labels.flatten(), then reshape to img.shape.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>_, labels, centers = cv2.kmeans(Z, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)</code>, then <code>centers.astype(np.uint8)[labels.flatten()].reshape(img.shape)</code> paints each pixel its cluster mean.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Separate touching blobs with marker-controlled watershed</h4>
+<p>Clustering cannot split two same-colored objects that touch; watershed can (Section 11.3). Threshold to a foreground mask, take its distance transform, place a marker at each peak, and flood.</p>
+<pre><code class="language-python">def watershed_segment(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, fg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dist = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist, 0.5 * dist.max(), 255, 0)
+    sure_fg = sure_fg.astype(np.uint8)
+    unknown = cv2.subtract(fg, sure_fg)
+    n, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1            # background must not be 0
+    markers[unknown == 255] = 0      # unknown region flagged for flooding
+    # TODO: call cv2.watershed(img, markers); it writes -1 on basin boundaries.
+    # Return a copy of img with boundary pixels (markers == -1) painted red.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cv2.watershed(img, markers)</code> modifies <code>markers</code> in place. Then <code>out = img.copy(); out[markers == -1] = (0, 0, 255)</code> draws the ridge lines that separate the basins.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Pull a foreground out with GrabCut</h4>
+<p>Section 11.4's interactive star. Give GrabCut a rectangle that loosely contains the foreground and let its iterated graph cut refine the boundary, then keep only the pixels it labels foreground.</p>
+<pre><code class="language-python">def grabcut_segment(img, rect=None):
+    h, w = img.shape[:2]
+    if rect is None:
+        rect = (int(0.1 * w), int(0.1 * h), int(0.8 * w), int(0.8 * h))
+    mask = np.zeros((h, w), np.uint8)
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    cv2.grabCut(img, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    # TODO: build a binary keep-mask that is 1 where mask is GC_FGD or GC_PR_FGD,
+    # else 0. Multiply it (as a 3-channel mask) into img so background goes black.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>keep = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)</code>, then <code>img * keep[:, :, None]</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Run the Felzenszwalb graph segmentation and SLIC superpixels</h4>
+<p>The two scikit-image methods of Sections 11.4 and 11.5. Felzenszwalb merges regions under an adaptive boundary predicate controlled by <code>scale</code>; SLIC oversegments into roughly equal superpixels. Both expect an RGB float image, so convert from BGR first.</p>
+<pre><code class="language-python">def felzenszwalb_segment(img, scale=200):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    labels = felzenszwalb(rgb, scale=scale, sigma=0.5, min_size=50)
+    return (mark_boundaries(rgb, labels) * 255).astype(np.uint8)[:, :, ::-1]
+
+def slic_segment(img, n_segments=120):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # TODO: call slic(rgb, n_segments=n_segments, compactness=10, start_label=1),
+    # overlay its boundaries with mark_boundaries, scale to 0..255 uint8,
+    # and convert back to BGR (reverse the last axis) so OpenCV can save it.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Mirror <code>felzenszwalb_segment</code>: <code>labels = slic(rgb, n_segments=n_segments, compactness=10, start_label=1)</code>, then the same <code>(mark_boundaries(rgb, labels) * 255).astype(np.uint8)[:, :, ::-1]</code> return.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Assemble the comparison grid and save it</h4>
+<p>Run every method, label each panel with its name, and tile the six images (original plus five results) into one grid. This grid is the artifact you keep, a single picture of Table 11.1.</p>
+<pre><code class="language-python">def labeled(panel, text):
+    out = panel.copy()
+    cv2.putText(out, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+panels = [
+    labeled(img, "original"),
+    labeled(kmeans_segment(img), "kmeans"),
+    labeled(watershed_segment(img), "watershed"),
+    labeled(grabcut_segment(img), "grabcut"),
+    labeled(felzenszwalb_segment(img), "felzenszwalb"),
+    labeled(slic_segment(img), "slic"),
+]
+# TODO: stack the six panels into a 2-row by 3-column grid with np.vstack and
+# np.hstack, then cv2.imwrite("segmentation_workbench.png", grid).
+# Hint: rows = [np.hstack(panels[0:3]), np.hstack(panels[3:6])]; np.vstack(rows).
+...</code></pre>
+<details>
+<summary>Hint</summary>
+<p>All panels share the input's height and width, so <code>grid = np.vstack([np.hstack(panels[0:3]), np.hstack(panels[3:6])])</code> tiles them cleanly, then <code>cv2.imwrite("segmentation_workbench.png", grid)</code>.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>One file, <code>segmentation_workbench.png</code>, a 2-by-3 grid. The <code>kmeans</code> panel shows flat color regions with speckle along boundaries and no separation between touching disks, exactly the failure Table 11.1 predicts for a method with no spatial term. The <code>watershed</code> panel draws red ridge lines that split the touching disks into separate basins. The <code>grabcut</code> panel keeps the central foreground and blacks out the background. The <code>felzenszwalb</code> and <code>slic</code> panels overlay region boundaries, with SLIC's boundaries forming a regular, roughly grid-like tessellation and Felzenszwalb's following the actual color edges. Reading left to right, top to bottom, you are looking at the chapter's spectrum from no spatial structure to a global energy to a deferred-decision oversegmentation.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Add a color-plus-position feature to the K-Means step by stacking scaled <code>(x, y)</code> coordinates onto the three color channels, then watch the speckle of Section 11.1 shrink as spatial proximity starts to count.</li>
+<li>Sweep the Felzenszwalb <code>scale</code> parameter over <code>[50, 200, 800]</code> and save a strip of the three results; this makes the scale-versus-region-count trade of Section 11.4 visible at a glance.</li>
+<li>Reach forward to <a href="../../part-3-deep-learning-for-vision/module-24-segmentation/index.html">Chapter 24</a>: feed your SLIC superpixels as nodes into a tiny region-adjacency graph and average each superpixel's color, previewing how superpixels become the compact substrate that learned models and CRFs reason over.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+from skimage.segmentation import felzenszwalb, slic, mark_boundaries
+
+def load_image(path="input.jpg"):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+    canvas = np.full((300, 400, 3), 200, np.uint8)
+    cv2.circle(canvas, (150, 150), 60, (200, 80, 60), -1)
+    cv2.circle(canvas, (230, 160), 60, (60, 160, 200), -1)
+    cv2.circle(canvas, (190, 220), 55, (80, 200, 120), -1)
+    return canvas
+
+def kmeans_segment(img, k=4):
+    Z = img.reshape(-1, 3).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(Z, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+    return centers.astype(np.uint8)[labels.flatten()].reshape(img.shape)
+
+def watershed_segment(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, fg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dist = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist, 0.5 * dist.max(), 255, 0)
+    sure_fg = sure_fg.astype(np.uint8)
+    unknown = cv2.subtract(fg, sure_fg)
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+    cv2.watershed(img, markers)
+    out = img.copy()
+    out[markers == -1] = (0, 0, 255)
+    return out
+
+def grabcut_segment(img, rect=None):
+    h, w = img.shape[:2]
+    if rect is None:
+        rect = (int(0.1 * w), int(0.1 * h), int(0.8 * w), int(0.8 * h))
+    mask = np.zeros((h, w), np.uint8)
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    cv2.grabCut(img, mask, rect, bgd, fgd, 5, cv2.GC_INIT_WITH_RECT)
+    keep = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    return img * keep[:, :, None]
+
+def felzenszwalb_segment(img, scale=200):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    labels = felzenszwalb(rgb, scale=scale, sigma=0.5, min_size=50)
+    return (mark_boundaries(rgb, labels) * 255).astype(np.uint8)[:, :, ::-1]
+
+def slic_segment(img, n_segments=120):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    labels = slic(rgb, n_segments=n_segments, compactness=10, start_label=1)
+    return (mark_boundaries(rgb, labels) * 255).astype(np.uint8)[:, :, ::-1]
+
+def labeled(panel, text):
+    out = panel.copy()
+    cv2.putText(out, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+if __name__ == "__main__":
+    img = load_image()
+    panels = [
+        labeled(img, "original"),
+        labeled(kmeans_segment(img), "kmeans"),
+        labeled(watershed_segment(img), "watershed"),
+        labeled(grabcut_segment(img), "grabcut"),
+        labeled(felzenszwalb_segment(img), "felzenszwalb"),
+        labeled(slic_segment(img), "slic"),
+    ]
+    grid = np.vstack([np.hstack(panels[0:3]), np.hstack(panels[3:6])])
+    cv2.imwrite("segmentation_workbench.png", grid)
+    print("wrote segmentation_workbench.png", grid.shape)</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

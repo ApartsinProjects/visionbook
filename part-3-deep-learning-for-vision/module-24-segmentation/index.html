@@ -43,6 +43,19 @@
 <p><strong>Segmentation is classification carried out per pixel: instead of one label for an image or one box for an object, the model assigns a category, and sometimes an identity, to every location in the frame.</strong> That single change of granularity drives the entire chapter. A network that outputs a dense map rather than a single vector must keep spatial resolution alive through pooling and strides, which is why the encoder-decoder shape returns again and again. Asking "which class is this pixel" gives semantic segmentation; asking additionally "which object instance is this pixel" gives instance segmentation; asking both at once over the whole image gives panoptic segmentation. Transformers then reframe all three as predicting a set of masks rather than labeling a grid, and the Segment Anything Model takes the final step: a single model that segments whatever you point at, with no fixed list of classes at all. By the end you will be able to read a per-pixel logit map, train a U-Net, run Mask R-CNN and SAM from a library, and report the right number, mean Intersection-over-Union or panoptic quality, for the right task.</p>
 </div>
 
+<div class="callout key-takeaway">
+<div class="callout-title">The Segmentation Ladder: One Schema for the Whole Chapter</div>
+<p>Every method in this chapter answers the same question, "what is at this location," at a finer and finer grain. Hold this five-rung ladder in mind and each section snaps into place:</p>
+<ol>
+<li><strong>What</strong> (semantic, <a href="section-24.1.html">24.1</a>): a class per pixel. FCN, U-Net, DeepLab.</li>
+<li><strong>What and which one</strong> (instance, <a href="section-24.2.html">24.2</a>): a class plus an identity per object. Mask R-CNN.</li>
+<li><strong>What and which one, everywhere</strong> (panoptic, <a href="section-24.3.html">24.3</a>): things and stuff in one partition. Panoptic quality.</li>
+<li><strong>The same answer, as a set of masks</strong> (transformers, <a href="section-24.4.html">24.4</a>): one model, all three readouts. SegFormer, Mask2Former.</li>
+<li><strong>Whatever you point at</strong> (promptable, <a href="section-24.5.html">24.5</a>): no class list at all. SAM. (And <a href="section-24.6.html">24.6</a> tells you how to score every rung.)</li>
+</ol>
+<p>Underneath all five runs a single engineering refrain worth memorizing: <strong>classification threw away the resolution; segmentation is the art of getting it back.</strong> Skip connections, dilation, and learned upsampling are just three answers to that one sentence. The <a href="#lab-24">Hands-On Lab</a> at the end of this chapter builds the first rung, a working U-Net, from scratch, trains it on a self-generating dataset, and scores it with the mean IoU and Dice metrics of <a href="section-24.6.html">Section 24.6</a>, so you exercise the encoder-decoder idea and the measurement toolkit in one runnable program.</p>
+</div>
+
 <div class="overview">
 <h2>Chapter Overview</h2>
 <p>
@@ -102,6 +115,272 @@ You should have read <a href="../module-19-convolutional-neural-networks/index.h
 <span class="section-desc">The measurement toolkit. Pixel cross-entropy, Dice, Tversky, and focal losses and when each helps, IoU, mean IoU, pixel accuracy, boundary-F1, and panoptic quality, and the practical traps of class imbalance and boundary error that decide whether a segmenter is actually good.</span>
 </li>
 </ul>
+
+<section class="lab" id="lab-24">
+<h2>Hands-On Lab: A U-Net Segmenter You Train and Score Yourself</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 75 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a small U-Net from scratch in PyTorch, train it to segment shapes against a noisy background, and grade it with the exact metrics from <a href="section-24.6.html">Section 24.6</a>, mean Intersection-over-Union and the Dice score. The dataset generates itself with code, so the lab is fully self-contained: there is nothing to download, it runs on a CPU in a couple of minutes, and because every mask is produced by the same generator that made the image, you can trust the ground truth absolutely. By the end you will have walked the chapter's central refrain, classification throws resolution away and segmentation gets it back, through a network you wrote line by line.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Assembling the encoder-decoder with skip connections that defines U-Net (<a href="section-24.1.html">Section 24.1</a>), the architecture that keeps and recovers spatial resolution.</li>
+<li>Generating a self-labeling synthetic segmentation dataset so the per-pixel ground truth is exact, the same trick the two-view lab of <a href="../../part-2-classical-computer-vision/module-13-two-view-stereo-depth/index.html">Chapter 13</a> uses for geometry.</li>
+<li>Training a dense predictor with pixel-wise cross-entropy and reading a per-pixel logit map (<a href="section-24.6.html">Section 24.6</a>).</li>
+<li>Computing mean IoU and Dice on validation masks, the right numbers for semantic segmentation, and seeing why pixel accuracy alone can mislead.</li>
+<li>Swapping your hand-built network for a one-line library model to confirm the Right Tool payoff (the stretch goal).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One library and no dataset; the script synthesizes its own images and masks, so it always runs to completion on any machine. Install with:</p>
+<pre><code class="language-bash">pip install torch numpy</code></pre>
+<p>Everything runs on the CPU in a couple of minutes at the small image size used here. A GPU, if present, simply makes it faster. Matplotlib is optional and only used by the first stretch goal to visualize a predicted mask.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Generate a self-labeling shapes dataset</h4>
+<p>Each sample is a small grayscale image with one bright disk on a noisy background, paired with a binary mask that is exactly the disk's pixels. Because one function draws both the image and its mask, the ground truth is perfect, which is what makes the lab self-grading.</p>
+<pre><code class="language-python">import numpy as np
+import torch
+
+def make_sample(size=64, rng=None):
+    rng = rng or np.random.default_rng()
+    img = rng.normal(0.2, 0.1, (size, size)).astype(np.float32)   # noisy background
+    cy, cx = rng.integers(16, size - 16, size=2)                   # random disk center
+    r = rng.integers(8, 14)                                        # random disk radius
+    yy, xx = np.mgrid[:size, :size]
+    mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r ** 2             # True inside the disk
+    img[mask] += 0.7                                               # brighten the disk
+    # TODO: return img as a (1, size, size) float32 tensor and mask as a
+    # (size, size) int64 tensor of class labels (0 = background, 1 = disk).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return torch.from_numpy(img)[None], torch.from_numpy(mask.astype(np.int64))</code>. The leading <code>[None]</code> adds the single channel dimension a convolution expects; the mask stays a 2D map of integer class indices, which is what cross-entropy wants as its target.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build the U-Net blocks</h4>
+<p>A U-Net is built from one repeated unit: two 3x3 convolutions, each followed by a ReLU, that keep the spatial size fixed. Write it once as a reusable block so the encoder and decoder can both call it.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+def conv_block(in_ch, out_ch):
+    # TODO: return an nn.Sequential of: Conv2d(in_ch, out_ch, 3, padding=1),
+    # ReLU, Conv2d(out_ch, out_ch, 3, padding=1), ReLU. The padding=1 keeps
+    # height and width unchanged so skip connections line up later.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>return nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True))</code>. Keeping <code>padding=1</code> means a 64x64 input stays 64x64, so when you concatenate an encoder feature onto a decoder feature their spatial shapes match exactly.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Wire the encoder, decoder, and skip connections</h4>
+<p>This is the heart of <a href="section-24.1.html">Section 24.1</a>. The encoder halves resolution with max pooling while doubling channels; the decoder upsamples back and, crucially, concatenates the matching encoder feature so fine spatial detail is restored. That concatenation is the skip connection.</p>
+<pre><code class="language-python">class UNet(nn.Module):
+    def __init__(self, n_classes=2):
+        super().__init__()
+        self.enc1 = conv_block(1, 16)
+        self.enc2 = conv_block(16, 32)
+        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = conv_block(32, 64)
+        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = conv_block(64, 32)        # 64 = 32 upsampled + 32 skip
+        self.up1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = conv_block(32, 16)        # 32 = 16 upsampled + 16 skip
+        self.head = nn.Conv2d(16, n_classes, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)                     # full resolution
+        e2 = self.enc2(self.pool(e1))         # half resolution
+        b = self.bottleneck(self.pool(e2))    # quarter resolution
+        d2 = self.up2(b)
+        # TODO: concatenate the encoder feature e2 onto d2 along the channel
+        # dim (dim=1), pass through self.dec2, then upsample with self.up1,
+        # concatenate e1, pass through self.dec1, and finally return self.head(...).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>d2 = self.dec2(torch.cat([d2, e2], dim=1))</code>; then <code>d1 = self.up1(d2)</code>; <code>d1 = self.dec1(torch.cat([d1, e1], dim=1))</code>; <code>return self.head(d1)</code>. The output has shape <code>(batch, n_classes, 64, 64)</code>: one logit map per class, the dense readout the chapter keeps returning to.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Train with pixel-wise cross-entropy</h4>
+<p>Generate a fresh batch each step and minimize cross-entropy averaged over every pixel. <code>nn.CrossEntropyLoss</code> expects raw logits of shape <code>(N, C, H, W)</code> and an integer target of shape <code>(N, H, W)</code>, exactly what Steps 1 and 3 produce.</p>
+<pre><code class="language-python">torch.manual_seed(0)
+rng = np.random.default_rng(0)
+model = UNet()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+def batch(n=16):
+    pairs = [make_sample(rng=rng) for _ in range(n)]
+    imgs = torch.stack([p[0] for p in pairs])
+    masks = torch.stack([p[1] for p in pairs])
+    return imgs, masks
+
+for step in range(300):
+    imgs, masks = batch()
+    logits = model(imgs)
+    # TODO: compute the loss with loss_fn(logits, masks), backpropagate,
+    # step the optimizer, and zero the gradients. Print the loss every 50 steps.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The canonical four lines: <code>loss = loss_fn(logits, masks)</code>; <code>opt.zero_grad()</code>; <code>loss.backward()</code>; <code>opt.step()</code>. Guard the print with <code>if step % 50 == 0:</code>. The loss should fall steadily from roughly 0.7 toward well under 0.1.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Score with mean IoU and Dice</h4>
+<p>Accuracy is misleading here: the disk is a small fraction of the image, so a model that predicts "all background" already scores high pixel accuracy. The honest metrics from <a href="section-24.6.html">Section 24.6</a> are IoU and Dice on the foreground class. Take the per-pixel argmax to get the predicted mask, then compute both.</p>
+<pre><code class="language-python">@torch.no_grad()
+def evaluate(model, n=64):
+    imgs, masks = batch(n)
+    pred = model(imgs).argmax(dim=1)          # (N, H, W) predicted class per pixel
+    p, g = (pred == 1), (masks == 1)          # foreground booleans
+    inter = (p &amp; g).sum().float()
+    union = (p | g).sum().float()
+    # TODO: return IoU = inter / union and Dice = 2 * inter / (p.sum() + g.sum()),
+    # both as plain Python floats. Add a tiny epsilon to each denominator to be safe.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>iou = (inter / (union + 1e-6)).item()</code>; <code>dice = (2 * inter / (p.sum() + g.sum() + 1e-6)).item()</code>; <code>return iou, dice</code>. After 300 steps both should land above about 0.9, and Dice is always slightly higher than IoU, the algebraic relationship noted in Section 24.6.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Report and sanity-check</h4>
+<p>Print the final metrics next to plain pixel accuracy to feel the gap the chapter warns about. The point is concrete: a single number can hide a useless model, which is why dense prediction is scored on overlap, not on how many pixels happened to be right.</p>
+<pre><code class="language-python">iou, dice = evaluate(model)
+imgs, masks = batch(64)
+acc = (model(imgs).argmax(1) == masks).float().mean().item()
+# TODO: print pixel accuracy, mean IoU, and Dice on one line each, then
+# state in a comment which of the three you would trust for an imbalanced mask.
+print(f"pixel accuracy: {acc:.3f}")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>print(f"foreground IoU: {iou:.3f}")</code> and <code>print(f"Dice: {dice:.3f}")</code>. Pixel accuracy will look impressive even early in training because background dominates; IoU and Dice are the numbers that actually track whether the disk is found, which is the lesson of Section 24.6.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>The training loop prints a loss that falls from about 0.7 to under 0.1 over 300 steps. The final report shows a pixel accuracy near 0.99 (inflated by the dominant background), a foreground IoU above roughly 0.90, and a Dice score a little higher still. The takeaway is the one Section 24.6 stresses: on an imbalanced mask the accuracy number flatters the model, while IoU and Dice report what you actually care about, how well the predicted region overlaps the true one. You have now built, trained, and correctly evaluated a semantic segmenter end to end.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Visualize a result: pick one validation image and plot the input, the ground-truth mask, and the predicted mask side by side with Matplotlib. Seeing the boundary error directly makes the boundary-F1 discussion of <a href="section-24.6.html">Section 24.6</a> concrete.</li>
+<li>Swap the loss for soft Dice loss (one minus the differentiable Dice of <a href="section-24.6.html">Section 24.6</a>) and compare convergence speed and final IoU against cross-entropy on the same seed. This shows why dense-prediction practitioners reach for region losses when the foreground is small.</li>
+<li>Library shortcut, the Right Tool principle in action: replace your hand-built <code>UNet</code> with <code>segmentation_models.pytorch</code> in one line, <code>import segmentation_models_pytorch as smp; model = smp.Unet(encoder_name="resnet18", in_channels=1, classes=2)</code>, train it with the identical loop, and note how a pretrained backbone reaches a higher IoU in fewer steps while you wrote almost no architecture code.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import numpy as np
+import torch
+import torch.nn as nn
+
+def make_sample(size=64, rng=None):
+    rng = rng or np.random.default_rng()
+    img = rng.normal(0.2, 0.1, (size, size)).astype(np.float32)
+    cy, cx = rng.integers(16, size - 16, size=2)
+    r = rng.integers(8, 14)
+    yy, xx = np.mgrid[:size, :size]
+    mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r ** 2
+    img[mask] += 0.7
+    return torch.from_numpy(img)[None], torch.from_numpy(mask.astype(np.int64))
+
+def conv_block(in_ch, out_ch):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True))
+
+class UNet(nn.Module):
+    def __init__(self, n_classes=2):
+        super().__init__()
+        self.enc1 = conv_block(1, 16)
+        self.enc2 = conv_block(16, 32)
+        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = conv_block(32, 64)
+        self.up2 = nn.ConvTranspose2d(64, 32, 2, stride=2)
+        self.dec2 = conv_block(64, 32)
+        self.up1 = nn.ConvTranspose2d(32, 16, 2, stride=2)
+        self.dec1 = conv_block(32, 16)
+        self.head = nn.Conv2d(16, n_classes, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        b = self.bottleneck(self.pool(e2))
+        d2 = self.up2(b)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return self.head(d1)
+
+torch.manual_seed(0)
+rng = np.random.default_rng(0)
+model = UNet()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+def batch(n=16):
+    pairs = [make_sample(rng=rng) for _ in range(n)]
+    imgs = torch.stack([p[0] for p in pairs])
+    masks = torch.stack([p[1] for p in pairs])
+    return imgs, masks
+
+for step in range(300):
+    imgs, masks = batch()
+    logits = model(imgs)
+    loss = loss_fn(logits, masks)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if step % 50 == 0:
+        print(f"step {step:3d}  loss {loss.item():.4f}")
+
+@torch.no_grad()
+def evaluate(model, n=64):
+    imgs, masks = batch(n)
+    pred = model(imgs).argmax(dim=1)
+    p, g = (pred == 1), (masks == 1)
+    inter = (p &amp; g).sum().float()
+    union = (p | g).sum().float()
+    iou = (inter / (union + 1e-6)).item()
+    dice = (2 * inter / (p.sum() + g.sum() + 1e-6)).item()
+    return iou, dice
+
+iou, dice = evaluate(model)
+imgs, masks = batch(64)
+acc = (model(imgs).argmax(1) == masks).float().mean().item()
+print(f"pixel accuracy: {acc:.3f}")    # high, but inflated by background
+print(f"foreground IoU: {iou:.3f}")    # the honest semantic-segmentation metric
+print(f"Dice: {dice:.3f}")             # always slightly above IoU</code></pre>
+</details>
+</section>
 
 <div class="whats-next">
 <h3>What's Next?</h3>

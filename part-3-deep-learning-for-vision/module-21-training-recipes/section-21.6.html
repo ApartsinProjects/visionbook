@@ -192,7 +192,7 @@ When a model refuses to learn, work the checks in order of cost, cheapest first,
 </div>
 
 <p>
-Two recurring culprits deserve a direct mention because they are common and easily missed. An <strong>exploding or NaN loss</strong> almost always means the learning rate is too high or you forgot gradient clipping; halve the rate or clip the gradient norm (rescale the gradient vector so its overall magnitude never exceeds a set ceiling, which caps any single runaway update). A loss that is <strong>flat from step zero</strong> usually means the gradient is not reaching the parameters at all, a detached tensor, a layer left in evaluation mode, or <code>requires_grad</code> mistakenly left False from the freezing of <a href="section-21.3.html">Section 21.3</a>. Both show up immediately in the overfit-one-batch check, which is why it sits so high in the playbook.
+Two recurring culprits deserve a direct mention because they are common and easily missed. An <strong>exploding or NaN loss</strong> almost always means the learning rate is too high or you forgot gradient clipping; halve the rate or clip the gradient norm (rescale the gradient vector so its overall magnitude never exceeds a set ceiling, which caps any single runaway update). A loss that is <strong>flat from step zero</strong> usually means the gradient is not reaching the parameters at all, a detached tensor, a layer left in evaluation mode, or <code>requires_grad</code> mistakenly left False from the freezing of <a href="section-21.3.html">Section 21.3</a>. Both show up immediately in the overfit-one-batch check, which is why it sits so high in the playbook. The Hands-On Lab at the end of this section is where the whole chapter comes together: you will assemble the data, augmentation, transfer, recipe, and sanity-check links into one script that trains and evaluates a real classifier on a small custom set.
 </p>
 
 <div class="callout library-shortcut">
@@ -215,6 +215,322 @@ trainer = L.Trainer(
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: Scaling Laws and Predicting the Curve Before You Run It</div>
 <p>A profound 2020-2026 development reframes debugging from reactive to predictive. Neural scaling laws show that, for a fixed architecture family, final loss follows a smooth power-law in model size, dataset size, and compute, so you can fit the law on a few small, cheap runs and <em>extrapolate</em> the loss of an expensive large run before launching it. A measured curve that falls below or above the predicted scaling line is itself a debugging signal: well below suggests a leak or contamination (the too-good-to-be-true flag from <a href="section-21.1.html">Section 21.1</a>), well above suggests a recipe or pipeline bug. The same machinery powers compute-optimal training (the Chinchilla result on balancing model and data size) and the data-quality scaling work behind the foundation models of <a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>. The humble overfit-one-batch check and the grand scaling law are two ends of one idea: the loss curve is predictable, and a curve that defies prediction is telling you exactly where to look.</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Train and Evaluate a Classifier With the Full Recipe</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>train_recipe.py</code>, that takes a pretrained backbone and trains it on a small real dataset (Oxford-IIIT Pets, 37 classes) using every link in this chapter's chain: normalization and a proper split (<a href="section-21.1.html">Section 21.1</a>), an augmentation pipeline with RandAugment and MixUp (<a href="section-21.2.html">Section 21.2</a>), a re-headed fine-tuned backbone (<a href="section-21.3.html">Section 21.3</a>), the modern recipe of AdamW with warmup-plus-cosine and label smoothing (<a href="section-21.4.html">Section 21.4</a>), and the sanity checks of this section run before the full run. The deliverable is a trained model, a validation accuracy you can quote, and a saved loss-and-accuracy curve you can read with the three shapes of subsection 1.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Loading a real dataset with the correct ImageNet normalization and a clean train/validation split (<a href="section-21.1.html">Section 21.1</a>).</li>
+<li>Composing an augmentation pipeline (resize, crop, flip, RandAugment) and applying MixUp in the training step (<a href="section-21.2.html">Section 21.2</a>).</li>
+<li>Re-heading a pretrained backbone for a new label set and fine-tuning rather than training from scratch (<a href="section-21.3.html">Section 21.3</a>).</li>
+<li>Assembling the modern recipe: AdamW with weight decay, a warmup-plus-cosine schedule, and label smoothing (<a href="section-21.4.html">Section 21.4</a>).</li>
+<li>Running the loss-at-init and overfit-one-batch sanity checks before launching, then reading the training curve (this section).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install torch torchvision timm matplotlib</code></pre>
+<p>A GPU shortens training to a few minutes, but every step runs on CPU at a smaller batch size. The dataset, <code>torchvision.datasets.OxfordIIITPet</code>, downloads automatically on first run (about 800 MB) and splits into a <code>trainval</code> and a <code>test</code> partition you will use as train and validation.</p>
+</div>
+
+<p>Put the chapter's full recipe into practice below. Work the steps in order; each prints a checkpoint so you can confirm progress before the long step. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Load the data with normalization and an augmentation pipeline</h4>
+<p>Two transform pipelines: a heavy one for training (random crop, flip, RandAugment) and a deterministic one for validation, both ending in the ImageNet normalization that every pretrained backbone expects (<a href="section-21.1.html">Section 21.1</a>).</p>
+<pre><code class="language-python">import torch
+from torchvision import transforms
+from torchvision.datasets import OxfordIIITPet
+from torch.utils.data import DataLoader
+
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandAugment(num_ops=2, magnitude=9),   # automated policy, Section 21.2
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+# TODO: build val_tf with a deterministic Resize(256) + CenterCrop(224),
+#       then ToTensor and the SAME Normalize(MEAN, STD). No randomness here.
+val_tf = ...
+
+train = OxfordIIITPet("./data", split="trainval", download=True, transform=train_tf)
+val   = OxfordIIITPet("./data", split="test",     download=True, transform=val_tf)
+train_loader = DataLoader(train, batch_size=32, shuffle=True,  num_workers=0)
+val_loader   = DataLoader(val,   batch_size=64, shuffle=False, num_workers=0)
+print(f"train={len(train)}  val={len(val)}  classes={len(train.classes)}")</code></pre>
+<details><summary>Hint</summary><p>The validation pipeline must be deterministic so the metric is reproducible: <code>transforms.Resize(256)</code>, <code>transforms.CenterCrop(224)</code>, <code>transforms.ToTensor()</code>, then the identical <code>Normalize(MEAN, STD)</code>. Augmentation belongs on the training set only.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Re-head a pretrained backbone</h4>
+<p>Load a pretrained ResNet-50 and swap its 1000-class ImageNet head for a 37-class one. This is transfer learning's central move (<a href="section-21.3.html">Section 21.3</a>): reuse the features, replace only the classifier.</p>
+<pre><code class="language-python">import timm
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+# TODO: create a pretrained "resnet50" with num_classes set to the dataset's
+#       class count, then move it to `device`. Hint: timm.create_model(...).
+model = ...
+print("head out features:", model.get_classifier().out_features)  # expect 37</code></pre>
+<details><summary>Hint</summary><p><code>timm.create_model("resnet50", pretrained=True, num_classes=len(train.classes)).to(device)</code> reuses the pretrained trunk and re-initializes a 37-way head. The <code>num_classes</code> argument does the head surgery for you.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Run the sanity checks before training</h4>
+<p>Never launch a long run unverified. Check the loss at initialization against $\ln K$ and confirm the model can overfit one batch, the two highest-value checks of this section.</p>
+<pre><code class="language-python">import math
+import torch.nn as nn
+
+xb, yb = next(iter(train_loader))
+xb, yb = xb.to(device), yb.to(device)
+
+# Loss at init should be about ln(K): the chance level for K classes.
+with torch.no_grad():
+    init_loss = nn.CrossEntropyLoss()(model(xb), yb).item()
+print(f"loss at init = {init_loss:.3f}  (expected about {math.log(len(train.classes)):.3f})")
+
+# Overfit ONE batch: a healthy model drives it toward zero in well under 100 steps.
+probe = nn.CrossEntropyLoss()
+opt_probe = torch.optim.Adam(model.parameters(), lr=1e-3)
+model.train()
+for step in range(60):
+    opt_probe.zero_grad()
+    loss = probe(model(xb), yb)
+    loss.backward(); opt_probe.step()
+    # TODO: every 20 steps, print step and loss.item() so you can watch it fall.
+    ...</code></pre>
+<details><summary>Hint</summary><p>A guard like <code>if step % 20 == 0: print(f"overfit step {step:3d} loss {loss.item():.3f}")</code> shows the loss diving toward zero. If it stalls near $\ln 37 \approx 3.6$, stop and fix the wiring before training. Re-create the model afterward so this probe does not pollute the real run.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Assemble the modern recipe</h4>
+<p>Build the optimizer, schedule, and loss that every strong 2024-2026 result uses together (<a href="section-21.4.html">Section 21.4</a>): AdamW with decoupled weight decay, a linear warmup into cosine decay, and cross-entropy with label smoothing.</p>
+<pre><code class="language-python">from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+model = timm.create_model("resnet50", pretrained=True,
+                          num_classes=len(train.classes)).to(device)  # fresh after probe
+EPOCHS = 8
+steps_per_epoch = len(train_loader)
+warmup_steps = steps_per_epoch  # one warmup epoch
+
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.05)
+# TODO: build a SequentialLR that does LinearLR warmup for `warmup_steps`,
+#       then CosineAnnealingLR for the remaining steps. Milestone = [warmup_steps].
+sched = ...
+loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)   # label smoothing, Section 21.4</code></pre>
+<details><summary>Hint</summary><p>Compose with <code>SequentialLR(opt, schedulers=[LinearLR(opt, start_factor=0.01, total_iters=warmup_steps), CosineAnnealingLR(opt, T_max=EPOCHS*steps_per_epoch - warmup_steps)], milestones=[warmup_steps])</code>, and call <code>sched.step()</code> once per optimizer step, not per epoch.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Train with MixUp in the loop</h4>
+<p>Run the training epochs. Inside each step apply MixUp (<a href="section-21.2.html">Section 21.2</a>): blend pairs of images and their labels with a Beta-sampled weight, then use the mixed-target cross-entropy. Step the scheduler every iteration.</p>
+<pre><code class="language-python">import numpy as np
+
+def mixup(x, y, num_classes, alpha=0.2):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    y1 = nn.functional.one_hot(y, num_classes).float()
+    mixed_y = lam * y1 + (1 - lam) * y1[idx]   # mix the LABELS too
+    return mixed_x, mixed_y
+
+for epoch in range(EPOCHS):
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        mx, my = mixup(xb, yb, len(train.classes))
+        opt.zero_grad()
+        # Soft-target cross-entropy: -sum(target * log_softmax(logits)).
+        logp = nn.functional.log_softmax(model(mx), dim=1)
+        loss = -(my * logp).sum(dim=1).mean()
+        loss.backward()
+        opt.step()
+        sched.step()   # TODO: confirm this is per-STEP, not per-epoch
+    print(f"epoch {epoch}  last train loss {loss.item():.3f}  lr {sched.get_last_lr()[0]:.2e}")</code></pre>
+<details><summary>Hint</summary><p>With MixUp the targets are soft (a blend of two one-hot vectors), so the standard <code>CrossEntropyLoss</code> on hard labels does not apply during training; the soft-target form <code>-(target * log_softmax(logits)).sum(1).mean()</code> is the correct loss. Keep <code>loss_fn</code> with label smoothing for any non-MixUp baseline you compare against.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Evaluate on the held-out validation set</h4>
+<p>Switch to eval mode (this freezes batch-norm statistics and disables dropout) and compute top-1 accuracy on the validation loader, the number that actually reports whether the recipe worked.</p>
+<pre><code class="language-python">@torch.no_grad()
+def accuracy(model, loader):
+    model.eval()
+    correct = total = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        preds = model(xb).argmax(dim=1)
+        # TODO: accumulate correct predictions and the total count
+        ...
+    return 100.0 * correct / total
+
+print(f"validation top-1 accuracy: {accuracy(model, val_loader):.2f}%")</code></pre>
+<details><summary>Hint</summary><p><code>correct += (preds == yb).sum().item()</code> and <code>total += yb.size(0)</code>. The <code>@torch.no_grad()</code> decorator and <code>model.eval()</code> are both required: the first saves memory, the second makes batch-norm use running statistics instead of the batch.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Plot and read the curve</h4>
+<p>Record per-epoch training loss and validation accuracy and plot them. Reading this curve with the three shapes of subsection 1 is what turns a finished run into a diagnosis.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+# Assume you appended to `train_losses` and `val_accs` (one value per epoch) above.
+fig, ax1 = plt.subplots(figsize=(6, 4))
+ax1.plot(train_losses, color="tab:blue", label="train loss")
+ax1.set_xlabel("epoch"); ax1.set_ylabel("train loss", color="tab:blue")
+ax2 = ax1.twinx()
+ax2.plot(val_accs, color="tab:orange", label="val acc")
+ax2.set_ylabel("val accuracy (%)", color="tab:orange")
+plt.title("Recipe training curve"); plt.tight_layout()
+plt.savefig("recipe_curve.png", dpi=120)
+print("saved recipe_curve.png")</code></pre>
+<details><summary>Hint</summary><p>Collect the metrics by initializing <code>train_losses, val_accs = [], []</code> before the epoch loop and appending the last training loss and <code>accuracy(model, val_loader)</code> at the end of each epoch. A healthy curve shows train loss falling while validation accuracy rises and then flattens.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>The sanity checks print a loss at init near $\ln 37 \approx 3.61$ and an overfit-one-batch loss diving below $0.1$ within sixty steps, confirming the pipeline before the real run. Training prints eight epochs with the learning rate rising during the warmup epoch and then decaying along the cosine curve, and the per-step MixUp loss noisier than a plain run because the targets are blended. On a GPU the whole run finishes in a few minutes; validation top-1 accuracy lands around 88 to 93 percent, far above what training the same ResNet-50 from scratch on this 37-class, roughly 3700-image set would reach, the transfer-learning payoff of <a href="section-21.3.html">Section 21.3</a> made concrete. The saved curve shows training loss falling steadily while validation accuracy climbs and plateaus, the healthy shape of Figure 21.6.1.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Ablate the recipe: rerun with MixUp off, then with label smoothing off, then with the schedule replaced by a constant learning rate, and tabulate the validation accuracy each change costs. This reproduces the chapter's thesis that the recipe, not the architecture, moves the number.</li>
+<li>Add model EMA (an exponential moving average of the weights, <a href="section-21.4.html">Section 21.4</a>): keep a shadow copy updated each step and evaluate it instead of the raw model. Report the accuracy difference.</li>
+<li>Make the validation split class-imbalanced by subsampling a few breeds heavily, then add the class-balanced or focal loss of <a href="section-21.5.html">Section 21.5</a> and measure whether per-class recall on the rare breeds improves.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import math
+import numpy as np
+import torch
+import torch.nn as nn
+import timm
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import OxfordIIITPet
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+# Step 1: data with augmentation + normalization
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandAugment(num_ops=2, magnitude=9),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+val_tf = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+train = OxfordIIITPet("./data", split="trainval", download=True, transform=train_tf)
+val   = OxfordIIITPet("./data", split="test",     download=True, transform=val_tf)
+K = len(train.classes)
+train_loader = DataLoader(train, batch_size=32, shuffle=True,  num_workers=0)
+val_loader   = DataLoader(val,   batch_size=64, shuffle=False, num_workers=0)
+
+# Step 3: sanity checks (on a throwaway model)
+probe_model = timm.create_model("resnet50", pretrained=True, num_classes=K).to(device)
+xb, yb = next(iter(train_loader))
+xb, yb = xb.to(device), yb.to(device)
+with torch.no_grad():
+    print(f"loss at init = {nn.CrossEntropyLoss()(probe_model(xb), yb).item():.3f} "
+          f"(expected about {math.log(K):.3f})")
+opt_probe = torch.optim.Adam(probe_model.parameters(), lr=1e-3)
+probe_model.train()
+for step in range(60):
+    opt_probe.zero_grad()
+    loss = nn.CrossEntropyLoss()(probe_model(xb), yb)
+    loss.backward(); opt_probe.step()
+    if step % 20 == 0:
+        print(f"overfit step {step:3d} loss {loss.item():.3f}")
+del probe_model, opt_probe
+
+# Step 2 + 4: fresh model and the modern recipe
+model = timm.create_model("resnet50", pretrained=True, num_classes=K).to(device)
+EPOCHS = 8
+steps_per_epoch = len(train_loader)
+warmup_steps = steps_per_epoch
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.05)
+sched = SequentialLR(
+    opt,
+    schedulers=[
+        LinearLR(opt, start_factor=0.01, total_iters=warmup_steps),
+        CosineAnnealingLR(opt, T_max=EPOCHS * steps_per_epoch - warmup_steps),
+    ],
+    milestones=[warmup_steps],
+)
+
+# Step 5: MixUp training loop
+def mixup(x, y, num_classes, alpha=0.2):
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    y1 = nn.functional.one_hot(y, num_classes).float()
+    mixed_y = lam * y1 + (1 - lam) * y1[idx]
+    return mixed_x, mixed_y
+
+@torch.no_grad()
+def accuracy(model, loader):
+    model.eval()
+    correct = total = 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        preds = model(xb).argmax(dim=1)
+        correct += (preds == yb).sum().item()
+        total += yb.size(0)
+    return 100.0 * correct / total
+
+train_losses, val_accs = [], []
+for epoch in range(EPOCHS):
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        mx, my = mixup(xb, yb, K)
+        opt.zero_grad()
+        logp = nn.functional.log_softmax(model(mx), dim=1)
+        loss = -(my * logp).sum(dim=1).mean()
+        loss.backward()
+        opt.step()
+        sched.step()
+    acc = accuracy(model, val_loader)
+    train_losses.append(loss.item()); val_accs.append(acc)
+    print(f"epoch {epoch}  train loss {loss.item():.3f}  "
+          f"val acc {acc:.2f}%  lr {sched.get_last_lr()[0]:.2e}")
+
+# Step 6 + 7: final accuracy and curve
+print(f"final validation top-1 accuracy: {val_accs[-1]:.2f}%")
+fig, ax1 = plt.subplots(figsize=(6, 4))
+ax1.plot(train_losses, color="tab:blue", label="train loss")
+ax1.set_xlabel("epoch"); ax1.set_ylabel("train loss", color="tab:blue")
+ax2 = ax1.twinx()
+ax2.plot(val_accs, color="tab:orange", label="val acc")
+ax2.set_ylabel("val accuracy (%)", color="tab:orange")
+plt.title("Recipe training curve"); plt.tight_layout()
+plt.savefig("recipe_curve.png", dpi=120)
+print("saved recipe_curve.png")</code></pre>
+</details>
 </div>
 
 <div class="callout exercise">

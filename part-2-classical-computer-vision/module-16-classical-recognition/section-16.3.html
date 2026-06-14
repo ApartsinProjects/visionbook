@@ -319,6 +319,10 @@ boxes, weights = hog.detectMultiScale(image, winStride=(8, 8), scale=1.05)
 <div class="code-caption">OpenCV's batteries-included pedestrian detector: <code>detectMultiScale</code> runs the full HOG+SVM sliding-window pyramid and grouping internally, collapsing the hundred-plus lines of Sections 1 through 4 into a single call returning boxes and scores.</div>
 </div>
 
+<p>
+The five stages of this section are easiest to internalize once you have wired them together yourself and watched the numbers move. The Hands-On Lab at the end of this section builds the complete Dalal-Triggs detector end to end, descriptor, support vector machine, sliding-window pyramid, hard negative mining, and non-maximum suppression, then measures it with the miss-rate curve Exercises 16.3.1 through 16.3.3 ask you to reason about.
+</p>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 16.3.1: Why a Linear Classifier? <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Dalal and Triggs reported that a linear SVM on HOG nearly matched a much slower kernel SVM, and they chose the linear one. Explain the two reasons a linear classifier is preferable for sliding-window detection specifically, referring to the per-window test-time cost and to the visualizability of the weight vector. Then argue why the same speed argument does not hold for the whole-image classification of <a href="section-16.2.html">Section 16.2</a>, where kernel SVMs were the norm.</p>
@@ -332,6 +336,329 @@ boxes, weights = hog.detectMultiScale(image, winStride=(8, 8), scale=1.05)
 <div class="callout exercise">
 <div class="callout-title">Exercise 16.3.3: The Value of Hard Negatives <span class="exercise-type analysis">Analysis</span></div>
 <p>Train two HOG+SVM detectors on the same positive set: one with negatives sampled randomly from background images, and one with two rounds of hard negative mining. Evaluate both with a miss-rate-versus-FPPI curve on a held-out test set. Quantify the improvement at a fixed FPPI of $1$ false positive per image, and inspect the hard negatives the mining collected; describe the three most common false-positive structures it found and explain, in terms of gradient orientations, why each one fooled the initial detector.</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build the Dalal-Triggs Pedestrian Detector End to End</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>hog_detector.py</code>, that trains a complete HOG plus linear-SVM pedestrian detector on a standard public dataset, hardens it with one round of hard negative mining, runs it as a sliding-window detector over an image pyramid, cleans the output with non-maximum suppression, and scores it honestly with the miss-rate-versus-false-positives-per-image curve of Section 5. The output is a working detector you trained yourself plus the curve that proves how good it is, the exact five-step recognition recipe of this chapter assembled into one runnable artifact.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Computing HOG descriptors with the canonical Dalal-Triggs parameters and training a maximum-margin linear SVM on them (Sections 1 and 2).</li>
+<li>Turning a window classifier into a detector with a sliding window over an image pyramid (Section 3, reusing the pyramid of <a href="../../part-1-image-processing/module-04-frequency-domain-multiscale/index.html">Chapter 4</a>).</li>
+<li>Implementing the hard negative mining bootstrap loop and greedy non-maximum suppression that detection cannot live without (Section 4).</li>
+<li>Scoring a detector with the miss-rate-versus-FPPI curve rather than accuracy (Section 5).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install scikit-image scikit-learn opencv-python numpy matplotlib</code></pre>
+<p>Use the INRIA Person dataset (or any small set of cropped person windows plus person-free background images). Resize positive crops to the canonical $64 \times 128$ window. No GPU is required; everything here runs on a CPU in a few minutes for a few thousand windows. The same pipeline works on any single-object class: swap the positive crops and you have a detector for that class instead.</p>
+</div>
+
+<p>Put the section's detection pipeline into practice below. Work through the steps in order; each one prints a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Encode the training windows as HOG vectors</h4>
+<p>Load the positive person crops and an initial random sample of background windows, resize each to $64 \times 128$, and turn every window into the $3780$-dimensional HOG vector of Section 1. This is the Represent step of the recognition recipe.</p>
+<pre><code class="language-python">import numpy as np, cv2
+from skimage.feature import hog
+
+WIN = (128, 64)  # (height, width): the canonical 64x128 pedestrian window
+
+def to_hog(gray):
+    return hog(gray, orientations=9, pixels_per_cell=(8, 8),
+               cells_per_block=(2, 2), block_norm="L2-Hys")
+
+def load_features(paths, label):
+    X = []
+    for p in paths:
+        g = cv2.resize(cv2.imread(p, cv2.IMREAD_GRAYSCALE), (WIN[1], WIN[0]))
+        # TODO: append the HOG vector of this window to X.
+        # Hint: use the to_hog helper above.
+        ...
+    return np.array(X), np.full(len(X), label)
+
+Xpos, ypos = load_features(pos_paths, +1)
+Xneg, yneg = load_features(neg_paths, -1)
+X = np.vstack([Xpos, Xneg]); y = np.concatenate([ypos, yneg])
+print(f"Training set: {len(Xpos)} positives, {len(Xneg)} negatives, dim {X.shape[1]}")</code></pre>
+<details><summary>Hint</summary><p>Inside the loop, call <code>X.append(to_hog(g))</code>. Every window must be encoded with the identical HOG parameters you will use at detection time, otherwise the SVM scores a feature it was never trained on. Expect <code>dim 3780</code>.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Train the linear SVM</h4>
+<p>Fit a linear support vector machine on the HOG vectors. The learned weight vector is the soft, maximum-margin pedestrian template of Section 2; scoring a window will be a single dot product with it. This is the Score step.</p>
+<pre><code class="language-python">from sklearn.svm import LinearSVC
+
+# TODO: train a LinearSVC on (X, y) and pull out the weight vector and bias.
+# Hint: small C (around 0.01) favors a wide margin; coef_ and intercept_ hold w and b.
+svm = ...
+w = ...
+b = ...
+print(f"Trained SVM; weight vector length {w.shape[0]}, bias {b:.3f}")</code></pre>
+<details><summary>Hint</summary><p><code>svm = LinearSVC(C=0.01, max_iter=20000).fit(X, y)</code>, then <code>w = svm.coef_.ravel()</code> and <code>b = svm.intercept_[0]</code>. Reshaping <code>w</code> back onto the window and visualizing it produces the ghostly average pedestrian described in Section 2.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Slide the detector over an image pyramid</h4>
+<p>Write the detection loop: at each pyramid scale, slide the $64 \times 128$ window with an $8$-pixel stride, HOG-encode and score each placement, and keep above-threshold boxes mapped back to original coordinates. This is the Search step that turns a classifier into a detector.</p>
+<pre><code class="language-python">def detect(image, w, b, stride=8, scales=10, downscale=1.2, thresh=0.5):
+    dets = []
+    for s in range(scales):
+        scale = downscale ** s
+        resized = cv2.resize(image, None, fx=1 / scale, fy=1 / scale)
+        if resized.shape[0] &lt; WIN[0] or resized.shape[1] &lt; WIN[1]:
+            break
+        for y0 in range(0, resized.shape[0] - WIN[0], stride):
+            for x0 in range(0, resized.shape[1] - WIN[1], stride):
+                patch = resized[y0:y0 + WIN[0], x0:x0 + WIN[1]]
+                # TODO: HOG-encode the patch, score it with w and b, and if the
+                # score exceeds thresh append (x, y, w_box, h_box, score) in
+                # ORIGINAL-image coordinates (multiply positions by scale).
+                ...
+    return dets
+
+raw = detect(cv2.imread("street.png", cv2.IMREAD_GRAYSCALE), w, b)
+print(f"raw detections before NMS: {len(raw)}")</code></pre>
+<details><summary>Hint</summary><p>Compute <code>score = w @ to_hog(patch) + b</code>; when <code>score &gt; thresh</code>, append <code>(int(x0*scale), int(y0*scale), int(WIN[1]*scale), int(WIN[0]*scale), score)</code>. Expect on the order of a thousand raw, overlapping detections, exactly the redundancy the next step removes.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Clean the output with non-maximum suppression</h4>
+<p>Collapse each cluster of overlapping boxes to the single highest-scoring one with greedy NMS, the Suppress step. Process boxes highest-score-first and discard any later box whose intersection-over-union with a kept box exceeds the threshold.</p>
+<pre><code class="language-python">def nms(boxes, scores, iou_thresh=0.4):
+    if len(boxes) == 0:
+        return []
+    b = np.array(boxes, dtype=np.float32)
+    x1, y1 = b[:, 0], b[:, 1]
+    x2, y2 = b[:, 0] + b[:, 2], b[:, 1] + b[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = np.argsort(scores)[::-1]
+    keep = []
+    while order.size &gt; 0:
+        i = order[0]; keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]]); yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]]); yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        # TODO: keep only the boxes whose IoU with box i is below iou_thresh.
+        order = ...
+    return keep
+
+kept = nms([d[:4] for d in raw], [d[4] for d in raw])
+print(f"after NMS: {len(kept)} detections")</code></pre>
+<details><summary>Hint</summary><p>The surviving boxes are those that do not overlap the kept one: <code>order = order[1:][iou &lt; iou_thresh]</code>. This is the identical greedy algorithm that survives into the deep detectors of <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a>.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Harden the detector with hard negative mining</h4>
+<p>Run the current detector over person-free background images, collect every above-threshold box as a hard negative, add those windows to the training set, and retrain. This bootstrap loop concentrates the SVM's capacity on the confusing background and typically halves the miss rate.</p>
+<pre><code class="language-python">hard = []
+for bg_path in background_image_paths:        # images known to contain no people
+    img = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)
+    for (x0, y0, bw, bh, score) in detect(img, w, b, thresh=0.0):
+        crop = cv2.resize(img[y0:y0 + bh, x0:x0 + bw], (WIN[1], WIN[0]))
+        hard.append(to_hog(crop))             # a false positive, now a labeled negative
+
+# TODO: add the hard negatives to the training set with label -1 and retrain.
+# Hint: vstack hard onto X, concatenate -1 labels onto y, refit the LinearSVC.
+X2, y2 = ..., ...
+svm2 = LinearSVC(C=0.01, max_iter=20000).fit(X2, y2)
+w, b = svm2.coef_.ravel(), svm2.intercept_[0]
+print(f"Mined {len(hard)} hard negatives; retrained detector")</code></pre>
+<details><summary>Hint</summary><p><code>X2 = np.vstack([X, np.array(hard)])</code> and <code>y2 = np.concatenate([y, np.full(len(hard), -1)])</code>. Detecting with <code>thresh=0.0</code> on background-only images surfaces every confident false positive; those lampposts and doorways are exactly the windows the first SVM never saw.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Score the detector with a miss-rate curve</h4>
+<p>Sweep the detection threshold over a test set, matching kept boxes to ground-truth boxes by IoU, and plot miss rate against false positives per image, the Settle step. The curve, not a single accuracy number, is the honest summary of a detector.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+
+def evaluate(test_images, gt_boxes, w, b, thresholds=np.linspace(-1, 2, 25)):
+    miss_rates, fppi = [], []
+    for t in thresholds:
+        misses = false_pos = total_gt = 0
+        for img, gts in zip(test_images, gt_boxes):
+            dets = nms_filter(detect(img, w, b, thresh=t))   # detect + NMS
+            matched, fp = match_to_gt(dets, gts, iou_thresh=0.5)
+            misses += len(gts) - matched; false_pos += fp; total_gt += len(gts)
+        # TODO: append miss rate (misses / total_gt) and FPPI (false_pos / #images).
+        ...
+    return fppi, miss_rates
+
+x, ymr = evaluate(test_images, gt_boxes, w, b)
+plt.loglog(x, ymr, marker="o"); plt.xlabel("false positives per image")
+plt.ylabel("miss rate"); plt.title("HOG+SVM pedestrian detector"); plt.savefig("miss_rate.png")
+print("Wrote miss_rate.png")</code></pre>
+<details><summary>Hint</summary><p>Append <code>miss_rates.append(misses / max(total_gt, 1))</code> and <code>fppi.append(false_pos / len(test_images))</code>. A detection counts as a hit when its IoU with an unmatched ground-truth box clears $0.5$; every unmatched detection is a false positive. Lowering the threshold pushes you down-and-right along the curve, the trade-off Section 5 describes.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: The Right Tool, the pretrained detector in three lines</h4>
+<p>You built the pipeline to understand it; in production OpenCV ships the whole thing pretrained. Run its built-in Dalal-Triggs people detector and compare its boxes against your own, mirroring this chapter's Right Tool principle.</p>
+<pre><code class="language-python"># TODO: load OpenCV's pretrained people SVM into a HOGDescriptor and run
+# detectMultiScale on a test image; it does descriptor, pyramid, slide, and
+# grouping internally. Hint: cv2.HOGDescriptor_getDefaultPeopleDetector().
+hog_cv = cv2.HOGDescriptor()
+...
+boxes, weights = ...
+print(f"OpenCV pretrained detector found {len(boxes)} pedestrians")</code></pre>
+<details><summary>Hint</summary><p><code>hog_cv.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())</code>, then <code>boxes, weights = hog_cv.detectMultiScale(image, winStride=(8, 8), scale=1.05)</code>. The roughly hundred lines of Steps 1 through 6 collapse to two calls; you wrote the long version so you can diagnose the short one when it misses.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>Step 1 reports a training set of a few hundred positives, a few thousand negatives, and dimension $3780$. Step 2 confirms a $3780$-length weight vector. Step 3 prints on the order of a thousand raw detections; Step 4 collapses them to a handful (single digits on a typical street image). Step 5 mines tens to hundreds of hard negatives and retrains. Step 6 writes <code>miss_rate.png</code>: a downward-sloping log-log curve where lowering the threshold trades a lower miss rate for a higher false-positive rate, and the post-mining detector's curve sits visibly below the pre-mining one. Step 7's pretrained detector should find roughly the same pedestrians your hand-built one does. If your miss rate stays high everywhere, the usual cause is too few or too-easy negatives; another round of hard negative mining is the fix, exactly as Section 4 predicts.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Add a second round of hard negative mining and overlay all three miss-rate curves (random negatives, one mining round, two mining rounds) on one plot to see the bootstrap converge, the experiment Exercise 16.3.3 describes.</li>
+<li>Replace the deletion in your NMS with soft-NMS (decay overlapping scores instead of removing the boxes) and check whether it recovers two pedestrians standing close together, the failure case of Exercise 16.3.2.</li>
+<li>Retrain the whole pipeline for a different rigid class (a stop sign, a car rear) by swapping only the positive crops, then compare your hand-crafted detector against a small CNN from <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> on the same data, previewing the plateau argument of <a href="section-16.6.html">Section 16.6</a>.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import numpy as np, cv2
+from skimage.feature import hog
+from sklearn.svm import LinearSVC
+import matplotlib.pyplot as plt
+
+WIN = (128, 64)  # (height, width)
+
+def to_hog(gray):
+    return hog(gray, orientations=9, pixels_per_cell=(8, 8),
+               cells_per_block=(2, 2), block_norm="L2-Hys")
+
+# Step 1: encode training windows as HOG vectors
+def load_features(paths, label):
+    X = [to_hog(cv2.resize(cv2.imread(p, cv2.IMREAD_GRAYSCALE), (WIN[1], WIN[0])))
+         for p in paths]
+    return np.array(X), np.full(len(X), label)
+
+Xpos, ypos = load_features(pos_paths, +1)
+Xneg, yneg = load_features(neg_paths, -1)
+X = np.vstack([Xpos, Xneg]); y = np.concatenate([ypos, yneg])
+
+# Step 2: train the linear SVM
+svm = LinearSVC(C=0.01, max_iter=20000).fit(X, y)
+w, b = svm.coef_.ravel(), svm.intercept_[0]
+
+# Step 3: sliding-window detection over a pyramid
+def detect(image, w, b, stride=8, scales=10, downscale=1.2, thresh=0.5):
+    dets = []
+    for s in range(scales):
+        scale = downscale ** s
+        resized = cv2.resize(image, None, fx=1 / scale, fy=1 / scale)
+        if resized.shape[0] < WIN[0] or resized.shape[1] < WIN[1]:
+            break
+        for y0 in range(0, resized.shape[0] - WIN[0], stride):
+            for x0 in range(0, resized.shape[1] - WIN[1], stride):
+                patch = resized[y0:y0 + WIN[0], x0:x0 + WIN[1]]
+                score = w @ to_hog(patch) + b
+                if score > thresh:
+                    dets.append((int(x0 * scale), int(y0 * scale),
+                                 int(WIN[1] * scale), int(WIN[0] * scale), float(score)))
+    return dets
+
+# Step 4: greedy non-maximum suppression
+def nms(boxes, scores, iou_thresh=0.4):
+    if len(boxes) == 0:
+        return []
+    b = np.array(boxes, dtype=np.float32)
+    x1, y1 = b[:, 0], b[:, 1]
+    x2, y2 = b[:, 0] + b[:, 2], b[:, 1] + b[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = np.argsort(scores)[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]; keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]]); yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]]); yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        order = order[1:][iou < iou_thresh]
+    return keep
+
+def nms_filter(dets):
+    if not dets:
+        return []
+    keep = nms([d[:4] for d in dets], [d[4] for d in dets])
+    return [dets[i] for i in keep]
+
+# Step 5: hard negative mining
+hard = []
+for bg_path in background_image_paths:
+    img = cv2.imread(bg_path, cv2.IMREAD_GRAYSCALE)
+    for (x0, y0, bw, bh, score) in detect(img, w, b, thresh=0.0):
+        crop = cv2.resize(img[y0:y0 + bh, x0:x0 + bw], (WIN[1], WIN[0]))
+        hard.append(to_hog(crop))
+X2 = np.vstack([X, np.array(hard)])
+y2 = np.concatenate([y, np.full(len(hard), -1)])
+svm2 = LinearSVC(C=0.01, max_iter=20000).fit(X2, y2)
+w, b = svm2.coef_.ravel(), svm2.intercept_[0]
+
+# Step 6: miss-rate-versus-FPPI evaluation
+def iou(a, g):
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    gx1, gy1, gx2, gy2 = g[0], g[1], g[0] + g[2], g[1] + g[3]
+    ix1, iy1 = max(ax1, gx1), max(ay1, gy1)
+    ix2, iy2 = min(ax2, gx2), min(ay2, gy2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (ax2 - ax1) * (ay2 - ay1) + (gx2 - gx1) * (gy2 - gy1) - inter
+    return inter / union if union > 0 else 0.0
+
+def match_to_gt(dets, gts, iou_thresh=0.5):
+    used = set(); matched = 0; fp = 0
+    for d in sorted(dets, key=lambda z: -z[4]):
+        hit = None
+        for j, g in enumerate(gts):
+            if j not in used and iou(d[:4], g) >= iou_thresh:
+                hit = j; break
+        if hit is None:
+            fp += 1
+        else:
+            used.add(hit); matched += 1
+    return matched, fp
+
+def evaluate(test_images, gt_boxes, w, b, thresholds=np.linspace(-1, 2, 25)):
+    miss_rates, fppi = [], []
+    for t in thresholds:
+        misses = false_pos = total_gt = 0
+        for img, gts in zip(test_images, gt_boxes):
+            dets = nms_filter(detect(img, w, b, thresh=t))
+            matched, fp = match_to_gt(dets, gts, iou_thresh=0.5)
+            misses += len(gts) - matched; false_pos += fp; total_gt += len(gts)
+        miss_rates.append(misses / max(total_gt, 1))
+        fppi.append(false_pos / len(test_images))
+    return fppi, miss_rates
+
+x, ymr = evaluate(test_images, gt_boxes, w, b)
+plt.loglog(np.clip(x, 1e-3, None), np.clip(ymr, 1e-3, None), marker="o")
+plt.xlabel("false positives per image"); plt.ylabel("miss rate")
+plt.title("HOG+SVM pedestrian detector"); plt.savefig("miss_rate.png")
+
+# Step 7: the Right Tool, OpenCV's pretrained detector
+hog_cv = cv2.HOGDescriptor()
+hog_cv.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+test = cv2.imread("street.png", cv2.IMREAD_GRAYSCALE)
+boxes, weights = hog_cv.detectMultiScale(test, winStride=(8, 8), scale=1.05)
+print(f"OpenCV pretrained detector found {len(boxes)} pedestrians")</code></pre>
+</details>
 </div>
 
 <nav class="chapter-nav">

@@ -40,7 +40,7 @@
 
 <div class="callout big-picture">
 <div class="callout-title">Big Picture</div>
-<p><strong>This chapter introduces the single most important operation in the entire book: convolution, the act of replacing each pixel with a weighted combination of its neighbors.</strong> Every filter in this chapter, from a humble blur to a precision edge detector, is one small kernel of numbers slid across the image. The same operation, with the numbers learned from data instead of designed by hand, becomes the convolutional layer at the heart of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> and the U-Net denoiser inside the diffusion models of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. Learn it well here, where the weights are small enough to read.</p>
+<p><strong>This chapter introduces the single most important operation in the entire book: convolution, the act of replacing each pixel with a weighted combination of its neighbors.</strong> Three words capture it, and they are worth keeping for the whole book: <strong>slide, multiply, sum</strong>. Every filter in this chapter, from a humble blur to a precision edge detector, is one small kernel of numbers slid across the image. The same operation, with the numbers learned from data instead of designed by hand, becomes the convolutional layer at the heart of <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> and the U-Net denoiser inside the diffusion models of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>. Learn it well here, where the weights are small enough to read.</p>
 </div>
 
 <div class="overview">
@@ -56,6 +56,9 @@ Two closing sections address the tensions the first four create. Smoothing fight
 </p>
 <p>
 A word on why this chapter deserves unusual attention. The convolution kernel is this book's signature recurring character. In Part I it is designed by hand: you will choose the weights and know exactly why each one is there. In <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a> the same sliding-window operation returns with learnable weights, and remarkably, the first layers of trained networks rediscover the very filters you build here: oriented edge detectors, blob detectors, and color-opponent kernels. In <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">Chapter 33</a>, stacks of convolutions form the U-Net that turns noise into photographs. Understanding what a $3 \times 3$ kernel can and cannot see is therefore not classical trivia; it is the foundation for reading every architecture diagram in the second half of this book.
+</p>
+<p>
+To turn this tour into something you can keep, the chapter ends with a single capstone project: the <a href="#lab-3">Hands-On Lab</a>, where you assemble every filter family from the six sections into one configurable filtering studio that loads an image, applies a chosen filter, reports the speedup from separability, and saves a labeled before-and-after panel.
 </p>
 </div>
 
@@ -106,6 +109,280 @@ You should be comfortable with images as NumPy arrays, including dtype pitfalls 
 Spatial filtering describes every operation in this chapter as a sum over neighborhoods, but there is a second, complementary language for the same ideas. In <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4: The Frequency Domain &amp; Multi-Scale Analysis</a>, images become sums of waves, and every kernel in this chapter acquires a frequency-domain identity: the Gaussian is revealed as a low-pass filter, sharpening as high-frequency boost, and convolution itself as simple multiplication of spectra. That viewpoint explains in one stroke why box filters ring, why large-kernel convolution is sometimes faster through the FFT, and how Gaussian and Laplacian pyramids compress an image into a stack of scales.
 </p>
 </div>
+
+<section class="lab" id="lab-3">
+<h2>Hands-On Lab: Build a Configurable Filtering Studio</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 75 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a small command-line filtering studio that loads any image, applies a filter you select from every family in this chapter (smoothing, sharpening, derivative, and edge-preserving), measures the speedup that separability buys for the Gaussian, and writes a labeled before-and-after comparison panel to disk.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Applying box, Gaussian, and median smoothing and reasoning about their artifacts (Section 3.2).</li>
+<li>Building an unsharp-mask sharpener from a blur, a subtraction, and an amplification (Section 3.3).</li>
+<li>Computing Sobel gradient magnitude and a Laplacian response as measuring instruments (Section 3.4).</li>
+<li>Calling the bilateral filter and seeing edge-preserving smoothing in action (Section 3.5).</li>
+<li>Timing a full two-dimensional Gaussian against its separable two-pass form to confirm the operation-count argument (Section 3.6).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One environment, two libraries, and any image of your own. Install with:</p>
+<pre><code class="language-bash">pip install opencv-python numpy</code></pre>
+<p>Save a test photo as <code>input.jpg</code> in the same folder, or let the script fall back to a synthetic test pattern if no file is found.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load an image and build a safe fallback</h4>
+<p>Read the image in grayscale so every filter has a single channel to work on, and generate a synthetic checkerboard-plus-noise pattern when no file is present so the lab always runs.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+import time
+
+def load_image(path="input.jpg"):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        return img
+    # TODO: build a 256x256 uint8 fallback: a checkerboard with added
+    # Gaussian noise, so smoothing and edge filters both have something to do.
+    # Hint: np.indices to make the board, np.random.normal for the noise,
+    # then np.clip(..., 0, 255).astype(np.uint8).
+    raise NotImplementedError
+
+img = load_image()
+print("loaded", img.shape, img.dtype)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>A quick checkerboard: <code>board = (((np.indices((256, 256)).sum(axis=0) // 32) % 2) * 200).astype(np.float64)</code>, then add <code>np.random.normal(0, 20, board.shape)</code> and clip to the valid range.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Implement the smoothing family</h4>
+<p>Wrap the three smoothers of Section 3.2 behind one function so the studio can switch between them by name. Each returns a uint8 image the same size as the input.</p>
+<pre><code class="language-python">def smooth(img, kind="gaussian", ksize=5):
+    if kind == "box":
+        return cv2.blur(img, (ksize, ksize))
+    if kind == "gaussian":
+        # TODO: return a Gaussian blur with this kernel size.
+        # Let OpenCV derive sigma from ksize by passing sigmaX=0.
+        ...
+    if kind == "median":
+        return cv2.medianBlur(img, ksize)  # ksize must be odd
+    raise ValueError(kind)</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cv2.GaussianBlur(img, (ksize, ksize), 0)</code>. The trailing <code>0</code> tells OpenCV to compute sigma from the kernel size using its standard rule.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Add the unsharp-mask sharpener</h4>
+<p>Sharpening is blur, subtract, amplify (Section 3.3). Blur the image, form the detail layer as the difference, then add a scaled copy of that detail back onto the original.</p>
+<pre><code class="language-python">def unsharp(img, ksize=5, amount=1.5):
+    blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
+    # TODO: combine the original and the blur so the result is
+    # original + amount * (original - blurred), in float, then clip
+    # back to uint8. cv2.addWeighted does this in one call.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)</code> computes <code>(1 + amount) * img - amount * blurred</code>, which is exactly the unsharp mask and stays in uint8.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Turn filters into measuring instruments</h4>
+<p>Add the derivative responses of Section 3.4: Sobel gradient magnitude (an edge strength map) and an absolute Laplacian (a second-derivative response). Compute these in a signed float type before scaling back to a viewable image.</p>
+<pre><code class="language-python">def gradient_magnitude(img):
+    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    # TODO: combine gx and gy into a magnitude, then map to 0..255 uint8.
+    # Hint: np.hypot for the magnitude, cv2.normalize for the rescale.
+    ...
+
+def laplacian_response(img):
+    lap = cv2.Laplacian(img, cv2.CV_64F, ksize=3)
+    return cv2.convertScaleAbs(lap)  # |lap| scaled into uint8</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>mag = np.hypot(gx, gy)</code> then <code>cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)</code>. Computing in <code>CV_64F</code> first avoids clipping the negative gradient lobes to zero.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Add edge-preserving smoothing</h4>
+<p>Bring in the bilateral filter of Section 3.5 so the studio can smooth noise while keeping edges crisp. Note how its two control parameters separate spatial reach from intensity tolerance.</p>
+<pre><code class="language-python">def edge_preserving(img, d=9, sigma_color=75, sigma_space=75):
+    # TODO: call the bilateral filter. d is the pixel neighborhood diameter,
+    # sigma_color controls how different intensities may be and still blend,
+    # sigma_space controls spatial reach.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cv2.bilateralFilter(img, d, sigma_color, sigma_space)</code>. Raising <code>sigma_color</code> makes the filter behave more like a plain Gaussian; lowering it protects edges more aggressively.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Measure the separability speedup</h4>
+<p>Confirm the central performance claim of Section 3.6. A two-dimensional Gaussian convolution costs $O(k^2)$ per pixel; the same blur done as two one-dimensional passes costs $O(2k)$. Time both on a large kernel and print the ratio.</p>
+<pre><code class="language-python">def time_separability(img, ksize=31, runs=20):
+    k = cv2.getGaussianKernel(ksize, 0)          # 1D Gaussian column
+    k2d = k @ k.T                                 # outer product: full 2D kernel
+
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        cv2.filter2D(img, -1, k2d)               # dense 2D convolution
+    full = time.perf_counter() - t0
+
+    # TODO: time the separable form with cv2.sepFilter2D(img, -1, k, k),
+    # then return the speedup ratio full / separable.
+    ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Mirror the first timing block but call <code>cv2.sepFilter2D(img, -1, k, k)</code> inside the loop. With a 31 by 31 kernel you should see the separable form run several times faster.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Assemble the studio and save a comparison panel</h4>
+<p>Wire the pieces into a dispatcher keyed by filter name, stack the original beside the filtered result with a labeled divider, and write the panel to disk. This is the artifact you keep.</p>
+<pre><code class="language-python">FILTERS = {
+    "box":       lambda im: smooth(im, "box", 5),
+    "gaussian":  lambda im: smooth(im, "gaussian", 5),
+    "median":    lambda im: smooth(im, "median", 5),
+    "sharpen":   lambda im: unsharp(im, 5, 1.5),
+    "gradient":  gradient_magnitude,
+    "laplacian": laplacian_response,
+    "bilateral": edge_preserving,
+}
+
+def run_studio(img, name):
+    out = FILTERS[name](img)
+    # TODO: place img and out side by side with a thin white divider column,
+    # then cv2.imwrite a file named f"studio_{name}.png".
+    # Hint: np.hstack with a (H, 4) white strip between the two images.
+    ...
+
+for name in FILTERS:
+    run_studio(img, name)
+ratio = time_separability(img)
+print(f"separable Gaussian speedup at k=31: {ratio:.1f}x")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Build the divider with <code>divider = np.full((img.shape[0], 4), 255, np.uint8)</code>, then <code>panel = np.hstack([img, divider, out])</code> and <code>cv2.imwrite(f"studio_{name}.png", panel)</code>.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Seven PNG files, one per filter, each a side-by-side panel of the original and the filtered result. The <code>studio_median.png</code> panel should show salt-and-pepper specks erased while edges stay sharp; <code>studio_gradient.png</code> should show bright contours on a dark background; <code>studio_bilateral.png</code> should look smoother than the original yet keep crisp boundaries. The console prints one line, for example <code>separable Gaussian speedup at k=31: 6.8x</code>; the exact number depends on your machine, but the separable form should be clearly faster, confirming the $O(2k)$ versus $O(k^2)$ argument of Section 3.6.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Add a border-mode switch (<code>cv2.BORDER_REFLECT</code>, <code>BORDER_REPLICATE</code>, <code>BORDER_CONSTANT</code>) and save panels that make the border artifacts of Section 3.6 visible at the image edge.</li>
+<li>Library shortcut: replace your hand-built <code>gradient_magnitude</code> with a single call to <code>skimage.filters.sobel</code> from scikit-image and confirm the maps match; this mirrors the book's Right Tool principle, where a from-scratch build is followed by the few-line production equivalent.</li>
+<li>Reach forward to <a href="../../part-3-deep-learning-for-vision/module-19-convolutional-neural-networks/index.html">Chapter 19</a>: load your 2D Gaussian kernel into a <code>torch.nn.Conv2d</code> layer as fixed weights and verify it reproduces the OpenCV blur, previewing convolution with learnable weights.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+import time
+
+def load_image(path="input.jpg"):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is not None:
+        return img
+    board = (((np.indices((256, 256)).sum(axis=0) // 32) % 2) * 200).astype(np.float64)
+    noisy = board + np.random.normal(0, 20, board.shape)
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+def smooth(img, kind="gaussian", ksize=5):
+    if kind == "box":
+        return cv2.blur(img, (ksize, ksize))
+    if kind == "gaussian":
+        return cv2.GaussianBlur(img, (ksize, ksize), 0)
+    if kind == "median":
+        return cv2.medianBlur(img, ksize)
+    raise ValueError(kind)
+
+def unsharp(img, ksize=5, amount=1.5):
+    blurred = cv2.GaussianBlur(img, (ksize, ksize), 0)
+    return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
+
+def gradient_magnitude(img):
+    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    return cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+def laplacian_response(img):
+    lap = cv2.Laplacian(img, cv2.CV_64F, ksize=3)
+    return cv2.convertScaleAbs(lap)
+
+def edge_preserving(img, d=9, sigma_color=75, sigma_space=75):
+    return cv2.bilateralFilter(img, d, sigma_color, sigma_space)
+
+def time_separability(img, ksize=31, runs=20):
+    k = cv2.getGaussianKernel(ksize, 0)
+    k2d = k @ k.T
+
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        cv2.filter2D(img, -1, k2d)
+    full = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        cv2.sepFilter2D(img, -1, k, k)
+    sep = time.perf_counter() - t0
+
+    return full / sep
+
+FILTERS = {
+    "box":       lambda im: smooth(im, "box", 5),
+    "gaussian":  lambda im: smooth(im, "gaussian", 5),
+    "median":    lambda im: smooth(im, "median", 5),
+    "sharpen":   lambda im: unsharp(im, 5, 1.5),
+    "gradient":  gradient_magnitude,
+    "laplacian": laplacian_response,
+    "bilateral": edge_preserving,
+}
+
+def run_studio(img, name):
+    out = FILTERS[name](img)
+    divider = np.full((img.shape[0], 4), 255, np.uint8)
+    panel = np.hstack([img, divider, out])
+    cv2.imwrite(f"studio_{name}.png", panel)
+
+if __name__ == "__main__":
+    img = load_image()
+    print("loaded", img.shape, img.dtype)
+    for name in FILTERS:
+        run_studio(img, name)
+        print("wrote", f"studio_{name}.png")
+    ratio = time_separability(img)
+    print(f"separable Gaussian speedup at k=31: {ratio:.1f}x")</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

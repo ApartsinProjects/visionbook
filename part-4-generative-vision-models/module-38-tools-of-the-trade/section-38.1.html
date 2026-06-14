@@ -261,6 +261,11 @@ image = pipe("a misty mountain valley at dawn", num_inference_steps=25).images[0
 </code></pre>
 <div class="code-caption"><strong>Code Fragment 4:</strong> The memory recipe for a small GPU. <code>enable_model_cpu_offload</code> keeps only the active component (text encoder, then denoiser, then VAE) on the GPU; <code>enable_vae_tiling</code> avoids the single large decode activation. The comment flags the one real gotcha: with offload enabled you must not also call <code>.to("cuda")</code>, because offload owns device placement.</div>
 
+<div class="callout note">
+<div class="callout-title">Notice the Exchange Rate</div>
+<p>Look at what those two lines actually buy. The all-resident SDXL pipeline wants 10 to 12 GB of VRAM, which is the line between a card you can afford and a card you cannot; model CPU offload plus VAE tiling drops that under 8 GB, enough headroom to fit a laptop GPU, and the toll is the "Small" entry in Table 38.1.1, a few percent of wall-clock. You are trading roughly a third of your memory footprint for single-digit-percent slower generation. That is the lopsided exchange rate the whole Accelerate layer exists to offer: it almost never costs speed in proportion to the memory it saves, because at any instant only one component (the denoiser, then the VAE) is actually on the GPU, and the rest is sitting in cheap system RAM doing nothing.</p>
+</div>
+
 <h2>5. The Surrounding Ecosystem</h2>
 
 <p>
@@ -310,7 +315,7 @@ The altitude question, pipeline or components, is settled by how much you need t
 <h2>7. Summary</h2>
 
 <p>
-Diffusers presents a generative model at two altitudes: a one-line pipeline and a set of swappable components, scheduler, denoiser, VAE, text encoder, that map directly onto the diffusion theory of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> and the latent-diffusion architecture of <a href="../module-34-text-to-image/index.html">Chapter 34</a>. Swap the scheduler to change the sampler without retraining; attach a LoRA through PEFT to specialize the model; reach for Accelerate's offload knobs to fit a small GPU. The surrounding libraries each own one job, and knowing which one owns a behavior is half of debugging it. When the orchestration outgrows a Python script, the next tool is a node-based workflow engine, the subject of <a href="section-38.2.html">Section 38.2</a>.
+Diffusers presents a generative model at two altitudes: a one-line pipeline and a set of swappable components, scheduler, denoiser, VAE, text encoder, that map directly onto the diffusion theory of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> and the latent-diffusion architecture of <a href="../module-34-text-to-image/index.html">Chapter 34</a>. Swap the scheduler to change the sampler without retraining; attach a LoRA through PEFT to specialize the model; reach for Accelerate's offload knobs to fit a small GPU. The surrounding libraries each own one job, and knowing which one owns a behavior is half of debugging it. When the orchestration outgrows a Python script, the next tool is a node-based workflow engine, the subject of <a href="section-38.2.html">Section 38.2</a>. The best way to make the component model muscle memory is to drive every knob in this section once, on one pipeline, and watch each change in isolation; put it into practice in the Hands-On Lab at the end of this section, which has you build a small generation studio that decomposes a pipeline, swaps the sampler, attaches a LoRA, fits the whole thing on an 8 GB GPU, and prices the result against a hosted Call.
 </p>
 
 <div class="callout exercise">
@@ -326,6 +331,195 @@ Diffusers presents a generative model at two altitudes: a one-line pipeline and 
 <div class="callout exercise">
 <div class="callout-title">Exercise 38.1.3: Fit It on a Small GPU <span class="exercise-type analysis">Analysis</span></div>
 <p>You must run an SDXL pipeline on an 8 GB GPU. Using Table 38.1.1, design a combination of memory-saving calls that you predict will fit, and justify the order in which you would add them (cheapest speed cost first). Then state, for each knob you chose, exactly what it trades and why it helps, and explain the specific reason you must not call <code>pipe.to("cuda")</code> when <code>enable_model_cpu_offload()</code> is active. If a single knob were not enough, which would you add next and why?</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Generation Studio That Drives Every Rung of the Stack</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+<div class="lab-objective">
+<p>Build a single, self-contained <code>studio.py</code> that loads one text-to-image pipeline and then exercises every concept of this chapter on it: it decomposes the pipeline into its four named components, swaps the scheduler for a faster solver, attaches a LoRA to specialize the style, fits the whole thing onto an 8 GB GPU with offload, and finishes by pricing a self-hosted batch against a hosted Call so you can make the build-versus-buy decision of <a href="section-38.3.html">Section 38.3</a> with real numbers. You end with a small, reusable generation harness, a portfolio-worthy artifact, and a printed cost table that turns the Code, Canvas, Call ladder from this chapter's opening into a concrete decision.</p>
+</div>
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Loading a modern Diffusers pipeline and decomposing it into its scheduler, denoiser, VAE, and text-encoder components, the "Encoder, Denoiser, VAE, Scheduler" mnemonic of Section 2.</li>
+<li>Swapping the sampler with <code>DPMSolverMultistepScheduler.from_config</code> and measuring the step-count-versus-quality trade-off from Section 2 and the Diffusion theory of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.</li>
+<li>Attaching and weighting a LoRA through the PEFT integration of Section 3 to specialize a generator without retraining, the generative form of transfer learning from <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</li>
+<li>Fitting the pipeline on an 8 GB GPU with the Accelerate offload knobs of Section 4 and Table 38.1.1.</li>
+<li>Estimating per-image cost for a self-hosted run versus a hosted API and making the build-versus-buy call that <a href="section-38.3.html">Section 38.3</a> frames.</li>
+</ul>
+</div>
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install "diffusers>=0.31" transformers accelerate peft safetensors torch</code></pre>
+<p>A CUDA GPU with 8 GB or more is the target; the offload step is exactly what lets the lab run on a small card. With no GPU, run on a free Colab T4: every step works there unchanged. The base checkpoint and the style LoRA download from the Hub on first use; nothing else is required and no API key is needed until the optional final cross-check.</p>
+</div>
+<p>Work through the steps in order. Each prints a checkpoint so you can confirm progress before moving on, and a complete reference solution is folded at the end.</p>
+<div class="lab-steps">
+<div class="lab-step">
+<h4>Step 1: Load the pipeline and name its components</h4>
+<p>Load an SDXL pipeline in half precision and print the class name and one key config value for each of the four components. This is the decomposition of Section 2: a "model" is a society of objects, and you must be able to reach each one before you can change it.</p>
+<pre><code class="language-python">import torch
+from diffusers import DiffusionPipeline
+
+pipe = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    torch_dtype=torch.float16, variant="fp16",
+)
+
+# TODO: without generating anything yet, print the class name and one config
+#   value for each component, in data-flow order:
+#     text_encoder (class), unet.config.sample_size,
+#     vae.config.scaling_factor, scheduler (class name).
+# Hint: each is a plain attribute, e.g. pipe.unet.config.sample_size
+print("components named")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Use <code>pipe.text_encoder.__class__.__name__</code>, <code>pipe.unet.config.sample_size</code>, <code>pipe.vae.config.scaling_factor</code>, and <code>pipe.scheduler.__class__.__name__</code>. The default SDXL scheduler is <code>EulerDiscreteScheduler</code>.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 2: Fit it on a small GPU with offload</h4>
+<p>Before generating, apply the memory recipe from Section 4 so the rest of the lab runs on an 8 GB card. The one real gotcha from Code Fragment 4 is in the comment: with offload active you must not also call <code>.to("cuda")</code>.</p>
+<pre><code class="language-python"># TODO: enable model CPU offload and VAE tiling so the pipeline fits under 8 GB.
+#   Do NOT call pipe.to("cuda") here; offload owns device placement.
+# Hint: two calls from Table 38.1.1, the cheapest-speed-cost pair.
+print("offload configured")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>pipe.enable_model_cpu_offload()</code> keeps one component on the GPU at a time; <code>pipe.enable_vae_tiling()</code> avoids the single large decode activation. These are the "Small" speed-cost rows of Table 38.1.1.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 3: Generate a baseline and swap the scheduler</h4>
+<p>Generate one image at the default settings, then swap only the scheduler to DPM-Solver++ and regenerate with the same seed at fewer steps. Time both. Section 2 predicts the faster solver reaches comparable quality in roughly 20 steps rather than 50, with the trained weights untouched.</p>
+<pre><code class="language-python">import time
+from diffusers import DPMSolverMultistepScheduler
+
+PROMPT = "a cinematic photo of a lighthouse in a storm, dramatic light"
+def gen(steps):
+    g = torch.Generator("cuda").manual_seed(0)
+    t0 = time.time()
+    img = pipe(PROMPT, num_inference_steps=steps, guidance_scale=6.5,
+               generator=g).images[0]
+    return img, time.time() - t0
+
+img_a, sec_a = gen(50)                      # baseline, default Euler scheduler
+img_a.save("a_euler50.png")
+
+# TODO: swap pipe.scheduler to DPMSolverMultistepScheduler using from_config
+#   (so it inherits the trained noise schedule), then regenerate at 20 steps.
+# Hint: pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+img_b, sec_b = gen(20)
+img_b.save("b_dpm20.png")
+print(f"euler50 {sec_a:.1f}s  vs  dpm20 {sec_b:.1f}s")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>from_config</code> is mandatory: it copies the betas and prediction type the U-Net trained against, so the new solver integrates the same reverse process. A fresh default config would solve a mismatched equation and degrade the image for no visible reason.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 4: Specialize the style with a LoRA</h4>
+<p>Attach a style LoRA through the PEFT integration of Section 3 and regenerate. The base weights are untouched; you are adapting a foundation model by loading a few million parameters, the generative form of the transfer-learning thread from <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
+<pre><code class="language-python"># TODO: load a style LoRA from the Hub, set its adapter weight to 0.8,
+#   then regenerate the same prompt and save the result.
+# Hint: pipe.load_lora_weights(repo, weight_name=..., adapter_name="style")
+#       pipe.set_adapters(["style"], adapter_weights=[0.8])
+img_c, _ = gen(20)
+img_c.save("c_lora.png")
+print("lora applied")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Any SDXL LoRA on the Hub works; the section uses <code>"ostris/super-cereal-sdxl-lora"</code> with <code>weight_name="cereal_box_sdxl_v1.safetensors"</code>. Call <code>pipe.unload_lora_weights()</code> if you want to compare against the un-adapted output afterward.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 5: Price the Code rung against the Call rung</h4>
+<p>Turn the wall-clock you measured into the build-versus-buy table of <a href="section-38.3.html">Section 38.3</a>. Estimate the per-image cost of the self-hosted run from your measured seconds and an hourly GPU rate, then compare it to a representative hosted per-image price. The crossover volume is the whole decision.</p>
+<pre><code class="language-python"># TODO: compute self-hosted cost per image from sec_b (your dpm20 time) and a
+#   rented-GPU hourly rate, then compare to a hosted per-image price.
+gpu_rate_per_hour = 0.80       # example rented-GPU price, adjust to your cloud
+hosted_price_per_image = 0.04  # example flagship-API per-image price
+self_cost = gpu_rate_per_hour / 3600 * sec_b
+print(f"self-hosted ~${self_cost:.4f}/img   hosted ${hosted_price_per_image:.4f}/img")
+# TODO: print which rung wins, and the monthly volume at which they break even.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The break-even volume per month is roughly the fixed cost of keeping a GPU available divided by the per-image saving; below it the hosted Call wins, above it the self-hosted Code rung wins. The numbers here are illustrative, the structure of the comparison is the point.</p>
+</details>
+</div>
+</div>
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>Step 1 prints four component lines, for example a <code>CLIPTextModel</code> text encoder, a U-Net <code>sample_size</code> of 128, a VAE <code>scaling_factor</code> near 0.13, and an <code>EulerDiscreteScheduler</code>. After Step 2 the whole pipeline runs under 8 GB. Step 3 produces two near-identical lighthouse images while the DPM-Solver++ run at 20 steps finishes noticeably faster than the 50-step Euler baseline, the visible proof that a scheduler swap changes the solver, not the model. Step 4 produces a third image in the LoRA's style from the same prompt. Step 5 prints a two-line cost comparison and a verdict naming the rung that wins at your assumed volume. You finish with four saved PNGs and a reusable <code>studio.py</code> that exercises the entire Code rung end to end.</p>
+</div>
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Add a fifth component swap: replace the VAE with a higher-fidelity decoder from the Hub and compare fine detail, confirming the VAE owns pixel sharpness as the Section 2 mnemonic claims.</li>
+<li>Export your generation graph as a ComfyUI workflow (the Canvas rung of <a href="section-38.2.html">Section 38.2</a>) and confirm the same prompt, scheduler, and LoRA reproduce your Step 4 image, so one artifact moves between the Code and Canvas rungs.</li>
+<li>Swap in a few-step distilled model or LCM-LoRA (the Research Frontier above) and re-run Step 5: recompute the self-hosted cost when generation drops from 20 steps to 4, and find the new break-even volume.</li>
+</ul>
+</div>
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import time, torch
+from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+
+# ---- Step 1: load and name the components ----
+pipe = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    torch_dtype=torch.float16, variant="fp16",
+)
+print("text_encoder:", pipe.text_encoder.__class__.__name__)
+print("unet sample_size:", pipe.unet.config.sample_size)
+print("vae scaling_factor:", pipe.vae.config.scaling_factor)
+print("scheduler:", pipe.scheduler.__class__.__name__)
+
+# ---- Step 2: fit on a small GPU (no .to('cuda') with offload) ----
+pipe.enable_model_cpu_offload()
+pipe.enable_vae_tiling()
+
+# ---- Step 3: baseline, then scheduler swap ----
+PROMPT = "a cinematic photo of a lighthouse in a storm, dramatic light"
+def gen(steps):
+    g = torch.Generator("cuda").manual_seed(0)
+    t0 = time.time()
+    img = pipe(PROMPT, num_inference_steps=steps, guidance_scale=6.5,
+               generator=g).images[0]
+    return img, time.time() - t0
+
+img_a, sec_a = gen(50)
+img_a.save("a_euler50.png")
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+img_b, sec_b = gen(20)
+img_b.save("b_dpm20.png")
+print(f"euler50 {sec_a:.1f}s  vs  dpm20 {sec_b:.1f}s")
+
+# ---- Step 4: specialize with a LoRA ----
+pipe.load_lora_weights(
+    "ostris/super-cereal-sdxl-lora",
+    weight_name="cereal_box_sdxl_v1.safetensors", adapter_name="style",
+)
+pipe.set_adapters(["style"], adapter_weights=[0.8])
+img_c, _ = gen(20)
+img_c.save("c_lora.png")
+
+# ---- Step 5: price Code vs Call ----
+gpu_rate_per_hour = 0.80
+hosted_price_per_image = 0.04
+self_cost = gpu_rate_per_hour / 3600 * sec_b
+print(f"self-hosted ~${self_cost:.4f}/img   hosted ${hosted_price_per_image:.4f}/img")
+winner = "self-hosted Code" if self_cost < hosted_price_per_image else "hosted Call"
+print("cheaper per image:", winner)
+# Per-image saving when self-hosting is cheaper sets the break-even volume:
+saving = hosted_price_per_image - self_cost
+if saving > 0:
+    # Assume a minimum-commitment GPU cost of one hour per active day, 30 days.
+    monthly_fixed = gpu_rate_per_hour * 1 * 30
+    print(f"break-even ~{monthly_fixed / saving:.0f} images/month")</code></pre>
+</details>
 </div>
 
 <nav class="chapter-nav">

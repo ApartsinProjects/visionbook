@@ -344,6 +344,10 @@ With several tools on the table, the practical question is which to reach for. T
 Reading the table top to bottom traces the chapter's own arc: the classical tool first, then the upgrades that target a specific weakness (scale, perception, rendering, speed), each leaving the core geometry intact. That is the honest state of the field in 2026. The neural reconstructors are extraordinary and getting better monthly, but the structure-from-motion pipeline of this chapter remains the accuracy reference they are measured against and the silent first stage inside most of them.
 </p>
 
+<p>
+The chapter's five verbs are easiest to feel when you drive them yourself. The Hands-On Lab at the end of this section runs all of them on a real image set with <code>pycolmap</code>, then reads back the same vital signs that Exercises 14.5.1 through 14.5.3 ask you to interpret on paper.
+</p>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 14.5.1: Read a Reconstruction's Vital Signs <span class="exercise-type conceptual">Conceptual</span></div>
 <p>You run COLMAP on 60 photos and <code>pycolmap</code> reports: 38 images registered, mean track length 2.3, length-2 fraction 71 percent, mean reprojection error 1.9 px, and the model split into <code>sparse/0/</code> (31 images) and <code>sparse/1/</code> (7 images). Diagnose the reconstruction. Which two numbers are unhealthy and what does each indicate? Is the split more likely a matching failure or a coverage gap, and which single diagnostic from Section 2 would settle it? Propose the most likely single change (from Sections 1, 3, or 4) that would merge the model and lengthen the tracks.</p>
@@ -357,6 +361,206 @@ Reading the table top to bottom traces the chapter's own arc: the classical tool
 <div class="callout exercise">
 <div class="callout-title">Exercise 14.5.3: The Pose Hand-off Bug Hunt <span class="exercise-type analysis">Analysis</span></div>
 <p>You convert a COLMAP model to <code>transforms.json</code> using the Section 4 listing, train a Gaussian-splatting model, and the render comes out correctly shaped but mirrored left-to-right. The point cloud and reprojection errors from <code>pycolmap</code> are healthy. Where is the bug, in COLMAP, in your conversion, or in the renderer, and why do the healthy <code>pycolmap</code> diagnostics rule out two of the three? Name the specific operation in the conversion most likely responsible (hint: it is not the world-to-camera inversion, which is already in the listing) and explain why a mirrored-but-otherwise-correct result points squarely at a coordinate-convention disagreement rather than at the geometry.</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Reconstruct a Scene End to End with pycolmap</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>reconstruct.py</code>, that takes a folder of photographs and runs the entire structure-from-motion pipeline of this chapter with <code>pycolmap</code>: extract and match features, run incremental mapping (seed, register, triangulate, bundle-adjust), then read back the reconstruction's vital signs and export camera poses plus a point cloud you can open in any 3D viewer. The output is a sparse 3D model of a real object you photographed yourself, the exact artifact a NeRF or Gaussian-splat trainer in <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> consumes as input.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Driving the five-verb pipeline (track, seed, register, triangulate, adjust) from Python rather than the COLMAP GUI (Sections 14.1 through 14.3).</li>
+<li>Reading a reconstruction's vital signs: registered-image count, mean track length, length-2 fraction, and mean reprojection error (Sections 14.2 and 14.5).</li>
+<li>Inspecting and exporting camera intrinsics and extrinsics, the $K$ matrix and $[R \mid t]$ poses of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a>.</li>
+<li>Diagnosing a multi-model split and capture-quality failures from numbers, not vibes.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install pycolmap numpy</code></pre>
+<p>You also need 20 to 40 overlapping photos of one rigid object or scene. Walk around a textured object (a building corner, a statue, a cluttered desk) taking a photo every 15 to 20 degrees with generous overlap, following the capture advice from Section 3 of this section. Put them all in a folder named <code>images/</code>. No GPU is required; <code>pycolmap</code> ships the full COLMAP engine as a Python wheel, so nothing else needs installing.</p>
+</div>
+
+<p>Put the section's reconstruction workflow into practice below. Work through the steps in order; each one prints a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Set up the project and extract features</h4>
+<p>Create a COLMAP database and run the feature extractor over every image. This is the detect-and-describe front end of <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>, the raw material every later verb consumes.</p>
+<pre><code class="language-python">from pathlib import Path
+import pycolmap
+
+image_dir = Path("images")
+work = Path("work"); work.mkdir(exist_ok=True)
+db_path = work / "database.db"
+
+# TODO: extract SIFT features from every image into db_path.
+# Hint: pycolmap.extract_features(database_path=db_path, image_path=image_dir)
+...
+print("Features extracted into", db_path)</code></pre>
+<details><summary>Hint</summary><p><code>pycolmap.extract_features(database_path=db_path, image_path=image_dir)</code> creates the database if it does not exist and fills the <code>keypoints</code> and <code>descriptors</code> tables. On a CPU-only machine it uses the SIFT implementation, no CUDA needed.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Match features into a verified match graph</h4>
+<p>Turn per-image descriptors into geometrically verified pairwise matches: the edges of the match graph from Section 14.1. For a few dozen unordered photos, exhaustive matching is cheap and the most thorough choice.</p>
+<pre><code class="language-python"># TODO: run exhaustive matching over the database you just built.
+# Hint: pycolmap.match_exhaustive(database_path=db_path)
+...
+print("Matching done; the database now holds verified two-view geometries")</code></pre>
+<details><summary>Hint</summary><p><code>pycolmap.match_exhaustive(db_path)</code> compares every image pair and runs RANSAC verification, populating the <code>two_view_geometries</code> table. If you captured an ordered video instead, <code>pycolmap.match_sequential</code> is the linear-cost alternative from the Section 5 table.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Run incremental mapping</h4>
+<p>This single call performs the heart of the chapter: it seeds from one well-chosen pair, then loops registering each next camera with PnP, triangulating fresh points, and bundle-adjusting, exactly the recipe of Sections 14.2 and 14.3. It returns one reconstruction per connected component it could not merge.</p>
+<pre><code class="language-python">sparse = work / "sparse"; sparse.mkdir(exist_ok=True)
+
+# TODO: run incremental mapping and capture the returned dict of reconstructions.
+# Hint: maps = pycolmap.incremental_mapping(db_path, image_dir, sparse)
+maps = ...
+print(f"Produced {len(maps)} reconstruction(s)")</code></pre>
+<details><summary>Hint</summary><p><code>pycolmap.incremental_mapping(database_path, image_path, output_path)</code> returns a dict keyed by integer model id. A healthy single-component capture yields <code>len(maps) == 1</code>; more than one means the graph fragmented, the multi-model split that Exercise 14.5.1 asks you to diagnose.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Read the reconstruction's vital signs</h4>
+<p>Pick the largest model and compute the four diagnostics this section trains you to read. Track length and reprojection error together tell you whether the geometry is trustworthy before you ever look at the point cloud.</p>
+<pre><code class="language-python">rec = max(maps.values(), key=lambda r: r.num_reg_images())
+
+track_lengths = [p.track.length() for p in rec.points3D.values()]
+mean_track = sum(track_lengths) / len(track_lengths)
+len2_frac = sum(t == 2 for t in track_lengths) / len(track_lengths)
+
+# TODO: compute the mean reprojection error over all 3D points.
+# Hint: each point exposes rec.points3D[id].error (in pixels)
+mean_reproj = ...
+
+print(f"Registered images : {rec.num_reg_images()}")
+print(f"3D points         : {rec.num_points3D()}")
+print(f"Mean track length : {mean_track:.2f}")
+print(f"Length-2 fraction : {len2_frac:.0%}")
+print(f"Mean reproj error : {mean_reproj:.2f} px")</code></pre>
+<details><summary>Hint</summary><p>Average <code>p.error</code> across <code>rec.points3D.values()</code>. A healthy small reconstruction registers most of your images, shows a mean track length above 3, a length-2 fraction well under half, and a mean reprojection error under about 1 pixel.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Inspect one camera's intrinsics and pose</h4>
+<p>Open one registered image and read the calibration the optimizer recovered: the focal length and principal point inside $K$, and the world-to-camera rotation and translation. These are the Chapter 12 quantities, now solved for from pixels alone.</p>
+<pre><code class="language-python">img = next(iter(rec.images.values()))
+cam = rec.cameras[img.camera_id]
+
+print("Camera model :", cam.model.name)
+print("Params (f, cx, cy, ...):", cam.params)
+# TODO: print the 3x4 world-to-camera matrix for this image.
+# Hint: img.cam_from_world.matrix() gives the [R | t] extrinsics
+print("Pose [R | t]:\n", ...)</code></pre>
+<details><summary>Hint</summary><p><code>img.cam_from_world</code> is a rigid transform; <code>.matrix()</code> returns the 3x4 array whose left block is $R$ and right column is $t$. This is the same world-to-camera convention Code Fragment 6 inverts when exporting to a neural renderer.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Export poses and a point cloud you can open</h4>
+<p>Persist the model in COLMAP's binary format and write the sparse points to a PLY file any 3D viewer (MeshLab, CloudCompare, Blender) can open. This is the deliverable: a portable 3D reconstruction of your own scene.</p>
+<pre><code class="language-python">model_out = work / "model"; model_out.mkdir(exist_ok=True)
+rec.write(model_out)               # cameras.bin, images.bin, points3D.bin
+
+# TODO: export the sparse point cloud as a PLY file for a 3D viewer.
+# Hint: rec.export_PLY(str(work / "points.ply"))
+...
+print("Wrote model to", model_out, "and points.ply")</code></pre>
+<details><summary>Hint</summary><p><code>rec.export_PLY(path)</code> writes every triangulated point with its averaged color. Open <code>points.ply</code> and you should recognize the silhouette of the object you photographed, sparse but unmistakable.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: The Right Tool, the one-call automatic pipeline</h4>
+<p>You drove the verbs one at a time to see them; in production the same result is one function. Reproduce the whole script with COLMAP's bundled automatic reconstructor, mirroring this chapter's Right Tool principle.</p>
+<pre><code class="language-python"># TODO: run the all-in-one automatic pipeline (extract, match, map) in one call.
+# Hint: pycolmap.AutomaticReconstructor or the automatic_reconstruction helper
+...
+# Compare the registered-image count and mean reprojection error against your
+# hand-driven run from Steps 1 through 4; they should match closely.</code></pre>
+<details><summary>Hint</summary><p>COLMAP exposes a one-shot automatic reconstruction that chains extraction, matching, and mapping with sensible defaults. The roughly thirty lines of Steps 1 through 6 collapse to a single call; the library picks the matcher, the seed pair, and the bundle-adjustment schedule for you. You wrote the long version so you can read its logs when the short version fails.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>Steps 1 and 2 print progress as features are extracted and pairs verified. Step 3 reports the number of reconstructions, ideally one for a well-captured set. Step 4 prints a vital-signs block resembling: roughly 30 of 35 images registered, several thousand 3D points, mean track length around 4 to 6, length-2 fraction under 25 percent, and mean reprojection error near 0.6 to 0.9 px. Step 5 shows a sensible focal length in pixels and a 3x4 pose matrix. Step 6 writes <code>points.ply</code>; opening it reveals a sparse but recognizable 3D outline of your object. If instead you see many images unregistered, a track length near 2, or a multi-model split, you have reproduced the failure modes of Exercise 14.5.1, and the fix is almost always capture (more overlap, more texture, less motion blur), not code.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Deliberately undercapture: shoot the same object with only 8 widely spaced photos, rerun, and watch the track length collapse and the model fragment. Then add intermediate views until it merges, building intuition for the overlap requirement of Section 14.1.</li>
+<li>Swap the SIFT front end for learned features by running the same images through <a href="https://github.com/cvg/Hierarchical-Localization" target="_blank" rel="noopener">hloc</a> (SuperPoint + LightGlue) into COLMAP's mapper, and compare verified-inlier counts on your hardest pair, the head-to-head of Exercise 14.5.2.</li>
+<li>Convert the exported model to a <code>transforms.json</code> with the Code Fragment 6 listing and train a Gaussian-splatting model from <a href="../../part-3-deep-learning-for-vision/module-27-depth-3d-neural-scenes/index.html">Chapter 27</a> on your own reconstruction, closing the loop from pixels to a photorealistic render.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">from pathlib import Path
+import pycolmap
+
+image_dir = Path("images")
+work = Path("work"); work.mkdir(exist_ok=True)
+db_path = work / "database.db"
+
+# Step 1: feature extraction (detect + describe, Chapter 10 front end)
+pycolmap.extract_features(database_path=db_path, image_path=image_dir)
+
+# Step 2: exhaustive matching with RANSAC verification (Section 14.1 match graph)
+pycolmap.match_exhaustive(database_path=db_path)
+
+# Step 3: incremental mapping = seed, register, triangulate, adjust (14.2 + 14.3)
+sparse = work / "sparse"; sparse.mkdir(exist_ok=True)
+maps = pycolmap.incremental_mapping(db_path, image_dir, sparse)
+print(f"Produced {len(maps)} reconstruction(s)")
+
+# Step 4: vital signs of the largest model
+rec = max(maps.values(), key=lambda r: r.num_reg_images())
+track_lengths = [p.track.length() for p in rec.points3D.values()]
+mean_track = sum(track_lengths) / len(track_lengths)
+len2_frac = sum(t == 2 for t in track_lengths) / len(track_lengths)
+mean_reproj = sum(p.error for p in rec.points3D.values()) / rec.num_points3D()
+print(f"Registered images : {rec.num_reg_images()}")
+print(f"3D points         : {rec.num_points3D()}")
+print(f"Mean track length : {mean_track:.2f}")
+print(f"Length-2 fraction : {len2_frac:.0%}")
+print(f"Mean reproj error : {mean_reproj:.2f} px")
+
+# Step 5: one camera's intrinsics and pose (Chapter 12 quantities, solved from pixels)
+img = next(iter(rec.images.values()))
+cam = rec.cameras[img.camera_id]
+print("Camera model :", cam.model.name)
+print("Params (f, cx, cy, ...):", cam.params)
+print("Pose [R | t]:\n", img.cam_from_world.matrix())
+
+# Step 6: export model and a PLY point cloud
+model_out = work / "model"; model_out.mkdir(exist_ok=True)
+rec.write(model_out)
+rec.export_PLY(str(work / "points.ply"))
+print("Wrote model to", model_out, "and points.ply")
+
+# Step 7: the Right Tool, one-call automatic reconstruction
+auto = work / "auto"; auto.mkdir(exist_ok=True)
+pycolmap.AutomaticReconstructor(
+    pycolmap.AutomaticReconstructionOptions(
+        workspace_path=str(auto),
+        image_path=str(image_dir),
+        dense=False,          # sparse model only; no GPU needed
+    )
+).run()
+print("Automatic pipeline finished; compare its sparse/ model to your hand-driven run")</code></pre>
+</details>
 </div>
 
 <nav class="chapter-nav">

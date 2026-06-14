@@ -83,7 +83,23 @@ def main():
                 "closing-html": html.rstrip().endswith("</html>"),
             }
             missing = [k for k, ok in checks.items() if not ok]
-            n_code = len(re.findall(r"<pre>", html))
+            # Count caption requirement only for BODY teaching code blocks. Lab
+            # scaffolding (starter code in lab-steps, solutions/hints in <details>,
+            # anything inside a lab container) is interactive scaffolding, not a
+            # numbered teaching fragment, so it carries no code-caption by design.
+            # lab block begins at the earliest lab marker (labs sit at the tail);
+            # markup varies: <section class="lab">, <div class="callout lab">, lab-steps.
+            lab_positions = [html.find(m) for m in ('class="lab"', 'callout lab', 'lab-steps', 'lab-step', 'Hands-On Lab', 'Hands-on Lab')]
+            lab_positions = [p for p in lab_positions if p != -1]
+            lab_start = min(lab_positions) if lab_positions else -1
+            def is_lab_pre(start):
+                pre = html[:start]
+                # inside an open <details> (lab hints/solutions)?
+                if pre.count("<details") > pre.count("</details>"):
+                    return True
+                # at or after the lab section start (labs live at the chapter tail)?
+                return lab_start != -1 and start > lab_start
+            n_code = sum(1 for m in re.finditer(r"<pre[ >]", html) if not is_lab_pre(m.start()))
             n_capt = len(re.findall(r'class="code-caption"', html))
             if n_capt < n_code:
                 missing.append(f"captions {n_capt}/{n_code}")

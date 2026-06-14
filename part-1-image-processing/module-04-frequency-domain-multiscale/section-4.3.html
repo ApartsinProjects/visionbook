@@ -255,6 +255,243 @@ high = butterworth(img, cutoff_frequency_ratio=0.06, high_pass=True,  order=2)</
 <p>Hand-designed transfer functions have learned descendants. Global Filter Networks (GFNet, NeurIPS 2021) make $H(u,v)$ a trainable parameter tensor: the network literally learns a bank of frequency-domain masks as its token mixer, and the learned masks turn out smooth and low-pass-heavy, echoing this section's designs. Fourier Domain Adaptation (FDA, CVPR 2020) filters between domains, transplanting low-frequency amplitude from real photos onto synthetic renders. And the idea of <em>scheduling</em> a low-pass cutoff over time now regulates 3D reconstruction: FreGS (CVPR 2024) anneals frequency content from coarse to fine while optimizing 3D Gaussian splats, preventing early overfitting to high frequencies, conceptually the same coarse-to-fine discipline that drives the pyramids of <a href="section-4.5.html">Section 4.5</a> and, one part later, the noise schedules of <a href="../../part-4-generative-vision-models/module-33-diffusion-models/index.html">diffusion models</a>, which destroy high frequencies first and regenerate them last.</p>
 </div>
 
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Frequency-Domain Restoration Studio</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>freq_studio.py</code>, that loads an image, displays its magnitude spectrum, applies any of three frequency-domain filters (Gaussian low-pass, Butterworth high-pass, automatic notch), and reports a quantitative quality score, then rescues a synthetically corrupted photograph that no single spatial filter can clean. This is the chapter's pixels-to-spectrum-and-back pipeline assembled into a tool you can point at any image.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Computing and displaying a centered log-magnitude spectrum with <code>numpy.fft</code> (Sections 4.1 and 4.2).</li>
+<li>Building radial transfer functions $H(u,v)$ and applying them by spectrum multiplication (Section 4.3).</li>
+<li>Locating periodic-noise spikes automatically and deleting them with conjugate-symmetric notches.</li>
+<li>Scoring a restoration with PSNR and comparing the notch approach against a blunt low-pass.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install numpy scipy scikit-image matplotlib</code></pre>
+<p>No image files needed: the lab uses <code>skimage.data.camera()</code> and synthesizes its own periodic corruption, so the script runs start to finish on any machine.</p>
+</div>
+
+<p>Put the section's filtering concepts into practice below. Work through the steps in order; each one prints or plots a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Load an image and show its spectrum</h4>
+<p>Establish the forward half of the pipeline: read a grayscale float image and display its centered log-magnitude spectrum so later steps have something to sculpt.</p>
+<pre><code class="language-python">import numpy as np
+import matplotlib.pyplot as plt
+from skimage import data, img_as_float
+
+img = img_as_float(data.camera())  # 512x512 grayscale in [0, 1]
+
+def log_spectrum(im):
+    # TODO: return the centered log-magnitude spectrum of im.
+    # Hint: np.fft.fft2 -> np.fft.fftshift -> np.log1p(np.abs(...))
+    ...
+
+plt.imshow(log_spectrum(img), cmap="gray"); plt.title("Spectrum"); plt.show()</code></pre>
+<details><summary>Hint</summary><p>The DC term dominates the linear magnitude, so the spectrum looks black without the log. <code>np.log1p(x)</code> computes $\log(1+x)$ and avoids $\log 0$.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build a radial distance grid and one transfer function</h4>
+<p>Every radial filter in this chapter is a function of distance from the spectrum center. Build that grid once, then express a Gaussian low-pass on top of it.</p>
+<pre><code class="language-python">def radial_grid(shape):
+    rows, cols = shape
+    u = np.arange(rows) - rows // 2
+    v = np.arange(cols) - cols // 2
+    U, V = np.meshgrid(v, u)  # note: meshgrid is x,y order
+    return np.sqrt(U**2 + V**2)
+
+def gaussian_lowpass(shape, d0):
+    D = radial_grid(shape)
+    # TODO: return the Gaussian transfer function H = exp(-D^2 / (2 d0^2))
+    ...</code></pre>
+<details><summary>Hint</summary><p>The Gaussian transfer function is $H(u,v) = e^{-D^2 / (2 D_0^2)}$ where $D$ is the radial grid and $D_0$ is the cutoff radius in frequency bins.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Apply a filter by multiplying the shifted spectrum</h4>
+<p>Wrap the transform, multiply, inverse-transform recipe into one reusable <code>apply_filter</code> so any transfer function from this section can drive it.</p>
+<pre><code class="language-python">def apply_filter(im, H):
+    F = np.fft.fftshift(np.fft.fft2(im))
+    # TODO: multiply by H, inverse-shift, inverse-transform, return the real part
+    ...
+
+blurred = apply_filter(img, gaussian_lowpass(img.shape, d0=40))</code></pre>
+<details><summary>Hint</summary><p>Reverse the order on the way back: <code>np.fft.ifft2(np.fft.ifftshift(F * H)).real</code>. Keep only <code>.real</code> because tiny imaginary residue is numerical noise.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Synthesize periodic corruption</h4>
+<p>Create the problem the notch will solve: add two oriented sinusoids whose energy lands as bright off-center spikes in the spectrum, the kind no spatial blur can remove without destroying detail.</p>
+<pre><code class="language-python">def add_periodic_noise(im, amp=0.3):
+    rows, cols = im.shape
+    y, x = np.mgrid[0:rows, 0:cols]
+    # TODO: add amp * (cos over a diagonal wave + cos over a vertical wave)
+    # Hint: 2*pi*(fx*x/cols + fy*y/rows) with a couple of integer cycle counts
+    ...
+
+noisy = add_periodic_noise(img)
+plt.imshow(log_spectrum(noisy), cmap="gray"); plt.title("Corrupted spectrum"); plt.show()</code></pre>
+<details><summary>Hint</summary><p>Use cycle counts in the tens, for example <code>fx, fy = 40, 60</code>, so the spikes sit well away from the DC center and are easy to detect in Step 5.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Detect the spikes and notch them automatically</h4>
+<p>Find the interference as local maxima of the log-magnitude spectrum outside a central exclusion radius, then place a soft Gaussian notch over each spike and its conjugate partner.</p>
+<pre><code class="language-python">from scipy.ndimage import maximum_filter
+
+def find_spikes(im, exclude=20, k=2):
+    S = log_spectrum(im)
+    rows, cols = S.shape
+    cy, cx = rows // 2, cols // 2
+    D = radial_grid(S.shape)
+    peaks = (S == maximum_filter(S, size=9)) & (D > exclude)
+    ys, xs = np.where(peaks)
+    order = np.argsort(S[ys, xs])[::-1]
+    # TODO: return the top-k (y, x) spike coordinates as a list of tuples
+    ...
+
+def notch_filter(shape, spikes, d0=8):
+    H = np.ones(shape)
+    rows, cols = shape
+    cy, cx = rows // 2, cols // 2
+    yy, xx = np.mgrid[0:rows, 0:cols]
+    for (sy, sx) in spikes:
+        for (py, px) in [(sy, sx), (2*cy - sy, 2*cx - sx)]:  # spike + conjugate
+            d2 = (yy - py)**2 + (xx - px)**2
+            # TODO: multiply H by (1 - exp(-d2 / (2 d0^2))) to carve a hole at (py, px)
+            ...
+    return H</code></pre>
+<details><summary>Hint</summary><p>A notch is the complement of a Gaussian bump: <code>1 - exp(-d2/(2*d0**2))</code> is near 0 at the spike and near 1 elsewhere. The conjugate partner is the point reflected through the center, which is why real-image spectra always show spikes in symmetric pairs.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Score the restoration and compare against a low-pass baseline</h4>
+<p>Quantify success with PSNR against the clean original, and confirm the central lesson: the targeted notch beats the blunt low-pass that has to sacrifice real detail to reach the same noise.</p>
+<pre><code class="language-python">from skimage.metrics import peak_signal_noise_ratio as psnr
+
+spikes = find_spikes(noisy, k=2)
+restored = apply_filter(noisy, notch_filter(noisy.shape, spikes))
+baseline = apply_filter(noisy, gaussian_lowpass(noisy.shape, d0=30))
+
+print(f"Noisy    PSNR: {psnr(img, np.clip(noisy, 0, 1)):.2f} dB")
+print(f"Low-pass PSNR: {psnr(img, np.clip(baseline, 0, 1)):.2f} dB")
+print(f"Notch    PSNR: {psnr(img, np.clip(restored, 0, 1)):.2f} dB")
+# TODO: plot noisy, baseline, and restored side by side for visual confirmation</code></pre>
+<details><summary>Hint</summary><p><code>plt.subplots(1, 3)</code> with shared <code>cmap="gray"</code> makes the comparison obvious; the low-pass image is noticeably softer than the notched one.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: The Right Tool, the library shortcut</h4>
+<p>You built the radial low-pass from scratch to understand it; in production you would reach for scikit-image. Reproduce the Step 3 blur in one call and confirm it matches your hand-built version, mirroring the section's Library Shortcut (Code 4.3.5).</p>
+<pre><code class="language-python">from skimage.filters import butterworth
+
+# A library low-pass in one line, no manual FFTs, shifts, or grids.
+lib_low = butterworth(noisy, cutoff_frequency_ratio=0.06, high_pass=False, order=2)
+# TODO: print the PSNR of lib_low against img and compare it to your Step 6 numbers</code></pre>
+<details><summary>Hint</summary><p>The library handles padding, color channels, and the shift conventions internally, which is why a from-scratch scaffold of roughly thirty lines collapses to one. The notch stage stays hand-built because notch geometry is inherently per-image.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>Running the finished script prints three PSNR values and shows two figures. The corrupted spectrum in Step 4 has two bright spike pairs flanking the center. The PSNR table reads roughly: noisy near 14 to 16 dB, the Gaussian low-pass baseline recovering to the low 20s, and the automatic notch reaching several dB higher than the baseline while keeping the cameraman's coat texture and tripod edges crisp. The side-by-side panel makes the difference plain: the low-pass image is uniformly soft, the notched image is sharp with the banding gone.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Generalize <code>find_spikes</code> to handle an unknown number of interferers by keeping every peak above a fraction of the brightest off-center magnitude, then notching all of them.</li>
+<li>Add a Butterworth high-pass mode that sharpens the restored image by boosting high frequencies, and observe the ringing trade-off from Exercise 4.3.3 as you raise the order.</li>
+<li>Swap <code>skimage.data.camera()</code> for a real scanned halftone image and reproduce the newspaper-archive scenario from this section's practical example, reporting OCR-relevant sharpness before and after.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import maximum_filter
+from skimage import data, img_as_float
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.filters import butterworth
+
+img = img_as_float(data.camera())
+
+def log_spectrum(im):
+    return np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(im))))
+
+def radial_grid(shape):
+    rows, cols = shape
+    u = np.arange(rows) - rows // 2
+    v = np.arange(cols) - cols // 2
+    U, V = np.meshgrid(v, u)
+    return np.sqrt(U**2 + V**2)
+
+def gaussian_lowpass(shape, d0):
+    D = radial_grid(shape)
+    return np.exp(-(D**2) / (2.0 * d0**2))
+
+def apply_filter(im, H):
+    F = np.fft.fftshift(np.fft.fft2(im))
+    return np.fft.ifft2(np.fft.ifftshift(F * H)).real
+
+def add_periodic_noise(im, amp=0.3):
+    rows, cols = im.shape
+    y, x = np.mgrid[0:rows, 0:cols]
+    n1 = np.cos(2 * np.pi * (40 * x / cols + 60 * y / rows))
+    n2 = np.cos(2 * np.pi * (50 * x / cols))
+    return im + amp * (n1 + n2) / 2.0
+
+def find_spikes(im, exclude=20, k=2):
+    S = log_spectrum(im)
+    D = radial_grid(S.shape)
+    peaks = (S == maximum_filter(S, size=9)) & (D > exclude)
+    ys, xs = np.where(peaks)
+    order = np.argsort(S[ys, xs])[::-1]
+    return [(int(ys[i]), int(xs[i])) for i in order[:k]]
+
+def notch_filter(shape, spikes, d0=8):
+    rows, cols = shape
+    cy, cx = rows // 2, cols // 2
+    yy, xx = np.mgrid[0:rows, 0:cols]
+    H = np.ones(shape)
+    for (sy, sx) in spikes:
+        for (py, px) in [(sy, sx), (2 * cy - sy, 2 * cx - sx)]:
+            d2 = (yy - py)**2 + (xx - px)**2
+            H *= (1.0 - np.exp(-d2 / (2.0 * d0**2)))
+    return H
+
+noisy = add_periodic_noise(img)
+spikes = find_spikes(noisy, k=2)
+restored = apply_filter(noisy, notch_filter(noisy.shape, spikes))
+baseline = apply_filter(noisy, gaussian_lowpass(noisy.shape, d0=30))
+lib_low = butterworth(noisy, cutoff_frequency_ratio=0.06, high_pass=False, order=2)
+
+print(f"Noisy     PSNR: {psnr(img, np.clip(noisy, 0, 1)):.2f} dB")
+print(f"Low-pass  PSNR: {psnr(img, np.clip(baseline, 0, 1)):.2f} dB")
+print(f"Notch     PSNR: {psnr(img, np.clip(restored, 0, 1)):.2f} dB")
+print(f"Library   PSNR: {psnr(img, np.clip(lib_low, 0, 1)):.2f} dB")
+
+fig, ax = plt.subplots(1, 4, figsize=(14, 4))
+for a, im, t in zip(ax, [noisy, baseline, restored, log_spectrum(noisy)],
+                    ["Corrupted", "Low-pass", "Notch restored", "Corrupted spectrum"]):
+    a.imshow(im, cmap="gray"); a.set_title(t); a.axis("off")
+plt.tight_layout(); plt.show()</code></pre>
+</details>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 4.3.1: Filter Forensics <span class="exercise-type conceptual">Conceptual</span></div>
 <p>You receive three blurred versions of the same photograph, produced by an ideal, a Butterworth (n = 2), and a Gaussian low-pass filter at the same cutoff, but the filenames are scrambled. Describe the visual evidence you would use to assign each image to its filter, and explain why examining regions near strong edges is more diagnostic than examining smooth regions.</p>

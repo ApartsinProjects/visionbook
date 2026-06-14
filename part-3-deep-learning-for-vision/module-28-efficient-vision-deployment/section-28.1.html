@@ -114,7 +114,7 @@ $$q = \mathrm{round}\!\left(\frac{x}{s}\right) + z, \qquad \hat{x} = s\,(q - z)$
 </div>
 
 <p>
-The scale $s = (\beta_{\max} - \beta_{\min}) / (2^b - 1)$ for $b$ bits spreads the float range across the $2^b$ integer levels (256 levels for int8), and the zero-point $z$ is the integer that the real value zero maps to, which lets the scheme represent asymmetric ranges exactly at zero (important because padding and ReLU produce many exact zeros). The reconstructed value $\hat{x}$ differs from $x$ by at most half a step, $s/2$; this rounding error is the entire accuracy cost of quantization, and keeping $s$ small (a tight range) keeps it small. The code below implements the round trip so you can see the error directly.
+The scale $s = (\beta_{\max} - \beta_{\min}) / (2^b - 1)$ for $b$ bits spreads the float range across the $2^b$ integer levels (256 levels for int8), and the zero-point $z$ is the integer that the real value zero maps to, which lets the scheme represent asymmetric ranges exactly at zero (important because padding and ReLU produce many exact zeros). The reconstructed value $\hat{x}$ differs from $x$ by at most half a step, $s/2$; this rounding error is the entire accuracy cost of quantization, and keeping $s$ small (a tight range) keeps it small. Here is why throwing away 24 of the 32 bits barely hurts: a float32 weight can take any of roughly four billion distinct values, but the network never needed that resolution. Snapping each weight to its nearest of only 256 evenly spaced levels moves it by at most half a step, a perturbation smaller than the noise the weight already survived during training, so summed over a layer the rounding errors partly cancel and the output barely moves. The model was carrying 32 bits of precision to make optimization smooth, not because the learned function needed it. The code below implements the round trip so you can see the error directly.
 </p>
 
 <pre><code class="language-python">import torch
@@ -328,7 +328,7 @@ Distillation is the most architecturally flexible of the three techniques becaus
 <h2>5. Stacking the Techniques <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
 <p>
-In practice you rarely use one technique alone. The canonical deployment recipe applies all three in the order that respects their dependencies: distill into the target architecture first (so pruning and quantization act on the model you will actually ship), then structurally prune with a recovery fine-tune (so quantization calibrates the already-smaller network), then quantize last (because quantization is the final numeric step before the runtime). Table 28.1.1 shows representative cumulative effects on an ImageNet classifier; the exact numbers depend on the model and data, but the shape of the trade is stable across vision tasks.
+In practice you rarely use one technique alone. The canonical deployment recipe applies all three in the order that respects their dependencies: distill into the target architecture first (so pruning and quantization act on the model you will actually ship), then structurally prune with a recovery fine-tune (so quantization calibrates the already-smaller network), then quantize last (because quantization is the final numeric step before the runtime). The three-word recipe is worth memorizing in exactly this order, <em>distill, prune, quantize</em>, because the order is the logic: each step should act on the model the next step will compress, so you choose the architecture before you thin it, and thin it before you round it. Table 28.1.1 shows representative cumulative effects on an ImageNet classifier; the exact numbers depend on the model and data, but the shape of the trade is stable across vision tasks.
 </p>
 
 <div class="comparison-table">
@@ -368,7 +368,7 @@ Read the table as a path down the accuracy-versus-cost curve. The big size and l
 <h2>6. Summary and the Road to a Runtime</h2>
 
 <p>
-We have three composable tools. Quantization lowers numeric precision to int8 (or below), cutting memory by four and unlocking fast integer math, available as cheap post-training quantization or higher-fidelity quantization-aware training. Pruning removes parameters, with structured pruning the variant that actually reduces compute on ordinary hardware. Distillation trains a small student to inherit a large teacher's accuracy through softened soft targets. Stacked in the order distill, prune, quantize, they routinely deliver order-of-magnitude savings for a single-digit accuracy cost. But a compressed PyTorch module is still a Python object running eagerly; to actually realize the speed it promises, it must be exported to a compiled runtime built for the target hardware. That is the subject of <a href="section-28.2.html">Section 28.2</a>, where ONNX, TensorRT, and OpenVINO turn the shrunk graph into a deployable engine.
+We have three composable tools. Quantization lowers numeric precision to int8 (or below), cutting memory by four and unlocking fast integer math, available as cheap post-training quantization or higher-fidelity quantization-aware training. Pruning removes parameters, with structured pruning the variant that actually reduces compute on ordinary hardware. Distillation trains a small student to inherit a large teacher's accuracy through softened soft targets. Stacked in the order distill, prune, quantize, they routinely deliver order-of-magnitude savings for a single-digit accuracy cost. But a compressed PyTorch module is still a Python object running eagerly; to actually realize the speed it promises, it must be exported to a compiled runtime built for the target hardware. That is the subject of <a href="section-28.2.html">Section 28.2</a>, where ONNX, TensorRT, and OpenVINO turn the shrunk graph into a deployable engine. Before moving on, put all three compression tools together in the Hands-On Lab at the end of this section, which builds a small compression studio that shrinks a pretrained classifier and reports the accuracy-size-latency trade for each technique.
 </p>
 
 <div class="callout exercise">
@@ -385,6 +385,297 @@ We have three composable tools. Quantization lowers numeric precision to int8 (o
 <div class="callout-title">Exercise 28.1.3: Distillation Temperature Sweep <span class="exercise-type analysis">Analysis</span></div>
 <p>Using the <code>distillation_loss</code> function from subsection 4, train a small student (a 4-layer CNN) to imitate a ResNet-18 teacher on CIFAR-10, sweeping the temperature $T$ over $\{1, 2, 4, 8, 16\}$ at fixed $\alpha = 0.7$. Record final student accuracy for each. Explain the shape of the resulting curve: why very low temperature (the soft targets approach hard labels) and very high temperature (the soft targets approach a uniform distribution) both tend to hurt, and where the useful middle lies. Connect the analysis to what the softened distribution is actually communicating about the class geometry.</p>
 </div>
+
+<section class="lab" id="lab-28.1">
+<h2>Hands-On Lab: A Model Compression Studio</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 75 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a small command-line compression studio that takes a pretrained image classifier and reports, in one table, the accuracy, on-disk size, and CPU latency of the float32 baseline against three compressed variants: a distilled student, a structured-pruned model, and an int8 dynamically quantized model. The artifact is a single reusable script that turns the accuracy-size-latency trade of Table 28.1.1 from theory into a measurement you ran yourself.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Post-training int8 quantization with the <code>torch.ao</code> quantization API.</li>
+<li>Structured channel pruning with <code>torch.nn.utils.prune</code> and brief recovery fine-tuning.</li>
+<li>Knowledge distillation with the temperature-scaled soft-target loss from subsection 4.</li>
+<li>Measuring real CPU latency and model size, not just FLOP estimates.</li>
+<li>Reading the accuracy-versus-cost curve to pick the variant that meets a budget.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>A CPU is enough; no GPU required. Install the dependencies and let torchvision cache CIFAR-10 (about 170 MB) on first run.</p>
+<pre><code class="language-bash">pip install "torch>=2.2" "torchvision>=0.17"</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load data and a pretrained teacher</h4>
+<p>Set up a CIFAR-10 train and test loader, and load a ResNet-18 with its final layer resized to ten classes. Fine-tune the teacher for two quick epochs so it is a reasonable model to compress and to distill from.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torchvision as tv
+from torchvision.transforms import v2
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tf = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True),
+                 v2.Normalize([0.49, 0.48, 0.45], [0.25, 0.24, 0.26])])
+train = tv.datasets.CIFAR10("./data", train=True,  download=True, transform=tf)
+test  = tv.datasets.CIFAR10("./data", train=False, download=True, transform=tf)
+train_dl = torch.utils.data.DataLoader(train, batch_size=128, shuffle=True, num_workers=2)
+test_dl  = torch.utils.data.DataLoader(test,  batch_size=256, num_workers=2)
+
+teacher = tv.models.resnet18(weights="IMAGENET1K_V1")
+teacher.fc = nn.Linear(teacher.fc.in_features, 10)
+# TODO: write train(model, loader, epochs) and evaluate(model, loader) -> accuracy.
+# Hint: standard cross-entropy loop; evaluate runs under torch.no_grad() on CPU for fair latency later.
+teacher = teacher.to(device)
+# TODO: train(teacher, train_dl, epochs=2)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Keep the loops minimal: an Adam optimizer at <code>lr=1e-3</code>, cross-entropy loss, and a counter of correct predictions over the test set. Two epochs are enough to reach the high seventies; the lab is about the compression delta, not the absolute number.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Write the measurement harness</h4>
+<p>Every variant must be judged on the same three axes. Write helpers that report model size on disk and median CPU latency for a single image, so each later step produces one comparable row.</p>
+<pre><code class="language-python">import os, time, copy, statistics
+
+def size_mb(model):
+    torch.save(model.state_dict(), "tmp.pt")
+    mb = os.path.getsize("tmp.pt") / 1e6
+    os.remove("tmp.pt"); return mb
+
+def cpu_latency_ms(model, runs=50):
+    model = model.to("cpu").eval()
+    x = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        for _ in range(5): model(x)            # warm up
+        # TODO: time `runs` forward passes and return the MEDIAN in milliseconds.
+        # Hint: collect time.perf_counter() deltas into a list, use statistics.median.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Use the median rather than the mean: one scheduling hiccup can double a single measurement, and the median is robust to that. Always measure latency on CPU with batch size one so the int8 model (CPU-only in PyTorch eager mode) is comparable to the others.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Distill a MobileNetV2 student</h4>
+<p>Train a smaller MobileNetV2 to imitate the teacher using the temperature-scaled soft-target loss. This is the architecture change that buys the biggest single jump down the cost curve.</p>
+<pre><code class="language-python">import torch.nn.functional as F
+
+def distillation_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.7):
+    soft = F.kl_div(F.log_softmax(student_logits / T, dim=1),
+                    F.softmax(teacher_logits / T, dim=1),
+                    reduction="batchmean") * (T * T)
+    hard = F.cross_entropy(student_logits, labels)
+    return alpha * soft + (1 - alpha) * hard
+
+student = tv.models.mobilenet_v2(weights=None, num_classes=10).to(device)
+teacher.eval()
+# TODO: train `student` for ~3 epochs. For each batch, get teacher_logits under
+#       torch.no_grad(), then backprop distillation_loss(student(x), teacher_logits, y).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Freeze the teacher with <code>teacher.eval()</code> and wrap its forward pass in <code>torch.no_grad()</code> so no gradients flow into it. The student trains normally; only the loss function changed. Reuse the temperature and alpha from Exercise 28.1.3 if you already swept them.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Structured-prune the student</h4>
+<p>Apply channel-level (structured) pruning to the student's convolutions, then fine-tune briefly to recover the lost accuracy. Structured pruning, unlike unstructured masking, is the variant that can actually shrink compute on ordinary hardware.</p>
+<pre><code class="language-python">import torch.nn.utils.prune as prune
+
+pruned = copy.deepcopy(student)
+for module in pruned.modules():
+    if isinstance(module, nn.Conv2d) and module.out_channels > 8:
+        # TODO: prune 30% of output channels by L2 norm, then make it permanent.
+        # Hint: prune.ln_structured(module, name="weight", amount=0.3, n=2, dim=0)
+        #       followed by prune.remove(module, "weight").
+        pass
+# TODO: fine-tune `pruned` for ~2 epochs to recover accuracy.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Pruning with the <code>prune</code> API zeroes channels but keeps the tensor shape, so on-disk size barely moves until you rebuild the layers as smaller dense convolutions (or use the Torch-Pruning library, see the stretch goals). For this lab, measure the accuracy recovery and note that the latency win needs the dense rebuild; that gap is the lesson.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Dynamically quantize to int8</h4>
+<p>Apply post-training dynamic quantization to the distilled student. This is the cheapest technique: no retraining, one function call, and it converts linear and convolutional weights to int8 for CPU inference.</p>
+<pre><code class="language-python">from torch.ao.quantization import quantize_dynamic
+
+q_student = copy.deepcopy(student).to("cpu").eval()
+# TODO: quantize q_student with quantize_dynamic, targeting {nn.Linear, nn.Conv2d},
+#       dtype=torch.qint8. Confirm size_mb(q_student) dropped versus the float student.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Dynamic quantization is <code>quantize_dynamic(model, {nn.Linear, nn.Conv2d}, dtype=torch.qint8)</code>. It quantizes weights statically and activations on the fly, so it needs no calibration data, which is exactly why it is the right first thing to try. For full static int8 with calibration, see the stretch goals.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Assemble the comparison table</h4>
+<p>Run every variant through the same accuracy, size, and latency harness and print one table. This is the deliverable: your own version of Table 28.1.1, measured rather than quoted.</p>
+<pre><code class="language-python">rows = []
+for name, model in [("Float32 teacher", teacher),
+                    ("Distilled student", student),
+                    ("+ Pruned (30%)", pruned),
+                    ("+ Int8 quantized", q_student)]:
+    # TODO: append (name, evaluate(model, test_dl), size_mb(model), cpu_latency_ms(model)).
+    pass
+
+print(f"{'Variant':22} {'Acc%':>6} {'MB':>7} {'ms':>7}")
+for n, acc, mb, ms in rows:
+    print(f"{n:22} {acc*100:6.1f} {mb:7.1f} {ms:7.2f}")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Evaluate the int8 model on CPU; the others can evaluate on whatever device trained them but must be measured for latency on CPU for a fair comparison. If a row's size or latency does not move the way the chapter predicts, that is a finding worth a sentence, not a bug to hide.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>A four-row table that traces the same downward path as Table 28.1.1. Exact numbers depend on your training budget, but the shape is consistent: the distilled student is several times smaller and faster than the teacher for a few points of accuracy, pruning trims a little more accuracy (and, once the layers are rebuilt dense, latency), and int8 quantization roughly quarters the on-disk size of the student with a sub-point accuracy change. A representative run looks like this.</p>
+<pre><code class="language-text">Variant                  Acc%      MB      ms
+Float32 teacher          78.4    44.8   18.30
+Distilled student        75.1     8.8    6.10
++ Pruned (30%)           73.9     8.7    5.95
++ Int8 quantized         74.8     2.4    4.40</code></pre>
+<p>The pruned row's size and latency barely move because the <code>prune</code> API keeps tensor shapes; closing that gap is the first stretch goal, and noticing it is the point of Step 4's hint.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Replace the masking-only pruning with the <a href="https://github.com/VainF/Torch-Pruning" target="_blank" rel="noopener">Torch-Pruning</a> library so the pruned layers become genuinely smaller dense convolutions, then re-measure: the latency row should finally move, reconciling the storage, FLOP, and wall-clock numbers the way Exercise 28.1.2 asks.</li>
+<li>Swap dynamic quantization for full static int8 with calibration (<code>torch.ao.quantization.prepare</code> then <code>convert</code> after running a few hundred calibration images), and compare its accuracy against the dynamic variant.</li>
+<li>Add a Library Shortcut column: export the distilled student with Ultralytics or to ONNX and run it through ONNX Runtime (the topic of <a href="section-28.2.html">Section 28.2</a>), then measure that latency against the eager PyTorch numbers to preview what a compiled runtime adds.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import os, time, copy, statistics
+import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision as tv
+import torch.nn.utils.prune as prune
+from torchvision.transforms import v2
+from torch.ao.quantization import quantize_dynamic
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- Step 1: data and teacher ---
+tf = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True),
+                 v2.Normalize([0.49, 0.48, 0.45], [0.25, 0.24, 0.26])])
+train = tv.datasets.CIFAR10("./data", train=True,  download=True, transform=tf)
+test  = tv.datasets.CIFAR10("./data", train=False, download=True, transform=tf)
+train_dl = torch.utils.data.DataLoader(train, batch_size=128, shuffle=True, num_workers=2)
+test_dl  = torch.utils.data.DataLoader(test,  batch_size=256, num_workers=2)
+
+def train_model(model, loader, epochs=2, loss_fn=None):
+    model.train().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for _ in range(epochs):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            out = model(x)
+            loss = loss_fn(out, y) if loss_fn else F.cross_entropy(out, y)
+            loss.backward(); opt.step()
+    return model
+
+def evaluate(model, loader):
+    model.eval(); dev = next(model.parameters()).device
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            pred = model(x.to(dev)).argmax(1).cpu()
+            correct += (pred == y).sum().item(); total += y.numel()
+    return correct / total
+
+teacher = tv.models.resnet18(weights="IMAGENET1K_V1")
+teacher.fc = nn.Linear(teacher.fc.in_features, 10)
+train_model(teacher, train_dl, epochs=2)
+
+# --- Step 2: measurement harness ---
+def size_mb(model):
+    torch.save(model.state_dict(), "tmp.pt")
+    mb = os.path.getsize("tmp.pt") / 1e6
+    os.remove("tmp.pt"); return mb
+
+def cpu_latency_ms(model, runs=50):
+    model = model.to("cpu").eval()
+    x = torch.randn(1, 3, 32, 32)
+    times = []
+    with torch.no_grad():
+        for _ in range(5): model(x)
+        for _ in range(runs):
+            t0 = time.perf_counter(); model(x)
+            times.append((time.perf_counter() - t0) * 1000)
+    return statistics.median(times)
+
+# --- Step 3: distillation ---
+def distillation_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.7):
+    soft = F.kl_div(F.log_softmax(student_logits / T, dim=1),
+                    F.softmax(teacher_logits / T, dim=1),
+                    reduction="batchmean") * (T * T)
+    hard = F.cross_entropy(student_logits, labels)
+    return alpha * soft + (1 - alpha) * hard
+
+student = tv.models.mobilenet_v2(weights=None, num_classes=10).to(device)
+teacher.eval()
+opt = torch.optim.Adam(student.parameters(), lr=1e-3)
+for _ in range(3):
+    for x, y in train_dl:
+        x, y = x.to(device), y.to(device)
+        with torch.no_grad():
+            t_logits = teacher(x)
+        opt.zero_grad()
+        loss = distillation_loss(student(x), t_logits, y, T=4.0, alpha=0.7)
+        loss.backward(); opt.step()
+
+# --- Step 4: structured pruning + recovery ---
+pruned = copy.deepcopy(student)
+for module in pruned.modules():
+    if isinstance(module, nn.Conv2d) and module.out_channels > 8:
+        prune.ln_structured(module, name="weight", amount=0.3, n=2, dim=0)
+        prune.remove(module, "weight")
+train_model(pruned, train_dl, epochs=2)
+
+# --- Step 5: dynamic int8 quantization ---
+q_student = copy.deepcopy(student).to("cpu").eval()
+q_student = quantize_dynamic(q_student, {nn.Linear, nn.Conv2d}, dtype=torch.qint8)
+
+# --- Step 6: comparison table ---
+rows = []
+for name, model in [("Float32 teacher", teacher),
+                    ("Distilled student", student),
+                    ("+ Pruned (30%)", pruned),
+                    ("+ Int8 quantized", q_student)]:
+    rows.append((name, evaluate(model, test_dl), size_mb(model), cpu_latency_ms(model)))
+
+print(f"{'Variant':22} {'Acc%':>6} {'MB':>7} {'ms':>7}")
+for n, acc, mb, ms in rows:
+    print(f"{n:22} {acc*100:6.1f} {mb:7.1f} {ms:7.2f}")
+</code></pre>
+</details>
+</section>
 
 <nav class="chapter-nav">
 <a class="prev" href="index.html">&#8592; Chapter 28 Index</a>

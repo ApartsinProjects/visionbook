@@ -218,6 +218,247 @@ The frontier in 2024 to 2026 is removing the per-subject training loop entirely.
 </p>
 </div>
 
+<p>The chapter ends where it began, at the assembly line. The Hands-On Lab below turns the three stations and three knobs of the opening key insight into a single program you build and run: it loads a generator, sweeps the prompt-engineering knobs of <a href="section-34.5.html">Section 34.5</a>, swaps the model of <a href="section-34.3.html">Section 34.3</a>, and finally bolts on a LoRA from this section so the same pipeline renders a concept the base model never saw.</p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Text-to-Image Studio You Control</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<h4>Objective</h4>
+<p>Build a small, reproducible text-to-image studio: one script that loads a latent diffusion pipeline, generates from a prompt with fixed seeds, sweeps the guidance scale and a negative prompt to see the conditioning move, swaps in a second model behind the same interface, and attaches a LoRA adapter so the pipeline renders a new concept. The deliverable is a labeled contact sheet of generations that makes the chapter's three stations and three knobs visible at a glance.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Treating the pipeline as the separable encode-generate-decode assembly line of <a href="section-34.2.html">Section 34.2</a> rather than one opaque box.</li>
+<li>Driving the prompt-engineering knobs of <a href="section-34.5.html">Section 34.5</a>: guidance scale, negative prompts, and fixed seeds for reproducibility.</li>
+<li>Swapping the generator backbone behind one interface, the model-landscape lesson of <a href="section-34.3.html">Section 34.3</a>.</li>
+<li>Attaching a LoRA adapter to customize the model on a single GPU (this section).</li>
+<li>Assembling the outputs into a labeled grid so each knob's effect is legible.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install diffusers transformers accelerate torch pillow</code></pre>
+<p>A GPU with 8 GB or more makes each generation take seconds; on CPU it still runs but a single image may take a minute or more, so lower the step count and grid size. The base model, Stable Diffusion 1.5, downloads automatically on first run (about 4 GB). For the LoRA step you can use any small community LoRA from the Hugging Face Hub, or one you trained in Exercise 34.6.2.</p>
+</div>
+
+<p>Work the steps in order; each prints or saves a checkpoint so you can confirm progress before the next. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Load the pipeline and expose its three stations</h4>
+<p>Load a latent diffusion pipeline and print the class of each station so the assembly line of <a href="section-34.2.html">Section 34.2</a> stops being abstract: a text encoder, a denoising U-Net, and a VAE decoder.</p>
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5", torch_dtype=dtype
+).to(device)
+pipe.set_progress_bar_config(disable=True)
+
+# TODO: print the class name of the three stations so the pipeline is concrete:
+#       the text encoder (pipe.text_encoder), the generator (pipe.unet),
+#       and the decoder (pipe.vae). Confirm they match Section 34.2's diagram.
+</code></pre>
+<details><summary>Hint</summary><p><code>print(type(pipe.text_encoder).__name__, type(pipe.unet).__name__, type(pipe.vae).__name__)</code> reports <code>CLIPTextModel</code>, <code>UNet2DConditionModel</code>, and <code>AutoencoderKL</code>: the encode, generate, and decode stations the chapter opened with.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Generate reproducibly with a fixed seed</h4>
+<p>A seed pins the starting noise so a generation is reproducible, the precondition for every comparison in <a href="section-34.5.html">Section 34.5</a>. Write a helper that generates one image for a given prompt, guidance scale, negative prompt, and seed.</p>
+<pre><code class="language-python">def generate(prompt, guidance=7.5, negative=None, seed=0, steps=30):
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # TODO: call pipe(...) with prompt, negative_prompt=negative,
+    #       guidance_scale=guidance, num_inference_steps=steps, generator=gen.
+    #       Return result.images[0].
+    ...
+
+img = generate("a watercolor painting of a lighthouse at dawn", seed=0)
+img.save("step2_base.png")
+print("saved step2_base.png")</code></pre>
+<details><summary>Hint</summary><p>The body is <code>return pipe(prompt, negative_prompt=negative, guidance_scale=guidance, num_inference_steps=steps, generator=gen).images[0]</code>. Reusing the same <code>seed</code> with the same arguments reproduces the exact image, which is what lets the next step isolate one knob at a time.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Sweep the guidance scale on one fixed seed</h4>
+<p>Guidance scale trades diversity for prompt fidelity (<a href="section-34.5.html">Section 34.5</a>). Hold the seed and prompt fixed and vary only the guidance to see the fidelity-versus-artifact tradeoff directly.</p>
+<pre><code class="language-python">prompt = "a watercolor painting of a lighthouse at dawn"
+scales = [1.5, 4.0, 7.5, 12.0, 20.0]
+
+# TODO: generate one image per scale with the SAME seed (e.g. 0), collect
+#       them in a list `row`, and label each with its guidance value.
+row = []
+for g in scales:
+    ...
+print(f"collected {len(row)} images across guidance {scales}")</code></pre>
+<details><summary>Hint</summary><p><code>row = [generate(prompt, guidance=g, seed=0) for g in scales]</code>. With the seed fixed, the only thing changing across the row is the guidance, so you can attribute every visible difference (washed-out at 1.5, oversaturated and artifacted at 20) to that single knob.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Add a negative prompt and compare</h4>
+<p>A negative prompt steers the unconditional branch of classifier-free guidance away from unwanted content (<a href="section-34.5.html">Section 34.5</a>). Generate a with-and-without pair on the same seed to isolate its effect.</p>
+<pre><code class="language-python">neg = "blurry, low quality, extra fingers, watermark, text"
+
+# TODO: generate two images on the same seed and guidance: one with
+#       negative=None and one with negative=neg. Store them as a labeled pair.
+pair = ...
+print("generated the with/without negative-prompt pair")</code></pre>
+<details><summary>Hint</summary><p><code>pair = [("no negative", generate(prompt, seed=1, negative=None)), ("with negative", generate(prompt, seed=1, negative=neg))]</code>. Keep every other argument identical so the only variable is the negative prompt.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Swap the generator behind the same interface</h4>
+<p>The model landscape of <a href="section-34.3.html">Section 34.3</a> is the same template with different knobs. Load a second model into a pipeline with the identical <code>generate</code> contract and render the same prompt and seed through both.</p>
+<pre><code class="language-python">from diffusers import DiffusionPipeline
+
+pipe2 = DiffusionPipeline.from_pretrained(
+    "stabilityai/sd-turbo", torch_dtype=dtype
+).to(device)
+pipe2.set_progress_bar_config(disable=True)
+
+# TODO: render the same prompt and seed through pipe2. SD-Turbo is distilled
+#       for very few steps, so use steps=1 and guidance=0.0. Note how the same
+#       sentence yields a different look because the model knob changed.
+gen2 = torch.Generator(device=device).manual_seed(0)
+img_turbo = ...
+img_turbo.save("step5_turbo.png")</code></pre>
+<details><summary>Hint</summary><p><code>img_turbo = pipe2(prompt, num_inference_steps=1, guidance_scale=0.0, generator=gen2).images[0]</code>. SD-Turbo is a few-step distilled model (<a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s consistency and distillation thread), so it ignores high guidance and finishes in one step; the comparison shows the generator knob changing the output, not the prompt.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Attach a LoRA and render a new concept</h4>
+<p>Now bolt this section's customization onto the base pipeline. Load a LoRA adapter and generate with its trigger token so the same model renders a concept it did not know before.</p>
+<pre><code class="language-python"># Use any SD-1.5-compatible LoRA on the Hub, or one you trained in Exercise 34.6.2.
+# TODO: call pipe.load_lora_weights(REPO_OR_PATH) to attach the adapter, then
+#       generate a prompt containing the LoRA's trigger token. Save the result.
+...
+img_lora = generate("a watercolor painting of a lighthouse, &lt;trigger&gt; style", seed=0)
+img_lora.save("step6_lora.png")
+pipe.unload_lora_weights()  # detach so later cells use the clean base model
+print("saved step6_lora.png")</code></pre>
+<details><summary>Hint</summary><p><code>pipe.load_lora_weights("some-user/some-style-lora")</code> attaches the rank-decomposed adapter in one line; <code>load_lora_weights</code> handles the weight injection of this section's subsection 4. Replace the placeholder trigger with the adapter's documented token. Call <code>pipe.unload_lora_weights()</code> when done so the base model is restored.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Assemble a labeled contact sheet</h4>
+<p>Tie the runs together into one annotated grid so each knob's effect is visible side by side, the deliverable of the lab.</p>
+<pre><code class="language-python">from PIL import Image, ImageDraw
+
+def contact_sheet(labeled_images, cols=5, cell=256):
+    rows = (len(labeled_images) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * cell, rows * (cell + 22)), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, (label, im) in enumerate(labeled_images):
+        x, y = (i % cols) * cell, (i // cols) * (cell + 22)
+        sheet.paste(im.resize((cell, cell)), (x, y + 22))
+        draw.text((x + 4, y + 4), label, fill="black")
+    return sheet
+
+# TODO: build a list of (label, image) tuples from the guidance sweep (Step 3),
+#       the negative-prompt pair (Step 4), and the model swap (Step 5), then
+#       call contact_sheet(...) and save it as studio_contact_sheet.png.
+...
+</code></pre>
+<details><summary>Hint</summary><p>Collect tuples like <code>[(f"g={g}", im) for g, im in zip(scales, row)]</code> plus the Step 4 pair and a <code>("sd-turbo", img_turbo)</code> entry, pass them to <code>contact_sheet</code>, and call <code>.save("studio_contact_sheet.png")</code>. The single image is the portfolio artifact that makes the three knobs legible.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>Step 1 prints <code>CLIPTextModel UNet2DConditionModel AutoencoderKL</code>, the three stations named. The guidance sweep produces a five-image row where low guidance ($1.5$) looks washed out and only loosely matches the prompt, mid guidance ($7.5$) is the sweet spot, and high guidance ($20$) is oversaturated with contrast artifacts, the tradeoff of <a href="section-34.5.html">Section 34.5</a> made visual. The negative-prompt pair shows the cleaner image on the same seed once the unwanted terms are pushed out. The SD-Turbo swap renders a recognizable version of the same scene in a single step, visibly different in style because the model knob changed. The LoRA generation injects the adapter's concept or style into the lighthouse scene. The final <code>studio_contact_sheet.png</code> is a labeled grid that summarizes the whole study in one image: one prompt, three knobs, one assembly line.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Add a seed grid: hold prompt and guidance fixed and vary only the seed across nine values, then render a 3-by-3 sheet showing the diversity a single prompt spans (<a href="section-34.5.html">Section 34.5</a>).</li>
+<li>Swap the encoder station instead of the generator: load an SDXL pipeline (dual text encoder, <a href="section-34.3.html">Section 34.3</a>) through the same <code>generate</code> contract and compare prompt following on a long compositional prompt, the encoder-ceiling argument of <a href="section-34.1.html">Section 34.1</a>.</li>
+<li>Compose two LoRAs (a subject and a style) into the pipeline with per-adapter weights, then sweep the weights and add the best result to the contact sheet, connecting to Exercise 34.6.2.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline, DiffusionPipeline
+from PIL import Image, ImageDraw
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+# Step 1: load the pipeline and name the three stations.
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5", torch_dtype=dtype
+).to(device)
+pipe.set_progress_bar_config(disable=True)
+print(type(pipe.text_encoder).__name__,
+      type(pipe.unet).__name__,
+      type(pipe.vae).__name__)
+
+# Step 2: a reproducible generation helper.
+def generate(prompt, guidance=7.5, negative=None, seed=0, steps=30):
+    gen = torch.Generator(device=device).manual_seed(seed)
+    return pipe(prompt, negative_prompt=negative, guidance_scale=guidance,
+                num_inference_steps=steps, generator=gen).images[0]
+
+prompt = "a watercolor painting of a lighthouse at dawn"
+
+# Step 3: guidance sweep on one fixed seed.
+scales = [1.5, 4.0, 7.5, 12.0, 20.0]
+row = [generate(prompt, guidance=g, seed=0) for g in scales]
+
+# Step 4: negative-prompt comparison on a fixed seed.
+neg = "blurry, low quality, extra fingers, watermark, text"
+pair = [("no negative", generate(prompt, seed=1, negative=None)),
+        ("with negative", generate(prompt, seed=1, negative=neg))]
+
+# Step 5: swap the generator behind the same idea.
+pipe2 = DiffusionPipeline.from_pretrained(
+    "stabilityai/sd-turbo", torch_dtype=dtype
+).to(device)
+pipe2.set_progress_bar_config(disable=True)
+gen2 = torch.Generator(device=device).manual_seed(0)
+img_turbo = pipe2(prompt, num_inference_steps=1, guidance_scale=0.0,
+                  generator=gen2).images[0]
+
+# Step 6: attach a LoRA and render a new concept.
+# Replace the repo id and trigger token with a real SD-1.5 LoRA.
+try:
+    pipe.load_lora_weights("ostris/watercolor_style_lora_sd15")
+    img_lora = generate(prompt + ", watercolor style", seed=0)
+    img_lora.save("step6_lora.png")
+    pipe.unload_lora_weights()
+except Exception as e:
+    print("LoRA step skipped (supply a valid adapter):", e)
+
+# Step 7: assemble the labeled contact sheet.
+def contact_sheet(labeled_images, cols=5, cell=256):
+    rows = (len(labeled_images) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * cell, rows * (cell + 22)), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, (label, im) in enumerate(labeled_images):
+        x, y = (i % cols) * cell, (i // cols) * (cell + 22)
+        sheet.paste(im.resize((cell, cell)), (x, y + 22))
+        draw.text((x + 4, y + 4), label, fill="black")
+    return sheet
+
+cells = [(f"g={g}", im) for g, im in zip(scales, row)]
+cells += pair
+cells += [("sd-turbo", img_turbo)]
+contact_sheet(cells).save("studio_contact_sheet.png")
+print("saved studio_contact_sheet.png")</code></pre>
+</details>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 34.6.1: Choosing a Rung <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each task, name the method on the ladder you would use and justify it from the forgetting-versus-capacity tradeoff of Table 34.6.1: (a) reproduce a specific person's face with high fidelity from 20 photos; (b) apply a consistent watercolor style to any prompt; (c) capture a simple recurring logo shape; (d) adapt a model to an entirely new domain (medical X-rays) with 50000 images. Then explain why DreamBooth needs a prior-preservation loss but textual inversion does not.</p>

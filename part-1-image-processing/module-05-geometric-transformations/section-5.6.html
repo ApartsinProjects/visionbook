@@ -275,6 +275,9 @@ Walk back through the hundred lines and notice how the chapter's sections each c
 <p>
 The scanner also hands the book its next problem. Its output is a binary image, and binary images have their own algebra: erosion to strip speckle, dilation to heal broken strokes, connected components to find characters, shape descriptors to classify them. That algebra is <a href="../module-06-morphology-binary-shape/index.html">Chapter 6: Morphology, Binary Images &amp; Shape</a>, and it begins exactly where <code>scan.png</code> ends.
 </p>
+<p>
+The scanner exercised the chapter on a single image with four trusted corners. The chapter's other headline application, stitching, needs the full registration machinery of <a href="section-5.5.html">Section 5.5</a> running on two images at once. Build it yourself in the Hands-On Lab below: a two-photo panorama stitcher that detects and matches features, fits a homography with RANSAC, and warps one frame onto the other's canvas. It is the natural companion to the scanner and the capstone for everything in Chapter 5.
+</p>
 <div class="callout exercise">
 <div class="callout-title">Exercise 5.6.1: Break the Corner Ordering <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Construct (on paper) a convex quadrilateral for which the sum/difference trick of Code 5.6.2 assigns two corners the same role, or the wrong roles. At what rotation angles of a long, thin receipt does this happen? Then describe the centroid-angle alternative (sort corners by <code>atan2</code> around their mean) and explain why it cannot produce duplicate assignments, but still needs a rule to decide which sorted corner is "top-left".</p>
@@ -287,6 +290,245 @@ The scanner also hands the book its next problem. Its output is a binary image, 
 <div class="callout-title">Exercise 5.6.3: How Wrong Corners Hurt <span class="exercise-type analysis">Analysis</span></div>
 <p>Perturb each of the four detected corners independently by Gaussian noise of $\sigma \in \{1, 2, 5, 10\}$ pixels before rectification, 50 trials each, and measure the damage to the output: (a) SSIM (the structural similarity index from <a href="../module-01-digital-image-fundamentals/section-1.5.html">Section 1.5</a>, where 1.0 is identical and lower means more distortion) between the perturbed and unperturbed scans, and (b) if you have an OCR engine available (e.g. <code>pytesseract</code>), character error rate on a printed test page. Plot both against $\sigma$. Which corner perturbations hurt most, and why does the answer depend on the camera angle? Relate the shape of the curve to the homography's sensitivity as the quad degenerates.</p>
 </div>
+<section class="lab" id="lab-5.6">
+<h2 class="lab-title">Hands-On Lab: Build a Two-Photo Panorama Stitcher</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a panorama stitcher from scratch that takes two overlapping photographs, discovers the homography between them with feature matching and RANSAC, warps the left image onto a canvas sized for both, and blends the seam, producing one wide panorama image you can keep.</p>
+</div>
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Picking the right transform from the hierarchy of <a href="section-5.1.html">Section 5.1</a>: two photos from one rotating camera relate by a homography.</li>
+<li>Estimating that homography from data with ORB matching and RANSAC, the registration pipeline of <a href="section-5.5.html">Section 5.5</a>.</li>
+<li>Composing transforms in homogeneous coordinates (<a href="section-5.2.html">Section 5.2</a>) to add a translation offset so nothing falls off the canvas.</li>
+<li>Executing the warp with <code>cv2.warpPerspective</code>, the inverse-mapping interpolation of Sections <a href="section-5.3.html">5.3</a> and <a href="section-5.4.html">5.4</a>.</li>
+<li>Reading the RANSAC inlier count as a built-in quality gate, exactly as in Output 5.5.4a.</li>
+</ul>
+</div>
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>You need <code>opencv-python</code> and <code>numpy</code> (both from <a href="../module-00-python-imaging-stack/index.html">Chapter 0</a>). Install with <code>pip install opencv-python numpy</code>. For input, take two photos of a wide scene (a bookshelf, a building, a landscape) from the same standing spot, rotating the camera roughly 20 to 30 degrees between shots so they share about 40 percent overlap. Save them as <code>left.jpg</code> and <code>right.jpg</code>. No download is required; your own pair works best.</p>
+</div>
+<div class="lab-steps">
+<h3>Steps</h3>
+<div class="lab-step">
+<h4>Step 1: Load the pair and detect features</h4>
+<p>Read both images and run an ORB detector on each. ORB returns keypoints (locations) and descriptors (binary signatures of each keypoint's neighborhood). This is the black-box front end from Section 5.5; you only consume its output.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+left  = cv2.imread("left.jpg")    # will be warped onto the right
+right = cv2.imread("right.jpg")   # the fixed reference frame
+
+gray_l = cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY)
+gray_r = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+
+# TODO: create an ORB detector aiming for a few thousand features
+# Hint: cv2.ORB_create(nfeatures=...)
+orb = ...
+
+# TODO: detect keypoints and compute descriptors for BOTH gray images
+# Hint: orb.detectAndCompute(image, None) returns (keypoints, descriptors)
+k_l, d_l = ...
+k_r, d_r = ...
+print(f"left: {len(k_l)} kp, right: {len(k_r)} kp")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>ORB descriptors are binary, so later you must match them with the Hamming distance, not the Euclidean L2 used for float descriptors like SIFT. Aim for <code>nfeatures=4000</code>: more features means more candidate matches for RANSAC to work with.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 2: Match descriptors across the two images</h4>
+<p>Find candidate correspondences by matching each left descriptor to its closest right descriptor. A brute-force matcher with cross-check keeps only pairs that are each other's mutual best match, which discards many obvious mismatches before RANSAC even runs.</p>
+<pre><code class="language-python"># TODO: build a brute-force matcher with Hamming distance and crossCheck=True
+# Hint: cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+bf = ...
+
+# TODO: match d_l against d_r, then sort matches by ascending distance
+# and keep the best few hundred
+matches = ...
+matches = sorted(matches, key=lambda m: m.distance)[:600]
+print(f"{len(matches)} candidate matches")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>With <code>crossCheck=True</code> you call <code>bf.match(d_l, d_r)</code> (a single best match per keypoint), not <code>bf.knnMatch</code>. Sorting by <code>m.distance</code> and slicing keeps the most confident candidates; RANSAC will still throw out the wrong ones.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 3: Estimate the homography with RANSAC</h4>
+<p>Gather the matched point coordinates into source and destination arrays, then fit a homography. Many candidates are wrong, so RANSAC is essential: it finds the largest set of matches that agree on one transform and ignores the rest, returning an inlier mask alongside the matrix.</p>
+<pre><code class="language-python">src = np.float32([k_l[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+dst = np.float32([k_r[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+# TODO: estimate the homography mapping left points to right points,
+# using RANSAC with a reprojection threshold of about 4 pixels
+# Hint: cv2.findHomography(src, dst, cv2.RANSAC, ransacReprojThreshold=...)
+H, mask = ...
+
+n_in = int(mask.sum())
+print(f"RANSAC kept {n_in}/{len(matches)} matches as inliers")
+assert n_in &gt;= 30, "too few inliers: re-shoot with more overlap"
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>H</code> maps left-image coordinates to right-image coordinates. The inlier count is your quality gauge from Output 5.5.4a: fewer than about 30 inliers means the pair does not overlap enough or the scene has too little texture. Try <code>cv2.USAC_MAGSAC</code> instead of <code>cv2.RANSAC</code> to skip the threshold-tuning, as the Research Frontier in Section 5.5 recommends.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 4: Size the canvas and add a translation offset</h4>
+<p>If you warp the left image with <code>H</code> alone, parts of it can land at negative coordinates and get clipped. Project the left image's four corners through <code>H</code>, combine them with the right image's corners, and build a translation matrix <code>T</code> that shifts everything into positive territory. Composing <code>T @ H</code> in homogeneous coordinates (Section 5.2) is exactly the chaining of transforms you learned to do by matrix multiplication.</p>
+<pre><code class="language-python">h_l, w_l = left.shape[:2]
+h_r, w_r = right.shape[:2]
+
+corners_l = np.float32([[0, 0], [0, h_l], [w_l, h_l], [w_l, 0]]).reshape(-1, 1, 2)
+warped_corners = cv2.perspectiveTransform(corners_l, H)
+corners_r = np.float32([[0, 0], [0, h_r], [w_r, h_r], [w_r, 0]]).reshape(-1, 1, 2)
+all_corners = np.concatenate([warped_corners, corners_r], axis=0)
+
+x_min, y_min = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+x_max, y_max = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+
+# TODO: build the 3x3 translation matrix T that shifts by (-x_min, -y_min)
+# Hint: a homogeneous translation is np.array([[1,0,tx],[0,1,ty],[0,0,1]])
+T = ...
+canvas_size = (x_max - x_min, y_max - y_min)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Use <code>tx = -x_min</code> and <code>ty = -y_min</code> so the most negative projected corner moves to coordinate 0. The canvas width is <code>x_max - x_min</code> and height is <code>y_max - y_min</code>. Keep <code>T</code> as <code>np.float32</code> or <code>np.float64</code> so the later matrix product stays floating point.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 5: Warp the left image and place the right image</h4>
+<p>Warp the left image with the composed matrix <code>T @ H</code> onto the full canvas, then copy the right image into its offset position. This is the inverse-mapping warp of Section 5.4 with bilinear interpolation from Section 5.3 doing the resampling under the hood.</p>
+<pre><code class="language-python"># TODO: warp the left image onto the canvas using T @ H as the transform
+# Hint: cv2.warpPerspective(left, T @ H, canvas_size)
+pano = ...
+
+# Paste the right image at its translated location (overwrite, for now)
+tx, ty = int(T[0, 2]), int(T[1, 2])
+pano[ty:ty + h_r, tx:tx + w_r] = right
+
+cv2.imwrite("panorama_hard_seam.jpg", pano)
+print(f"panorama size: {pano.shape[1]}x{pano.shape[0]}")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Matrix multiplication order matters: <code>T @ H</code> applies <code>H</code> first (left into the right frame) then <code>T</code> (the canvas shift), reading right to left as composition always does. At this point you have a working panorama with a visible hard seam where the two images meet; Step 6 softens it.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 6: Blend the seam with a feathered mask</h4>
+<p>The hard overwrite in Step 5 leaves an obvious line and any exposure difference shows as a step. Replace it with a simple linear feather: build a weight that ramps from the warped-left side to the right side across the overlap, and blend the two layers by that weight. This is a one-level version of the multi-band blending that <code>cv2.Stitcher</code> does internally.</p>
+<pre><code class="language-python">warped_left = cv2.warpPerspective(left, T @ H, canvas_size)
+right_layer = np.zeros_like(warped_left)
+right_layer[ty:ty + h_r, tx:tx + w_r] = right
+
+# Coverage masks (single channel) for each layer
+mask_l = (warped_left.sum(axis=2) &gt; 0).astype(np.float32)
+mask_r = (right_layer.sum(axis=2) &gt; 0).astype(np.float32)
+
+# TODO: turn the two binary masks into normalized blend weights so that
+# wl + wr = 1 wherever either image has content (avoid divide-by-zero)
+# Hint: total = mask_l + mask_r; weight = mask / np.maximum(total, 1e-6)
+wl = ...
+wr = ...
+
+blended = (warped_left * wl[..., None] + right_layer * wr[..., None])
+cv2.imwrite("panorama.jpg", blended.astype(np.uint8))
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For a smoother seam, blur each mask with <code>cv2.GaussianBlur(mask, (0, 0), sigmaX=25)</code> BEFORE normalizing: the Gaussian turns the sharp coverage edge into a gradual ramp, so the two exposures cross-fade over a band instead of meeting at a line. This is the chapter's filtering (<a href="../module-03-spatial-filtering-convolution/index.html">Chapter 3</a>) reused for compositing.</p>
+</details>
+</div>
+</div>
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>The console reports a few thousand keypoints per image, several hundred candidate matches, and a RANSAC inlier count typically between 100 and 400 for a well-overlapping pair (printed as a line like <code>RANSAC kept 247/600 matches as inliers</code>). The saved <code>panorama.jpg</code> is a single wide image, noticeably wider than either input, with the two photographs fused along the overlap. With the feathered mask from Step 6, the seam is hard to spot; with the hard overwrite from Step 5, you will see a faint vertical line and any brightness mismatch. Straight lines in the scene (shelf edges, window frames) stay straight across the join when the homography is good.</p>
+</div>
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Extend to three or more images by stitching pairwise left to right, accumulating each new homography onto the running canvas transform. Watch the error grow toward the right edge: that drift is exactly what the bundle adjustment of <a href="../../part-2-classical-computer-vision/module-14-sfm-visual-slam/index.html">Chapter 14</a> later corrects.</li>
+<li>Draw the RANSAC inliers and outliers with <code>cv2.drawMatches</code> using the inlier mask to color them differently, visualizing Figure 5.5.1's consensus idea on your own photos.</li>
+<li>Library shortcut: reproduce the whole result with OpenCV's built-in stitcher and compare. The Library Shortcut callout in Section 5.5 shows it is three lines: <code>cv2.Stitcher_create(cv2.Stitcher_PANORAMA).stitch([left, right])</code>. Note how the production version also handles exposure compensation and multi-band blending that your feather only approximates.</li>
+</ul>
+</div>
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python"># Two-photo panorama stitcher: detect, match, RANSAC-fit, warp, blend.
+import cv2
+import numpy as np
+
+def stitch(left, right):
+    gray_l = cv2.cvtColor(left,  cv2.COLOR_BGR2GRAY)
+    gray_r = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+
+    # Step 1: detect ORB features in both images
+    orb = cv2.ORB_create(nfeatures=4000)
+    k_l, d_l = orb.detectAndCompute(gray_l, None)
+    k_r, d_r = orb.detectAndCompute(gray_r, None)
+
+    # Step 2: match with Hamming distance + cross-check, keep best 600
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = sorted(bf.match(d_l, d_r), key=lambda m: m.distance)[:600]
+
+    # Step 3: homography from left to right, RANSAC rejecting outliers
+    src = np.float32([k_l[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst = np.float32([k_r[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, ransacReprojThreshold=4.0)
+    n_in = int(mask.sum())
+    print(f"RANSAC kept {n_in}/{len(matches)} matches as inliers")
+    assert n_in &gt;= 30, "too few inliers: re-shoot with more overlap"
+
+    # Step 4: size the canvas and build a translation offset
+    h_l, w_l = left.shape[:2]
+    h_r, w_r = right.shape[:2]
+    corners_l = np.float32([[0, 0], [0, h_l], [w_l, h_l], [w_l, 0]]).reshape(-1, 1, 2)
+    warped_corners = cv2.perspectiveTransform(corners_l, H)
+    corners_r = np.float32([[0, 0], [0, h_r], [w_r, h_r], [w_r, 0]]).reshape(-1, 1, 2)
+    all_corners = np.concatenate([warped_corners, corners_r], axis=0)
+    x_min, y_min = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+    x_max, y_max = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+    T = np.array([[1, 0, -x_min],
+                  [0, 1, -y_min],
+                  [0, 0, 1]], dtype=np.float64)
+    canvas_size = (x_max - x_min, y_max - y_min)
+
+    # Step 5: warp left onto the canvas; stage right on its own layer
+    warped_left = cv2.warpPerspective(left, T @ H, canvas_size)
+    tx, ty = int(T[0, 2]), int(T[1, 2])
+    right_layer = np.zeros_like(warped_left)
+    right_layer[ty:ty + h_r, tx:tx + w_r] = right
+
+    # Step 6: feathered linear blend across the overlap
+    mask_l = (warped_left.sum(axis=2) &gt; 0).astype(np.float32)
+    mask_r = (right_layer.sum(axis=2) &gt; 0).astype(np.float32)
+    mask_l = cv2.GaussianBlur(mask_l, (0, 0), sigmaX=25)
+    mask_r = cv2.GaussianBlur(mask_r, (0, 0), sigmaX=25)
+    total = mask_l + mask_r
+    wl = mask_l / np.maximum(total, 1e-6)
+    wr = mask_r / np.maximum(total, 1e-6)
+    blended = warped_left * wl[..., None] + right_layer * wr[..., None]
+    return blended.astype(np.uint8)
+
+if __name__ == "__main__":
+    left  = cv2.imread("left.jpg")
+    right = cv2.imread("right.jpg")
+    pano = stitch(left, right)
+    cv2.imwrite("panorama.jpg", pano)
+    print(f"panorama size: {pano.shape[1]}x{pano.shape[0]}")
+</code></pre>
+</details>
+</section>
 <nav class="chapter-nav">
 <a class="prev" href="section-5.5.html"><span class="nav-label">Section 5.5: Image Registration &amp; Alignment</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 5</span></a>

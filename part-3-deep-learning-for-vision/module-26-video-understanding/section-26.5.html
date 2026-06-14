@@ -271,7 +271,7 @@ for frame_result in results:
     ids = frame_result.boxes.id                  # stable track ID per box, or None
     boxes = frame_result.boxes.xyxy              # the detection boxes this frame</code></pre>
 <div class="code-caption"><strong>Code Fragment 5:</strong> The full Kalman, Hungarian, and two-pass tracker of Code Fragments 1 through 4 as two lines using Ultralytics <code>YOLO.track</code> with <code>tracker="bytetrack.yaml"</code>. The library runs detection, the Kalman tracks, the assignment, and ByteTrack's recovery pass internally, exposing a stable <code>boxes.id</code> per object; switching to <code>"botsort.yaml"</code> adds the DeepSORT-style appearance model.</div>
-<p>The wrapper runs detection, maintains the Kalman tracks, solves the assignment, and applies ByteTrack's two-pass recovery, exposing a stable <code>id</code> per object per frame. Swapping <code>tracker="botsort.yaml"</code> adds the re-identification appearance model of DeepSORT. This is the production form of everything in this section.</p>
+<p>The wrapper runs detection, maintains the Kalman tracks, solves the assignment, and applies ByteTrack's two-pass recovery, exposing a stable <code>id</code> per object per frame. Swapping <code>tracker="botsort.yaml"</code> adds the re-identification appearance model of DeepSORT. This is the production form of everything in this section, and the <a href="#lab-26">Hands-On Lab</a> at the end of this section has you build the from-scratch version and then drop in this two-line shortcut, so you see both the learning path and the practical payoff on one real video.</p>
 </div>
 
 <div class="callout research-frontier">
@@ -292,6 +292,278 @@ for frame_result in results:
 <div class="callout exercise">
 <div class="callout-title">Exercise 26.5.3: When Does the Low-Confidence Pass Help <span class="exercise-type analysis">Analysis</span></div>
 <p>ByteTrack's second pass matches tracks to low-confidence detections. Using a video with crowding (or a synthetic sequence where objects periodically occlude each other and their detection scores drop), measure the number of ID switches and the number of fragmented tracks with and without the second pass at several detector confidence thresholds. Tabulate the results and write one paragraph explaining the regime in which the low-confidence pass helps most, and the regime in which it could hurt by associating genuine false positives. Connect the trade to the precision-recall thinking of <a href="../module-23-object-detection/index.html">Chapter 23</a>.</p>
+</div>
+
+<div class="callout lab" id="lab-26">
+<div class="callout-title">Hands-On Lab: A Multi-Object Tracker That Counts People Crossing a Line</div>
+
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 80 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<p><strong>Objective.</strong> Build a complete tracking-by-detection pipeline that reads a video clip, detects people in every frame, links those per-frame detections into stable tracks with your own IoU-and-motion association, and uses the resulting track identities to count how many distinct people cross a virtual line. The artifact ties the whole chapter together: the clip decoding of <a href="section-26.1.html">Section 26.1</a>, an object detector from <a href="../module-23-object-detection/index.html">Chapter 23</a>, the motion-prediction-then-match logic of this section, and a final library shortcut that swaps your tracker for production ByteTrack in two lines.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Decoding a video into frames and iterating over it without loading the whole clip into memory (<a href="section-26.1.html">Section 26.1</a>).</li>
+<li>Running a per-frame detector and filtering its boxes to one class (the person detector of <a href="../module-23-object-detection/index.html">Chapter 23</a>).</li>
+<li>Predicting each track's next box with a constant-velocity motion model, the lightweight cousin of the Kalman filter from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</li>
+<li>Associating detections to tracks by IoU with greedy or Hungarian matching, then birthing, ageing, and retiring tracks (this section).</li>
+<li>Turning stable track identities into a real measurement: a unique line-crossing count, and the production form with Ultralytics <code>YOLO.track</code> (the "Right Tool").</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>Runs in Colab or any machine with PyTorch. The detector runs on CPU at a few frames per second, which is fine for a short clip; a GPU is faster but not required. Use any short street or pedestrian video (a ten to twenty second clip is plenty), or download one of the sample MOT clips. The first <code>YOLO</code> call downloads the weights automatically.</p>
+<pre><code class="language-bash">pip install ultralytics opencv-python scipy numpy</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Decode the video and run the detector frame by frame</h4>
+<p>Open the clip with OpenCV and step through it one frame at a time. For each frame, run the detector and keep only the person boxes above a confidence threshold. This is the per-frame "detections" stream that the tracker will consume; nothing here remembers identity yet.</p>
+<pre><code class="language-python">import cv2, numpy as np
+from ultralytics import YOLO
+
+detector = YOLO("yolo11n.pt")        # COCO detector from Chapter 23; class 0 is "person"
+cap = cv2.VideoCapture("street.mp4")
+
+# TODO: loop over frames with cap.read(); for each frame run the detector,
+#       keep only class-0 (person) boxes with conf > 0.4, and collect them as
+#       an (N, 5) array of [x1, y1, x2, y2, score] per frame in `frames_dets`.
+frames_dets = []
+# Hint: r = detector(frame, verbose=False)[0]; inspect r.boxes.cls / .conf / .xyxy
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Inside the loop: <code>ok, frame = cap.read(); if not ok: break</code>. Then <code>r = detector(frame, verbose=False)[0]</code>, build a boolean mask <code>(r.boxes.cls == 0) &amp; (r.boxes.conf &gt; 0.4)</code>, and stack <code>r.boxes.xyxy[mask]</code> with <code>r.boxes.conf[mask]</code> into one array. Keep the frames themselves in a list too if you want to draw the result later.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Write the IoU helper and a cost matrix</h4>
+<p>Association needs a similarity between a predicted track box and a new detection box. Intersection-over-union is the standard choice. Build a vectorized IoU that compares every track to every detection at once, then turn it into a cost matrix (one minus IoU) for the matcher.</p>
+<pre><code class="language-python">def iou_matrix(tracks_xyxy, dets_xyxy):
+    # tracks_xyxy: (T, 4), dets_xyxy: (D, 4) -> (T, D) IoU
+    # TODO: compute pairwise intersection area, union area, and return I / U.
+    # Hint: broadcast with tracks[:, None, :] against dets[None, :, :]
+    ...
+    return iou
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>x1 = np.maximum(t[:,None,0], d[None,:,0])</code> and likewise for the other three corners (max for the top-left, min for the bottom-right). Intersection width is <code>(x2 - x1).clip(min=0)</code>; union is area_t + area_d minus intersection. Add <code>1e-9</code> to the denominator.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Predict each track forward with constant velocity</h4>
+<p>Before matching frame <em>t</em>, predict where each existing track should be, using the velocity estimated from its last two boxes. Matching against the predicted box rather than the last observed box is what lets a tracker follow a fast mover, exactly the point of Exercise 26.5.1.</p>
+<pre><code class="language-python">class Track:
+    def __init__(self, box, track_id):
+        self.id = track_id
+        self.box = np.asarray(box, float)   # last observed [x1,y1,x2,y2]
+        self.vel = np.zeros(4)              # per-frame velocity of the box corners
+        self.age = 0; self.misses = 0       # frames since birth / since last match
+
+    def predict(self):
+        # TODO: return the predicted box for this frame as self.box + self.vel
+        ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Keep it simple: <code>return self.box + self.vel</code>. You will update <code>self.vel</code> when a detection matches (Step 4) as <code>new_box - self.box</code>, optionally smoothed, e.g. <code>self.vel = 0.7*self.vel + 0.3*(new_box - self.box)</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Match, then birth, age, and retire tracks</h4>
+<p>This is the core update. Predict every track, score it against every detection, solve the assignment, and accept only matches above an IoU gate. Matched tracks absorb the detection; unmatched detections start new tracks; unmatched tracks miss a frame and are deleted after a few consecutive misses.</p>
+<pre><code class="language-python">from scipy.optimize import linear_sum_assignment
+
+def update(tracks, dets, next_id, iou_gate=0.3, max_misses=15):
+    preds = np.array([t.predict() for t in tracks]) if tracks else np.empty((0,4))
+    # TODO: build the IoU matrix between preds and dets, solve with
+    #       linear_sum_assignment(1 - iou), and split into matched pairs
+    #       (iou >= iou_gate), unmatched detections, and unmatched tracks.
+    # TODO: update matched tracks (box, vel, misses=0); spawn a Track for each
+    #       unmatched detection; increment misses on unmatched tracks and drop
+    #       any with misses > max_misses.
+    return tracks, next_id
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>row, col = linear_sum_assignment(1 - iou)</code> gives candidate pairs; keep only those where <code>iou[r, c] &gt;= iou_gate</code>. Track indices not in the kept rows are unmatched tracks; detection indices not in the kept columns are unmatched detections. Birth a track with <code>Track(dets[d, :4], next_id); next_id += 1</code>.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Run the tracker over the whole clip</h4>
+<p>Drive the update across every frame, collecting, for each track id, the sequence of box centers it visited. This per-id trajectory is what the counting step in Step 6 consumes, and it is the object permanence the bare detector of <a href="../module-23-object-detection/index.html">Chapter 23</a> never had.</p>
+<pre><code class="language-python">tracks, next_id = [], 0
+trajectories = {}                 # id -> list of (cx, cy) centers over time
+
+for dets in frames_dets:
+    tracks, next_id = update(tracks, dets, next_id)
+    # TODO: for each live track, append its box center to trajectories[track.id]
+    ...
+
+print(f"{len(trajectories)} distinct tracks seen across the clip")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The center of a box <code>[x1,y1,x2,y2]</code> is <code>((x1+x2)/2, (y1+y2)/2)</code>. Use <code>trajectories.setdefault(t.id, []).append(center)</code>. The count of distinct track ids approximates the number of distinct people, before line-crossing logic narrows it to those who actually crossed.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Count unique line crossings</h4>
+<p>Pick a horizontal line at some image row. A person has crossed when their trajectory passes from one side of the line to the other. Counting crossings per track id (rather than per frame) is the whole payoff of tracking: identity is what stops you from counting the same person dozens of times.</p>
+<pre><code class="language-python">LINE_Y = 360            # the counting line, in pixels (tune to your video)
+crossed = set()
+
+# TODO: for each id's trajectory, check whether consecutive centers move from
+#       above LINE_Y to below it (or vice versa); if so, add the id to `crossed`.
+print(f"{len(crossed)} people crossed the line")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For consecutive centers <code>(_, y0)</code> and <code>(_, y1)</code> in a trajectory, a crossing happened when <code>(y0 - LINE_Y)</code> and <code>(y1 - LINE_Y)</code> have opposite signs. Add the id to the set on the first such event so each person counts once. Restricting to one direction (<code>y0 &lt; LINE_Y &lt;= y1</code>) counts only downward crossings.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>A console report of the number of distinct tracks and the number of unique line crossings, plus, if you draw the boxes, an annotated video where each person keeps the same numbered, same-colored box from frame to frame. On a clean street clip the crossing count should match a manual tally within one or two, and the failure cases are instructive: an ID switch (two people swapping numbers) appears when paths cross and IoU alone cannot disambiguate them, the exact failure that the appearance embedding of DeepSORT was built to fix. If your count is wildly too high, your tracks are fragmenting and being reborn with new ids, so raise <code>max_misses</code> or lower the IoU gate.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li><strong>Library shortcut (the "Right Tool").</strong> Replace Steps 1 through 5 with the two-line streaming tracker from the Library Shortcut above: <code>for r in YOLO("yolo11n.pt").track(source="street.mp4", tracker="bytetrack.yaml", persist=True, stream=True):</code> and read <code>r.boxes.id</code> for the same per-object identities. Feed those ids into your Step 6 counter and confirm the crossing count agrees with your from-scratch pipeline. Note how much association bookkeeping the library absorbed.</li>
+<li><strong>Add an appearance term (DeepSORT).</strong> Compute a simple color-histogram embedding for each detection crop and add a cosine-distance appearance cost to the IoU cost in Step 4. Re-run on a clip where two people cross and confirm the ID switch disappears, reproducing the DeepSORT contribution of this section.</li>
+<li><strong>Add the low-confidence pass (ByteTrack).</strong> Keep detections down to a confidence of 0.1, split them into high and low sets, and add a second matching pass that links still-unmatched tracks to the low-confidence boxes, as in Code Fragment 4. Measure ID switches with and without it on a crowded clip, connecting the result to Exercise 26.5.3.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2, numpy as np
+from scipy.optimize import linear_sum_assignment
+from ultralytics import YOLO
+
+# ---- Step 1: decode + detect per frame ----
+detector = YOLO("yolo11n.pt")
+cap = cv2.VideoCapture("street.mp4")
+frames_dets = []
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    r = detector(frame, verbose=False)[0]
+    mask = (r.boxes.cls == 0) &amp; (r.boxes.conf &gt; 0.4)          # class 0 = person
+    xyxy = r.boxes.xyxy[mask].cpu().numpy()
+    conf = r.boxes.conf[mask].cpu().numpy()[:, None]
+    frames_dets.append(np.hstack([xyxy, conf]) if len(xyxy) else np.empty((0, 5)))
+cap.release()
+
+# ---- Step 2: vectorized IoU ----
+def iou_matrix(t, d):
+    if len(t) == 0 or len(d) == 0:
+        return np.zeros((len(t), len(d)))
+    x1 = np.maximum(t[:, None, 0], d[None, :, 0])
+    y1 = np.maximum(t[:, None, 1], d[None, :, 1])
+    x2 = np.minimum(t[:, None, 2], d[None, :, 2])
+    y2 = np.minimum(t[:, None, 3], d[None, :, 3])
+    inter = (x2 - x1).clip(min=0) * (y2 - y1).clip(min=0)
+    at = (t[:, 2] - t[:, 0]) * (t[:, 3] - t[:, 1])
+    ad = (d[:, 2] - d[:, 0]) * (d[:, 3] - d[:, 1])
+    return inter / (at[:, None] + ad[None, :] - inter + 1e-9)
+
+# ---- Step 3: track with constant-velocity prediction ----
+class Track:
+    def __init__(self, box, track_id):
+        self.id = track_id
+        self.box = np.asarray(box, float)
+        self.vel = np.zeros(4)
+        self.age = 0
+        self.misses = 0
+    def predict(self):
+        return self.box + self.vel
+    def correct(self, box):
+        box = np.asarray(box, float)
+        self.vel = 0.7 * self.vel + 0.3 * (box - self.box)
+        self.box = box
+        self.age += 1
+        self.misses = 0
+
+# ---- Step 4: match + birth/age/retire ----
+def update(tracks, dets, next_id, iou_gate=0.3, max_misses=15):
+    preds = np.array([t.predict() for t in tracks]) if tracks else np.empty((0, 4))
+    dboxes = dets[:, :4] if len(dets) else np.empty((0, 4))
+    iou = iou_matrix(preds, dboxes)
+    matched_t, matched_d = set(), set()
+    if iou.size:
+        rows, cols = linear_sum_assignment(1 - iou)
+        for r_i, c_i in zip(rows, cols):
+            if iou[r_i, c_i] &gt;= iou_gate:
+                tracks[r_i].correct(dboxes[c_i])
+                matched_t.add(r_i); matched_d.add(c_i)
+    # unmatched detections -> new tracks
+    for j in range(len(dboxes)):
+        if j not in matched_d:
+            tracks.append(Track(dboxes[j], next_id)); next_id += 1
+    # unmatched tracks -> age, then prune
+    survivors = []
+    for i, t in enumerate(tracks[:len(preds)]):
+        if i not in matched_t:
+            t.misses += 1
+    for t in tracks:
+        if t.misses &lt;= max_misses:
+            survivors.append(t)
+    return survivors, next_id
+
+# ---- Step 5: run over the clip ----
+tracks, next_id = [], 0
+trajectories = {}
+for dets in frames_dets:
+    tracks, next_id = update(tracks, dets, next_id)
+    for t in tracks:
+        cx = (t.box[0] + t.box[2]) / 2
+        cy = (t.box[1] + t.box[3]) / 2
+        trajectories.setdefault(t.id, []).append((cx, cy))
+print(f"{len(trajectories)} distinct tracks seen across the clip")
+
+# ---- Step 6: unique line crossings ----
+LINE_Y = 360
+crossed = set()
+for tid, traj in trajectories.items():
+    for (_, y0), (_, y1) in zip(traj, traj[1:]):
+        if (y0 - LINE_Y) * (y1 - LINE_Y) &lt; 0:          # opposite sides of the line
+            crossed.add(tid)
+            break
+print(f"{len(crossed)} people crossed the line")
+
+# ---- Stretch: the same result with production ByteTrack ----
+# crossed_lib = set()
+# yolo = YOLO("yolo11n.pt")
+# for r in yolo.track(source="street.mp4", tracker="bytetrack.yaml",
+#                     persist=True, stream=True, classes=[0], verbose=False):
+#     if r.boxes.id is None:
+#         continue
+#     for box, tid in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.id.cpu().numpy()):
+#         cy = (box[1] + box[3]) / 2
+#         # accumulate per-id centers and apply the same crossing test as above
+</code></pre>
+</details>
 </div>
 
 <nav class="chapter-nav">

@@ -100,10 +100,267 @@ This chapter builds directly on <a href="../module-12-camera-models-calibration/
 </li>
 </ul>
 
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Whole Chapter in One Mental Model</div>
+<p>If only one schema survives the week, make it the chapter's spine, a five-link chain that runs left to right: <strong>constrain, encode, estimate, match, intersect.</strong> A second view <em>constrains</em> each match to an epipolar line (13.1); that constraint <em>encodes</em> into one $3 \times 3$ matrix, $E$ or $F$ (13.2), with the homography $H$ as its point-to-point special case (13.3); robust fitting <em>estimates</em> the matrix and the camera motion hiding inside it (13.2); rectification turns the lines into scanlines so a dense matcher can <em>match</em> every pixel into a disparity (13.4); and triangulation <em>intersects</em> the rays, via $Z = fB/d$ for rectified pairs (13.5) or the DLT for arbitrary ones (13.6), to recover 3D points. Two phrases anchor the consequences: depth from images is recoverable only <strong>up to scale</strong> until something metric pins it, and depth precision degrades with the <strong>square of distance</strong>. Every later 3D chapter, Chapter 14's structure from motion and Chapter 27's neural scenes, runs this same five-link chain inside its inner loop. The <a href="#lab-13">Hands-On Lab</a> at the end of this chapter walks all five links in one runnable program against a synthetic cube that lets you grade every step.</p>
+</div>
+
+<section class="lab" id="lab-13">
+<h2>Hands-On Lab: A Two-View Reconstruction From Scratch</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 75 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Run the chapter's whole five-link chain (constrain, encode, estimate, match, intersect) inside one runnable program. You will start from two views of a known synthetic cube, estimate the essential matrix from point matches, recover the camera motion hiding inside it, triangulate the matched points into 3D, then check your reconstruction against ground truth with reprojection error. Because the scene is synthesized with exact camera poses, the lab grades itself: you can compare your recovered rotation, translation direction, and 3D points to the values that generated the images, something no real dataset lets you do.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Projecting known 3D points through two calibrated cameras to build a self-checking correspondence set (the pinhole model of <a href="../module-12-camera-models-calibration/index.html">Chapter 12</a> used in reverse).</li>
+<li>Estimating the essential matrix from matches and recovering relative pose with the cheirality test (Section 13.2).</li>
+<li>Verifying the epipolar constraint $x'^\top E x = 0$ numerically on your own matches (Section 13.1).</li>
+<li>Triangulating matched pairs into 3D points with the linear DLT method and resolving the up-to-scale ambiguity (Section 13.6).</li>
+<li>Auditing a reconstruction with reprojection error, the same metric bundle adjustment minimizes in <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>Two libraries and no dataset; the script generates its own cube and cameras, so it always runs to completion. Install with:</p>
+<pre><code class="language-bash">pip install opencv-python numpy</code></pre>
+<p>Everything runs on the CPU in well under a second. Matplotlib is optional and only used by the final stretch goal for a 3D scatter of the recovered points.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Build a synthetic scene and two cameras</h4>
+<p>Define the 3D corners of a cube and two calibrated cameras with the same intrinsics $K$ but different poses. The second camera is the first translated sideways (a baseline) and rotated slightly toward the scene, exactly the rig of Section 13.1.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+np.random.seed(0)
+
+# Shared intrinsics: 800 px focal length, principal point at image center.
+K = np.array([[800, 0, 320],
+              [0, 800, 240],
+              [0,   0,   1]], float)
+
+# A cube of 3D points in world coordinates, sitting in front of the cameras.
+g = np.linspace(-0.5, 0.5, 3)
+X = np.array([[x, y, z] for x in g for y in g for z in g]) + [0, 0, 6]
+
+# Camera 1 is the world origin (R = I, t = 0).
+R1, t1 = np.eye(3), np.zeros(3)
+
+# TODO: define camera 2's pose. Build a small rotation R2 about the y axis
+# (use cv2.Rodrigues on the vector [0, -0.15, 0]) and a translation
+# t2 = [1.0, 0, 0] (a 1-metre rightward baseline). Keep them as (3,3) and (3,).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>R2, _ = cv2.Rodrigues(np.array([0.0, -0.15, 0.0]))</code> gives the rotation matrix; <code>t2 = np.array([1.0, 0.0, 0.0])</code> is the baseline. A camera pose maps a world point $X$ to camera coordinates as $R X + t$, so these two numbers fully place camera 2.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Project the cube into both images</h4>
+<p>Push every 3D corner through each camera with the projection $x \sim K (R X + t)$ to get two sets of pixel coordinates. These perfectly corresponding pixel pairs are the matches that <a href="../module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> would have produced from a real image, with zero outliers so you can isolate the geometry.</p>
+<pre><code class="language-python">def project(X, K, R, t):
+    Xc = X @ R.T + t                 # world -> camera coordinates
+    x = Xc @ K.T                     # camera -> homogeneous pixels
+    return x[:, :2] / x[:, 2:3]      # perspective divide
+
+pts1 = project(X, K, R1, t1)
+# TODO: produce pts2 the same way using R2 and t2 from Step 1.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>pts2 = project(X, K, R2, t2)</code>. Each row of <code>pts1</code> and the matching row of <code>pts2</code> are the same cube corner seen from the two views, the noiseless ideal of a verified match.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Estimate the essential matrix and check the epipolar constraint</h4>
+<p>Estimate $E$ from the matches with OpenCV's RANSAC-wrapped solver (Section 13.2), then verify it: every match should satisfy $x'^\top E x \approx 0$ when the points are expressed as normalized homogeneous rays $K^{-1}[x,y,1]^\top$ (Section 13.1).</p>
+<pre><code class="language-python">E, mask = cv2.findEssentialMat(pts1, pts2, K,
+                               method=cv2.RANSAC, prob=0.999, threshold=1.0)
+
+def to_rays(pts, K):
+    h = np.hstack([pts, np.ones((len(pts), 1))])
+    return h @ np.linalg.inv(K).T    # normalized image-plane rays
+
+r1, r2 = to_rays(pts1, K), to_rays(pts2, K)
+# TODO: compute the per-match epipolar residual r2[i] @ E @ r1[i] for all i
+# and print its maximum absolute value. It should be tiny (about 1e-12).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>res = np.einsum('ij,jk,ik-&gt;i', r2, E, r1)</code> gives one residual per match; <code>print(np.abs(res).max())</code>. A near-zero maximum confirms your $E$ encodes the same epipolar geometry that generated the points.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Recover the camera motion from E</h4>
+<p>Decompose $E$ into a rotation and a unit translation direction with <code>cv2.recoverPose</code>, which runs the cheirality test of Section 13.2 to pick the one physically valid solution out of the four that $E$ admits. Compare the result to the ground-truth pose from Step 1.</p>
+<pre><code class="language-python">n_in, R_est, t_est, _ = cv2.recoverPose(E, pts1, pts2, K)
+
+# Ground-truth relative pose (camera 1 -> camera 2).
+R_gt = R2
+t_gt = t2 / np.linalg.norm(t2)       # recoverPose returns t up to scale
+
+# TODO: print the rotation error in degrees and the angle between the
+# estimated and ground-truth translation directions. Both should be ~0.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Rotation error: <code>ang = np.degrees(np.arccos((np.trace(R_est @ R_gt.T) - 1) / 2))</code>. Translation direction error: <code>np.degrees(np.arccos(np.clip(abs(t_est.ravel() @ t_gt), -1, 1)))</code>. The <code>abs</code> absorbs the sign flip, since $E$ only fixes the baseline direction up to sign.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Triangulate the matches into 3D</h4>
+<p>Build the two camera projection matrices $P_1 = K[I \mid 0]$ and $P_2 = K[R_{est} \mid t_{est}]$, then call <code>cv2.triangulatePoints</code>, the linear DLT of Section 13.6. The output is homogeneous; divide through to get Euclidean 3D points.</p>
+<pre><code class="language-python">P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+P2 = K @ np.hstack([R_est, t_est])     # t_est is already a column vector
+
+Xh = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+# TODO: convert the 4xN homogeneous output Xh into an Nx3 array of
+# Euclidean points by dividing the first three rows by the fourth.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>X_est = (Xh[:3] / Xh[3]).T</code>. These points live in the reconstruction's own coordinate frame and are correct only up to a single global scale, because $t$ was recovered as a unit vector.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Fix the scale and measure 3D error</h4>
+<p>Depth from two views is recoverable only up to scale (the chapter's recurring caveat), so the recovered cube is the right shape but the wrong size. Estimate the single scale factor that best aligns your points to ground truth, apply it, and report the residual 3D error.</p>
+<pre><code class="language-python"># Centre both clouds, then find the scalar that best matches their sizes.
+Xc_gt = X - X.mean(0)
+Xc_est = X_est - X_est.mean(0)
+scale = (Xc_gt * Xc_est).sum() / (Xc_est * Xc_est).sum()
+
+# TODO: build X_aligned = scale * Xc_est + X.mean(0) and print the mean
+# Euclidean distance between X_aligned and the ground-truth X.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>X_aligned = scale * Xc_est + X.mean(0)</code>; <code>err = np.linalg.norm(X_aligned - X, axis=1).mean()</code>. On noiseless input this should be tiny (well below a millimetre), confirming the cube was reconstructed up to the expected scale freedom.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Audit with reprojection error</h4>
+<p>The honest final check, and the quantity <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a>'s bundle adjustment minimizes: project your triangulated points back into both images and measure how far they land from the original matches. Low reprojection error is the certificate that estimation, pose recovery, and triangulation all agree.</p>
+<pre><code class="language-python">def reproj_error(X3d, pts, P):
+    h = np.hstack([X3d, np.ones((len(X3d), 1))]) @ P.T
+    proj = h[:, :2] / h[:, 2:3]
+    return np.linalg.norm(proj - pts, axis=1).mean()
+
+# TODO: print the mean reprojection error in both views using X_est
+# (the unscaled triangulation), P1 with pts1, and P2 with pts2.
+print("inliers used by recoverPose:", n_in)
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>print(reproj_error(X_est, pts1, P1), reproj_error(X_est, pts2, P2))</code>. Use the unscaled <code>X_est</code> here, not <code>X_aligned</code>: reprojection error is scale-invariant because the global scale cancels in the projection. Both numbers should be a small fraction of a pixel.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>The script prints, in order: an epipolar residual maximum near <code>1e-12</code> (Step 3); a rotation error and a translation-direction error both within a small fraction of a degree (Step 4); a mean 3D alignment error well below a millimetre after scale fixing (Step 6); and two reprojection errors, one per view, each a tiny fraction of a pixel (Step 7), alongside the inlier count (all matches, since the input is noiseless). The takeaway is concrete: from nothing but two pixel-coordinate lists and $K$, you recovered the camera motion and the 3D cube up to scale, and every internal consistency check passed.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Add Gaussian pixel noise to <code>pts1</code> and <code>pts2</code> (for example <code>pts + np.random.normal(0, 0.5, pts.shape)</code>) and plot how rotation error, translation-direction error, and reprojection error grow as the noise standard deviation rises from 0 to 2 pixels. This reproduces in miniature why real pipelines wrap every estimator in RANSAC and a refinement step.</li>
+<li>Make depth metric instead of up-to-scale: assume you know the true baseline length (1 metre) and rescale the reconstruction by the ratio of the known baseline to the recovered unit translation, then verify the cube edge length comes out at 1 metre. This is the metric-pinning move of Section 13.5.</li>
+<li>Library shortcut, the Right Tool principle in action: replace your hand-rolled scale alignment in Step 6 with a single call to <code>cv2.estimateAffine3D</code> (or a Procrustes/Umeyama similarity fit) to register the two point clouds, and visualize both with a Matplotlib 3D scatter. Note how much of the manual centring and scaling the library absorbs.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+np.random.seed(0)
+
+K = np.array([[800, 0, 320],
+              [0, 800, 240],
+              [0,   0,   1]], float)
+
+g = np.linspace(-0.5, 0.5, 3)
+X = np.array([[x, y, z] for x in g for y in g for z in g]) + [0, 0, 6]
+
+R1, t1 = np.eye(3), np.zeros(3)
+R2, _ = cv2.Rodrigues(np.array([0.0, -0.15, 0.0]))
+t2 = np.array([1.0, 0.0, 0.0])
+
+def project(X, K, R, t):
+    Xc = X @ R.T + t
+    x = Xc @ K.T
+    return x[:, :2] / x[:, 2:3]
+
+pts1 = project(X, K, R1, t1)
+pts2 = project(X, K, R2, t2)
+
+E, mask = cv2.findEssentialMat(pts1, pts2, K,
+                               method=cv2.RANSAC, prob=0.999, threshold=1.0)
+
+def to_rays(pts, K):
+    h = np.hstack([pts, np.ones((len(pts), 1))])
+    return h @ np.linalg.inv(K).T
+
+r1, r2 = to_rays(pts1, K), to_rays(pts2, K)
+res = np.einsum('ij,jk,ik->i', r2, E, r1)
+print("max epipolar residual:", np.abs(res).max())
+
+n_in, R_est, t_est, _ = cv2.recoverPose(E, pts1, pts2, K)
+R_gt = R2
+t_gt = t2 / np.linalg.norm(t2)
+rot_err = np.degrees(np.arccos((np.trace(R_est @ R_gt.T) - 1) / 2))
+trans_err = np.degrees(np.arccos(np.clip(abs(t_est.ravel() @ t_gt), -1, 1)))
+print("rotation error (deg):", rot_err)
+print("translation direction error (deg):", trans_err)
+
+P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+P2 = K @ np.hstack([R_est, t_est])
+Xh = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+X_est = (Xh[:3] / Xh[3]).T
+
+Xc_gt = X - X.mean(0)
+Xc_est = X_est - X_est.mean(0)
+scale = (Xc_gt * Xc_est).sum() / (Xc_est * Xc_est).sum()
+X_aligned = scale * Xc_est + X.mean(0)
+print("mean 3D error after scale fix:",
+      np.linalg.norm(X_aligned - X, axis=1).mean())
+
+def reproj_error(X3d, pts, P):
+    h = np.hstack([X3d, np.ones((len(X3d), 1))]) @ P.T
+    proj = h[:, :2] / h[:, 2:3]
+    return np.linalg.norm(proj - pts, axis=1).mean()
+
+print("reprojection error view 1:", reproj_error(X_est, pts1, P1))
+print("reprojection error view 2:", reproj_error(X_est, pts2, P2))
+print("inliers used by recoverPose:", n_in)</code></pre>
+</details>
+</section>
+
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>
-Two views recover depth along a single baseline; the obvious next question is what happens with two hundred views, or with a video stream from a camera that never stops moving. <a href="../module-14-sfm-visual-slam/index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a> generalizes everything built here: pairwise relative poses chain into global camera trajectories, triangulated points merge into a single 3D model, and bundle adjustment polishes both simultaneously. The two-view estimators of this chapter literally run inside those systems, thousands of times per reconstruction, which is why getting them right here pays off there.
+Two views recover depth along a single baseline; the obvious next question is what happens with two hundred views, or with a video stream from a camera that never stops moving. <a href="../module-14-sfm-visual-slam/index.html">Chapter 14: Structure from Motion &amp; Visual SLAM</a> generalizes everything built here: pairwise relative poses chain into global camera trajectories, triangulated points merge into a single 3D model, and bundle adjustment polishes both simultaneously. The two-view estimators of this chapter literally run inside those systems, thousands of times per reconstruction, which is why getting them right here pays off there. The Hands-On Lab above is a one-pair instance of exactly that inner loop, reprojection-error audit and all.
 </p>
 </div>
 

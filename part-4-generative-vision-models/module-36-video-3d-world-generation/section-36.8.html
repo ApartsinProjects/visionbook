@@ -208,6 +208,338 @@ World-model evaluation is itself a fast-moving research area. The central 2024 t
 <p><span class="exercise-type">Analysis.</span> The chapter presented generative world models (Sections 36.5, 36.6) and predictive ones (Section 36.7). Design an evaluation protocol that can fairly compare a pixel-rendering simulator against a decoder-free JEPA predictor on the same task, given that one produces video and the other produces only embeddings. Which triad axes can be measured for both without rendering, and which require a decoder, and what does that asymmetry imply about how to run a fair benchmark?</p>
 </div>
 
+<p>
+This is the place to assemble the whole chapter into one running system. The capstone lab below builds a tiny latent-dynamics world model, the recurrent state-space recipe of <a href="section-36.5.html">Section 36.5</a> stripped to its essentials, trains a policy entirely in imagination, and then scores it on the consistency triad this section defined. It is the chapter's single thread, a latent space with dynamics, made into something you can run and measure.
+</p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build and Evaluate a Tiny World Model</div>
+
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 75 minutes</span>
+<span class="lab-difficulty">Advanced</span>
+</div>
+
+<div class="lab-objective">
+<p><strong>Objective.</strong> Build a complete, self-contained world-model agent on a toy environment that needs no external dataset or GPU: a recurrent state-space model (RSSM) that learns the environment's latent dynamics from logged experience, a policy trained <em>entirely in imagination</em> on dreamed rollouts (the Dreamer recipe of <a href="section-36.5.html">Section 36.5</a>), and an evaluation harness that scores the result on the consistency triad of this section: one-step prediction accuracy (physical consistency), action controllability, and long-horizon coherence (prediction drift over a rollout). The finished artifact is a single figure with three panels, one per triad axis, plus a printed agent return, that lets you say not just "the agent learned" but "the dream is faithful in these specific ways and unfaithful in those."</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Implementing the RSSM transition (deterministic GRU memory plus a stochastic latent with a prior used for imagination and a posterior used for training) from <a href="section-36.5.html">Section 36.5</a>.</li>
+<li>Training latent dynamics with the reconstruction-plus-KL objective, the same evidence-lower-bound structure as the VAEs of <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>.</li>
+<li>Running an imagination rollout and training a policy on dreamed trajectories without touching the environment, the sample-efficiency payoff of the three-loops schema.</li>
+<li>Measuring action controllability by checking that different actions produce measurably different predicted futures, the second triad axis of this section.</li>
+<li>Quantifying long-horizon coherence as the growth of open-loop prediction error, the drift diagnostic that separates a renderer from a simulator.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>Runs on CPU in minutes; no GPU, no Gym, and no downloads are required. The environment is a tiny deterministic-plus-noise navigation task defined in pure NumPy and PyTorch so the whole lab is reproducible from one file.</p>
+<pre><code class="language-bash">pip install torch numpy matplotlib</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Define a tiny controllable environment and log experience</h4>
+<p>A world model needs experience to learn from. Build a 1D "slider" task: a point on a line moves left or right by the chosen action plus a little noise, and the observation is a noisy reading of the position. Logging random episodes gives the model loop something to train on, exactly the cheap experience the warehouse-robot story in Section 36.5 logged before dreaming.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F, numpy as np
+torch.manual_seed(0); np.random.seed(0)
+ACTIONS = torch.tensor([-1.0, 0.0, 1.0])   # left, stay, right
+
+def step_env(pos, action_idx):
+    pos = np.clip(pos + 0.1 * ACTIONS[action_idx].item() + 0.01 * np.random.randn(), -1, 1)
+    obs = pos + 0.02 * np.random.randn()    # noisy observation of true position
+    reward = 1.0 - abs(pos)                  # reward peaks at the center (pos = 0)
+    return pos, np.array([obs], dtype=np.float32), reward
+
+def log_episode(T=30):
+    pos, obs_seq, act_seq, rew_seq = np.random.uniform(-1, 1), [], [], []
+    for _ in range(T):
+        a = np.random.randint(3)
+        pos, obs, r = step_env(pos, a)
+        # TODO: append obs, a one-hot of the action (length 3), and r to the three lists.
+        # Hint: one_hot = np.eye(3, dtype=np.float32)[a]
+        ...
+    return np.stack(obs_seq), np.stack(act_seq), np.array(rew_seq, dtype=np.float32)
+
+episodes = [log_episode() for _ in range(200)]   # the replay buffer
+print(episodes[0][0].shape, episodes[0][1].shape)  # (30, 1) (30, 3)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Inside the loop: <code>obs_seq.append(obs); act_seq.append(np.eye(3, dtype=np.float32)[a]); rew_seq.append(r)</code>. The one-hot action vector is what the RSSM and the policy both consume.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build the RSSM cell</h4>
+<p>This is the engine of Section 36.5, scaled down. The GRU carries deterministic memory; the prior predicts the next stochastic latent from memory alone (used when dreaming); the posterior corrects it with the observation (used in training). A small decoder maps the latent state back to a predicted observation and reward so the model can be trained and scored.</p>
+<pre><code class="language-python">class RSSM(nn.Module):
+    def __init__(self, stoch=8, deter=32, act=3, obs=1, hidden=64):
+        super().__init__()
+        self.gru = nn.GRUCell(stoch + act, deter)
+        self.prior = nn.Sequential(nn.Linear(deter, hidden), nn.SiLU(), nn.Linear(hidden, 2 * stoch))
+        self.post  = nn.Sequential(nn.Linear(deter + obs, hidden), nn.SiLU(), nn.Linear(hidden, 2 * stoch))
+        self.dec   = nn.Sequential(nn.Linear(deter + stoch, hidden), nn.SiLU(), nn.Linear(hidden, obs + 1))
+        self.stoch = stoch
+
+    def sample(self, params):
+        mean, logstd = params.chunk(2, -1)
+        std = torch.exp(logstd.clamp(-5, 2))
+        return mean + std * torch.randn_like(std), mean, std
+
+    def forward(self, z, a, h, obs=None):
+        h = self.gru(torch.cat([z, a], -1), h)        # advance deterministic memory
+        prior = self.prior(h)
+        if obs is None:                                # IMAGINATION: dream the next state
+            z, _, _ = self.sample(prior)
+            return z, h, prior, None
+        # TODO: compute the posterior from cat([h, obs]), sample z from it, and return
+        #       (z, h, prior, post) so the KL(post || prior) loss can be formed in Step 3.
+        ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>post = self.post(torch.cat([h, obs], -1)); z, _, _ = self.sample(post); return z, h, prior, post</code>. The decoder is not called here; it is applied to <code>cat([h, z])</code> in the training and evaluation loops.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Train the latent dynamics (the model loop)</h4>
+<p>Unroll the RSSM over each logged episode with the posterior, decode the predicted observation and reward at every step, and minimize reconstruction error plus the KL that pulls the prior (the dreaming path) toward the posterior (the observing path). This KL is the term that teaches the prior to dream accurately, the same ELBO structure as a VAE.</p>
+<pre><code class="language-python">def kl(prior, post):
+    pm, pls = prior.chunk(2, -1); qm, qls = post.chunk(2, -1)
+    pv, qv = torch.exp(pls.clamp(-5, 2)) ** 2, torch.exp(qls.clamp(-5, 2)) ** 2
+    return (0.5 * ((qm - pm) ** 2 / pv + qv / pv - 1 + (pv.log() - qv.log()))).sum(-1).mean()
+
+model = RSSM(); opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+for epoch in range(40):
+    obs, act, rew = [torch.tensor(np.stack(x)) for x in zip(*episodes)]  # [B, T, .]
+    B, Tn = obs.shape[0], obs.shape[1]
+    z, h = torch.zeros(B, model.stoch), torch.zeros(B, 32)
+    rec_loss, kl_loss = 0.0, 0.0
+    for t in range(Tn):
+        z, h, prior, post = model(z, act[:, t], h, obs=obs[:, t])
+        pred = model.dec(torch.cat([h, z], -1))
+        # TODO: add MSE(pred[:, :1], obs[:, t]) + MSE(pred[:, 1:], rew[:, t:t+1]) to rec_loss,
+        #       and add kl(prior, post) to kl_loss.
+        ...
+    loss = rec_loss / Tn + 1.0 * kl_loss / Tn
+    opt.zero_grad(); loss.backward(); opt.step()
+    if epoch % 10 == 0: print(f"epoch {epoch}  rec {rec_loss.item()/Tn:.4f}  kl {kl_loss.item()/Tn:.4f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>rec_loss = rec_loss + F.mse_loss(pred[:, :1], obs[:, t]) + F.mse_loss(pred[:, 1:], rew[:, t:t+1]); kl_loss = kl_loss + kl(prior, post)</code>. Reconstruction loss should fall well below 0.01; if the KL collapses to zero, lower its weight, the posterior-collapse failure of Chapter 31.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Train a policy in imagination (the imagination loop)</h4>
+<p>Now never touch the environment again. Roll the trained RSSM forward with the prior only, let a tiny policy choose actions from the latent state, decode the predicted reward, and train the policy to maximize total dreamed reward. Because the whole rollout is differentiable, the gradient of return flows back through the imagined dynamics into the policy, the analytic policy gradient model-free methods cannot get.</p>
+<pre><code class="language-python">policy = nn.Sequential(nn.Linear(32 + 8, 64), nn.SiLU(), nn.Linear(64, 3))
+popt = torch.optim.Adam(policy.parameters(), lr=3e-3)
+for it in range(300):
+    z, h = torch.zeros(64, 8), torch.zeros(64, 32)   # 64 parallel dreams
+    total_reward = 0.0
+    for _ in range(15):                               # 15-step imagined horizon
+        logits = policy(torch.cat([h, z], -1))
+        a = F.softmax(logits, -1)                     # soft action keeps it differentiable
+        z, h, _, _ = model(z, a, h, obs=None)         # dream forward with the prior
+        # TODO: decode the reward (last column of model.dec(cat([h, z]))) and add its
+        #       mean to total_reward.
+        ...
+    loss = -total_reward                              # maximize dreamed return
+    popt.zero_grad(); loss.backward(); popt.step()
+    if it % 100 == 0: print(f"iter {it}  dreamed return {total_reward.item():.3f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>r = model.dec(torch.cat([h, z], -1))[:, 1:]; total_reward = total_reward + r.mean()</code>. The dreamed return should climb as the policy learns to steer the slider toward the center where reward peaks.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Score the consistency triad</h4>
+<p>This is the section's payoff: a world model is only as good as its dream, so measure it. Compute three numbers, one per triad axis. (1) <em>Physical consistency</em>: one-step open-loop prediction error against held-out real episodes. (2) <em>Controllability</em>: dream two futures from the same state with all-left versus all-right actions and check the predicted positions diverge. (3) <em>Coherence</em>: open-loop prediction error as a function of rollout length, the drift curve.</p>
+<pre><code class="language-python">@torch.no_grad()
+def open_loop_error(horizon):
+    obs, act, _ = [torch.tensor(np.stack(x)) for x in zip(*[log_episode() for _ in range(64)])]
+    z, h = torch.zeros(64, 8), torch.zeros(64, 32)
+    z, h, _, _ = model(z, act[:, 0], h, obs=obs[:, 0])   # one observed warm-up step
+    err = []
+    for t in range(1, horizon):
+        z, h, _, _ = model(z, act[:, t], h, obs=None)    # dream, no observation
+        pred_obs = model.dec(torch.cat([h, z], -1))[:, :1]
+        err.append(F.mse_loss(pred_obs, obs[:, t]).item())
+    return err
+
+# TODO: build the controllability check: from a fixed warmed-up (z, h), dream 10 steps
+#       with the all-left one-hot and again with the all-right one-hot, decode the final
+#       predicted observation for each, and report the absolute difference (should be > 0).
+drift = open_loop_error(horizon=25)
+print("one-step error:", drift[0], " 24-step error:", drift[-1])</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For controllability, reuse the warm-up from <code>open_loop_error</code>, then run two separate dream loops feeding <code>ACTIONS</code> index 0 (left) and index 2 (right) as fixed one-hot tensors; decode each final state and compare. A faithful model gives a clearly positive gap; a degenerate one gives near zero, meaning actions do not control the future.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Plot the triad and read the verdict</h4>
+<p>Put the three measurements in one figure so the diagnosis is visual. The drift curve is the most revealing: a flat line means a faithful simulator, a sharply rising line means a renderer that looks plausible for one frame and then loses the plot, exactly the distinction this section argues photorealism metrics cannot see.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+fig, ax = plt.subplots(1, 3, figsize=(12, 3.2))
+ax[0].bar(["1-step"], [drift[0]]); ax[0].set_title("Physical consistency\n(lower is better)")
+ax[1].set_title("Controllability\n(left vs right gap)")    # fill from your Step 5 check
+ax[2].plot(range(1, 25), drift, marker="."); ax[2].set_title("Coherence: drift vs horizon")
+ax[2].set_xlabel("imagined step"); ax[2].set_ylabel("prediction MSE")
+plt.tight_layout(); plt.savefig("world_model_triad.png", dpi=130)
+print("saved world_model_triad.png")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Store the controllability gap from Step 5 in a variable and draw it with <code>ax[1].bar(["gap"], [gap])</code>. A healthy run shows a low one-step error, a clearly positive controllability gap, and a drift curve that rises gently rather than exploding.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Training prints a reconstruction loss falling below about 0.01 and a non-collapsed KL; the imagination loop prints a dreamed return that climbs as the policy learns to hold the slider near the center. The final figure <code>world_model_triad.png</code> has three panels: a small one-step prediction error (physical consistency), a clearly positive left-versus-right gap (controllability), and a drift curve that rises gradually with horizon (coherence). Read together, these say the dream is locally accurate, genuinely action-controllable, and degrades gracefully, the three things Section 36.8 argues an FVD or photorealism score would never reveal on its own.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Sabotage controllability on purpose: retrain with the action input to the GRU zeroed out, then re-run the triad. The one-step error may stay low while the controllability gap collapses to near zero, a concrete example of the "great FVD, terrible world model" clip from this section's first exercise.</li>
+<li>Add a rare high-stakes transition (a "wall" the slider rarely hits) that appears in only a handful of logged episodes, then check whether the dream ever predicts it, the rare-transition failure mode of the Section 36.5 analysis exercise.</li>
+<li>Right Tool: swap the from-scratch RSSM for the reference DreamerV3 implementation (<a href="https://github.com/danijar/dreamerv3" target="_blank" rel="noopener">github.com/danijar/dreamerv3</a>) on a Gym <code>CartPole-v1</code> task, the one-command path the library-shortcut callout in <a href="section-36.5.html">Section 36.5</a> shows, and compare its drift curve against your tiny model's.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F, numpy as np
+import matplotlib.pyplot as plt
+torch.manual_seed(0); np.random.seed(0)
+ACTIONS = torch.tensor([-1.0, 0.0, 1.0])
+
+# --- Step 1: environment and logging ---
+def step_env(pos, action_idx):
+    pos = np.clip(pos + 0.1 * ACTIONS[action_idx].item() + 0.01 * np.random.randn(), -1, 1)
+    obs = pos + 0.02 * np.random.randn()
+    reward = 1.0 - abs(pos)
+    return pos, np.array([obs], dtype=np.float32), reward
+
+def log_episode(T=30):
+    pos, obs_seq, act_seq, rew_seq = np.random.uniform(-1, 1), [], [], []
+    for _ in range(T):
+        a = np.random.randint(3)
+        pos, obs, r = step_env(pos, a)
+        obs_seq.append(obs); act_seq.append(np.eye(3, dtype=np.float32)[a]); rew_seq.append(r)
+    return np.stack(obs_seq), np.stack(act_seq), np.array(rew_seq, dtype=np.float32)
+
+episodes = [log_episode() for _ in range(200)]
+
+# --- Step 2: RSSM ---
+class RSSM(nn.Module):
+    def __init__(self, stoch=8, deter=32, act=3, obs=1, hidden=64):
+        super().__init__()
+        self.gru = nn.GRUCell(stoch + act, deter)
+        self.prior = nn.Sequential(nn.Linear(deter, hidden), nn.SiLU(), nn.Linear(hidden, 2 * stoch))
+        self.post  = nn.Sequential(nn.Linear(deter + obs, hidden), nn.SiLU(), nn.Linear(hidden, 2 * stoch))
+        self.dec   = nn.Sequential(nn.Linear(deter + stoch, hidden), nn.SiLU(), nn.Linear(hidden, obs + 1))
+        self.stoch = stoch
+    def sample(self, params):
+        mean, logstd = params.chunk(2, -1)
+        std = torch.exp(logstd.clamp(-5, 2))
+        return mean + std * torch.randn_like(std), mean, std
+    def forward(self, z, a, h, obs=None):
+        h = self.gru(torch.cat([z, a], -1), h)
+        prior = self.prior(h)
+        if obs is None:
+            z, _, _ = self.sample(prior)
+            return z, h, prior, None
+        post = self.post(torch.cat([h, obs], -1))
+        z, _, _ = self.sample(post)
+        return z, h, prior, post
+
+# --- Step 3: train dynamics ---
+def kl(prior, post):
+    pm, pls = prior.chunk(2, -1); qm, qls = post.chunk(2, -1)
+    pv, qv = torch.exp(pls.clamp(-5, 2)) ** 2, torch.exp(qls.clamp(-5, 2)) ** 2
+    return (0.5 * ((qm - pm) ** 2 / pv + qv / pv - 1 + (pv.log() - qv.log()))).sum(-1).mean()
+
+model = RSSM(); opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+for epoch in range(40):
+    obs, act, rew = [torch.tensor(np.stack(x)) for x in zip(*episodes)]
+    B, Tn = obs.shape[0], obs.shape[1]
+    z, h = torch.zeros(B, model.stoch), torch.zeros(B, 32)
+    rec_loss, kl_loss = 0.0, 0.0
+    for t in range(Tn):
+        z, h, prior, post = model(z, act[:, t], h, obs=obs[:, t])
+        pred = model.dec(torch.cat([h, z], -1))
+        rec_loss = rec_loss + F.mse_loss(pred[:, :1], obs[:, t]) + F.mse_loss(pred[:, 1:], rew[:, t:t+1])
+        kl_loss = kl_loss + kl(prior, post)
+    loss = rec_loss / Tn + 1.0 * kl_loss / Tn
+    opt.zero_grad(); loss.backward(); opt.step()
+    if epoch % 10 == 0: print(f"epoch {epoch}  rec {rec_loss.item()/Tn:.4f}  kl {kl_loss.item()/Tn:.4f}")
+
+# --- Step 4: policy in imagination ---
+policy = nn.Sequential(nn.Linear(32 + 8, 64), nn.SiLU(), nn.Linear(64, 3))
+popt = torch.optim.Adam(policy.parameters(), lr=3e-3)
+for it in range(300):
+    z, h = torch.zeros(64, 8), torch.zeros(64, 32)
+    total_reward = 0.0
+    for _ in range(15):
+        a = F.softmax(policy(torch.cat([h, z], -1)), -1)
+        z, h, _, _ = model(z, a, h, obs=None)
+        total_reward = total_reward + model.dec(torch.cat([h, z], -1))[:, 1:].mean()
+    (-total_reward).backward(); popt.step(); popt.zero_grad()
+    if it % 100 == 0: print(f"iter {it}  dreamed return {total_reward.item():.3f}")
+
+# --- Step 5: triad ---
+@torch.no_grad()
+def open_loop_error(horizon):
+    obs, act, _ = [torch.tensor(np.stack(x)) for x in zip(*[log_episode() for _ in range(64)])]
+    z, h = torch.zeros(64, 8), torch.zeros(64, 32)
+    z, h, _, _ = model(z, act[:, 0], h, obs=obs[:, 0])
+    err = []
+    for t in range(1, horizon):
+        z, h, _, _ = model(z, act[:, t], h, obs=None)
+        err.append(F.mse_loss(model.dec(torch.cat([h, z], -1))[:, :1], obs[:, t]).item())
+    return err
+
+@torch.no_grad()
+def controllability_gap():
+    obs, act, _ = [torch.tensor(np.stack(x)) for x in zip(*[log_episode() for _ in range(64)])]
+    z0, h0 = torch.zeros(64, 8), torch.zeros(64, 32)
+    z0, h0, _, _ = model(z0, act[:, 0], h0, obs=obs[:, 0])
+    outs = []
+    for idx in (0, 2):                                  # all-left, all-right
+        z, h = z0.clone(), h0.clone()
+        a = F.one_hot(torch.tensor(idx), 3).float().expand(64, 3)
+        for _ in range(10):
+            z, h, _, _ = model(z, a, h, obs=None)
+        outs.append(model.dec(torch.cat([h, z], -1))[:, :1])
+    return (outs[1] - outs[0]).abs().mean().item()
+
+drift = open_loop_error(25)
+gap = controllability_gap()
+print("one-step error:", drift[0], " 24-step error:", drift[-1], " control gap:", gap)
+
+# --- Step 6: plot ---
+fig, ax = plt.subplots(1, 3, figsize=(12, 3.2))
+ax[0].bar(["1-step"], [drift[0]]); ax[0].set_title("Physical consistency\n(lower is better)")
+ax[1].bar(["gap"], [gap]); ax[1].set_title("Controllability\n(left vs right gap)")
+ax[2].plot(range(1, 25), drift, marker="."); ax[2].set_title("Coherence: drift vs horizon")
+ax[2].set_xlabel("imagined step"); ax[2].set_ylabel("prediction MSE")
+plt.tight_layout(); plt.savefig("world_model_triad.png", dpi=130)
+print("saved world_model_triad.png")</code></pre>
+</details>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-36.7.html">&#8592; Section 36.7: Predictive World Models: JEPA &amp; Decoder-Free Latents</a>
 <a href="index.html">Chapter 36</a>

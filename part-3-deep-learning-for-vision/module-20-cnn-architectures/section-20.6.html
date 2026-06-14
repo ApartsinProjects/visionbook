@@ -199,6 +199,10 @@ Putting the chapter together, here is a procedure for choosing an architecture f
 <li><strong>Only then consider exotic options.</strong> Vision transformers (<a href="../module-22-vision-transformers/index.html">Chapter 22</a>), quantization and pruning (<a href="../module-28-efficient-vision-deployment/index.html">Chapter 28</a>), or a custom design, when a strong, pretrained CNN provably cannot meet the constraints.</li>
 </ol>
 
+<p>
+This checklist is exactly what the Hands-On Lab below turns into a runnable tool. You will profile the chapter's backbones on the four numbers, draw the frontier from your own measurements, and then fine-tune the model the checklist chooses, ending with a single decision report you could paste into a project ticket.
+</p>
+
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: The Defect Detector That Did Not Need a Transformer</div>
 <p><strong>Who:</strong> a manufacturing-vision team building a surface-defect classifier for an inline inspection camera, 2025. <strong>Situation:</strong> a vendor proposal recommended a large vision transformer, citing its ImageNet supremacy. <strong>Problem:</strong> the team had only about four thousand labeled defect images, a strict 15-millisecond-per-frame latency budget on an industrial edge box, and no GPU at the line. <strong>Decision:</strong> they followed the checklist: hard constraints first (CPU edge box, 15 ms, small dataset), so they took a pretrained EfficientNet-B0, re-headed it to their six defect classes, and full-fine-tuned it. <strong>Result:</strong> 96% accuracy after fine-tuning, 9 ms per frame on the edge CPU, trained in under an hour on a single workstation GPU. The transformer, tested for due diligence, needed far more data to match the accuracy and missed the latency budget badly. <strong>Lesson:</strong> the leaderboard champion is rarely the project champion. A pretrained efficient CNN, fine-tuned, is the correct first answer for the large majority of applied vision tasks, and the checklist gets you there without a month of experiments.</p>
@@ -207,6 +211,310 @@ Putting the chapter together, here is a procedure for choosing an architecture f
 <div class="callout research-frontier">
 <div class="callout-title">Research Frontier: The Backbone Is Becoming a Foundation Model</div>
 <p>The selection story is shifting under the field's feet from 2024 to 2026. Increasingly the strongest starting point is not an ImageNet-supervised backbone but a self-supervised foundation model (DINOv2, the SigLIP and CLIP image encoders, and successors), pretrained on hundreds of millions of unlabeled or weakly labeled images, whose frozen features rival fully fine-tuned task-specific networks (<a href="../module-25-self-supervised-foundation-models/index.html">Chapter 25</a>). Libraries like timm and Hugging Face now serve these alongside the classic CNNs, so the practical question is evolving from "which architecture?" to "which pretrained representation, and do I even need to fine-tune it?". The frontier-and-checklist discipline of this section still applies; what changes is that the cheapest sufficient model is more and more often a frozen foundation backbone with a small trained head. The architectures of this chapter remain the bodies of those foundation models, which is why understanding them is the durable skill.</p>
+</div>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Backbone Selection Bake-Off</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>backbone_bakeoff.py</code>, that loads several of this chapter's architectures from pretrained weights, measures all four stats-sheet numbers (parameters, FLOPs, measured latency, and published accuracy), plots the accuracy-versus-latency frontier from your own timings, then fine-tunes the model your decision checklist selects on a small dataset and prints a one-paragraph decision report. This is the whole chapter, from LeNet's template to ConvNeXt, turned into the selection tool the section's checklist describes.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Loading pretrained backbones (ResNet, EfficientNet, MobileNet, ConvNeXt) with a single factory call (subsection 3).</li>
+<li>Separating the four numbers, parameters, FLOPs, measured latency, and accuracy, and seeing where they disagree (subsection 1, <a href="section-20.4.html">Section 20.4</a>).</li>
+<li>Benchmarking forward-pass latency correctly, with warm-up and synchronization, and drawing the efficient frontier (Figure 20.6.1).</li>
+<li>Re-heading a frozen backbone and fine-tuning it on a small custom set instead of training from scratch (subsection 3).</li>
+<li>Turning measurements into a decision via the section's checklist rather than a leaderboard.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install torch torchvision timm matplotlib</code></pre>
+<p>A GPU makes the fine-tuning step faster but is not required; every step runs on CPU, and the timing step deliberately measures whatever hardware you are on. The fine-tuning step uses <code>torchvision.datasets.Flowers102</code>, which downloads automatically on first run (about 350 MB).</p>
+</div>
+
+<p>Put the section's selection procedure into practice below. Work the steps in order; each prints a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Load the candidate backbones from pretrained weights</h4>
+<p>Assemble the shortlist the checklist would consider on a server with a phone fallback. Loading pretrained weights is the chapter's central practical lesson: you almost never start from scratch.</p>
+<pre><code class="language-python">import timm
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+NAMES = ["resnet50", "efficientnet_b0", "mobilenetv3_small_100", "convnext_tiny"]
+
+# TODO: build a dict {name: model} of pretrained backbones in eval mode on `device`.
+# Hint: timm.create_model(name, pretrained=True), then .eval().to(device)
+models = {}
+for name in NAMES:
+    ...
+print({n: type(m).__name__ for n, m in models.items()})</code></pre>
+<details><summary>Hint</summary><p><code>timm.create_model(name, pretrained=True)</code> returns a ready model; chain <code>.eval().to(device)</code>. Wrap the loop body in a try/except so one missing weight file does not abort the whole shortlist.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Count parameters and estimate FLOPs</h4>
+<p>Two of the four numbers come from the model itself, no hardware needed. Counting them first shows why parameters and FLOPs are not interchangeable, the warning from subsection 1.</p>
+<pre><code class="language-python">def param_count_m(model):
+    # TODO: return the total parameter count in millions.
+    # Hint: sum p.numel() for p in model.parameters(), divide by 1e6
+    ...
+
+# FLOPs via fvcore if available, else skip gracefully.
+def gflops(model):
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        x = torch.randn(1, 3, 224, 224, device=next(model.parameters()).device)
+        return FlopCountAnalysis(model, x).total() / 1e9
+    except Exception:
+        return float("nan")
+
+for n, m in models.items():
+    print(f"{n:24s} params={param_count_m(m):6.1f}M  GFLOPs={gflops(m):6.2f}")</code></pre>
+<details><summary>Hint</summary><p><code>sum(p.numel() for p in model.parameters()) / 1e6</code> gives millions of parameters. FLOP counting needs a dummy input of the model's expected size; <code>fvcore</code> is optional, so degrade to <code>nan</code> rather than crashing if it is not installed.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Measure latency the right way</h4>
+<p>Latency is the only number that must be measured on your hardware. The discipline is warm-up first (to trigger lazy CUDA kernels and cache allocation), then synchronize, then time many runs and take the median.</p>
+<pre><code class="language-python">import time
+
+@torch.no_grad()
+def latency_ms(model, runs=30, warmup=5):
+    x = torch.randn(1, 3, 224, 224, device=device)
+    for _ in range(warmup):
+        model(x)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        model(x)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        # TODO: append the elapsed milliseconds for this run to `times`
+        ...
+    times.sort()
+    return times[len(times) // 2]  # median
+
+for n, m in models.items():
+    print(f"{n:24s} {latency_ms(m):7.2f} ms on {device}")</code></pre>
+<details><summary>Hint</summary><p>Elapsed milliseconds for one run is <code>(time.perf_counter() - t0) * 1000</code>. The warm-up loop and the <code>synchronize()</code> calls are what separate an honest measurement from a misleading one; without them the first timed run includes one-time setup cost.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Plot the frontier from your own numbers</h4>
+<p>Pair each model's measured latency with its published top-1 accuracy and draw the scatter. This reproduces Figure 20.6.1 with your hardware on the x-axis, the only frontier that matters for your project.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+
+# Published ImageNet top-1 (%), from torchvision/timm model cards (Table 20.6.1).
+ACC = {"resnet50": 80.9, "efficientnet_b0": 77.7,
+       "mobilenetv3_small_100": 67.7, "convnext_tiny": 82.1}
+
+lat = {n: latency_ms(m) for n, m in models.items()}
+
+fig, ax = plt.subplots(figsize=(6, 4))
+for n in models:
+    # TODO: scatter point (lat[n], ACC[n]) and annotate it with the model name
+    ...
+ax.set_xlabel(f"Measured latency (ms, {device})"); ax.set_ylabel("ImageNet top-1 (%)")
+ax.set_title("Accuracy vs measured latency"); plt.tight_layout(); plt.show()</code></pre>
+<details><summary>Hint</summary><p><code>ax.scatter(lat[n], ACC[n])</code> plots the point; <code>ax.annotate(n, (lat[n], ACC[n]))</code> labels it. A model is on the frontier if no other model is both faster and more accurate; eyeball it from the plot, or compute it in the stretch goal.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Apply the checklist and pick one model</h4>
+<p>Encode the section's checklist as code: given an accuracy floor and a latency budget, return the cheapest model that clears both. This is the step that converts four numbers into a decision.</p>
+<pre><code class="language-python">def choose(acc, lat, min_acc, max_lat_ms):
+    # Keep only models that clear BOTH constraints, then pick the fastest survivor.
+    feasible = {n: lat[n] for n in acc if acc[n] >= min_acc and lat[n] <= max_lat_ms}
+    # TODO: return the name with the smallest latency among `feasible`,
+    #       or None if nothing qualifies. Hint: min(feasible, key=feasible.get)
+    ...
+
+pick = choose(ACC, lat, min_acc=75.0, max_lat_ms=max(lat.values()) + 1)
+print("Checklist selects:", pick)</code></pre>
+<details><summary>Hint</summary><p><code>min(feasible, key=feasible.get)</code> returns the key with the smallest value. Guard the empty case with <code>if not feasible: return None</code> so a too-strict budget reports "no model qualifies" instead of raising.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Re-head and fine-tune the chosen backbone</h4>
+<p>The checklist says fine-tune, never train from scratch. Replace the 1000-class ImageNet head with one sized to the new task, freeze the body for a quick linear probe, and train only the head for a few hundred steps.</p>
+<pre><code class="language-python">import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import Flowers102
+
+tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+train = Flowers102(root="./data", split="train", download=True, transform=tf)
+loader = DataLoader(train, batch_size=32, shuffle=True, num_workers=0)
+
+net = timm.create_model(pick, pretrained=True, num_classes=102).to(device)
+# TODO: freeze every parameter, then unfreeze ONLY the classifier head
+#       (timm exposes it via net.get_classifier()) so this is a linear probe.
+...
+
+opt = torch.optim.Adam((p for p in net.parameters() if p.requires_grad), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+net.train()
+for step, (xb, yb) in enumerate(loader):
+    xb, yb = xb.to(device), yb.to(device)
+    opt.zero_grad(); loss = loss_fn(net(xb), yb); loss.backward(); opt.step()
+    if step % 10 == 0: print(f"step {step:3d}  loss {loss.item():.3f}")
+    if step == 60: break</code></pre>
+<details><summary>Hint</summary><p>Set <code>p.requires_grad = False</code> for all parameters, then set it back to <code>True</code> for the parameters of <code>net.get_classifier()</code>. Passing only the trainable parameters to the optimizer is what makes this a fast linear probe rather than a full fine-tune; the falling loss confirms the frozen features are already useful, the feature-reuse lesson of subsection 3.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Print the decision report</h4>
+<p>Close the loop with a short, paste-ready summary that justifies the choice with measurements rather than hype, exactly what a reviewer or a project ticket wants.</p>
+<pre><code class="language-python">print("=== Backbone decision report ===")
+print(f"Shortlist : {', '.join(models)}")
+for n in models:
+    print(f"  {n:24s} {param_count_m(models[n]):5.1f}M  "
+          f"{lat[n]:6.2f} ms  {ACC[n]:.1f}% top-1")
+# TODO: print the selected model, why it won (cheapest that cleared the bar),
+#       and the constraints it was chosen under.
+...</code></pre>
+<details><summary>Hint</summary><p>One f-string is enough: name the pick, restate the accuracy floor and latency budget it satisfied, and note that it was the cheapest survivor. The point of the report is that the decision is reproducible from the numbers above it.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>The script prints a four-row table whose columns disagree in instructive ways: MobileNetV3-Small has the fewest parameters and FLOPs yet often does not have the lowest latency on a desktop CPU because its depthwise convolutions are memory-bandwidth-bound (<a href="section-20.4.html">Section 20.4</a>), while ResNet-50 and ConvNeXt-Tiny sit near the top for accuracy at higher cost. The frontier plot shows accuracy rising with latency, with one or two models dominated (slower and less accurate than a competitor) and the rest tracing the curve. With a 75% accuracy floor and a generous latency budget the checklist typically selects EfficientNet-B0 or ResNet-50; tightening the latency budget flips the choice toward the smaller models. The fine-tuning loop shows cross-entropy loss falling from roughly 4.6 (random over 102 classes) toward 2 or below within sixty steps, and the decision report prints a single justified recommendation.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Compute the efficient frontier programmatically: a model is on it when no other model is both faster and more accurate. Mark frontier points and dominated points in different colors on the Step 4 plot.</li>
+<li>Replace the linear probe in Step 6 with a full fine-tune (unfreeze everything, drop the learning rate to <code>1e-4</code>), run both for the same step budget on the same data, and report the accuracy gap, reproducing Exercise 20.6.3's transfer-versus-scratch comparison.</li>
+<li>Add a vision transformer (<code>vit_tiny_patch16_224</code>) to the shortlist and place it on your frontier, previewing the head-to-head with <a href="../module-22-vision-transformers/index.html">Chapter 22</a> and testing whether the checklist still prefers a CNN under a tight latency budget.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import time
+import torch
+import torch.nn as nn
+import timm
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import Flowers102
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+NAMES = ["resnet50", "efficientnet_b0", "mobilenetv3_small_100", "convnext_tiny"]
+ACC = {"resnet50": 80.9, "efficientnet_b0": 77.7,
+       "mobilenetv3_small_100": 67.7, "convnext_tiny": 82.1}
+
+# Step 1: load pretrained backbones
+models = {}
+for name in NAMES:
+    try:
+        models[name] = timm.create_model(name, pretrained=True).eval().to(device)
+    except Exception as e:
+        print(f"skip {name}: {e}")
+
+# Step 2: parameters and FLOPs
+def param_count_m(model):
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+def gflops(model):
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        x = torch.randn(1, 3, 224, 224, device=next(model.parameters()).device)
+        return FlopCountAnalysis(model, x).total() / 1e9
+    except Exception:
+        return float("nan")
+
+# Step 3: latency
+@torch.no_grad()
+def latency_ms(model, runs=30, warmup=5):
+    x = torch.randn(1, 3, 224, 224, device=device)
+    for _ in range(warmup):
+        model(x)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        model(x)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000)
+    times.sort()
+    return times[len(times) // 2]
+
+lat = {n: latency_ms(m) for n, m in models.items()}
+
+# Step 4: frontier plot
+fig, ax = plt.subplots(figsize=(6, 4))
+for n in models:
+    ax.scatter(lat[n], ACC[n])
+    ax.annotate(n, (lat[n], ACC[n]), fontsize=8, xytext=(4, 4),
+                textcoords="offset points")
+ax.set_xlabel(f"Measured latency (ms, {device})")
+ax.set_ylabel("ImageNet top-1 (%)")
+ax.set_title("Accuracy vs measured latency")
+plt.tight_layout(); plt.savefig("frontier.png", dpi=120)
+
+# Step 5: checklist selection
+def choose(acc, lat, min_acc, max_lat_ms):
+    feasible = {n: lat[n] for n in acc if acc[n] >= min_acc and lat[n] <= max_lat_ms}
+    if not feasible:
+        return None
+    return min(feasible, key=feasible.get)
+
+pick = choose(ACC, lat, min_acc=75.0, max_lat_ms=max(lat.values()) + 1)
+print("Checklist selects:", pick)
+
+# Step 6: re-head and linear-probe fine-tune on Flowers102
+tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor()])
+train = Flowers102(root="./data", split="train", download=True, transform=tf)
+loader = DataLoader(train, batch_size=32, shuffle=True, num_workers=0)
+
+net = timm.create_model(pick, pretrained=True, num_classes=102).to(device)
+for p in net.parameters():
+    p.requires_grad = False
+for p in net.get_classifier().parameters():
+    p.requires_grad = True
+
+opt = torch.optim.Adam((p for p in net.parameters() if p.requires_grad), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+net.train()
+for step, (xb, yb) in enumerate(loader):
+    xb, yb = xb.to(device), yb.to(device)
+    opt.zero_grad()
+    loss = loss_fn(net(xb), yb)
+    loss.backward()
+    opt.step()
+    if step % 10 == 0:
+        print(f"step {step:3d}  loss {loss.item():.3f}")
+    if step == 60:
+        break
+
+# Step 7: decision report
+print("=== Backbone decision report ===")
+print(f"Shortlist : {', '.join(models)}")
+for n in models:
+    print(f"  {n:24s} {param_count_m(models[n]):5.1f}M  "
+          f"GFLOPs={gflops(models[n]):5.2f}  {lat[n]:6.2f} ms  {ACC[n]:.1f}% top-1")
+print(f"Selected  : {pick}")
+print("Why       : cheapest model that cleared the 75.0% accuracy floor within "
+      "the latency budget; fine-tuned, not trained from scratch.")</code></pre>
+</details>
 </div>
 
 <div class="callout exercise">

@@ -248,6 +248,381 @@ The line from here to the rest of Part IV is direct. VQGAN's autoencoder is the 
 <p>Write a one-page comparison of the continuous VAE latent of <a href="section-31.3.html">Section 31.3</a> against the discrete VQ-VAE latent of this section, organized around four axes: (1) how you generate (sample a Gaussian and decode, versus learn and sample a prior over tokens), (2) interpolation behavior (smooth versus discrete jumps), (3) what generative model the latent invites (custom continuous model versus borrowed sequence transformer), and (4) the failure modes (posterior collapse versus codebook collapse). Conclude with a recommendation: for a system that wants to reuse a powerful pretrained sequence model and one that wants smooth latent-space editing, which latent would you choose and why? Connect your answer to the continuous-versus-discrete choice that <a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s latent diffusion faces.</p>
 </div>
 
+<p>The chapter has now built three latents from the same skeleton: the plain code of <a href="section-31.1.html">Section 31.1</a>, the samplable Gaussian code of <a href="section-31.3.html">Section 31.3</a>, and the discrete codebook of this section. The Hands-On Lab below pulls all three into one runnable experiment so you can see, in a single figure, exactly how the constraint decides what the code becomes.</p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: A Latent-Space Showdown, AE vs VAE vs VQ-VAE</div>
+
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<p><strong>Objective.</strong> Train three autoencoders that share one convolutional encoder-decoder backbone but differ only in the constraint on the bottleneck (none, a Gaussian prior, a discrete codebook), then produce one shareable figure that proves the chapter's thesis: a plain autoencoder reconstructs but cannot be sampled, the VAE makes the latent space dense and samplable, and the VQ-VAE turns the image into a grid of tokens. The artifact ties together Sections 31.1, 31.3, and 31.6 on a single dataset with a single training harness.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Building one convolutional encoder-decoder backbone and reusing it under three different bottleneck constraints (Sections 31.1, 31.3, 31.6).</li>
+<li>Implementing the VAE reparameterization trick and the analytic Gaussian KL term, and the VQ straight-through estimator with its commitment loss.</li>
+<li>Demonstrating the plain autoencoder's fatal flaw: decoding a random latent draw yields garbage (Section 31.1).</li>
+<li>Sampling the VAE prior and interpolating between two encodings to show a smooth, dense latent space (Section 31.3).</li>
+<li>Measuring codebook utilization for the VQ-VAE and diagnosing codebook collapse (Section 31.6).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>Runs in Colab or any machine with PyTorch. MNIST is tiny, so all three models train in a few minutes each on a GPU and still finish on CPU if you cut the epoch count. No downloads beyond the dataset.</p>
+<pre><code class="language-bash">pip install torch torchvision matplotlib</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Build the shared backbone</h4>
+<p>Write one convolutional encoder that maps a 28x28 MNIST digit down to a small spatial grid, and one transposed-convolution decoder that maps back up. All three models reuse these so that any difference in results comes from the bottleneck constraint alone, not from a different network.</p>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+class Encoder(nn.Module):
+    """28x28x1 -> (C, 7, 7) feature grid."""
+    def __init__(self, ch=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, ch, 4, stride=2, padding=1), nn.ReLU(),   # 28 -> 14
+            nn.Conv2d(ch, ch, 4, stride=2, padding=1), nn.ReLU())  # 14 -> 7
+    def forward(self, x):
+        return self.net(x)
+
+class Decoder(nn.Module):
+    """(C, 7, 7) -> 28x28x1 image in [0, 1]."""
+    def __init__(self, ch=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(ch, ch, 4, stride=2, padding=1), nn.ReLU(),  # 7 -> 14
+            nn.ConvTranspose2d(ch, 1, 4, stride=2, padding=1))              # 14 -> 28
+    def forward(self, z):
+        return torch.sigmoid(self.net(z))
+
+# TODO: load MNIST as tensors in [0, 1] and build a DataLoader with batch_size=128.
+# Hint: torchvision.datasets.MNIST with transform=torchvision.transforms.ToTensor().
+train_loader = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>ds = torchvision.datasets.MNIST("./data", train=True, download=True, transform=torchvision.transforms.ToTensor())</code> then <code>train_loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=True)</code>. ToTensor already scales pixels to [0, 1], which matches the sigmoid decoder output.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Model 1, the plain autoencoder</h4>
+<p>The simplest constraint is just the bottleneck width. Flatten the encoder grid to a small vector, then expand it back. Train it to minimize reconstruction error. This is the model of <a href="section-31.1.html">Section 31.1</a>.</p>
+<pre><code class="language-python">class PlainAE(nn.Module):
+    def __init__(self, ch=32, zdim=16):
+        super().__init__()
+        self.enc, self.dec = Encoder(ch), Decoder(ch)
+        self.to_z   = nn.Linear(ch * 7 * 7, zdim)
+        self.from_z = nn.Linear(zdim, ch * 7 * 7)
+        self.ch = ch
+    def forward(self, x):
+        h = self.enc(x).flatten(1)
+        z = self.to_z(h)                       # the code (no constraint on its shape)
+        # TODO: map z back through self.from_z, reshape to (B, ch, 7, 7), decode.
+        recon = ...
+        return recon, z
+# Hint: loss is F.binary_cross_entropy(recon, x). Train ~10 epochs with Adam(lr=1e-3).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>g = self.from_z(z).view(-1, self.ch, 7, 7); recon = self.dec(g)</code>. Keep this training loop in a small reusable <code>train(model, loss_fn)</code> helper; you will call it three times.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Model 2, the VAE</h4>
+<p>Add the one constraint that makes the code samplable: have the encoder output a mean and log-variance, sample with the reparameterization trick, and add the analytic Gaussian KL term that pulls the posterior toward the standard-normal prior. This is the model of <a href="section-31.3.html">Section 31.3</a>.</p>
+<pre><code class="language-python">class VAE(nn.Module):
+    def __init__(self, ch=32, zdim=16):
+        super().__init__()
+        self.enc, self.dec = Encoder(ch), Decoder(ch)
+        self.to_mu     = nn.Linear(ch * 7 * 7, zdim)
+        self.to_logvar = nn.Linear(ch * 7 * 7, zdim)
+        self.from_z    = nn.Linear(zdim, ch * 7 * 7)
+        self.ch = ch
+    def forward(self, x):
+        h = self.enc(x).flatten(1)
+        mu, logvar = self.to_mu(h), self.to_logvar(h)
+        # TODO: reparameterize: std = exp(0.5*logvar); z = mu + std * randn_like(std).
+        z = ...
+        g = self.from_z(z).view(-1, self.ch, 7, 7)
+        return self.dec(g), mu, logvar
+
+def vae_loss(recon, x, mu, logvar):
+    bce = F.binary_cross_entropy(recon, x, reduction="sum") / x.size(0)
+    # TODO: the closed-form KL of a diagonal Gaussian to N(0, I).
+    kl = ...
+    return bce + kl
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Reparameterize with <code>z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)</code>. The KL is <code>kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)</code>. Dividing both terms by batch size keeps their scale comparable.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Model 3, the VQ-VAE</h4>
+<p>Replace the continuous code with a learned codebook. Snap each spatial location of the encoder grid to its nearest codebook vector, pass the gradient straight through, and add the commitment loss. This is the quantizer of subsection 2 of this section, applied to the same backbone.</p>
+<pre><code class="language-python">class VectorQuantizer(nn.Module):
+    def __init__(self, n_codes=64, dim=32, beta=0.25):
+        super().__init__()
+        self.codebook = nn.Embedding(n_codes, dim)
+        self.codebook.weight.data.uniform_(-1/n_codes, 1/n_codes)
+        self.beta = beta
+    def forward(self, z):                         # z: (B, dim, H, W)
+        B, C, H, W = z.shape
+        flat = z.permute(0, 2, 3, 1).reshape(-1, C)         # (B*H*W, dim)
+        d = (flat.pow(2).sum(1, keepdim=True)
+             - 2 * flat @ self.codebook.weight.t()
+             + self.codebook.weight.pow(2).sum(1))
+        idx = d.argmin(1)                                    # nearest code per location
+        zq = self.codebook(idx).view(B, H, W, C).permute(0, 3, 1, 2)
+        # TODO: commitment + codebook loss, then straight-through: zq = z + (zq - z).detach()
+        loss = ...
+        zq_st = ...
+        return zq_st, loss, idx
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>loss = F.mse_loss(zq.detach(), z) * self.beta + F.mse_loss(zq, z.detach())</code> (commitment plus codebook term), then <code>zq_st = z + (zq - z).detach()</code> so the forward value is the quantized code but the gradient flows to the encoder. The VQ-VAE decodes <code>zq_st</code> directly (no Linear bottleneck) and adds <code>loss</code> to the reconstruction BCE.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Show the plain AE cannot be sampled</h4>
+<p>Here is the chapter's pivot made visible. Encode the test set with the plain AE to find the typical range of its codes, then decode a batch of random codes drawn from that range. Because nothing forced the code space to be filled smoothly, the outputs are smeary nonsense, not digits.</p>
+<pre><code class="language-python">ae.eval()
+with torch.no_grad():
+    # TODO: collect z = ae.to_z(ae.enc(x).flatten(1)) over the test set,
+    #       then sample z_rand ~ Normal(z.mean(0), z.std(0)) and decode it.
+    z_rand = ...
+    fake = ae.dec(ae.from_z(z_rand).view(-1, ae.ch, 7, 7))
+# Display `fake`: expect blurry, non-digit blobs.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Even sampling from the empirical mean and std of real codes fails, because the codes occupy a thin, hole-filled manifold inside that box. That gap is exactly what the VAE's KL term closes.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Sample and interpolate the VAE</h4>
+<p>Now repeat the sampling for the VAE, but draw straight from the prior, no statistics needed, because training guaranteed the prior is the right distribution. Then interpolate linearly between the encodings of two test digits and decode each step to show the latent space morphs smoothly.</p>
+<pre><code class="language-python">vae.eval()
+with torch.no_grad():
+    z = torch.randn(64, 16, device=device)                  # straight from N(0, I)
+    samples = vae.dec(vae.from_z(z).view(-1, vae.ch, 7, 7))
+    # TODO: encode two test images to their means mu_a, mu_b, then decode
+    #       mu_a*(1-t) + mu_b*t for t in linspace(0, 1, 8).
+    interp = ...
+# Display `samples` (plausible digits) and `interp` (a smooth morph a -> b).
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For interpolation use the posterior means (not a fresh sample) for a clean path: <code>mu_a = vae.to_mu(vae.enc(xa).flatten(1))</code>, likewise <code>mu_b</code>, then stack <code>vae.dec(...)</code> for each <code>t</code>. The intermediate digits should look like valid handwriting, not double exposures.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: Measure VQ-VAE codebook usage and compose the figure</h4>
+<p>Run the test set through the VQ-VAE, count how many of the 64 codebook entries are ever selected, and reconstruct a few digits. Then lay everything out in one figure: a reconstruction row per model, the AE's failed random samples, the VAE's prior samples and interpolation, and the VQ codebook-usage histogram.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+# TODO: accumulate all `idx` from the VQ-VAE over the test set, then
+#       used = torch.unique(all_idx).numel(); print(f"{used}/64 codes used").
+#       Build a figure with: AE/VAE/VQ reconstructions, AE random (Step 5),
+#       VAE samples + interpolation (Step 6), and a bar plot of code usage.
+#       Save with plt.savefig("latent_showdown.png", dpi=150, bbox_inches="tight").
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Bincount the indices with <code>torch.bincount(all_idx, minlength=64)</code> for the histogram; a healthy run uses most of the 64 codes. If only a handful are used you have reproduced codebook collapse from Exercise 31.6.2, and the library-shortcut note explains the EMA and reinit fixes.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>A single saved PNG, <code>latent_showdown.png</code>. All three models should reconstruct test digits recognizably. The plain autoencoder's random-code panel (Step 5) should show blurry, non-digit blobs, the visible proof of its hole-filled latent space. The VAE's prior-sample panel should show plausible (slightly soft) digits, and its interpolation row should morph smoothly from one digit to another with valid handwriting at every step. The VQ-VAE usage histogram should show most of the 64 codebook entries in active use; a near-empty histogram signals codebook collapse. Reconstruction BCE for all three typically settles to a similar low value within about ten epochs, which is the point: similar reconstruction, radically different generative behavior, decided entirely by the bottleneck constraint.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li><strong>Sweep the VAE beta.</strong> Retrain the VAE with the KL term scaled by beta in {0.5, 1, 4} as in <a href="section-31.4.html">Section 31.4</a>, and compare interpolation smoothness against reconstruction sharpness. You should see the disentanglement-versus-fidelity trade-off directly.</li>
+<li><strong>Library shortcut (the "Right Tool").</strong> Swap your hand-written quantizer for <code>vector-quantize-pytorch</code>: <code>from vector_quantize_pytorch import VectorQuantize; vq = VectorQuantize(dim=32, codebook_size=64)</code>, which returns the quantized tensor, indices, and commitment loss in one call and handles the EMA codebook updates that prevent the collapse you may have hit in Step 7.</li>
+<li><strong>Connect forward to diffusion.</strong> Treat the VAE encoder as a fixed compressor and report the spatial compression ratio of its latent grid versus the pixel image; this is exactly the role the autoencoder plays in the latent diffusion of <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+import torchvision, torchvision.transforms as T
+import matplotlib.pyplot as plt
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(0)
+
+# ---- Step 1: data and shared backbone ----
+ds = torchvision.datasets.MNIST("./data", train=True,  download=True, transform=T.ToTensor())
+ts = torchvision.datasets.MNIST("./data", train=False, download=True, transform=T.ToTensor())
+train_loader = torch.utils.data.DataLoader(ds, batch_size=128, shuffle=True)
+test_loader  = torch.utils.data.DataLoader(ts, batch_size=256, shuffle=False)
+
+class Encoder(nn.Module):
+    def __init__(self, ch=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, ch, 4, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(ch, ch, 4, stride=2, padding=1), nn.ReLU())
+    def forward(self, x): return self.net(x)
+
+class Decoder(nn.Module):
+    def __init__(self, ch=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(ch, ch, 4, stride=2, padding=1), nn.ReLU(),
+            nn.ConvTranspose2d(ch, 1, 4, stride=2, padding=1))
+    def forward(self, z): return torch.sigmoid(self.net(z))
+
+def train(model, loss_fn, epochs=10, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    for ep in range(epochs):
+        for x, _ in train_loader:
+            x = x.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model, x)
+            loss.backward(); opt.step()
+    return model
+
+# ---- Step 2: plain autoencoder ----
+class PlainAE(nn.Module):
+    def __init__(self, ch=32, zdim=16):
+        super().__init__()
+        self.enc, self.dec = Encoder(ch), Decoder(ch)
+        self.to_z, self.from_z = nn.Linear(ch*7*7, zdim), nn.Linear(zdim, ch*7*7)
+        self.ch = ch
+    def forward(self, x):
+        z = self.to_z(self.enc(x).flatten(1))
+        recon = self.dec(self.from_z(z).view(-1, self.ch, 7, 7))
+        return recon, z
+
+ae = PlainAE().to(device)
+train(ae, lambda m, x: F.binary_cross_entropy(m(x)[0], x))
+
+# ---- Step 3: VAE ----
+class VAE(nn.Module):
+    def __init__(self, ch=32, zdim=16):
+        super().__init__()
+        self.enc, self.dec = Encoder(ch), Decoder(ch)
+        self.to_mu, self.to_logvar = nn.Linear(ch*7*7, zdim), nn.Linear(ch*7*7, zdim)
+        self.from_z = nn.Linear(zdim, ch*7*7); self.ch = ch
+    def forward(self, x):
+        h = self.enc(x).flatten(1)
+        mu, logvar = self.to_mu(h), self.to_logvar(h)
+        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)   # reparameterize
+        return self.dec(self.from_z(z).view(-1, self.ch, 7, 7)), mu, logvar
+
+def vae_step(m, x):
+    recon, mu, logvar = m(x)
+    bce = F.binary_cross_entropy(recon, x, reduction="sum") / x.size(0)
+    kl  = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+    return bce + kl
+
+vae = VAE().to(device)
+train(vae, vae_step)
+
+# ---- Step 4: VQ-VAE ----
+class VectorQuantizer(nn.Module):
+    def __init__(self, n_codes=64, dim=32, beta=0.25):
+        super().__init__()
+        self.codebook = nn.Embedding(n_codes, dim)
+        self.codebook.weight.data.uniform_(-1/n_codes, 1/n_codes)
+        self.beta = beta
+    def forward(self, z):
+        B, C, H, W = z.shape
+        flat = z.permute(0, 2, 3, 1).reshape(-1, C)
+        d = (flat.pow(2).sum(1, keepdim=True)
+             - 2 * flat @ self.codebook.weight.t()
+             + self.codebook.weight.pow(2).sum(1))
+        idx = d.argmin(1)
+        zq = self.codebook(idx).view(B, H, W, C).permute(0, 3, 1, 2)
+        loss = F.mse_loss(zq.detach(), z) * self.beta + F.mse_loss(zq, z.detach())
+        zq_st = z + (zq - z).detach()                            # straight-through
+        return zq_st, loss, idx
+
+class VQVAE(nn.Module):
+    def __init__(self, ch=32, n_codes=64):
+        super().__init__()
+        self.enc, self.dec = Encoder(ch), Decoder(ch)
+        self.vq = VectorQuantizer(n_codes, ch)
+    def forward(self, x):
+        zq, vq_loss, idx = self.vq(self.enc(x))
+        return self.dec(zq), vq_loss, idx
+
+def vq_step(m, x):
+    recon, vq_loss, _ = m(x)
+    return F.binary_cross_entropy(recon, x) + vq_loss
+
+vq = VQVAE().to(device)
+train(vq, vq_step)
+
+# ---- Step 5: the plain AE cannot be sampled ----
+ae.eval(); xb, _ = next(iter(test_loader)); xb = xb.to(device)
+with torch.no_grad():
+    codes = torch.cat([ae.to_z(ae.enc(x.to(device)).flatten(1)) for x, _ in test_loader])
+    z_rand = torch.randn(16, 16, device=device) * codes.std(0) + codes.mean(0)
+    ae_fake = ae.dec(ae.from_z(z_rand).view(-1, ae.ch, 7, 7)).cpu()
+
+# ---- Step 6: VAE sampling and interpolation ----
+vae.eval()
+with torch.no_grad():
+    vae_samples = vae.dec(vae.from_z(torch.randn(16, 16, device=device))
+                          .view(-1, vae.ch, 7, 7)).cpu()
+    xa, xb2 = xb[0:1], xb[1:2]
+    mu_a = vae.to_mu(vae.enc(xa).flatten(1)); mu_b = vae.to_mu(vae.enc(xb2).flatten(1))
+    interp = torch.cat([vae.dec(vae.from_z(mu_a*(1-t) + mu_b*t).view(-1, vae.ch, 7, 7))
+                        for t in torch.linspace(0, 1, 8)]).cpu()
+
+# ---- Step 7: codebook usage and the composite figure ----
+vq.eval()
+with torch.no_grad():
+    all_idx = torch.cat([vq(x.to(device))[2] for x, _ in test_loader])
+    usage = torch.bincount(all_idx, minlength=64).cpu()
+    vq_recon = vq(xb[:8])[0].cpu()
+    ae_recon = ae(xb[:8])[0].cpu(); vae_recon = vae(xb[:8])[0].cpu()
+print(f"VQ-VAE codebook usage: {(usage > 0).sum().item()}/64 codes used")
+
+def row(ax, imgs, title):
+    ax.imshow(torch.cat([i[0] for i in imgs], dim=1), cmap="gray"); ax.set_title(title); ax.axis("off")
+
+fig, axs = plt.subplots(6, 1, figsize=(9, 11))
+row(axs[0], ae_recon,  "AE reconstructions")
+row(axs[1], vae_recon, "VAE reconstructions")
+row(axs[2], ae_fake,   "AE: decoded random codes (garbage, the fatal flaw)")
+row(axs[3], vae_samples, "VAE: samples from the prior (plausible digits)")
+row(axs[4], interp,    "VAE: interpolation between two digits (smooth)")
+axs[5].bar(range(64), usage); axs[5].set_title("VQ-VAE codebook usage"); axs[5].set_xlabel("code index")
+plt.tight_layout(); plt.savefig("latent_showdown.png", dpi=150, bbox_inches="tight")
+print("saved latent_showdown.png")</code></pre>
+</details>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-31.5.html">&#8592; Section 31.5: Hierarchical VAEs: From Ladder Networks to NVAE</a>
 <a href="index.html">Chapter 31</a>

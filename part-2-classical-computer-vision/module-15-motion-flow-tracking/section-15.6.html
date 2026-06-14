@@ -56,7 +56,7 @@ Model a tracked object by a hidden <strong>state vector</strong>. For a point mo
 $$ F = \begin{bmatrix} 1 & 0 & \Delta t & 0 \\ 0 & 1 & 0 & \Delta t \\ 0 & 0 & 1 & 0 \\ 0 & 0 & 0 & 1 \end{bmatrix}, \qquad H = \begin{bmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 \end{bmatrix}. $$
 </p>
 <p>
-The filter runs a two-step cycle each frame. The <strong>predict</strong> step pushes the belief forward by the physics and inflates its uncertainty by the process noise $Q$ (how much real motion departs from constant velocity):
+The filter runs a two-step cycle each frame that compresses to three words: <strong>predict by physics, correct by surprise</strong>. The <strong>predict</strong> step pushes the belief forward by the physics and inflates its uncertainty by the process noise $Q$ (how much real motion departs from constant velocity):
 </p>
 <p>
 $$ \hat{\mathbf{x}}^- = F \hat{\mathbf{x}}, \qquad P^- = F P F^\top + Q. $$
@@ -73,7 +73,7 @@ The <strong>update</strong> step folds in the new measurement $\mathbf{z}$, weig
 $$ K = P^- H^\top (H P^- H^\top + R)^{-1}, \quad \hat{\mathbf{x}} = \hat{\mathbf{x}}^- + K(\mathbf{z} - H\hat{\mathbf{x}}^-), \quad P = (I - KH)P^-. $$
 </p>
 <p>
-The bracketed term $\mathbf{z} - H\hat{\mathbf{x}}^-$ is the <strong>innovation</strong>, the surprise between what was measured and what was predicted; the gain decides how much of that surprise to believe. Code Fragment 1 implements the full cycle from scratch on a noisy 2D trajectory so the predict-update mechanics are visible.
+The bracketed term $\mathbf{z} - H\hat{\mathbf{x}}^-$ is the <strong>innovation</strong>, the surprise between what was measured and what was predicted; the gain decides how much of that surprise to believe. That is the "correct by surprise" half of the cycle made literal: no surprise means no correction. Code Fragment 1 implements the full cycle from scratch on a noisy 2D trajectory so the predict-update mechanics are visible.
 </p>
 
 <pre><code class="language-python">import numpy as np
@@ -143,6 +143,11 @@ $$ d^2(\text{track } i, \text{detection } j) = (\mathbf{z}_j - H\hat{\mathbf{x}}
 <p>
 After gating, we have a cost matrix: rows are tracks, columns are detections, entries are association costs (Mahalanobis distance, or one minus an intersection-over-union, or an appearance-embedding distance). We want the one-to-one assignment of detections to tracks that minimizes total cost, with each track getting at most one detection and vice versa. Greedily grabbing the cheapest pair, then the next cheapest, is fast but can be badly suboptimal: an early greedy choice can force two later tracks into expensive pairings. The <strong>Hungarian algorithm</strong> (Kuhn, 1955) solves this assignment problem optimally in polynomial time. SciPy exposes it as <code>linear_sum_assignment</code>. Figure 15.6.1 lays out the per-frame multi-object loop that strings prediction, gating, Hungarian assignment, and the Kalman update together.
 </p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Watch Greedy Pick the Wrong Pair</div>
+<p>The smallest case shows why optimal assignment is worth a real algorithm. Two tracks, two detections, costs in pixels: track A is 1 from detection 1 and 2 from detection 2; track B is 3 from detection 1 and 100 from detection 2 (detection 2 is far from B). Greedy grabs the globally cheapest pair first, A with detection 1 at cost 1, which forces B onto the only thing left, detection 2, at cost 100, for a total of 101. The Hungarian algorithm instead pairs A with detection 2 (cost 2) and B with detection 1 (cost 3), total 5. One greedy first move was twenty times worse, and you can push that gap as high as you like by raising the 100. This is exactly the crowded-scene trap: the moment two tracked objects cross, the geometrically cheapest single match is often the one that strands a neighbor on an absurd pairing and triggers an identity switch.</p>
+</div>
 
 <figure class="diagram">
 <svg viewBox="0 0 780 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The multi-object tracking loop: Kalman predict for all tracks, gating against new detections, Hungarian assignment, Kalman update for matched tracks, with two side branches creating new tracks from unmatched detections and deleting tracks that go unmatched too long, then looping to the next frame.">
@@ -269,6 +274,333 @@ This is where the chapter's tracking thread hands off. The motion model is hand-
 <div class="callout exercise">
 <div class="callout-title">Exercise 15.6.3: Greedy Versus Optimal Assignment <span class="exercise-type analysis">Analysis</span></div>
 <p>Construct a 3-track by 3-detection cost matrix on which greedy nearest-neighbor assignment (repeatedly take the globally cheapest remaining pair) gives a strictly higher total cost than the Hungarian optimum. Solve both by hand and with <code>scipy.optimize.linear_sum_assignment</code>, and report the cost gap. Then argue, in terms of this example, why a multi-object tracker in a crowded scene benefits from optimal assignment, and describe a situation where the practical difference is negligible (so greedy is acceptable for speed).</p>
+</div>
+
+<p>The three exercises above each isolate one moving part. The Hands-On Lab that closes the chapter now assembles all of them, plus the background-subtraction detector of <a href="section-15.4.html">Section 15.4</a>, into one running multi-object tracker that writes an annotated video you can keep.</p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a SORT-Style Multi-Object Tracker End to End</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build a working multi-object tracker that takes a fixed-camera video, finds moving objects with background subtraction, and follows each one with a stable numeric identity through noise and brief occlusions, writing out an annotated video with persistent ID labels and motion trails. This is a miniature, readable reimplementation of SORT, the constant-velocity Kalman plus Hungarian-association tracker that still anchors production pipelines.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Turning a MOG2 background model into clean object detections with morphological cleanup (<a href="section-15.4.html">Section 15.4</a>).</li>
+<li>Wrapping the predict-update Kalman cycle of Code Fragment 1 into a reusable per-track class with constant-velocity state $[p_x, p_y, v_x, v_y]$.</li>
+<li>Matching this frame's detections to last frame's predicted tracks by an IoU cost with <code>scipy.optimize.linear_sum_assignment</code> (Code Fragment 2).</li>
+<li>Managing the track lifecycle: birth from unmatched detections, coasting through gaps on prediction alone, and death after a few unmatched frames.</li>
+<li>Reading identity switches as a diagnostic, the same failure that motivates the appearance term of DeepSORT.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install opencv-python numpy scipy</code></pre>
+<p>You also need one short clip from a static camera with two to five moving objects: people on a walkway, cars at an intersection, or fish in a tank all work well. A 10 to 30 second clip is plenty. Public traffic or pedestrian clips are easy to find, or record your own from a phone propped against a window. Save it as <code>input.mp4</code> in your working directory. No GPU is required; everything here runs on CPU in real time on a laptop.</p>
+</div>
+
+<p>Work through the steps in order. Each one prints or draws a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Detect moving objects with background subtraction</h4>
+<p>Reuse the Section 15.4 workhorse to turn each frame into a list of foreground boxes. MOG2 learns the static scene; morphology removes speckle and fills holes; contour bounding boxes above an area threshold become your per-frame detections.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=40, detectShadows=True)
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+def detect(frame, min_area=600):
+    mask = bg.apply(frame)
+    mask[mask &lt; 200] = 0          # drop the gray shadow label, keep hard foreground
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    boxes = []
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        # TODO: keep only contours with area &gt;= min_area, and append [x, y, w, h]
+        # Hint: cv2.contourArea(c) and cv2.boundingRect(c)
+        ...
+    return boxes</code></pre>
+<details><summary>Hint</summary><p>Inside the loop: <code>if cv2.contourArea(c) &lt; min_area: continue</code>, then <code>x, y, w, h = cv2.boundingRect(c)</code> and <code>boxes.append([x, y, w, h])</code>. The first few dozen frames will be noisy while MOG2 still learns the background; that is expected and the tracker tolerates it.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Wrap the Kalman cycle into a Track class</h4>
+<p>Promote Code Fragment 1 from a script into one object per tracked thing. The state is $[p_x, p_y, v_x, v_y]$ on the box center; <code>predict</code> advances by physics and inflates uncertainty, <code>update</code> folds in a matched detection center.</p>
+<pre><code class="language-python">dt = 1.0
+F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], float)
+H = np.array([[1,0,0,0],[0,1,0,0]], float)
+Q = np.eye(4) * 0.05
+R = np.eye(2) * 8.0
+
+class Track:
+    _next_id = 0
+    def __init__(self, box):
+        cx, cy = box[0] + box[2]/2, box[1] + box[3]/2
+        self.x = np.array([cx, cy, 0, 0], float)
+        self.P = np.eye(4) * 100.0
+        self.wh = (box[2], box[3])
+        self.id = Track._next_id; Track._next_id += 1
+        self.time_since_update = 0
+
+    def predict(self):
+        # TODO: advance self.x and self.P one step (the Code Fragment 1 predict step)
+        # Hint: self.x = F @ self.x ; self.P = F @ self.P @ F.T + Q
+        ...
+        self.time_since_update += 1
+        return self.box()
+
+    def update(self, box):
+        z = np.array([box[0] + box[2]/2, box[1] + box[3]/2], float)
+        K = self.P @ H.T @ np.linalg.inv(H @ self.P @ H.T + R)
+        self.x = self.x + K @ (z - H @ self.x)
+        self.P = (np.eye(4) - K @ H) @ self.P
+        self.wh = (box[2], box[3]); self.time_since_update = 0
+
+    def box(self):
+        cx, cy = self.x[0], self.x[1]; w, h = self.wh
+        return [cx - w/2, cy - h/2, w, h]</code></pre>
+<details><summary>Hint</summary><p>The predict step is exactly two lines, <code>self.x = F @ self.x</code> and <code>self.P = F @ self.P @ F.T + Q</code>, mirroring $\hat{\mathbf{x}}^- = F\hat{\mathbf{x}}$ and $P^- = FPF^\top + Q$. The update method is given in full so you can compare it to Code Fragment 1's gain computation.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Build the IoU cost matrix and assign</h4>
+<p>Each frame, every existing track first predicts where it should be. You then match those predicted boxes to the new detections by an assignment that maximizes total overlap, which is Code Fragment 2's Hungarian step on a cost of one minus IoU.</p>
+<pre><code class="language-python">from scipy.optimize import linear_sum_assignment
+
+def iou(a, b):
+    ax2, ay2 = a[0]+a[2], a[1]+a[3]
+    bx2, by2 = b[0]+b[2], b[1]+b[3]
+    ix = max(0, min(ax2, bx2) - max(a[0], b[0]))
+    iy = max(0, min(ay2, by2) - max(a[1], b[1]))
+    inter = ix * iy
+    union = a[2]*a[3] + b[2]*b[3] - inter
+    return inter / union if union &gt; 0 else 0.0
+
+def associate(tracks, detections, iou_thresh=0.3):
+    if not tracks or not detections:
+        return [], list(range(len(tracks))), list(range(len(detections)))
+    cost = np.zeros((len(tracks), len(detections)))
+    for t, tr in enumerate(tracks):
+        for d, det in enumerate(detections):
+            cost[t, d] = 1.0 - iou(tr.box(), det)     # low cost = high overlap
+    # TODO: solve the assignment, then keep only pairs whose IoU clears iou_thresh.
+    # Hint: rows, cols = linear_sum_assignment(cost); a pair is valid if 1 - cost[r,c] >= iou_thresh
+    ...
+    return matches, unmatched_tracks, unmatched_dets</code></pre>
+<details><summary>Hint</summary><p>After <code>rows, cols = linear_sum_assignment(cost)</code>, loop the paired indices and route each into <code>matches</code> if <code>1 - cost[r, c] &gt;= iou_thresh</code>, otherwise treat both the track and the detection as unmatched. Any track index never appearing in <code>rows</code>, and any detection index never appearing in <code>cols</code>, is also unmatched and belongs in the leftover lists.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Run the per-frame tracker loop with lifecycle management</h4>
+<p>This is where the pieces become a tracker. Predict all tracks, associate, update the matched ones, birth a track for each unmatched detection, and delete tracks that have gone too many frames without a match. The <code>max_age</code> budget is exactly what lets a track coast through a brief occlusion on prediction alone.</p>
+<pre><code class="language-python">def step_tracker(tracks, detections, max_age=10):
+    for tr in tracks:
+        tr.predict()
+    matches, unmatched_tr, unmatched_det = associate(tracks, detections)
+
+    for t, d in matches:
+        tracks[t].update(detections[d])
+    # TODO: birth a new Track for each unmatched detection
+    # TODO: drop any track whose time_since_update exceeds max_age
+    # Hint: tracks.append(Track(detections[d])) ; then filter the list by time_since_update
+    ...
+    return tracks</code></pre>
+<details><summary>Hint</summary><p>Birth: <code>for d in unmatched_det: tracks.append(Track(detections[d]))</code>. Death: <code>tracks = [tr for tr in tracks if tr.time_since_update &lt;= max_age]</code> and return that filtered list. A larger <code>max_age</code> survives longer occlusions but risks an old ghost track stealing a new object's detection.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Draw IDs and trails, and write the annotated video</h4>
+<p>Read the clip frame by frame, run the tracker, and draw each track's box, its numeric ID, and a short trail of recent centers. The deliverable is an annotated MP4 that shows persistent identities surviving the moments detection flickers.</p>
+<pre><code class="language-python">cap = cv2.VideoCapture("input.mp4")
+fps = cap.get(cv2.CAP_PROP_FPS) or 25
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+writer = cv2.VideoWriter("tracked.mp4", cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+tracks, trails = [], {}
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    detections = detect(frame)
+    tracks = step_tracker(tracks, detections)
+    for tr in tracks:
+        if tr.time_since_update == 0:                 # only draw confirmed tracks
+            x, y, bw, bh = map(int, tr.box())
+            cv2.rectangle(frame, (x, y), (x+bw, y+bh), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID {tr.id}", (x, y-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            trails.setdefault(tr.id, []).append((int(tr.x[0]), int(tr.x[1])))
+            for p in trails[tr.id][-20:]:
+                cv2.circle(frame, p, 2, (0, 200, 255), -1)
+    writer.write(frame)
+cap.release(); writer.release()
+print("Wrote tracked.mp4")</code></pre>
+<details><summary>Hint</summary><p>If no window appears, that is fine; you are writing to a file, not displaying. Open <code>tracked.mp4</code> in any player afterward. If colors look swapped, remember OpenCV draws in BGR, which is already what these tuples assume.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Stress-test with a crossing and count identity switches</h4>
+<p>Find a moment in your clip where two similar objects pass close to or across each other, and watch the IDs. Count how many times an object's ID changes when it should not. This number is the headline metric of multi-object tracking, and reproducing the switch by hand is the point of the exercise.</p>
+<pre><code class="language-python"># TODO: print one line per frame listing the active IDs, then scan for an ID
+# on an object that changes across a crossing. No new tracker code is needed;
+# just log [tr.id for tr in tracks if tr.time_since_update == 0] each frame
+# and inspect the log around the crossing you identified by eye.
+...</code></pre>
+<details><summary>Hint</summary><p>Geometry alone cannot tell two same-sized boxes apart at the instant their predicted positions overlap, so the Hungarian step can legitimately swap them. That is not a bug in your code; it is the exact gap that DeepSORT's appearance embedding closes, as the Section 1 practical example describes.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>For the first second or two the boxes flicker as MOG2 learns the background, then stabilize into a handful of green boxes, each carrying a constant <code>ID N</code> label and a fading orange trail behind it. A correctly built tracker holds an object's ID steady as it walks across the frame, and crucially keeps the ID alive through a one to ten frame detection dropout (someone passing behind a pole) because the Kalman filter coasts on its prediction. The written <code>tracked.mp4</code> is your portfolio artifact. At a clean crossing of two distinct objects, IDs should persist; at a crossing of two near-identical objects, expect occasional ID switches, which is the documented limitation that Step 6 asks you to count and that motivates appearance-based association. If every object gets a brand-new ID each frame, your association threshold is too strict or your detector boxes are too unstable; loosen <code>iou_thresh</code> or raise <code>min_area</code>.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Add a confirmation rule (a track must be matched in, say, 3 of its first 5 frames before it is drawn) to suppress the flicker tracks born from background noise, mirroring SORT's <code>min_hits</code> parameter.</li>
+<li>Swap the background-subtraction detector for a learned detector (run a small YOLO from <a href="../../part-3-deep-learning-for-vision/module-23-object-detection/index.html">Chapter 23</a> per frame and feed its boxes into the same <code>step_tracker</code>) and watch identity stability improve on cluttered scenes; the tracker code does not change at all.</li>
+<li>Add a simple appearance term: store a small color histogram (<a href="../../part-1-image-processing/module-02-point-operations-histograms/index.html">Chapter 2</a>) per track and add a histogram-distance term to the association cost, then re-run your crossing from Step 6 and confirm the ID switches drop. You have just rebuilt the core idea of DeepSORT.</li>
+</ul>
+</div>
+
+<p>Steps 1 through 5 build the tracker from its named parts; the Right Tool version is one import away. The reference solution below ends with a <code>library-shortcut</code> note showing the same pipeline driven by the maintained <code>sort-tracker-py</code> package and points to the production trackers built into Ultralytics, the practical payoff once you understand what is inside.</p>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import cv2
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+# --- Step 1: detector from background subtraction (Section 15.4) ---
+bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=40, detectShadows=True)
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+def detect(frame, min_area=600):
+    mask = bg.apply(frame)
+    mask[mask < 200] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    boxes = []
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        boxes.append([x, y, w, h])
+    return boxes
+
+# --- Step 2: per-track constant-velocity Kalman filter (Code Fragment 1) ---
+dt = 1.0
+F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], float)
+H = np.array([[1,0,0,0],[0,1,0,0]], float)
+Q = np.eye(4) * 0.05
+R = np.eye(2) * 8.0
+
+class Track:
+    _next_id = 0
+    def __init__(self, box):
+        cx, cy = box[0] + box[2]/2, box[1] + box[3]/2
+        self.x = np.array([cx, cy, 0, 0], float)
+        self.P = np.eye(4) * 100.0
+        self.wh = (box[2], box[3])
+        self.id = Track._next_id; Track._next_id += 1
+        self.time_since_update = 0
+    def predict(self):
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        self.time_since_update += 1
+        return self.box()
+    def update(self, box):
+        z = np.array([box[0] + box[2]/2, box[1] + box[3]/2], float)
+        K = self.P @ H.T @ np.linalg.inv(H @ self.P @ H.T + R)
+        self.x = self.x + K @ (z - H @ self.x)
+        self.P = (np.eye(4) - K @ H) @ self.P
+        self.wh = (box[2], box[3]); self.time_since_update = 0
+    def box(self):
+        cx, cy = self.x[0], self.x[1]; w, h = self.wh
+        return [cx - w/2, cy - h/2, w, h]
+
+# --- Step 3: IoU cost + Hungarian assignment (Code Fragment 2) ---
+def iou(a, b):
+    ax2, ay2 = a[0]+a[2], a[1]+a[3]
+    bx2, by2 = b[0]+b[2], b[1]+b[3]
+    ix = max(0, min(ax2, bx2) - max(a[0], b[0]))
+    iy = max(0, min(ay2, by2) - max(a[1], b[1]))
+    inter = ix * iy
+    union = a[2]*a[3] + b[2]*b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+def associate(tracks, detections, iou_thresh=0.3):
+    if not tracks or not detections:
+        return [], list(range(len(tracks))), list(range(len(detections)))
+    cost = np.zeros((len(tracks), len(detections)))
+    for t, tr in enumerate(tracks):
+        for d, det in enumerate(detections):
+            cost[t, d] = 1.0 - iou(tr.box(), det)
+    rows, cols = linear_sum_assignment(cost)
+    matches, matched_t, matched_d = [], set(), set()
+    for r, c in zip(rows, cols):
+        if 1.0 - cost[r, c] >= iou_thresh:
+            matches.append((r, c)); matched_t.add(r); matched_d.add(c)
+    unmatched_tracks = [t for t in range(len(tracks)) if t not in matched_t]
+    unmatched_dets = [d for d in range(len(detections)) if d not in matched_d]
+    return matches, unmatched_tracks, unmatched_dets
+
+# --- Step 4: lifecycle (predict, match, update, birth, death) ---
+def step_tracker(tracks, detections, max_age=10):
+    for tr in tracks:
+        tr.predict()
+    matches, unmatched_tr, unmatched_det = associate(tracks, detections)
+    for t, d in matches:
+        tracks[t].update(detections[d])
+    for d in unmatched_det:
+        tracks.append(Track(detections[d]))
+    tracks = [tr for tr in tracks if tr.time_since_update <= max_age]
+    return tracks
+
+# --- Step 5: run over the clip and write the annotated video ---
+cap = cv2.VideoCapture("input.mp4")
+fps = cap.get(cv2.CAP_PROP_FPS) or 25
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+writer = cv2.VideoWriter("tracked.mp4", cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+tracks, trails = [], {}
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    detections = detect(frame)
+    tracks = step_tracker(tracks, detections)
+    # Step 6: log active IDs so you can scan for switches around a crossing
+    print([tr.id for tr in tracks if tr.time_since_update == 0])
+    for tr in tracks:
+        if tr.time_since_update == 0:
+            x, y, bw, bh = map(int, tr.box())
+            cv2.rectangle(frame, (x, y), (x+bw, y+bh), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID {tr.id}", (x, y-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            trails.setdefault(tr.id, []).append((int(tr.x[0]), int(tr.x[1])))
+            for p in trails[tr.id][-20:]:
+                cv2.circle(frame, p, 2, (0, 200, 255), -1)
+    writer.write(frame)
+cap.release(); writer.release()
+print("Wrote tracked.mp4")</code></pre>
+<p class="code-caption">The full Chapter 15 capstone: a SORT-style multi-object tracker assembled from the chapter's own parts (MOG2 detection, a constant-velocity Kalman filter per track, and Hungarian IoU association), writing an annotated video with persistent IDs and motion trails.</p>
+<div class="callout library-shortcut">
+<div class="callout-title">The Right Tool: SORT in a Few Lines</div>
+<p>You built SORT to see its parts; in production you import it. The maintained <code>sort-tracker-py</code> package wraps exactly this Kalman-plus-Hungarian logic behind one <code>Sort().update(detections)</code> call, and the trackers built into Ultralytics (<code>model.track(source="input.mp4", tracker="bytetrack.yaml")</code>) pair a learned detector with ByteTrack or BoT-SORT in a single line. The roughly one hundred lines above collapse to a handful; the library handles state initialization, track confirmation, and the matching cascade. You wrote the long version so that when a production tracker switches an identity, you know which of the three named parts to inspect.</p>
+</div>
+</details>
 </div>
 
 <nav class="chapter-nav">

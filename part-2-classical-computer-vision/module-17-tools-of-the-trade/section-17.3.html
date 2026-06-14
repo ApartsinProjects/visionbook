@@ -178,6 +178,9 @@ Multi-object tracking (<a href="../module-15-motion-flow-tracking/index.html">Ch
 <div class="callout-title">Research Frontier: Benchmarks Race to Stay Hard</div>
 <p>The defining 2023 to 2026 dynamic in this space is benchmark saturation: learned methods have so thoroughly solved the classic datasets that the error bars collapse and rankings become noise. The community's response has been new, harder benchmarks. <strong>Spring</strong> (Mehl et al., CVPR 2023) rebuilt optical-flow evaluation at 4K resolution with billion-pixel ground truth because Sintel's leaderboard had compressed to near-ties. The <strong>Image Matching Challenge</strong> (organized through 2024 to 2025) reframed feature matching around downstream pose accuracy on phototourism data rather than HPatches mAP, because descriptors that win on HPatches do not always win at reconstruction. And <strong>TartanAir</strong> and its successors push SLAM into photometrically brutal synthetic conditions that the TUM RGB-D sequences never contained. The meta-lesson for 2026: a benchmark is a moving target, a 2018 state-of-the-art number is not a 2026 state-of-the-art number, and the only safe comparison is one run on the same dataset version with the same official devkit. The learned methods that drive this saturation are the subject of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a> and <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">Chapter 25</a>.</p>
 </div>
+<p>
+The alignment-and-scale subtlety above is not a detail to read past; it is the single most common way an honest-looking trajectory number lies. The best way to internalize it is to build the scoreboard yourself once, then watch a tool reproduce it. Put the section's evaluation lessons into practice in the Hands-On Lab at the end of this section, which has you implement Absolute Trajectory Error from scratch, expose the scale-correction trap on a controlled example, and finish by reproducing your own numbers with evo.
+</p>
 <div class="callout exercise">
 <div class="callout-title">Exercise 17.3.1: Pick the Benchmark <span class="exercise-type conceptual">Conceptual</span></div>
 <p>For each claim a paper might make, name the dataset and metric from Table 17.3.1 (or Section 4) you would expect it to report on, and one weakness of that benchmark the authors should disclose: (a) "our descriptor is more robust to illumination change"; (b) "our stereo method is accurate on driving scenes"; (c) "our optical flow handles large motions and motion blur"; (d) "our multi-object tracker preserves identities through occlusion."</p>
@@ -189,6 +192,207 @@ Multi-object tracking (<a href="../module-15-motion-flow-tracking/index.html">Ch
 <div class="callout exercise">
 <div class="callout-title">Exercise 17.3.3: The Scale-Correction Trap <span class="exercise-type analysis">Analysis</span></div>
 <p>Take any monocular trajectory estimate and its ground truth (TUM RGB-D provides both). Compute the ATE twice with evo: once with scale correction (<code>-a -s</code>) and once without (<code>-a</code> only). Report both numbers and the recovered scale factor. Explain, using the monocular scale ambiguity of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>, why the two ATEs differ and which one a robotics customer deploying the system without a scale oracle actually cares about.</p>
+</div>
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Trajectory-Evaluation Harness and Expose the Scale-Correction Trap</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+<div class="lab-objective">
+<p>Build, from numpy alone, a trajectory-evaluation tool that aligns an estimated camera path to ground truth and reports the Absolute Trajectory Error (ATE), then use it to reproduce the production failure of this section's Practical Example: a monocular trajectory that looks excellent only because scale correction quietly rescaled it. You will finish with a small, reusable scoreboard, the top layer of the chapter's verbs-pipelines-scoreboards stack, and confirm your numbers against the standard tool evo.</p>
+</div>
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Implementing the Umeyama closed-form similarity alignment (rotation, translation, and optional scale) that underlies every honest ATE computation in Section 4.</li>
+<li>Computing ATE root-mean-square error and reading it as the global-consistency metric defined in Section 4 alongside RPE.</li>
+<li>Distinguishing rigid alignment (for stereo and RGB-D) from similarity alignment with a free scale (for monocular), the distinction behind the monocular scale ambiguity of <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>.</li>
+<li>Demonstrating the scale-correction trap of this section's Practical Example: why <code>evo -a -s</code> can flatter exactly the weakness that sinks a method in the field.</li>
+<li>Cross-checking a hand-rolled metric against the production tool evo from the chapter bibliography.</li>
+</ul>
+</div>
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install numpy evo</code></pre>
+<p>No dataset download and no GPU are required: the lab generates its own ground-truth and estimated trajectories so the answer is known in advance and every step is reproducible. The <code>evo</code> install is used only in the final cross-check step; the harness itself depends on numpy alone.</p>
+</div>
+<p>Work through the steps in order. Each prints a checkpoint so you can confirm progress before moving on, and a complete reference solution is folded at the end.</p>
+<div class="lab-steps">
+<div class="lab-step">
+<h4>Step 1: Generate a ground-truth path and a flawed monocular estimate</h4>
+<p>Create a known ground-truth trajectory and a deliberately corrupted estimate of it. The corruption is the realistic monocular failure of this section's Practical Example: the estimated path is rotated, shifted, and uniformly shrunk by an unknown scale, then lightly noised. Because you build both paths, you know the true error and can check your harness against it.</p>
+<pre><code class="language-python">import numpy as np
+
+rng = np.random.default_rng(0)
+t = np.linspace(0, 4 * np.pi, 200)
+# Ground-truth path: a rising spiral, positions only (N x 3), in meters.
+gt = np.stack([np.cos(t), np.sin(t), 0.15 * t], axis=1)
+
+# TODO: build `est` from `gt` as a monocular estimate would relate to truth:
+#   1. shrink by a true scale factor s_true = 0.5 (monocular has no metric scale),
+#   2. rotate by a fixed rotation R_true about the z axis (e.g. 30 degrees),
+#   3. translate by a fixed offset t_true (e.g. [2, -1, 0.5]),
+#   4. add small Gaussian noise (std 0.01) so the fit is not exact.
+# Hint: est_i = s_true * (R_true @ gt_i) + t_true + noise_i
+s_true = 0.5
+# ... define R_true, t_true, then est = ...
+print("gt shape", gt.shape, "est shape", est.shape)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>A rotation about z by angle $\theta$ is <code>R = np.array([[cos, -sin, 0], [sin, cos, 0], [0, 0, 1]])</code>. Apply it to all points at once with <code>(R @ gt.T).T</code>, then scale, add the translation by broadcasting, and add <code>rng.normal(0, 0.01, gt.shape)</code>.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 2: Implement Umeyama alignment</h4>
+<p>Write the closed-form fit that best overlays one path onto another. Section 4 names this as the subtle step every ATE depends on. The same routine serves both alignment modes: pass <code>with_scale=False</code> for the rigid alignment used with stereo and RGB-D, and <code>with_scale=True</code> for the similarity alignment used with monocular methods.</p>
+<pre><code class="language-python">def umeyama(src, dst, with_scale):
+    """Least-squares similarity (s, R, t) mapping src onto dst.
+    src, dst: (N, 3) arrays. Returns s (float), R (3x3), t (3,)."""
+    mu_src, mu_dst = src.mean(0), dst.mean(0)
+    sc, dc = src - mu_src, dst - mu_dst
+    cov = (dc.T @ sc) / len(src)
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:   # reflection guard
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    # TODO: compute the scale `s`.
+    #   with_scale=True  -> s = trace(diag(D) @ S) / variance of src
+    #   with_scale=False -> s = 1.0 (rigid alignment, no rescaling)
+    # Then compute t = mu_dst - s * R @ mu_src and return s, R, t.
+    ...
+    return s, R, t</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The source variance is <code>var = (sc ** 2).sum() / len(src)</code>. With scale, <code>s = np.trace(np.diag(D) @ S) / var</code>. The translation is <code>t = mu_dst - s * R @ mu_src</code> in both modes.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 3: Compute ATE after alignment</h4>
+<p>Align the estimate to the ground truth, then measure the leftover positional error. ATE is the root-mean-square of the per-pose Euclidean distances after the best alignment, the global-consistency number from Section 4.</p>
+<pre><code class="language-python">def ate_rmse(gt, est, with_scale):
+    # TODO: align est onto gt with umeyama(est, gt, with_scale),
+    #   map every est point: est_aligned = s * (R @ est_i) + t,
+    #   then return sqrt(mean(||gt_i - est_aligned_i||^2)) and the scale s.
+    ...
+    return rmse, s
+
+rmse_rigid, s_rigid = ate_rmse(gt, est, with_scale=False)
+rmse_sim,   s_sim   = ate_rmse(gt, est, with_scale=True)
+print(f"ATE rigid  (no scale): {rmse_rigid:.4f} m, recovered scale {s_rigid:.3f}")
+print(f"ATE similarity (-s):   {rmse_sim:.4f} m, recovered scale {s_sim:.3f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Apply the fit with <code>est_aligned = (s * (R @ est.T)).T + t</code>. The error is <code>np.sqrt(((gt - est_aligned) ** 2).sum(1).mean())</code>.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 4: Read the trap in the two numbers</h4>
+<p>Compare the two ATEs and the recovered scale. The similarity fit should recover a scale near the true 0.5 and report a tiny error, while the rigid fit, forbidden from rescaling, reports a large error. Print the contrast in plain language so the lesson is unmissable.</p>
+<pre><code class="language-python"># TODO: print a one-line verdict. The similarity ATE looks excellent only
+#   because it silently rescaled the estimate by ~2x to match metric truth.
+#   The rigid ATE is the number a robot WITHOUT a scale oracle actually lives with.
+print(f"similarity hides a {1.0 / s_sim:.2f}x scale error that rigid alignment exposes")
+# Expected: rigid ATE >> similarity ATE; recovered scale ~ 0.5.</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Connect it back to the Practical Example: <code>evo -a -s</code> on a benchmark is the similarity fit, and it answers a different question than a deployed monocular system, which has no oracle to rescale against, faces in the field.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 5: Cross-check against evo</h4>
+<p>Write both trajectories to TUM-format files and confirm your hand-rolled ATE matches the standard tool. This is the chapter's recurring move: build the scoreboard once to understand it, then hand the job to the library that does it correctly at scale.</p>
+<pre><code class="language-python"># TUM format per line: timestamp tx ty tz qx qy qz qw  (identity quaternion here).
+def write_tum(path, xyz):
+    with open(path, "w") as f:
+        for i, p in enumerate(xyz):
+            f.write(f"{i:.6f} {p[0]} {p[1]} {p[2]} 0 0 0 1\n")
+
+write_tum("gt.txt", gt)
+write_tum("est.txt", est)
+# TODO: from the shell, run both and compare to your Step 3 numbers:
+#   evo_ape tum gt.txt est.txt -a        # rigid: should match rmse_rigid
+#   evo_ape tum gt.txt est.txt -a -s     # similarity: should match rmse_sim
+print("wrote gt.txt and est.txt; run evo_ape to confirm")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>evo prints an "rmse" row in its statistics table. With <code>-s</code> it also prints the estimated scale; it should agree with your <code>s_sim</code> near 0.5. Small differences come only from timestamp handling, not the math.</p>
+</details>
+</div>
+</div>
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>The similarity-aligned ATE prints as a small number (well under a centimeter, dominated by the injected noise) with a recovered scale near 0.500, while the rigid ATE prints far larger (on the order of the spiral's own size) because it cannot undo the 2x scale mismatch. The verdict line reports roughly a 2.00x scale error hidden by the similarity fit. In Step 5, <code>evo_ape ... -a</code> reproduces your rigid number and <code>evo_ape ... -a -s</code> reproduces both your similarity number and the recovered scale, confirming the harness is correct. The takeaway matches the Practical Example: the flattering monocular number was an alignment artifact, not field performance.</p>
+</div>
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Add Relative Pose Error (RPE) to the harness: measure drift over fixed frame intervals rather than after global alignment, and observe that RPE is far less sensitive to the scale trap than ATE.</li>
+<li>Replace the synthetic estimate with a real one: run the <a href="../module-14-sfm-visual-slam/index.html">Chapter 14</a> reconstruction lab on your own photos, export the camera centers as a trajectory, and score them against an approximate ground truth path.</li>
+<li>Sweep the noise level and plot ATE versus noise for both alignment modes, then mark where benchmark saturation (the Research Frontier above) would make rankings unreliable.</li>
+</ul>
+</div>
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import numpy as np
+
+# ---- Step 1: ground truth and a flawed monocular estimate ----
+rng = np.random.default_rng(0)
+t = np.linspace(0, 4 * np.pi, 200)
+gt = np.stack([np.cos(t), np.sin(t), 0.15 * t], axis=1)
+
+s_true = 0.5
+th = np.deg2rad(30)
+R_true = np.array([[np.cos(th), -np.sin(th), 0],
+                   [np.sin(th),  np.cos(th), 0],
+                   [0, 0, 1]])
+t_true = np.array([2.0, -1.0, 0.5])
+est = s_true * (R_true @ gt.T).T + t_true + rng.normal(0, 0.01, gt.shape)
+
+# ---- Step 2: Umeyama similarity alignment ----
+def umeyama(src, dst, with_scale):
+    mu_src, mu_dst = src.mean(0), dst.mean(0)
+    sc, dc = src - mu_src, dst - mu_dst
+    cov = (dc.T @ sc) / len(src)
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    if with_scale:
+        var = (sc ** 2).sum() / len(src)
+        s = np.trace(np.diag(D) @ S) / var
+    else:
+        s = 1.0
+    t = mu_dst - s * R @ mu_src
+    return s, R, t
+
+# ---- Step 3: ATE after alignment ----
+def ate_rmse(gt, est, with_scale):
+    s, R, t = umeyama(est, gt, with_scale)
+    est_aligned = (s * (R @ est.T)).T + t
+    rmse = np.sqrt(((gt - est_aligned) ** 2).sum(1).mean())
+    return rmse, s
+
+rmse_rigid, s_rigid = ate_rmse(gt, est, with_scale=False)
+rmse_sim,   s_sim   = ate_rmse(gt, est, with_scale=True)
+print(f"ATE rigid  (no scale): {rmse_rigid:.4f} m, recovered scale {s_rigid:.3f}")
+print(f"ATE similarity (-s):   {rmse_sim:.4f} m, recovered scale {s_sim:.3f}")
+
+# ---- Step 4: read the trap ----
+print(f"similarity hides a {1.0 / s_sim:.2f}x scale error that rigid alignment exposes")
+
+# ---- Step 5: cross-check against evo ----
+def write_tum(path, xyz):
+    with open(path, "w") as f:
+        for i, p in enumerate(xyz):
+            f.write(f"{i:.6f} {p[0]} {p[1]} {p[2]} 0 0 0 1\n")
+
+write_tum("gt.txt", gt)
+write_tum("est.txt", est)
+print("wrote gt.txt and est.txt")
+# Shell cross-check:
+#   evo_ape tum gt.txt est.txt -a       -> rmse matches rmse_rigid
+#   evo_ape tum gt.txt est.txt -a -s    -> rmse matches rmse_sim, scale ~ 0.5</code></pre>
+</details>
 </div>
 <nav class="chapter-nav">
 <a class="prev" href="section-17.2.html"><span class="nav-label">Section 17.2: Reconstruction Tooling: COLMAP, OpenMVG &amp; Friends</span></a>

@@ -140,7 +140,14 @@ Each parameter of the camera model is constrained by a specific kind of view, so
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Every Parameter Is Paid For by a Region of Capture Space</div>
-<p>Focal length is bought with tilted views, distortion with frame-corner coverage, the principal point with views distributed around the center, and noise resilience with view count. This is why a single RMS number cannot certify a calibration: a dataset can be excellent for the parameters it exercised and silent about the rest, and the optimizer will happily report a tight fit on the silent ones too. When a downstream system misbehaves (a stereo rig in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> that triangulates bent walls, say), ask first which parameter would cause it, then ask whether your capture set actually paid for that parameter.</p>
+<p>The capture checklist above is easier to remember as a four-line price list, because each parameter is bought by one kind of view:</p>
+<ul>
+<li><strong>Tilt</strong> buys focal length ($f_x, f_y$).</li>
+<li><strong>Corners</strong> buy the distortion coefficients.</li>
+<li><strong>Spread</strong> buys the principal point ($c_x, c_y$).</li>
+<li><strong>Count</strong> buys noise resilience.</li>
+</ul>
+<p>This is why a single RMS number cannot certify a calibration: a dataset can be excellent for the parameters it exercised and silent about the rest, and the optimizer will happily report a tight fit on the silent ones too. When a downstream system misbehaves (a stereo rig in <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a> that triangulates bent walls, say), ask first which parameter would cause it, then ask whether your capture set actually paid for that parameter (tilt, corners, spread, or count).</p>
 </div>
 
 <h2>3. ChArUco Calibration with the Modern API <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
@@ -283,6 +290,232 @@ Finally, know the recalibration triggers by heart: any lens or focus change, any
 <div class="callout exercise">
 <div class="callout-title">Exercise 12.5.3: Residual Forensics on a Sabotaged Dataset <span class="exercise-type analysis">Analysis</span></div>
 <p>Take a good 25-view capture set and create three corrupted variants: (a) recalibrate with <code>k2, k3</code> fixed to zero (<code>CALIB_FIX_K2 | CALIB_FIX_K3</code>) to simulate an insufficient distortion model; (b) digitally shear one view's image by 0.5 degrees to simulate a moved board; (c) drop all views whose board center is in the outer third of the frame to simulate lazy coverage. For each variant, produce the residual quiver plot and the parameter standard deviations, and write down the visual signature that identifies each failure. You are building the diagnostic lookup table this section claims exists; verify it.</p>
+</div>
+
+<p>The exercises above sharpen individual instincts; the Hands-On Lab below assembles the chapter's full three-beat arc, project, calibrate, and locate, into a single script you can run with no camera and no downloaded images.</p>
+
+<div class="callout lab">
+<div class="callout-title">Hands-On Lab: Build a Synthetic Calibration and Pose Workbench</div>
+<div class="lab-meta"><span class="lab-difficulty">Difficulty: Intermediate</span> <span class="lab-duration">Duration: 60 to 90 minutes</span></div>
+
+<div class="lab-objective">
+<p>Build one self-contained script, <code>calib_workbench.py</code>, that invents a virtual camera with known intrinsics and distortion, renders a printed checkerboard from many synthetic viewpoints, recovers the camera parameters with Zhang's method, then estimates a fresh pose with PnP and verifies it by reprojection. Because the script generates its own scene, you can compare every recovered number against the exact ground truth, the one luxury real calibration never grants, which turns the whole chapter into something you can falsify on your own machine.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Projecting 3D points through the pinhole model and intrinsic matrix $K$ with <code>cv2.projectPoints</code> (Section 12.1).</li>
+<li>Adding and later recovering Brown-Conrady radial distortion (Section 12.2).</li>
+<li>Running <code>cv2.calibrateCamera</code> over synthetic views and reading its RMS reprojection error (Section 12.3).</li>
+<li>Solving the Perspective-n-Point problem with <code>cv2.solvePnP</code> and measuring reprojection residuals (Section 12.4).</li>
+<li>Judging a calibration against ground truth, the diagnostic mindset of this section (Section 12.5).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<pre><code class="language-bash">pip install numpy opencv-python</code></pre>
+<p>No image files and no physical checkerboard are needed: the script defines the board geometry numerically and projects it, so it runs start to finish on any machine, including a headless one.</p>
+</div>
+
+<p>Put the section's workflow concepts into practice below. Work through the steps in order; each prints a checkpoint so you can confirm progress before moving on. A complete reference solution is folded at the end.</p>
+
+<div class="lab-steps">
+
+<div class="lab-step">
+<h4>Step 1: Define a ground-truth camera</h4>
+<p>Invent the camera you are pretending to own: a resolution, an intrinsic matrix $K$, and a five-coefficient distortion vector. Everything downstream is judged against these numbers.</p>
+<pre><code class="language-python">import numpy as np
+import cv2
+
+W, H = 1280, 960
+K_true = np.array([[1000.0,    0.0, 640.0],
+                   [   0.0, 1000.0, 480.0],
+                   [   0.0,    0.0,   1.0]])
+# TODO: define dist_true as a (5,) array [k1, k2, p1, p2, k3]
+# Hint: a mild barrel lens has a negative k1, for example -0.25, with smaller k2, p1, p2, k3
+dist_true = ...
+print("ground-truth focal:", K_true[0, 0], "px")</code></pre>
+<details><summary>Hint</summary><p>Try <code>dist_true = np.array([-0.25, 0.10, 0.001, -0.001, 0.02])</code>. Keep $k_1$ dominant and negative so the barrel effect is visible but the polynomial stays well-behaved across the frame.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build the checkerboard's 3D object points</h4>
+<p>A planar target lives at $z=0$ in its own coordinate frame. Lay out the inner-corner grid in metric units so the recovered translations come out in meters.</p>
+<pre><code class="language-python">COLS, ROWS = 9, 6          # inner corners
+SQUARE = 0.025             # 25 mm squares
+
+def board_points(cols, rows, square):
+    pts = np.zeros((rows * cols, 3), np.float32)
+    # TODO: fill columns 0 and 1 with the x, y grid (column 2 stays 0 for a planar board)
+    # Hint: np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square
+    ...
+    return pts
+
+objp = board_points(COLS, ROWS, SQUARE)
+print("object points:", objp.shape)   # (54, 3)</code></pre>
+<details><summary>Hint</summary><p><code>pts[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)</code> then multiply by <code>square</code>. The board is flat, so the third coordinate is left at zero, exactly the planarity Zhang's method exploits.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Synthesize many views by projecting the board</h4>
+<p>Replace a capture session with a loop: for each random board pose, project the object points through the ground-truth camera (distortion included) to get the pixel corners a detector would have found.</p>
+<pre><code class="language-python">rng = np.random.default_rng(0)
+
+def random_pose():
+    rvec = rng.uniform(-0.5, 0.5, 3).astype(np.float64)        # tilt in radians
+    tvec = np.array([rng.uniform(-0.1, 0.1),
+                     rng.uniform(-0.1, 0.1),
+                     rng.uniform(0.4, 0.8)], np.float64)        # board 0.4 to 0.8 m away
+    return rvec, tvec
+
+image_points = []
+for _ in range(20):
+    rvec, tvec = random_pose()
+    # TODO: project objp with cv2.projectPoints using K_true and dist_true
+    # keep only views whose corners all fall inside [0, W) x [0, H)
+    ...
+print("usable views:", len(image_points))</code></pre>
+<details><summary>Hint</summary><p><code>proj, _ = cv2.projectPoints(objp, rvec, tvec, K_true, dist_true)</code> returns an <code>(N,1,2)</code> array. Accept the view only if <code>proj</code> is fully in bounds; discard and resample otherwise so calibration never sees off-screen corners.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Calibrate and compare against ground truth</h4>
+<p>Run Zhang's method on the synthetic corners as if you had never seen <code>K_true</code>, then hold the recovered numbers up against the truth you secretly know.</p>
+<pre><code class="language-python">obj_list = [objp] * len(image_points)
+rms, K_est, dist_est, rvecs, tvecs = cv2.calibrateCamera(
+    obj_list, image_points, (W, H), None, None)
+
+print(f"RMS reprojection error: {rms:.4f} px")
+# TODO: print the focal-length error |K_est[0,0] - K_true[0,0]|
+#       and the principal-point error, in pixels
+...</code></pre>
+<details><summary>Hint</summary><p>With noiseless synthetic corners the RMS should be a small fraction of a pixel and <code>K_est</code> should match <code>K_true</code> to within a pixel or two. If it does not, your Step 3 views are too similar; widen the tilt range so every parameter is constrained.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Add corner noise and watch the error grow</h4>
+<p>Real detectors are not exact. Perturb the corners with sub-pixel Gaussian noise, recalibrate, and confirm that RMS and the parameter errors rise together, the link this section asks you to internalize.</p>
+<pre><code class="language-python">noisy_points = [p + rng.normal(0, 0.3, p.shape).astype(np.float32)
+                for p in image_points]
+# TODO: recalibrate with noisy_points and report the new RMS and focal error
+...</code></pre>
+<details><summary>Hint</summary><p>A 0.3 px corner noise typically lifts the RMS into the few-tenths-of-a-pixel range and the focal error to a handful of pixels. The takeaway: RMS tracks corner-localization quality, which is why subpixel refinement matters.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Estimate a fresh pose with PnP and reproject</h4>
+<p>Calibration over, switch to the per-frame job. Generate one brand-new pose, project it through the recovered camera, solve PnP for the pose, and measure how far the reprojected corners land from where they should.</p>
+<pre><code class="language-python">rvec_gt, tvec_gt = random_pose()
+proj_gt, _ = cv2.projectPoints(objp, rvec_gt, tvec_gt, K_est, dist_est)
+
+# TODO: recover the pose with cv2.solvePnP(objp, proj_gt, K_est, dist_est)
+#       then reproject and print the mean pixel reprojection error
+...</code></pre>
+<details><summary>Hint</summary><p><code>ok, rvec_pnp, tvec_pnp = cv2.solvePnP(objp, proj_gt, K_est, dist_est)</code>. Reproject with the recovered pose and compare to <code>proj_gt</code>; the mean error should be a tiny fraction of a pixel because the inputs are consistent.</p></details>
+</div>
+
+<div class="lab-step">
+<h4>Step 7: The Right Tool, the robust library shortcut</h4>
+<p>You solved a clean PnP; production data carries outliers. Corrupt a few corners and let OpenCV's RANSAC variant reject them in one call, mirroring this chapter's robust-pose theme.</p>
+<pre><code class="language-python">corrupt = proj_gt.copy()
+corrupt[[3, 17, 40]] += rng.uniform(-50, 50, (3, 1, 2)).astype(np.float64)
+
+# A robust pose in one call: RANSAC finds the inliers for you.
+ok, rvec_r, tvec_r, inliers = cv2.solvePnPRansac(objp, corrupt, K_est, dist_est)
+# TODO: print how many inliers RANSAC kept and confirm the three corrupted
+#       indices are absent from the inlier set
+...</code></pre>
+<details><summary>Hint</summary><p><code>inliers</code> is an index array; the corrupted rows 3, 17, and 40 should not appear in it. The single <code>solvePnPRansac</code> call replaces a hand-written sample-and-vote loop of dozens of lines, the same Right Tool collapse seen throughout the book.</p></details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h4>Expected Output</h4>
+<p>The finished script prints a short report. Step 4's noiseless calibration shows an RMS well under 0.01 px and a focal-length error of at most a pixel or two, with the recovered distortion close to <code>dist_true</code>. Step 5's noisy run lifts the RMS to a few tenths of a pixel and the focal error to a handful of pixels, demonstrating the RMS-versus-accuracy link. Step 6's clean PnP reprojects to a small fraction of a pixel. Step 7 reports that RANSAC kept the honest corners and dropped the three you sabotaged. Seeing recovered numbers converge on the ground truth you planted is the proof that the project-calibrate-locate pipeline of this chapter actually closes.</p>
+</div>
+
+<div class="lab-stretch">
+<h4>Stretch Goals</h4>
+<ul>
+<li>Sweep the view count from 3 to 30 and plot focal-length error against the number of views, reproducing the diminishing-returns curve that justifies the capture protocol of this section.</li>
+<li>Fix <code>k3</code> to zero during calibration (<code>cv2.CALIB_FIX_K3</code>) on a barrel lens with a real <code>k3</code> and watch the residuals develop the radial signature described in Exercise 12.5.3.</li>
+<li>Replace the synthetic projection with a real webcam and a printed checkerboard, swapping <code>projectPoints</code> for <code>cv2.findChessboardCorners</code>, and confirm your workbench transfers unchanged to physical capture, the bridge to <a href="../module-13-two-view-stereo-depth/index.html">Chapter 13</a>'s stereo rig.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import numpy as np
+import cv2
+
+# ---- Step 1: ground-truth camera ----
+W, H = 1280, 960
+K_true = np.array([[1000.0,    0.0, 640.0],
+                   [   0.0, 1000.0, 480.0],
+                   [   0.0,    0.0,   1.0]])
+dist_true = np.array([-0.25, 0.10, 0.001, -0.001, 0.02])
+
+# ---- Step 2: board object points ----
+COLS, ROWS, SQUARE = 9, 6, 0.025
+def board_points(cols, rows, square):
+    pts = np.zeros((rows * cols, 3), np.float32)
+    pts[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    return pts * square
+objp = board_points(COLS, ROWS, SQUARE)
+
+# ---- Step 3: synthesize views ----
+rng = np.random.default_rng(0)
+def random_pose():
+    rvec = rng.uniform(-0.5, 0.5, 3).astype(np.float64)
+    tvec = np.array([rng.uniform(-0.1, 0.1), rng.uniform(-0.1, 0.1),
+                     rng.uniform(0.4, 0.8)], np.float64)
+    return rvec, tvec
+
+image_points = []
+while len(image_points) &lt; 20:
+    rvec, tvec = random_pose()
+    proj, _ = cv2.projectPoints(objp, rvec, tvec, K_true, dist_true)
+    p = proj.reshape(-1, 2)
+    if (p[:, 0] &gt;= 0).all() and (p[:, 0] &lt; W).all() and \
+       (p[:, 1] &gt;= 0).all() and (p[:, 1] &lt; H).all():
+        image_points.append(proj.astype(np.float32))
+
+# ---- Step 4: calibrate and compare ----
+obj_list = [objp] * len(image_points)
+rms, K_est, dist_est, rvecs, tvecs = cv2.calibrateCamera(
+    obj_list, image_points, (W, H), None, None)
+print(f"RMS reprojection error: {rms:.4f} px")
+print(f"focal error: {abs(K_est[0,0] - K_true[0,0]):.3f} px")
+print(f"principal-point error: "
+      f"{abs(K_est[0,2]-K_true[0,2]):.3f}, {abs(K_est[1,2]-K_true[1,2]):.3f} px")
+
+# ---- Step 5: noisy corners ----
+noisy_points = [p + rng.normal(0, 0.3, p.shape).astype(np.float32)
+                for p in image_points]
+rms_n, K_n, dist_n, _, _ = cv2.calibrateCamera(
+    obj_list, noisy_points, (W, H), None, None)
+print(f"noisy RMS: {rms_n:.4f} px, noisy focal error: "
+      f"{abs(K_n[0,0]-K_true[0,0]):.3f} px")
+
+# ---- Step 6: fresh pose with PnP ----
+rvec_gt, tvec_gt = random_pose()
+proj_gt, _ = cv2.projectPoints(objp, rvec_gt, tvec_gt, K_est, dist_est)
+ok, rvec_pnp, tvec_pnp = cv2.solvePnP(objp, proj_gt, K_est, dist_est)
+reproj, _ = cv2.projectPoints(objp, rvec_pnp, tvec_pnp, K_est, dist_est)
+err = np.linalg.norm(reproj.reshape(-1, 2) - proj_gt.reshape(-1, 2), axis=1)
+print(f"PnP mean reprojection error: {err.mean():.5f} px")
+
+# ---- Step 7: robust PnP with RANSAC ----
+corrupt = proj_gt.copy()
+corrupt[[3, 17, 40]] += rng.uniform(-50, 50, (3, 1, 2)).astype(np.float64)
+ok, rvec_r, tvec_r, inliers = cv2.solvePnPRansac(objp, corrupt, K_est, dist_est)
+kept = set(inliers.ravel().tolist())
+print(f"RANSAC kept {len(kept)} / {len(objp)} corners")
+print(f"corrupted indices in inlier set: {[i for i in (3,17,40) if i in kept]}")</code></pre>
+</details>
 </div>
 
 <nav class="chapter-nav">

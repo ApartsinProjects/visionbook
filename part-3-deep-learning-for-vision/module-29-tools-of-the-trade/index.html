@@ -52,7 +52,7 @@ Read Section 29.1 first; it will stop you from training a backbone you could hav
 </div>
 <div class="callout big-picture">
 <div class="callout-title">Big Picture</div>
-<p><strong>In deep vision you rarely build a model from random weights; you download one, adapt it, track the experiment, and audit the data, and choosing the right tool for each of those four steps decides whether a project ships in a week or stalls for a month.</strong> The theory of Chapters 18 through 28 does not change. The tooling decides whether applying it means writing a training loop or writing a config file, and whether your accuracy ceiling is the model or the mislabeled examples you never looked at.</p>
+<p><strong>In deep vision you rarely build a model from random weights; you download one, adapt it, track the experiment, and audit the data, and choosing the right tool for each of those four steps decides whether a project ships in a week or stalls for a month.</strong> Four verbs name the whole stack: <strong>download, adapt, audit, track</strong>. Each section of this chapter equips one of them, and the four together are the deep vision workflow that the from-scratch chapters of Part III earned the right to skip. The theory of Chapters 18 through 28 does not change. The tooling decides whether applying it means writing a training loop or writing a config file, and whether your accuracy ceiling is the model or the mislabeled examples you never looked at.</p>
 </div>
 <div class="objectives">
 <h3>Learning Objectives</h3>
@@ -98,6 +98,284 @@ This chapter consolidates all of Part III, so any of <a href="../module-18-neura
 <div class="callout-title">Fun Fact</div>
 <p>The model-hub idea is younger than most readers assume. As recently as 2018, getting a pretrained ResNet often meant downloading a Caffe <code>.caffemodel</code> from a lab's web page, converting it with a community script, and hoping the BatchNorm statistics survived. torchvision's <code>model_zoo</code>, timm's first release, and the Hugging Face Hub's pivot to vision all landed within a few years of each other, and the entire "just download the weights" workflow this chapter takes for granted is barely older than the transformer.</p>
 </div>
+
+<p>
+The four verbs of this chapter, download, adapt, audit, and track, only become a single skill when you run them once, end to end, on a real dataset. The Hands-On Lab below does exactly that: it builds one small but complete deep vision project that touches every tool in the chapter, so the four sections stop being a reference and become a workflow you have executed.
+</p>
+
+<section class="lab" id="lab-29">
+<h2>Hands-On Lab: A Reproducible Deep Vision Pipeline End to End</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build one small but complete deep vision project that exercises all four verbs of this chapter on a single real dataset: <strong>download</strong> a pretrained backbone from a hub (<a href="section-29.1.html">Section 29.1</a>), <strong>adapt</strong> it by fine-tuning a new classification head on the Oxford-IIIT Pets dataset, <strong>track</strong> the run so every epoch is logged and recoverable (<a href="section-29.4.html">Section 29.4</a>), and <strong>audit</strong> the trained model's predictions visually to find the images it gets wrong (<a href="section-29.3.html">Section 29.3</a>). The artifact you finish with is a fine-tuned classifier, a logged run with a training curve, and a ranked list of the model's hardest mistakes, the same three deliverables a real project hands off.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Loading a pretrained backbone and its <em>matching</em> preprocessing transform from the same source, the one discipline of <a href="section-29.1.html">Section 29.1</a> that prevents the silent accuracy-killing mismatch bug.</li>
+<li>Adapting a hub model to a new label set by replacing the classification head and fine-tuning, the transfer-learning workflow of <a href="../module-21-training-recipes/index.html">Chapter 21</a>.</li>
+<li>Instrumenting a training loop with an experiment tracker so the run logs its config, per-epoch metrics, and a checkpoint artifact (<a href="section-29.4.html">Section 29.4</a>).</li>
+<li>Auditing predictions visually with FiftyOne to surface the highest-confidence mistakes that an aggregate accuracy number hides (<a href="section-29.3.html">Section 29.3</a>).</li>
+<li>Assembling the four-legged reproducibility contract, model, config, data, run, into one runnable script.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One deep-learning stack plus the two tools the chapter introduces. The Oxford-IIIT Pets dataset (37 cat and dog breeds, about 7,400 images) downloads automatically through torchvision on first run, so there is no manual data step. TensorBoard ships with PyTorch and needs no account; FiftyOne installs with one line. A GPU finishes the suggested three epochs in a few minutes, but the code runs on CPU too (slower). Install with:</p>
+<pre><code class="language-bash">pip install torch torchvision timm fiftyone tensorboard</code></pre>
+<p>Everything below lives in one script. The model is a timm-loaded backbone fine-tuned only on its head, so it reaches a meaningful accuracy on Pets in a few epochs rather than the hours a full fine-tune would need.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Download a backbone and its matching transform</h4>
+<p>Load a pretrained backbone from timm and, in the same breath, resolve the exact preprocessing it expects, the inseparable model-and-transform pair of <a href="section-29.1.html">Section 29.1</a>. Resolving the transform from the model (rather than hand-copying constants) is what keeps the input distribution aligned with what the weights were trained on.</p>
+<pre><code class="language-python">import timm
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Load a small, fast backbone pretrained on ImageNet. num_classes=37 swaps in a
+# fresh head sized for the 37 Pets breeds; the backbone weights stay pretrained.
+model = timm.create_model("resnet18", pretrained=True, num_classes=37).to(device)
+
+# TODO: resolve THIS model's preprocessing config, then build train and eval
+# transforms from it. Use timm.data.resolve_model_data_config(model) and
+# timm.data.create_transform(**cfg, is_training=True) for training (adds
+# augmentation) and is_training=False for evaluation.
+cfg = ...
+train_tf = ...
+eval_tf = ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>cfg = timm.data.resolve_model_data_config(model)</code>, then <code>train_tf = timm.data.create_transform(**cfg, is_training=True)</code> and <code>eval_tf = timm.data.create_transform(**cfg, is_training=False)</code>. Passing <code>num_classes=37</code> to <code>create_model</code> is the head swap: timm discards the 1000-way ImageNet classifier and attaches a randomly initialized 37-way one.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Load the Pets dataset with the resolved transforms</h4>
+<p>Point torchvision at Oxford-IIIT Pets, which downloads on first use, and wrap each split in the transform from Step 1. The training split gets the augmenting transform; the test split gets the plain evaluation transform, so you never leak augmentation into the metric.</p>
+<pre><code class="language-python">from torchvision.datasets import OxfordIIITPet
+from torch.utils.data import DataLoader
+
+# download=True fetches ~7,400 images on first run, then caches them.
+train_ds = OxfordIIITPet(root="data", split="trainval",
+                         transform=train_tf, download=True)
+test_ds = OxfordIIITPet(root="data", split="test",
+                        transform=eval_tf, download=True)
+
+# TODO: build a training DataLoader (batch_size=64, shuffle=True) and a test
+# DataLoader (batch_size=64, shuffle=False). Set num_workers to taste.
+train_dl = ...
+test_dl = ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>train_dl = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2)</code> and <code>test_dl = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2)</code>. Shuffle the training loader so batches are decorrelated; never shuffle the test loader, so prediction order matches the dataset order you will need in Step 5.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Start a tracked run and log the config</h4>
+<p>Open a tracker before training so the run records what it is about to do. TensorBoard is the zero-setup option of <a href="section-29.4.html">Section 29.4</a>: a single writer object captures the config and will receive per-epoch metrics. Logging the config up front is what makes the run reproducible later.</p>
+<pre><code class="language-python">from torch.utils.tensorboard import SummaryWriter
+
+config = {"backbone": "resnet18", "lr": 1e-3, "epochs": 3,
+          "dataset": "oxford-iiit-pet", "head_only": True}
+
+# TODO: create a SummaryWriter and record the config. Use
+# writer = SummaryWriter(comment="pets-resnet18") and log the hyperparameters
+# once with writer.add_hparams(config, {}) so the run is self-describing.
+writer = ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>writer = SummaryWriter(comment="pets-resnet18")</code>, then <code>writer.add_hparams(config, {})</code>. Run <code>tensorboard --logdir runs</code> in a second terminal to watch the curve appear live. If you prefer the hosted dashboard, the same loop logs to Weights and Biases by swapping in the <code>wandb.init(config=config)</code> and <code>wandb.log(...)</code> calls from Code Fragment 1 of Section 29.4.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Fine-tune the head and log each epoch</h4>
+<p>Freeze the backbone and train only the new head for a few epochs, the cheap, fast transfer-learning move of <a href="../module-21-training-recipes/index.html">Chapter 21</a>. After each epoch, compute test accuracy and log both the loss and the accuracy to the tracker so you get a curve, not just a final number.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+# Freeze every parameter, then re-enable only the classifier head.
+for p in model.parameters():
+    p.requires_grad = False
+for p in model.get_classifier().parameters():
+    p.requires_grad = True
+
+opt = torch.optim.Adam(model.get_classifier().parameters(), lr=config["lr"])
+loss_fn = nn.CrossEntropyLoss()
+
+for epoch in range(config["epochs"]):
+    model.train()
+    for x, y in train_dl:
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad()
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+
+    # Evaluate and log. TODO: compute test accuracy over test_dl with the model
+    # in eval() mode and torch.no_grad(), then log it and the last loss to the
+    # tracker: writer.add_scalar("val/acc", acc, epoch) and
+    # writer.add_scalar("train/loss", loss.item(), epoch).
+    acc = ...
+    print(f"epoch {epoch}: val acc {acc:.3f}")
+
+torch.save(model.state_dict(), "pets_resnet18.pt")   # the run's artifact
+writer.close()</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For accuracy: set <code>model.eval()</code>, loop under <code>with torch.no_grad():</code>, accumulate <code>(model(x).argmax(1) == y).sum().item()</code> over the test set, and divide by <code>len(test_ds)</code>. Then call <code>writer.add_scalar("val/acc", acc, epoch)</code>. Head-only fine-tuning of ResNet-18 should clear 80 percent on Pets within three epochs because the frozen backbone already encodes generic animal features.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Audit the mistakes in FiftyOne</h4>
+<p>An accuracy number tells you the model is wrong 15 percent of the time but not which images or why. Load the test set and the model's predictions into FiftyOne, the visual auditing tool of <a href="section-29.3.html">Section 29.3</a>, and sort to the highest-confidence wrong predictions, the most informative failures.</p>
+<pre><code class="language-python">import fiftyone as fo
+from fiftyone import ViewField as F
+
+classes = test_ds.classes
+dataset = fo.Dataset("pets-audit")
+model.eval()
+
+# Attach each test image plus its ground truth and the model's top prediction.
+# test_ds._images holds the file paths and test_ds._labels the integer breeds.
+for img_path, label in zip(test_ds._images, test_ds._labels):
+    sample = fo.Sample(filepath=img_path)
+    sample["truth"] = fo.Classification(label=classes[label])
+    x = eval_tf(__import__("PIL").Image.open(img_path).convert("RGB"))
+    with torch.no_grad():
+        logits = model(x.unsqueeze(0).to(device)).softmax(1)[0]
+    conf, pred = logits.max(0)
+    sample["pred"] = fo.Classification(label=classes[pred], confidence=float(conf))
+    dataset.add_sample(sample)
+
+# TODO: build a view of confident mistakes: samples where pred != truth,
+# sorted by descending prediction confidence. Filter with
+# F("pred.label") != F("truth.label") and sort_by("pred.confidence",
+# reverse=True), then fo.launch_app(view=...).
+mistakes = ...
+session = fo.launch_app(view=mistakes)</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>mistakes = dataset.match(F("pred.label") != F("truth.label")).sort_by("pred.confidence", reverse=True)</code>, then <code>fo.launch_app(view=mistakes)</code>. The top of this view is where the model is both wrong and sure, often a mislabeled image, an ambiguous breed, or two cats in one frame, exactly the systematic failures Section 29.3 argues aggregate metrics hide.</p>
+</details>
+</div>
+
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>The training loop prints a rising validation accuracy that reaches roughly 0.80 to 0.88 after three head-only epochs, with the matching curve visible in TensorBoard at <code>http://localhost:6006</code>. Step 4 leaves a checkpoint file <code>pets_resnet18.pt</code> on disk as the run's artifact. Step 5 opens the FiftyOne app in your browser showing the confident mistakes ranked by confidence; the first few are typically visually confusable breeds (for example British Shorthair versus Russian Blue) or images with an occluding object, the hard cases that explain most of the residual error. Together these are the three deliverables of a real project: a fine-tuned model, a logged and reproducible run, and a prioritized error list.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Unfreeze the backbone for a final epoch at a 10x lower learning rate (discriminative fine-tuning) and log it as a second tracked run, then compare the two runs' curves in the tracker side by side, the cross-run comparison that motivates a tracker in the first place.</li>
+<li>Swap the backbone for a stronger one in a single string (<code>timm.create_model("convnext_tiny", pretrained=True, num_classes=37)</code>) and confirm the accuracy gain, demonstrating timm's one-line architecture swap from <a href="section-29.1.html">Section 29.1</a>.</li>
+<li>Use the FiftyOne view to find and correct any genuinely mislabeled test images, export the cleaned split as a new dataset version (the versioning idea of <a href="section-29.3.html">Section 29.3</a>), and re-evaluate to measure how much of the error was label noise rather than model error.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python"># Full reproducible deep vision pipeline: download, adapt, track, audit.
+import timm, torch, torch.nn as nn
+from torchvision.datasets import OxfordIIITPet
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from PIL import Image
+import fiftyone as fo
+from fiftyone import ViewField as F
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- Step 1: download backbone + matching transform ---
+model = timm.create_model("resnet18", pretrained=True, num_classes=37).to(device)
+cfg = timm.data.resolve_model_data_config(model)
+train_tf = timm.data.create_transform(**cfg, is_training=True)
+eval_tf = timm.data.create_transform(**cfg, is_training=False)
+
+# --- Step 2: data ---
+train_ds = OxfordIIITPet("data", "trainval", transform=train_tf, download=True)
+test_ds = OxfordIIITPet("data", "test", transform=eval_tf, download=True)
+train_dl = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2)
+test_dl = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2)
+
+# --- Step 3: tracker ---
+config = {"backbone": "resnet18", "lr": 1e-3, "epochs": 3,
+          "dataset": "oxford-iiit-pet", "head_only": True}
+writer = SummaryWriter(comment="pets-resnet18")
+writer.add_hparams(config, {})
+
+# --- Step 4: head-only fine-tune, logging each epoch ---
+for p in model.parameters():
+    p.requires_grad = False
+for p in model.get_classifier().parameters():
+    p.requires_grad = True
+opt = torch.optim.Adam(model.get_classifier().parameters(), lr=config["lr"])
+loss_fn = nn.CrossEntropyLoss()
+
+for epoch in range(config["epochs"]):
+    model.train()
+    last_loss = 0.0
+    for x, y in train_dl:
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad()
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+        last_loss = loss.item()
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for x, y in test_dl:
+            x, y = x.to(device), y.to(device)
+            correct += (model(x).argmax(1) == y).sum().item()
+    acc = correct / len(test_ds)
+    writer.add_scalar("train/loss", last_loss, epoch)
+    writer.add_scalar("val/acc", acc, epoch)
+    print(f"epoch {epoch}: val acc {acc:.3f}")
+
+torch.save(model.state_dict(), "pets_resnet18.pt")
+writer.close()
+
+# --- Step 5: audit mistakes in FiftyOne ---
+classes = test_ds.classes
+dataset = fo.Dataset("pets-audit")
+model.eval()
+for img_path, label in zip(test_ds._images, test_ds._labels):
+    sample = fo.Sample(filepath=img_path)
+    sample["truth"] = fo.Classification(label=classes[label])
+    x = eval_tf(Image.open(img_path).convert("RGB")).unsqueeze(0).to(device)
+    with torch.no_grad():
+        probs = model(x).softmax(1)[0]
+    conf, pred = probs.max(0)
+    sample["pred"] = fo.Classification(label=classes[int(pred)],
+                                       confidence=float(conf))
+    dataset.add_sample(sample)
+
+mistakes = (dataset
+            .match(F("pred.label") != F("truth.label"))
+            .sort_by("pred.confidence", reverse=True))
+session = fo.launch_app(view=mistakes)
+session.wait()   # keep the app open until you close the script
+</code></pre>
+</details>
+</section>
+
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>

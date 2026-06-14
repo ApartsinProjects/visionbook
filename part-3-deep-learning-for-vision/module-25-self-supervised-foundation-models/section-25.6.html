@@ -176,7 +176,7 @@ print(f"trainable: {trainable:,} of {total:,} params ({100*trainable/total:.3f}%
 <div class="code-caption"><strong>Code Fragment 1:</strong> Adapting a frozen foundation model. Freezing the DINOv2 backbone and training only a linear head specializes an 86-million-parameter model to a new task by learning under eight thousand parameters, the practical embodiment of the foundation-model workflow.</div>
 
 <p>
-The printed line is the whole point of the chapter in one number: a task is solved by training under one ten-thousandth of the model's parameters, because the foundation model already learned to see. The practical example shows a team living by this workflow.
+The printed line is the whole point of the chapter in one number: a task is solved by training under one ten-thousandth of the model's parameters, because the foundation model already learned to see. The practical example shows a team living by this workflow, and the Hands-On Lab at the end of this section has you build that workflow yourself, comparing a frozen DINOv2 backbone against CLIP zero-shot classification on the same images.
 </p>
 
 <div class="callout practical-example">
@@ -218,6 +218,224 @@ The frontier direction unifies the chapter's threads. Pixel reconstruction (MAE)
 <div class="callout-title">Exercise 25.6.3: Pixels, Language, or Representations <span class="exercise-type analysis">Analysis</span></div>
 <p>The section contrasts three self-supervised prediction targets: pixels (MAE), language (CLIP), and representations (JEPA). For each, state what the model is penalized for getting wrong, and argue what kind of information that penalty encourages the model to keep versus discard. Then explain the specific complaint JEPA raises against pixel reconstruction, why predicting in representation space is claimed to address it, and how this connects to learning motion and dynamics for the video models of <a href="../module-26-video-understanding/index.html">Chapter 26</a>.</p>
 </div>
+
+<section class="lab" id="lab-25.6">
+<h2>Hands-On Lab: Build a Label-Free Vision Toolkit From Two Foundation Models</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: ~75 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Stand up a small image toolkit that needs no task labels, built entirely on two pretrained foundation models from this chapter. You will use a frozen DINOv2 backbone to embed a folder of your own photos and find visually similar images by nearest neighbor, then use CLIP to classify those same photos zero-shot from a list of category names you type at runtime. The finished artifact is a single script that, given a folder of images and a list of candidate labels, returns for each image its zero-shot label, its confidence, and its three nearest visual neighbors, the practical embodiment of the foundation-model workflow this chapter has been building toward.</p>
+</div>
+
+<div class="lab-skills">
+<h4>What You'll Practice</h4>
+<ul>
+<li>Loading a frozen self-supervised backbone (DINOv2) through <code>torch.hub</code>, the frozen-feature default of subsection 2</li>
+<li>Extracting and L2-normalizing embeddings, then ranking by cosine similarity, the dot-product similarity measure used since <a href="section-25.2.html">Section 25.2</a></li>
+<li>Running CLIP zero-shot classification with prompt templates, the open-vocabulary recipe of <a href="section-25.4.html">Section 25.4</a></li>
+<li>Contrasting a pixel-and-distillation backbone (DINOv2) with a language-aligned one (CLIP) on the same images, the choose-by-objective skill of Table 25.6.1</li>
+<li>Building a reusable adapter-on-a-backbone pipeline instead of training a model from scratch</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>A machine with Python 3.9 or newer (a free Colab GPU runtime is ideal but a modern CPU runs the base models on a few dozen images). Install PyTorch, the Hugging Face stack for CLIP, and the small extras DINOv2 needs:</p>
+<pre><code class="language-bash">pip install torch torchvision transformers pillow numpy</code></pre>
+<p>For data, drop twenty to fifty of your own photos into a folder named <code>images/</code>. A mix of a few recognizable categories works best (for example pets, vehicles, and food), so that both the nearest-neighbor grouping and the zero-shot labels have something to separate. No annotations of any kind are required: that is the entire point.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Load and preprocess your image folder</h4>
+<p>Read every image in the folder and build the two transforms the two models expect. DINOv2 wants ImageNet-normalized tensors at a multiple of its patch size; CLIP brings its own processor. Getting the preprocessing right is most of the battle.</p>
+<pre><code class="language-python">from pathlib import Path
+from PIL import Image
+import torch
+from torchvision import transforms
+
+paths = sorted(Path("images").glob("*.jpg")) + sorted(Path("images").glob("*.png"))
+pil_images = [Image.open(p).convert("RGB") for p in paths]
+print(f"loaded {len(pil_images)} images")
+
+# DINOv2 expects a square crop sized to a multiple of the patch (14) and
+# the standard ImageNet mean/std normalization.
+# TODO: build a torchvision transform that Resize((224, 224)), ToTensor(),
+# and Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]).
+dino_tf = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Compose the three steps with <code>transforms.Compose([...])</code>. 224 is a multiple of 14, so it fits the ViT-B/14 patch grid without padding. CLIP needs no manual transform here; its processor handles resizing and normalization in Step 3.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Embed every image with a frozen DINOv2 backbone</h4>
+<p>Load DINOv2, freeze it, and run a no-gradient forward pass to get one feature vector per image. L2-normalize the vectors so that a dot product becomes cosine similarity, exactly the trick the contrastive methods of <a href="section-25.2.html">Section 25.2</a> rely on.</p>
+<pre><code class="language-python">backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+backbone.eval()
+for p in backbone.parameters():
+    p.requires_grad_(False)            # frozen feature extractor, no training
+
+batch = torch.stack([dino_tf(im) for im in pil_images])
+with torch.no_grad():
+    feats = backbone(batch)            # (N, 768) CLS-token features
+# TODO: L2-normalize feats along dim=1 so each row has unit length,
+# then compute the (N, N) cosine-similarity matrix as feats @ feats.T.
+dino_emb = ...
+sim = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Use <code>torch.nn.functional.normalize(feats, dim=1)</code>. After normalization, <code>dino_emb @ dino_emb.T</code> is the cosine-similarity matrix; its diagonal is all ones (every image is identical to itself).</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Run CLIP zero-shot classification on the same images</h4>
+<p>Load a CLIP model and processor, wrap your candidate category names in a prompt template, and let CLIP score each image against each label in its shared embedding space. This is the open-vocabulary move of <a href="section-25.4.html">Section 25.4</a>: no training, just text comparison.</p>
+<pre><code class="language-python">from transformers import CLIPModel, CLIPProcessor
+
+clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip.eval()
+
+labels = ["a dog", "a cat", "a car", "a plate of food", "a building"]
+# TODO: build prompt strings with a template like "a photo of {label}",
+# call proc(text=prompts, images=pil_images, return_tensors="pt", padding=True),
+# run clip(**inputs), then softmax outputs.logits_per_image over dim=1.
+probs = ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The template matters: "a photo of a dog" usually beats the bare word "dog", the prompt-engineering effect of Exercise 25.4.2. <code>outputs.logits_per_image</code> has shape (num_images, num_labels); a row softmax turns it into per-image label probabilities.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Report the toolkit's two outputs per image</h4>
+<p>For each image, print the CLIP zero-shot label with its confidence and the file names of its three nearest DINOv2 neighbors. This is the deliverable: one model gives you a name, the other gives you visual neighbors, neither needed a single label from you.</p>
+<pre><code class="language-python">for i, path in enumerate(paths):
+    top = probs[i].argmax().item()
+    conf = probs[i][top].item()
+    # TODO: get the indices of the 3 most similar images to image i,
+    # excluding i itself, using sim[i] (set sim[i, i] to -1 first or skip it),
+    # then print path.name, labels[top], conf, and the neighbor file names.
+    ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Copy the row <code>row = sim[i].clone(); row[i] = -1</code> so an image is not its own neighbor, then <code>row.topk(3).indices</code> gives the three nearest. Map those indices back through <code>paths</code> to get file names.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Compare what the two backbones group by</h4>
+<p>Pick two images that CLIP labels the same but DINOv2 places far apart (or the reverse), and write down why. This step turns the toolkit into understanding: DINOv2 groups by visual appearance, CLIP groups by nameable concept, and the gap between them is the choose-by-objective lesson of this section.</p>
+<pre><code class="language-python"># TODO: scan for a pair (i, j) where probs[i].argmax() == probs[j].argmax()
+# (same CLIP label) but sim[i, j] is low (DINOv2 thinks they look different),
+# print both file names and the values, and note the disagreement in a comment.
+...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Two photos of very different-looking dogs share a CLIP label but can sit far apart in DINOv2 space, because DINOv2 was never told the word "dog". The reverse case, visually similar images CLIP labels differently, exposes where appearance and concept come apart.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Step 1 reports the number of images loaded. Step 2 produces an <code>(N, 768)</code> embedding matrix and an <code>(N, N)</code> similarity matrix whose diagonal is all ones. Step 4 prints one block per image, for example <code>cat_03.jpg -&gt; "a cat" (0.91); neighbors: cat_01.jpg, cat_07.jpg, cat_02.jpg</code>, where the neighbors are visibly the same kind of subject. Step 5 surfaces at least one disagreement pair with a one-line explanation. The finished artifact is a single script that takes a folder and a label list and returns, per image, a zero-shot name and three visual neighbors, plus a short note on where the two backbones disagree and why.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Swap CLIP for SigLIP (<code>google/siglip-base-patch16-224</code>) and compare zero-shot confidences; SigLIP's sigmoid loss (Section 25.4) gives calibrated per-label scores rather than a forced softmax over your label set.</li>
+<li>Add masking: run the <a href="https://github.com/facebookresearch/segment-anything" target="_blank" rel="noopener">Segment Anything</a> automatic mask generator on one image and overlay the masks, connecting the toolkit to the promptable segmentation of <a href="section-25.5.html">Section 25.5</a>.</li>
+<li>Library Shortcut: replace the hand-built DINOv2 nearest-neighbor search with a single <code>sklearn.neighbors.NearestNeighbors</code> index over the embeddings, and time how the query cost scales as you grow the folder, the retrieval pattern that feeds forward into <a href="../module-27-depth-3d-neural-scenes/index.html">Chapter 27</a>.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python"># Label-free vision toolkit: DINOv2 nearest neighbors + CLIP zero-shot labels.
+from pathlib import Path
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from transformers import CLIPModel, CLIPProcessor
+
+# --- Step 1: load and preprocess ---
+paths = sorted(Path("images").glob("*.jpg")) + sorted(Path("images").glob("*.png"))
+pil_images = [Image.open(p).convert("RGB") for p in paths]
+print(f"loaded {len(pil_images)} images")
+
+dino_tf = transforms.Compose([
+    transforms.Resize((224, 224)),                       # 224 is a multiple of 14
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),     # ImageNet normalization
+])
+
+# --- Step 2: DINOv2 embeddings and cosine-similarity matrix ---
+backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+backbone.eval()
+for p in backbone.parameters():
+    p.requires_grad_(False)
+
+batch = torch.stack([dino_tf(im) for im in pil_images])
+with torch.no_grad():
+    feats = backbone(batch)                              # (N, 768)
+dino_emb = F.normalize(feats, dim=1)                     # unit-length rows
+sim = dino_emb @ dino_emb.T                              # cosine similarity (N, N)
+
+# --- Step 3: CLIP zero-shot classification ---
+clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip.eval()
+
+labels = ["a dog", "a cat", "a car", "a plate of food", "a building"]
+prompts = [f"a photo of {lbl}" for lbl in labels]       # prompt template helps
+inputs = proc(text=prompts, images=pil_images, return_tensors="pt", padding=True)
+with torch.no_grad():
+    out = clip(**inputs)
+probs = out.logits_per_image.softmax(dim=1)             # (N, num_labels)
+
+# --- Step 4: per-image report ---
+for i, path in enumerate(paths):
+    top = probs[i].argmax().item()
+    conf = probs[i][top].item()
+    row = sim[i].clone()
+    row[i] = -1                                          # exclude self
+    nbrs = [paths[j].name for j in row.topk(3).indices.tolist()]
+    print(f'{path.name} -> "{labels[top]}" ({conf:.2f}); neighbors: {", ".join(nbrs)}')
+
+# --- Step 5: find a disagreement (same CLIP label, low DINOv2 similarity) ---
+clip_label = probs.argmax(dim=1)
+N = len(paths)
+for i in range(N):
+    for j in range(i + 1, N):
+        if clip_label[i] == clip_label[j] and sim[i, j] < 0.4:
+            print(f"DISAGREE: {paths[i].name} & {paths[j].name} both "
+                  f'"{labels[clip_label[i]]}" but DINOv2 sim={sim[i, j]:.2f}')
+            break
+    else:
+        continue
+    break
+# DINOv2 groups by appearance; CLIP groups by nameable concept. The gap between
+# them is exactly the choose-by-objective lesson of Table 25.6.1.</code></pre>
+</details>
+</section>
 
 <nav class="chapter-nav">
 <a class="prev" href="section-25.5.html">&#8592; Section 25.5: Open-Vocabulary Detection &amp; Segmentation</a>

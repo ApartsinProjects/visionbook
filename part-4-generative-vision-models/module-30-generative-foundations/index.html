@@ -103,12 +103,292 @@ This chapter is mostly conceptual and probabilistic, so the deepest prerequisite
 </li>
 </ul>
 
+<div class="callout key-takeaway">
+<div class="callout-title">Remember the Chapter in One Card</div>
+<p>If you carry three things out of this chapter, carry these. First, the <strong>hinge</strong>: generation moves the image from the right of the conditioning bar to the left, from $p(y \mid \mathbf{x})$ to $p(\mathbf{x})$, which is why it is the harder half of the joint. Second, the <strong>five families</strong>, recalled by the route each one takes to a sample: <em>compress</em> (VAE), <em>contest</em> (GAN), <em>invert</em> (flow), <em>chain</em> (autoregressive), <em>denoise</em> (diffusion). Third, the <strong>trilemma</strong>: fidelity, diversity, speed, and you usually keep two. Hinge, five families, trilemma, that triplet is the scaffold every later chapter hangs on.</p>
+</div>
+
 <div class="whats-next">
 <h3>What's Next?</h3>
 <p>
-With the map in hand, the rest of Part IV walks the territory one family at a time. <a href="../module-31-autoencoders-vaes/index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders</a> is the immediate sequel and takes the latent-variable idea of <a href="section-30.3.html">Section 30.3</a> and turns it into a trainable model: the autoencoder that compresses and reconstructs, then the variational autoencoder that makes the latent space a proper probability distribution you can sample from. It is the cleanest place to make the abstract notion of "decode a latent into an image" concrete and runnable. From there the part follows the map: <a href="../module-32-gans/index.html">Chapter 32</a> builds the adversarial game, and <a href="../module-33-diffusion-models/index.html">Chapter 33</a> cashes in the score and Langevin machinery of <a href="section-30.4.html">Section 30.4</a> to build the diffusion models that dominate image generation today. The trilemma of <a href="section-30.5.html">Section 30.5</a> and the metrics of <a href="section-30.6.html">Section 30.6</a> will be your companions through every one of those chapters, the lens through which you judge each new method.
+With the map in hand, the rest of Part IV walks the territory one family at a time. <a href="../module-31-autoencoders-vaes/index.html">Chapter 31: Autoencoders &amp; Variational Autoencoders</a> is the immediate sequel and takes the latent-variable idea of <a href="section-30.3.html">Section 30.3</a> and turns it into a trainable model: the autoencoder that compresses and reconstructs, then the variational autoencoder that makes the latent space a proper probability distribution you can sample from. It is the cleanest place to make the abstract notion of "decode a latent into an image" concrete and runnable. From there the part follows the map: <a href="../module-32-gans/index.html">Chapter 32</a> builds the adversarial game, and <a href="../module-33-diffusion-models/index.html">Chapter 33</a> cashes in the score and Langevin machinery of <a href="section-30.4.html">Section 30.4</a> to build the diffusion models that dominate image generation today. The trilemma of <a href="section-30.5.html">Section 30.5</a> and the metrics of <a href="section-30.6.html">Section 30.6</a> will be your companions through every one of those chapters, the lens through which you judge each new method. Before moving on, make the whole chapter concrete in the Hands-On Lab below, where energy, score, denoising score matching, Langevin sampling, and a coverage metric come together as one small generative model you train and sample from yourself.
 </p>
 </div>
+
+<section class="lab" id="lab-30">
+<h2>Hands-On Lab: A Score-Based Generator You Can Train and Sample</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: about 60 to 90 minutes</span>
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build the smallest complete generative model that still uses every load-bearing idea of this chapter: take a two-dimensional dataset whose true distribution you can see, learn its score field with a tiny network trained by denoising score matching, sample new points by annealed Langevin dynamics, and then measure how well the generated cloud covers the real one. The two-dimensional data keeps every quantity plottable, so you watch $p(\mathbf{x})$, the score arrows of <a href="section-30.4.html">Section 30.4</a>, the sampling walk, and the quality-versus-coverage tension of <a href="section-30.5.html">Section 30.5</a> all on one screen, with no image-sized U-Net or GPU in the way.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Treating generation as learning a distribution $p(\mathbf{x})$ over data rather than a label given data, the hinge of <a href="section-30.1.html">Section 30.1</a>.</li>
+<li>Training a score network with the denoising score matching objective, where the regression target is a scaling of the noise that was added (<a href="section-30.4.html">Section 30.4</a>).</li>
+<li>Conditioning the network on the noise level so one network covers many scales, the multi-scale idea behind annealed sampling (<a href="section-30.4.html">Section 30.4</a>).</li>
+<li>Turning a learned score field into samples with annealed Langevin dynamics, the score term plus calibrated noise of <a href="section-30.4.html">Section 30.4</a>.</li>
+<li>Reading the quality-diversity-speed trade by varying the step count and a coverage metric, the practitioner's lens of <a href="section-30.5.html">Section 30.5</a> and the measurement problem of <a href="section-30.6.html">Section 30.6</a>.</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One scientific-Python stack and no download; <code>scikit-learn</code> generates the toy dataset in memory. Everything runs on CPU in a couple of minutes. Install with:</p>
+<pre><code class="language-bash">pip install torch scikit-learn matplotlib</code></pre>
+<p>The whole lab is one short script. The model is a four-layer multilayer perceptron, deliberately tiny, so the focus stays on the score-and-sample loop rather than on architecture.</p>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Make a distribution you can see</h4>
+<p>Generate the classic two-moons dataset and standardize it. Two interleaving crescents are an honest stand-in for the manifold picture of <a href="section-30.1.html">Section 30.1</a>: the data occupies a thin, curved region of the plane while most of the plane is empty, so a generator that ignores the shape is instantly visible.</p>
+<pre><code class="language-python">import torch
+import numpy as np
+from sklearn.datasets import make_moons
+
+def get_data(n=4000):
+    x, _ = make_moons(n_samples=n, noise=0.05, random_state=0)
+    x = (x - x.mean(0)) / x.std(0)                 # standardize to roughly unit scale
+    return torch.tensor(x, dtype=torch.float32)
+
+data = get_data()
+# TODO: print data.shape and data.std(0) to confirm a (4000, 2) tensor
+# whose two columns each have standard deviation near 1.0.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>print(data.shape, data.std(0))</code> should report <code>torch.Size([4000, 2])</code> and two numbers close to <code>1.0</code>. Standardizing matters because the noise scales in Step 4 are chosen relative to unit-scale data.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Build a noise-conditioned score network</h4>
+<p>The network takes a point and a noise level and returns a two-dimensional score vector, the estimate of $\nabla_{\mathbf{x}} \log p_\sigma(\mathbf{x})$ from <a href="section-30.4.html">Section 30.4</a>. Feeding the noise level $\sigma$ in as an extra input is what lets a single network represent the score at every scale, the trick that makes the annealed sampling of Step 5 possible.</p>
+<pre><code class="language-python">import torch.nn as nn
+
+class ScoreNet(nn.Module):
+    def __init__(self, dim=2, hidden=128):
+        super().__init__()
+        # Input is the point (dim) plus one channel for log(sigma).
+        self.net = nn.Sequential(
+            nn.Linear(dim + 1, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x, sigma):                    # x: (B, 2), sigma: (B, 1)
+        # TODO: concatenate x with log(sigma) along dim=1 and pass through
+        # self.net. Conditioning on log(sigma) (not sigma) keeps the very
+        # small and very large scales numerically comparable.
+        h = ...
+        return self.net(h)
+
+score_net = ScoreNet()</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>h = torch.cat([x, torch.log(sigma)], dim=1)</code> then <code>return self.net(h)</code>. Passing <code>log(sigma)</code> rather than <code>sigma</code> spreads a geometric range of scales evenly across the input, which the network learns from far more easily.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Write the denoising score matching loss</h4>
+<p>This is the objective of <a href="section-30.4.html">Section 30.4</a> made runnable. Add Gaussian noise of scale $\sigma$ to a clean point; the score of that noised point has the closed form $-(\mathbf{x}_\text{noisy} - \mathbf{x}) / \sigma^2 = -\boldsymbol{\epsilon} / \sigma$, so the network's regression target is simply a scaling of the noise that was added. Weighting the per-sample loss by $\sigma^2$ balances the contribution of every scale.</p>
+<pre><code class="language-python">def dsm_loss(net, x, sigmas):
+    sigma = sigmas[torch.randint(len(sigmas), (x.size(0),))].unsqueeze(1)  # (B,1)
+    eps = torch.randn_like(x)
+    x_noisy = x + sigma * eps                       # corrupt each point
+    # TODO: the closed-form target score is -eps / sigma. Predict the score
+    # with net(x_noisy, sigma), then return the sigma^2-weighted mean squared
+    # error between prediction and target: (sigma**2 * (pred - target)**2).mean().
+    target = ...
+    pred = ...
+    return ...</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>target = -eps / sigma</code>, <code>pred = net(x_noisy, sigma)</code>, and <code>return (sigma ** 2 * (pred - target) ** 2).mean()</code>. The <code>sigma ** 2</code> weight cancels the <code>1 / sigma</code> that makes small-noise targets enormous, so no single scale dominates training. This is exactly the loss a diffusion U-Net minimizes in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>, just in two dimensions.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Choose a geometric ladder of noise scales and train</h4>
+<p>Pick noise levels spaced geometrically from large to small, the annealing schedule that <a href="section-30.4.html">Section 30.4</a> introduces. The large scales blur the two moons into one broad blob whose score is easy to learn from anywhere; the small scales sharpen them back into the true shape. Train the network to match the score at all of them at once.</p>
+<pre><code class="language-python">sigmas = torch.exp(torch.linspace(np.log(1.0), np.log(0.01), 10))  # 10 scales, large to small
+opt = torch.optim.Adam(score_net.parameters(), lr=1e-3)
+
+for step in range(3000):
+    idx = torch.randint(len(data), (256,))
+    batch = data[idx]
+    loss = dsm_loss(score_net, batch, sigmas)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 500 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The loss should fall steadily and settle below roughly <code>0.1</code> within 3000 steps on CPU. If it stalls high, confirm Step 3 returns the <code>sigma ** 2</code>-weighted error; an unweighted loss lets the smallest scale swamp the gradient and the network never learns the broad structure.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Sample by annealed Langevin dynamics</h4>
+<p>Now turn the learned arrows into points, the procedure of <a href="section-30.4.html">Section 30.4</a>. Start from broad Gaussian noise, and for each scale from large to small take several Langevin steps: move along the score, then add calibrated Gaussian noise. Walking from coarse to fine scales is what lets the sampler find both moons instead of collapsing onto one, the coverage concern of <a href="section-30.5.html">Section 30.5</a>.</p>
+<pre><code class="language-python">@torch.no_grad()
+def sample(net, sigmas, n=2000, steps_per_scale=20, eta=0.1):
+    x = torch.randn(n, 2)                            # start from broad noise
+    for sigma in sigmas:                            # large to small
+        s = torch.full((n, 1), float(sigma))
+        step_size = eta * (sigma / sigmas[-1]) ** 2 # bigger steps at coarse scales
+        for _ in range(steps_per_scale):
+            score = net(x, s)
+            # TODO: one Langevin update. Move along the score by
+            # 0.5 * step_size * score, then add sqrt(step_size) * randn_like(x).
+            # Drop the noise term and the cloud collapses onto the modes.
+            x = ...
+    return x
+
+samples = sample(score_net, sigmas)</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>x = x + 0.5 * step_size * score + torch.sqrt(torch.tensor(step_size)) * torch.randn_like(x)</code>. The score term pulls toward the moons; the noise term is what makes this sampling rather than optimization, exactly the distinction Exercise 30.4.2 asks you to feel. Remove it and every sample piles onto the nearest crescent.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Plot the result and measure coverage</h4>
+<p>Overlay real and generated points to judge fidelity by eye, then put a number on coverage with a simple nearest-neighbour recall: the fraction of real points that have a generated point nearby. This is a toy stand-in for the precision-and-recall view of generative evaluation in <a href="section-30.6.html">Section 30.6</a>, where precision asks whether samples are realistic and recall asks whether they cover the data.</p>
+<pre><code class="language-python">import matplotlib.pyplot as plt
+from sklearn.neighbors import NearestNeighbors
+
+plt.scatter(data[:, 0], data[:, 1], s=4, alpha=0.3, label="real")
+plt.scatter(samples[:, 0], samples[:, 1], s=4, alpha=0.3, label="generated")
+plt.legend(); plt.axis("equal"); plt.title("score-based samples vs data")
+plt.savefig("score_samples.png", dpi=120)
+
+# Coverage (toy recall): fraction of real points within radius r of a sample.
+nn = NearestNeighbors(n_neighbors=1).fit(samples.numpy())
+dist, _ = nn.kneighbors(data.numpy())
+# TODO: set coverage to the fraction of entries in dist that are below 0.15,
+# then print it. A higher number means the generated cloud reaches more of
+# the real data (better recall / coverage).
+coverage = ...
+print(f"coverage (recall proxy): {coverage:.2f}")</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>coverage = (dist &lt; 0.15).mean()</code>. A well-trained model with both moons populated reaches roughly 0.85 or higher; a sampler that collapsed onto one crescent scores near 0.5, the numerical signature of the mode-dropping that <a href="section-30.5.html">Section 30.5</a> calls a coverage failure.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>Two artifacts. First, <code>score_samples.png</code>, where the orange generated cloud traces both crescents of the blue real data rather than smearing across the empty plane or piling onto one moon. Second, a printed coverage near 0.85 or above when both moons are populated. The training loss should fall below roughly 0.1. Now rerun Step 5 with <code>steps_per_scale=2</code>: sampling is much faster but the cloud is noisier and coverage drops, the quality-and-coverage versus speed trade of <a href="section-30.5.html">Section 30.5</a> made measurable in your own run. Exact numbers vary with seed; what should hold is a visibly two-moon sample and coverage far above the one-moon baseline of 0.5.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Disable the noise term in Step 5 (keep only the score step) and replot; watch the samples collapse onto the moon centres and coverage fall, the diversity loss that the noise term prevents, exactly as Exercise 30.4.2 predicts.</li>
+<li>Swap <code>make_moons</code> for <code>sklearn.datasets.make_circles</code> or a three-blob Gaussian mixture and retrain; a sampler that handles disconnected modes without dropping any is passing the coverage test of <a href="section-30.5.html">Section 30.5</a> on a harder distribution.</li>
+<li>Add a likelihood-free competitor: fit a two-component Gaussian mixture to the same data with <code>sklearn.mixture.GaussianMixture</code>, sample from it, and compare its coverage and its by-eye fidelity against your score model, a hands-on version of the family comparison on the map of <a href="section-30.2.html">Section 30.2</a>.</li>
+</ul>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Diffusers Scales the Same Loop to Images</div>
+<p>The script above is roughly seventy lines and exposes the score, the schedule, and every Langevin step on purpose. The Hugging Face <code>diffusers</code> library (the reference source in the bibliography) wraps the identical denoise-and-sample loop, scaled to images and wired to a trained U-Net, behind a handful of calls: a scheduler object holds the noise ladder of Step 4, and a pipeline runs the sampling of Step 5 with one <code>pipe()</code>. That is a seventy-to-a-handful reduction, and the math you just wrote by hand is exactly what those calls hide. Build the score loop once at two dimensions to understand it; reach for <code>diffusers</code> when the data becomes pictures in <a href="../module-33-diffusion-models/index.html">Chapter 33</a>.</p>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import make_moons
+from sklearn.neighbors import NearestNeighbors
+
+torch.manual_seed(0)
+
+# Step 1: a distribution you can see.
+def get_data(n=4000):
+    x, _ = make_moons(n_samples=n, noise=0.05, random_state=0)
+    x = (x - x.mean(0)) / x.std(0)
+    return torch.tensor(x, dtype=torch.float32)
+
+data = get_data()
+
+# Step 2: noise-conditioned score network.
+class ScoreNet(nn.Module):
+    def __init__(self, dim=2, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim + 1, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x, sigma):
+        h = torch.cat([x, torch.log(sigma)], dim=1)
+        return self.net(h)
+
+score_net = ScoreNet()
+
+# Step 3: denoising score matching loss.
+def dsm_loss(net, x, sigmas):
+    sigma = sigmas[torch.randint(len(sigmas), (x.size(0),))].unsqueeze(1)
+    eps = torch.randn_like(x)
+    x_noisy = x + sigma * eps
+    target = -eps / sigma
+    pred = net(x_noisy, sigma)
+    return (sigma ** 2 * (pred - target) ** 2).mean()
+
+# Step 4: geometric noise ladder and training.
+sigmas = torch.exp(torch.linspace(np.log(1.0), np.log(0.01), 10))
+opt = torch.optim.Adam(score_net.parameters(), lr=1e-3)
+for step in range(3000):
+    idx = torch.randint(len(data), (256,))
+    loss = dsm_loss(score_net, data[idx], sigmas)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 500 == 0:
+        print(f"step {step:4d}  loss {loss.item():.4f}")
+
+# Step 5: annealed Langevin sampling.
+@torch.no_grad()
+def sample(net, sigmas, n=2000, steps_per_scale=20, eta=0.1):
+    x = torch.randn(n, 2)
+    for sigma in sigmas:
+        s = torch.full((n, 1), float(sigma))
+        step_size = eta * (sigma / sigmas[-1]) ** 2
+        for _ in range(steps_per_scale):
+            score = net(x, s)
+            x = x + 0.5 * step_size * score \
+                + torch.sqrt(torch.tensor(step_size)) * torch.randn_like(x)
+    return x
+
+samples = sample(score_net, sigmas)
+
+# Step 6: plot and measure coverage.
+plt.scatter(data[:, 0], data[:, 1], s=4, alpha=0.3, label="real")
+plt.scatter(samples[:, 0], samples[:, 1], s=4, alpha=0.3, label="generated")
+plt.legend(); plt.axis("equal"); plt.title("score-based samples vs data")
+plt.savefig("score_samples.png", dpi=120)
+
+nn_model = NearestNeighbors(n_neighbors=1).fit(samples.numpy())
+dist, _ = nn_model.kneighbors(data.numpy())
+coverage = (dist < 0.15).mean()
+print(f"coverage (recall proxy): {coverage:.2f}")</code></pre>
+</details>
+</section>
 
 <section class="bibliography">
 <h2>Bibliography &amp; Further Reading</h2>

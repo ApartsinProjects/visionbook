@@ -357,7 +357,7 @@ print(counts)
 <div class="code-caption"><strong>Code Fragment 4:</strong> The chapter's capstone in one page: Otsu threshold, morphological opening, two-level contour retrieval, a five-number descriptor per outer contour, and four readable rules that sort a fastener tray into screws, washers, and nuts, with topology (the hole) doing the heaviest lifting and an explicit reject class for everything else.</div>
 
 <p>
-Three habits in this code repay study. The reject class exists because a rule-based system should fail loudly on the unexpected, never shrug a foreign object into the nearest class. The hole feature comes from the hierarchy, not from any intensity heuristic, so grease stains cannot fake it. And every threshold (0.80, 2.5, 200) traces to a measurable property of golden samples, so recalibrating for a new part is a measurement session, not a retraining run. When classes finally overlap in every descriptor you can write down, that is the boundary of this method and the on-ramp to the learned features of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> and the classifiers of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>.
+Three habits in this code repay study. The reject class exists because a rule-based system should fail loudly on the unexpected, never shrug a foreign object into the nearest class. The hole feature comes from the hierarchy, not from any intensity heuristic, so grease stains cannot fake it. And every threshold (0.80, 2.5, 200) traces to a measurable property of golden samples, so recalibrating for a new part is a measurement session, not a retraining run. When classes finally overlap in every descriptor you can write down, that is the boundary of this method and the on-ramp to the learned features of <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a> and the classifiers of <a href="../../part-2-classical-computer-vision/module-16-classical-recognition/index.html">Chapter 16</a>. The chapter's five verbs (threshold, clean, label, measure, decide) are now all in your hands; the Hands-On Lab at the end of this section asks you to assemble them into one complete, runnable inspection station that you build and run end to end.
 </p>
 
 <div class="callout practical-example">
@@ -389,6 +389,293 @@ Three habits in this code repay study. The reject class exists because a rule-ba
 <div class="callout-title">Exercise 6.6.3: The Circularity Ceiling <span class="exercise-type analysis">Analysis</span></div>
 <p>Rasterize perfect disks of radius 2 to 200 pixels and plot measured circularity $4\pi A / P^2$ using <code>cv2.contourArea</code> and <code>cv2.arcLength</code> against radius. Explain the curve's small-radius behavior and its large-radius asymptote (it does not reach 1.0; quantify the gap and attribute it to the staircase perimeter bias of Section 2). Repeat with <code>skimage.measure.perimeter_crofton</code>, which estimates perimeter by the Crofton intersection formula, and recommend, with numbers, a minimum part diameter in pixels below which a circularity-based accept/reject gate should not be trusted.</p>
 </div>
+
+<section class="lab" id="lab-6.6">
+<h2>Hands-On Lab: A Backlit Fastener-Inspection Station</h2>
+<div class="lab-meta">
+<span class="lab-duration">Duration: ~75 minutes</span>
+<span class="lab-difficulty">Intermediate</span>
+</div>
+
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build a complete, runnable binary-vision inspection station that synthesizes its own backlit parts tray, then runs the chapter's full five-verb pipeline (threshold, clean, label, measure, decide) to count and classify screws, washers, and hex nuts, flag defects, and render an annotated overlay plus a pass/fail report, with no external image files required.</p>
+</div>
+
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Otsu thresholding into a binary mask, then morphological opening and closing to remove speckle and fill pinholes (Sections <a href="section-6.2.html">6.2</a> and <a href="section-6.3.html">6.3</a>).</li>
+<li>Labeling connected components and reading per-object region properties (<a href="section-6.4.html">Section 6.4</a>).</li>
+<li>Tracing contours with a two-level hierarchy to detect holes by topology, not intensity (Section 1 of this section).</li>
+<li>Building a small, interpretable descriptor vector (circularity, solidity, aspect ratio, vertex count, hole count) and a rule-based classifier with an explicit reject class (Sections 4 and 5).</li>
+<li>Using the sign of the seventh Hu moment as an auditable handedness check (Section 3).</li>
+</ul>
+</div>
+
+<div class="lab-prereqs">
+<h3>Setup</h3>
+<p>One environment, three libraries, zero downloads. The tray is drawn synthetically with OpenCV so the lab is fully self-contained and reproducible.</p>
+<pre><code class="language-bash">pip install opencv-python numpy</code></pre>
+</div>
+
+<div class="lab-steps">
+<h3>Steps</h3>
+
+<div class="lab-step">
+<h4>Step 1: Synthesize a backlit parts tray</h4>
+<p>A backlit station gives near-binary images: bright background, dark parts. Draw a few screws (filled rounded rectangles), washers (annuli), and hex nuts (filled hexagons with a central hole) on a bright canvas, at random positions and angles, then add mild sensor noise so the cleanup steps have something to do.</p>
+<pre><code class="language-python">import cv2
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+def make_tray(h=480, w=640):
+    img = np.full((h, w), 235, np.uint8)            # bright backlit canvas
+    truth = []                                       # ground-truth labels
+
+    def place(draw_fn, label, n):
+        for _ in range(n):
+            cx, cy = rng.integers(70, w - 70), rng.integers(70, h - 70)
+            ang = rng.uniform(0, 180)
+            draw_fn(img, cx, cy, ang)
+            truth.append(label)
+
+    # TODO: implement three drawing helpers that paint DARK parts (value ~40):
+    #   - a screw: a long thin rounded rectangle (use cv2.fillPoly on a rotated box)
+    #   - a washer: a filled dark disk with a bright disk punched in its center
+    #   - a nut:    a filled dark regular hexagon with a bright disk punched out
+    # Hint: build points, rotate with cv2.getRotationMatrix2D, then cv2.fillPoly.
+
+    place(draw_screw, "screw", 4)
+    place(draw_washer, "washer", 3)
+    place(draw_nut, "nut", 2)
+
+    noise = rng.normal(0, 6, img.shape)
+    img = np.clip(img.astype(float) + noise, 0, 255).astype(np.uint8)
+    return img, truth
+
+tray, truth = make_tray()
+cv2.imwrite("tray.png", tray)
+print("parts placed:", truth)</code></pre>
+<details>
+<summary>Hint</summary>
+<p>For the hexagon, generate six vertices with <code>angle = np.deg2rad(60*k)</code>, scale by a radius, offset by the centre, rotate the whole point set, and pass them to <code>cv2.fillPoly</code>. To punch a hole, draw a bright filled circle (value 235) on top of the dark part after drawing it.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 2: Threshold and clean the mask</h4>
+<p>Convert the grayscale tray to a binary foreground mask with Otsu, then de-speckle with an opening and seal pinholes with a closing. This is the "threshold" and "clean" verbs from the chapter's five-step pipeline.</p>
+<pre><code class="language-python"># TODO: Otsu-threshold `tray` so DARK parts become white foreground.
+#   Hint: cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU with thresh value 0.
+# TODO: build a 5x5 elliptical structuring element with cv2.getStructuringElement.
+# TODO: apply MORPH_OPEN then MORPH_CLOSE with cv2.morphologyEx to get `clean`.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Opening (erode then dilate) deletes structures smaller than the element, removing isolated noise pixels; closing (dilate then erode) fills small gaps. Order matters: open first to kill speckle, then close to repair the parts. An ellipse element avoids the blocky artifacts a square leaves on round parts.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 3: Sanity-check with connected components</h4>
+<p>Before contour analysis, label the cleaned mask and print one row per blob. This is the "label" and a first pass of the "measure" verb, and it tells you immediately whether cleanup left the right number of parts.</p>
+<pre><code class="language-python"># TODO: call cv2.connectedComponentsWithStats(clean, connectivity=8).
+# TODO: loop over labels 1..n-1, printing area (stats[i, cv2.CC_STAT_AREA])
+#       and centroid; skip components with area < 200 as dust.
+# Expected: roughly 9 surviving components, one per placed part.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>connectedComponentsWithStats</code> returns <code>(count, labels, stats, centroids)</code>. Label 0 is always the background. If you see far more than nine survivors, your opening element is too small; if parts merged, two were drawn touching and a watershed split (Section 6.5) would be needed.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 4: Describe each part with a shape-descriptor vector</h4>
+<p>Trace outer contours with a two-level hierarchy so a hole is detected by topology, then compute the five-number descriptor from Section 4 for every part. This is the heart of the "measure" verb.</p>
+<pre><code class="language-python">def describe(c):
+    area  = cv2.contourArea(c)
+    perim = cv2.arcLength(c, True)
+    # TODO: circularity = 4*pi*area / perim**2  (guard perim > 0)
+    # TODO: solidity    = area / contourArea(convexHull(c))
+    # TODO: aspect      = longer side / shorter side of cv2.minAreaRect(c)
+    # TODO: vertices    = len(cv2.approxPolyDP(c, 0.02*perim, True))
+    # return a dict(area=, circularity=, solidity=, aspect=, vertices=)
+    ...
+
+contours, hier = cv2.findContours(clean, cv2.RETR_CCOMP,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+# TODO: for each OUTER contour (hier[0][i][3] == -1) with area >= 200,
+#       record has_hole = hier[0][i][2] != -1 and its descriptor.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>In <code>RETR_CCOMP</code> mode the hierarchy quadruple is <code>[next, previous, first_child, parent]</code>. An outer contour has <code>parent == -1</code>; it owns a hole when <code>first_child != -1</code>. Skip the hole borders themselves so you do not double-count.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 5: Classify with readable rules and a reject class</h4>
+<p>Turn descriptors into decisions with the auditable rule set from Section 5. Topology (the hole) does the heavy lifting; an explicit reject class fails loudly on anything implausible. This is the "decide" verb.</p>
+<pre><code class="language-python">def classify(d, has_hole):
+    # TODO: washer  -> has_hole and circularity > 0.80
+    # TODO: nut     -> has_hole and 5 <= vertices <= 7
+    # TODO: screw   -> (not has_hole) and aspect > 2.5
+    # TODO: anything else -> "reject"
+    ...
+# TODO: tally counts per label and compare against `truth` from Step 1.
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Every threshold (0.80, 2.5, 200) should come from measuring your synthetic golden samples, not from guessing. If a nut is misread as a washer, its hexagon was simplified to too few vertices; widen the vertex band or lower the Douglas-Peucker tolerance.</p>
+</details>
+</div>
+
+<div class="lab-step">
+<h4>Step 6: Render an annotated overlay and a pass/fail report</h4>
+<p>Draw each contour on a color copy of the tray, colored by predicted class, with the centroid and label printed. Then emit a one-line verdict: PASS when the counts match the expected kit (4 screws, 3 washers, 2 nuts, 0 rejects), FAIL otherwise. This is the deliverable a line operator would actually see.</p>
+<pre><code class="language-python"># TODO: overlay = cv2.cvtColor(tray, cv2.COLOR_GRAY2BGR)
+# TODO: for each classified part, draw its contour (color by class) and
+#       cv2.putText the label at the centroid.
+# TODO: cv2.imwrite("inspection.png", overlay)
+# TODO: expected = {"screw": 4, "washer": 3, "nut": 2}
+#       print("PASS" if counts == expected and rejects == 0 else "FAIL")
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Use a dict mapping label to BGR color, for example screw blue, washer green, nut orange, reject red, so a glance at <code>inspection.png</code> tells you what the station decided. The centroid comes from <code>cv2.moments(c)</code> as <code>(m10/m00, m01/m00)</code>.</p>
+</details>
+</div>
+</div>
+
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>The console prints nine surviving components in Step 3, a descriptor table in Step 4, and a final tally that matches the placed parts, for example <code>{'screw': 4, 'washer': 3, 'nut': 2}</code> followed by <code>PASS</code>. The saved <code>inspection.png</code> shows every part outlined and labeled in its class color over the original tray, with no part left unclassified and no background blob mislabeled. Re-running with a different random seed in Step 1 reshuffles positions and angles but the verdict logic still classifies every part correctly, demonstrating the rotation and translation robustness the chapter built.</p>
+</div>
+
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Add a left-hand and a right-hand bracket to the tray (one the mirror of the other) and tell them apart using only the sign of the seventh Hu moment, as in the bracket practical example of Section 5; confirm every other descriptor is identical for the pair.</li>
+<li>Inject a defect: draw one washer with a notch bitten out of its rim and one nut with a hairline crack. Add a solidity gate (reject solidity below 0.95) so the inspection station catches both as defects, and verify the verdict flips to FAIL.</li>
+<li>Place two screws so they touch, watch the connected-component count drop, then separate them with a distance-transform watershed (<a href="section-6.5.html">Section 6.5</a>) before the contour stage so the count recovers.</li>
+</ul>
+</div>
+
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python"># Complete, runnable fastener-inspection station: synthesize a tray, then run
+# the five-verb pipeline (threshold, clean, label, measure, decide) end to end.
+import cv2
+import numpy as np
+
+rng = np.random.default_rng(0)
+DARK, BRIGHT = 40, 235
+
+def _rotate(pts, cx, cy, ang):
+    M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+    pts = np.hstack([pts, np.ones((len(pts), 1))])
+    return (M @ pts.T).T.astype(np.int32)
+
+def draw_screw(img, cx, cy, ang):
+    L, Wd = 60, 14
+    box = np.array([[cx-L, cy-Wd], [cx+L, cy-Wd],
+                    [cx+L, cy+Wd], [cx-L, cy+Wd]], np.float32)
+    cv2.fillPoly(img, [_rotate(box, cx, cy, ang)], DARK)
+
+def draw_washer(img, cx, cy, ang):
+    cv2.circle(img, (cx, cy), 34, DARK, -1)
+    cv2.circle(img, (cx, cy), 15, BRIGHT, -1)        # punch the hole
+
+def draw_nut(img, cx, cy, ang):
+    r = 36
+    hexp = np.array([[cx + r*np.cos(np.deg2rad(60*k)),
+                      cy + r*np.sin(np.deg2rad(60*k))] for k in range(6)],
+                    np.float32)
+    cv2.fillPoly(img, [_rotate(hexp, cx, cy, ang)], DARK)
+    cv2.circle(img, (cx, cy), 14, BRIGHT, -1)        # threaded hole
+
+def make_tray(h=480, w=640):
+    img = np.full((h, w), BRIGHT, np.uint8)
+    truth = []
+    def place(fn, label, n):
+        for _ in range(n):
+            cx, cy = int(rng.integers(70, w-70)), int(rng.integers(70, h-70))
+            fn(img, cx, cy, rng.uniform(0, 180))
+            truth.append(label)
+    place(draw_screw, "screw", 4)
+    place(draw_washer, "washer", 3)
+    place(draw_nut, "nut", 2)
+    img = np.clip(img.astype(float) + rng.normal(0, 6, img.shape),
+                  0, 255).astype(np.uint8)
+    return img, truth
+
+# --- threshold + clean ---------------------------------------------------
+tray, truth = make_tray()
+_, bw = cv2.threshold(tray, 0, 255,
+                      cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+clean = cv2.morphologyEx(bw, cv2.MORPH_OPEN, se)
+clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, se)
+
+# --- label sanity check --------------------------------------------------
+n, labels, stats, cents = cv2.connectedComponentsWithStats(clean, connectivity=8)
+survivors = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 200]
+print(f"{len(survivors)} components survive cleanup")
+
+# --- measure -------------------------------------------------------------
+def describe(c):
+    area  = cv2.contourArea(c)
+    perim = cv2.arcLength(c, True)
+    circ  = 4*np.pi*area/perim**2 if perim > 0 else 0.0
+    sol   = area / max(cv2.contourArea(cv2.convexHull(c)), 1e-6)
+    w, h  = cv2.minAreaRect(c)[1]
+    aspect = max(w, h) / max(min(w, h), 1e-6)
+    verts  = len(cv2.approxPolyDP(c, 0.02*perim, True))
+    return dict(area=area, circularity=circ, solidity=sol,
+                aspect=aspect, vertices=verts)
+
+# --- decide --------------------------------------------------------------
+def classify(d, has_hole):
+    if has_hole and d["circularity"] > 0.80:
+        return "washer"
+    if has_hole and 5 <= d["vertices"] <= 7:
+        return "nut"
+    if not has_hole and d["aspect"] > 2.5:
+        return "screw"
+    return "reject"
+
+contours, hier = cv2.findContours(clean, cv2.RETR_CCOMP,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+colors = {"screw": (200, 80, 0), "washer": (0, 170, 0),
+          "nut": (0, 140, 255), "reject": (0, 0, 230)}
+overlay = cv2.cvtColor(tray, cv2.COLOR_GRAY2BGR)
+counts = {}
+for i, c in enumerate(contours):
+    if hier[0][i][3] != -1 or cv2.contourArea(c) < 200:
+        continue                                     # skip holes and dust
+    has_hole = hier[0][i][2] != -1
+    label = classify(describe(c), has_hole)
+    counts[label] = counts.get(label, 0) + 1
+    m = cv2.moments(c)
+    px, py = int(m["m10"]/m["m00"]), int(m["m01"]/m["m00"])
+    cv2.drawContours(overlay, [c], -1, colors[label], 2)
+    cv2.putText(overlay, label, (px-25, py), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, colors[label], 1, cv2.LINE_AA)
+
+cv2.imwrite("inspection.png", overlay)
+print("counts:", counts)
+expected = {"screw": 4, "washer": 3, "nut": 2}
+verdict = "PASS" if counts == expected and counts.get("reject", 0) == 0 else "FAIL"
+print("verdict:", verdict)
+# Representative output:
+# 9 components survive cleanup
+# counts: {'screw': 4, 'washer': 3, 'nut': 2}
+# verdict: PASS</code></pre>
+</details>
+</section>
 
 <nav class="chapter-nav">
 <a class="prev" href="section-6.5.html">&#8592; Section 6.5: Distance Transforms &amp; Skeletonization</a>

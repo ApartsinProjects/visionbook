@@ -270,6 +270,293 @@ for name, m in metrics.items():
 <div class="callout-title">Exercise 8.3.3: When Metrics Disagree <span class="exercise-type analysis">Analysis</span></div>
 <p>Construct two degradations of the same Kodak image with equal PSNR (tune their strengths until PSNRs match within 0.05 dB): a Gaussian blur and additive noise. Score both with SSIM and LPIPS. Which degradation does each metric prefer, and what does that reveal about what each one measures? Relate your finding to the over-smoothing bias discussed in Section 4 and to the frequency content removed by each degradation (<a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>).</p>
 </div>
+<p>
+The three threads of this chapter, choosing a library deliberately (<a href="section-8.1.html">Section 8.1</a>), measuring and comparing speed honestly (<a href="section-8.2.html">Section 8.2</a>), and scoring quality reproducibly (this section), only become a single skill when you wire them into one harness. Put them together in the hands-on lab below, which turns this chapter into a runnable denoising benchmark studio you can keep and reuse.
+</p>
+<div class="lab">
+<div class="lab-meta">
+<span class="lab-difficulty">Difficulty: Intermediate</span>
+<span class="lab-duration">Duration: about 60 to 75 minutes</span>
+</div>
+<h2>Hands-On Lab: A Denoising Benchmark Studio</h2>
+<div class="lab-objective">
+<h3>Objective</h3>
+<p>Build one self-contained, reproducible script that pits three denoisers from three different libraries against a clean-versus-noisy image set, times each one, scores each with PSNR and two SSIM protocols, and prints a ranked leaderboard plus a tidy CSV, the whole Part I toolbox working as a single harness.</p>
+</div>
+<div class="lab-skills">
+<h3>What You'll Practice</h3>
+<ul>
+<li>Reaching across OpenCV, scikit-image, and SciPy ndimage in one pipeline while keeping dtype and value-range conventions straight (<a href="section-8.1.html">Section 8.1</a>).</li>
+<li>Timing real work honestly with warm-up runs and repeated trials (<a href="section-8.2.html">Section 8.2</a>).</li>
+<li>Manufacturing reproducible (clean, noisy) pairs from built-in test images with a fixed random seed.</li>
+<li>Scoring with PSNR and both the scikit-image default and the Wang et al. (2004) SSIM protocols, with an explicit <code>data_range</code>.</li>
+<li>Emitting a results table that a colleague can reproduce to four decimals.</li>
+</ul>
+</div>
+<div class="lab-prereqs">
+<h4>Setup</h4>
+<p>No downloads: every image comes from <code>skimage.data</code>. Install the three libraries the harness compares.</p>
+<pre><code class="language-bash">pip install opencv-python scikit-image scipy numpy</code></pre>
+</div>
+<div class="lab-steps">
+<h3>Steps</h3>
+<div class="lab-step">
+<h4>Step 1: Assemble a reproducible test set</h4>
+<p>Pull a few grayscale classics from <code>skimage.data</code>, normalize them to float in [0, 1] so every library speaks the same units, and add seeded Gaussian noise to manufacture (clean, noisy) pairs. Reusing the seed is what makes the whole lab reproducible.</p>
+<pre><code class="language-python">import numpy as np
+from skimage import data, img_as_float
+
+def make_pairs(sigma=25 / 255, seed=7):
+    rng = np.random.default_rng(seed)
+    images = {
+        "camera": data.camera(),
+        "coins": data.coins(),
+        "moon": data.moon(),
+    }
+    pairs = {}
+    for name, raw in images.items():
+        clean = img_as_float(raw)              # uint8 -> float64 in [0, 1]
+        # TODO: add Gaussian noise of standard deviation `sigma`, then clip to [0, 1]
+        # Hint: rng.normal(0.0, sigma, clean.shape), then np.clip(...)
+        noisy = ...
+        pairs[name] = (clean, noisy)
+    return pairs
+
+pairs = make_pairs()
+print({k: v[0].shape for k, v in pairs.items()})
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The clean image is already float in [0, 1], so the noise standard deviation must be on the same scale: 25 gray levels out of 255 is <code>25 / 255</code>. Clip after adding noise so values stay in range, exactly as Code 8.3.2 did for the zone plate.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 2: Wrap three denoisers behind one signature</h4>
+<p>Each library wants its inputs in a slightly different form. Wrap each denoiser so all three take a float [0, 1] image and return a float [0, 1] image, hiding the per-library conversions behind a common interface.</p>
+<pre><code class="language-python">import cv2
+from scipy import ndimage as ndi
+from skimage.restoration import denoise_bilateral
+
+def denoise_opencv_nlm(img):
+    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)   # OpenCV wants uint8
+    out = cv2.fastNlMeansDenoising(u8, h=12)
+    return out.astype(np.float64) / 255.0
+
+def denoise_scipy_gaussian(img):
+    # TODO: return a Gaussian-blurred copy using scipy.ndimage (sigma about 1.0)
+    # Hint: ndi.gaussian_filter keeps float input float; no conversion needed
+    return ...
+
+def denoise_skimage_bilateral(img):
+    # skimage works natively in float [0, 1]
+    return denoise_bilateral(img, sigma_color=0.1, sigma_spatial=3)
+
+denoisers = {
+    "opencv_nlm": denoise_opencv_nlm,
+    "scipy_gaussian": denoise_scipy_gaussian,
+    "skimage_bilateral": denoise_skimage_bilateral,
+}
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p><code>ndi.gaussian_filter(img, sigma=1.0)</code> preserves dtype, so the SciPy path needs no uint8 round-trip. Only the OpenCV path crosses the dtype boundary, the Section 8.1 trap made concrete.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 3: Time each denoiser honestly</h4>
+<p>Naive timing measures import caching and cold caches, not the algorithm. Run one warm-up call, then time several repeats and keep the best, the honest-measurement discipline from Section 8.2.</p>
+<pre><code class="language-python">import time
+
+def timed(fn, img, repeats=3):
+    fn(img)                                  # warm-up: ignore the first call
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        out = fn(img)
+        best = min(best, time.perf_counter() - t0)
+    # TODO: return both the denoised image `out` and the best time in milliseconds
+    return ...
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Return <code>out, best * 1000.0</code>. Reporting the minimum across repeats, not the mean, follows the rule from Section 8.2: the fastest run is the one least polluted by background scheduling noise.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 4: Score with PSNR and two SSIM protocols</h4>
+<p>Reuse the scoring logic from Code 8.3.3. Always pass an explicit <code>data_range</code>, and compute SSIM both under the scikit-image defaults and under the Wang et al. (2004) flags so the protocol gap from Output 8.3.3a is visible in your own results.</p>
+<pre><code class="language-python">from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+def score(clean, restored):
+    psnr = peak_signal_noise_ratio(clean, restored, data_range=1.0)
+    ssim_default = structural_similarity(clean, restored, data_range=1.0)
+    # TODO: compute SSIM under the Wang et al. (2004) protocol
+    # Hint: gaussian_weights=True, sigma=1.5, use_sample_covariance=False
+    ssim_paper = ...
+    return psnr, ssim_default, ssim_paper
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>The three flags are exactly the ones in Code 8.3.3. Without an explicit <code>data_range=1.0</code>, scikit-image guesses from the dtype, the single most common silent bug in evaluation scripts.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 5: Run the grid and collect rows</h4>
+<p>Loop over every (image, denoiser) combination, restore, time, and score, accumulating one record per run. This nested loop is the harness itself.</p>
+<pre><code class="language-python">rows = []
+for img_name, (clean, noisy) in pairs.items():
+    for method_name, fn in denoisers.items():
+        restored, ms = timed(fn, noisy)
+        psnr, ssim_d, ssim_p = score(clean, restored)
+        rows.append({
+            "image": img_name, "method": method_name,
+            "psnr": psnr, "ssim_default": ssim_d,
+            "ssim_paper": ssim_p, "time_ms": ms,
+        })
+print(f"collected {len(rows)} runs")           # expect 3 images x 3 methods = 9
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>If you see fewer than nine rows, a denoiser raised an exception and you swallowed it; let errors surface during development, then add handling only once the happy path works.</p>
+</details>
+</div>
+<div class="lab-step">
+<h4>Step 6: Print a leaderboard and write a reproducible CSV</h4>
+<p>Average each method's scores across the images, rank by the paper-protocol SSIM, and write every row to CSV with a header comment that pins library versions, so a colleague can reproduce your numbers to four decimals.</p>
+<pre><code class="language-python">import csv, statistics, skimage, cv2 as _cv
+
+# Leaderboard: mean paper-SSIM and mean time per method
+by_method = {}
+for r in rows:
+    by_method.setdefault(r["method"], []).append(r)
+print(f"{'method':20s} {'SSIM(paper)':>12s} {'time_ms':>10s}")
+for method, recs in sorted(
+        by_method.items(),
+        key=lambda kv: statistics.mean(r['ssim_paper'] for r in kv[1]),
+        reverse=True):
+    s = statistics.mean(r["ssim_paper"] for r in recs)
+    t = statistics.mean(r["time_ms"] for r in recs)
+    print(f"{method:20s} {s:12.4f} {t:10.1f}")
+
+# TODO: write all `rows` to results.csv with csv.DictWriter, prefixing
+# a comment line that records skimage.__version__ and _cv.__version__
+</code></pre>
+<details>
+<summary>Hint</summary>
+<p>Open the file, write one comment line such as <code># skimage=&lt;ver&gt; opencv=&lt;ver&gt;</code>, then use <code>csv.DictWriter(f, fieldnames=rows[0].keys())</code> with <code>writeheader()</code> and <code>writerows(rows)</code>. Recording versions is what makes "reproducible to four decimals" an honest claim.</p>
+</details>
+</div>
+</div>
+<div class="lab-expected">
+<h3>Expected Output</h3>
+<p>A nine-row run and a leaderboard ranked by paper-protocol SSIM. On the seeded set, the non-local means and bilateral methods should clearly outscore the plain Gaussian blur on SSIM (the blur removes noise and signal alike), while the Gaussian path is the fastest, a concrete instance of the speed-versus-quality tradeoff this chapter keeps returning to. Your exact numbers will differ slightly by library version, which is precisely why the CSV records them. A representative leaderboard:</p>
+<pre class="code-output">method               SSIM(paper)    time_ms
+skimage_bilateral         0.8021       38.4
+opencv_nlm                0.7864       21.7
+scipy_gaussian            0.6190        2.1
+</pre>
+</div>
+<div class="lab-stretch">
+<h3>Stretch Goals</h3>
+<ul>
+<li>Add a noise sweep: rerun the grid at sigma 15, 25, and 50 (the BSD68 protocol from Table 8.3.1) and plot SSIM against sigma per method, watching the curves cross.</li>
+<li>Swap the synthetic Gaussian noise for the zone plate of Code 8.3.2 to see which denoiser best preserves the high-frequency rings, connecting the result to the frequency analysis of <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>.</li>
+<li>Add a perceptual metric: install <code>pyiqa</code> and add LPIPS (Code 8.3.4) as a fourth column, then check whether it reorders the leaderboard the way Section 4 predicts.</li>
+</ul>
+</div>
+<details class="lab-solution">
+<summary>Complete Solution</summary>
+<pre><code class="language-python">import csv, statistics, time
+import numpy as np
+import cv2
+from scipy import ndimage as ndi
+import skimage
+from skimage import data, img_as_float
+from skimage.restoration import denoise_bilateral
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+# Step 1: reproducible (clean, noisy) pairs
+def make_pairs(sigma=25 / 255, seed=7):
+    rng = np.random.default_rng(seed)
+    images = {"camera": data.camera(), "coins": data.coins(), "moon": data.moon()}
+    pairs = {}
+    for name, raw in images.items():
+        clean = img_as_float(raw)
+        noisy = np.clip(clean + rng.normal(0.0, sigma, clean.shape), 0.0, 1.0)
+        pairs[name] = (clean, noisy)
+    return pairs
+
+# Step 2: three denoisers, one signature (float [0, 1] in and out)
+def denoise_opencv_nlm(img):
+    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    return cv2.fastNlMeansDenoising(u8, h=12).astype(np.float64) / 255.0
+
+def denoise_scipy_gaussian(img):
+    return ndi.gaussian_filter(img, sigma=1.0)
+
+def denoise_skimage_bilateral(img):
+    return denoise_bilateral(img, sigma_color=0.1, sigma_spatial=3)
+
+denoisers = {
+    "opencv_nlm": denoise_opencv_nlm,
+    "scipy_gaussian": denoise_scipy_gaussian,
+    "skimage_bilateral": denoise_skimage_bilateral,
+}
+
+# Step 3: honest timing (warm-up, then best of N)
+def timed(fn, img, repeats=3):
+    fn(img)
+    best = float("inf")
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        out = fn(img)
+        best = min(best, time.perf_counter() - t0)
+    return out, best * 1000.0
+
+# Step 4: PSNR plus two SSIM protocols
+def score(clean, restored):
+    psnr = peak_signal_noise_ratio(clean, restored, data_range=1.0)
+    ssim_default = structural_similarity(clean, restored, data_range=1.0)
+    ssim_paper = structural_similarity(
+        clean, restored, data_range=1.0,
+        gaussian_weights=True, sigma=1.5, use_sample_covariance=False)
+    return psnr, ssim_default, ssim_paper
+
+# Step 5: run the grid
+pairs = make_pairs()
+rows = []
+for img_name, (clean, noisy) in pairs.items():
+    for method_name, fn in denoisers.items():
+        restored, ms = timed(fn, noisy)
+        psnr, ssim_d, ssim_p = score(clean, restored)
+        rows.append({
+            "image": img_name, "method": method_name,
+            "psnr": round(psnr, 4), "ssim_default": round(ssim_d, 4),
+            "ssim_paper": round(ssim_p, 4), "time_ms": round(ms, 1),
+        })
+
+# Step 6: leaderboard + reproducible CSV
+by_method = {}
+for r in rows:
+    by_method.setdefault(r["method"], []).append(r)
+print(f"{'method':20s} {'SSIM(paper)':>12s} {'time_ms':>10s}")
+for method, recs in sorted(
+        by_method.items(),
+        key=lambda kv: statistics.mean(r['ssim_paper'] for r in kv[1]),
+        reverse=True):
+    s = statistics.mean(r["ssim_paper"] for r in recs)
+    t = statistics.mean(r["time_ms"] for r in recs)
+    print(f"{method:20s} {s:12.4f} {t:10.1f}")
+
+with open("results.csv", "w", newline="") as f:
+    f.write(f"# skimage={skimage.__version__} opencv={cv2.__version__}\n")
+    writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+print("wrote results.csv")
+</code></pre>
+</details>
+</div>
 <nav class="chapter-nav">
 <a class="prev" href="section-8.2.html"><span class="nav-label">Section 8.2: Performance: Vectorization, OpenCV Optimizations &amp; GPU Arrays</span></a>
 <a class="up" href="index.html"><span class="nav-label">Chapter 8</span></a>
