@@ -8,7 +8,7 @@ Structured metadata: `KDP/metadata/metadata.yaml`. Validated deliverables below.
 | File | What | Status |
 |---|---|---|
 | `KDP/output/building-vision-ai.epub` | Reflowable EPUB 3 manuscript (26.4 MB, 277 chapters, 244 illustrations, server-rendered KaTeX math) | **epubcheck 5.3.0: 0 fatals / 0 errors / 0 warnings** |
-| `KDP/cover/cover_kdp.jpg` | Ebook cover, 1600x2143 baseline JPEG | OK (see cover note) |
+| `KDP/cover/cover_kdp.jpg` | Ebook cover, 1600x2560 baseline JPEG | OK (see cover note) |
 
 Rebuild the EPUB any time: `HTML2EPUB_KATEX_OUTPUT=html python -m html2epub build .`
 Re-validate: run epubcheck 5.3.0 (Java) on the .epub.
@@ -53,10 +53,9 @@ Re-validate: run epubcheck 5.3.0 (Java) on the .epub.
 
 ## Cover note
 
-KDP's ideal ebook cover is 1.6:1 (height:width), i.e. 1600 x 2560 px. The current
-cover is 1600 x 2143 (1.34:1), which KDP accepts (minimum 1000 px on the shorter
-side, 72+ dpi). For the textbook-perfect ratio, regenerate the cover art at 1600 x
-2560 and re-export; not required for submission.
+`cover_kdp.jpg` is **1600 x 2560 px (1.6:1), baseline RGB JPEG, 300 dpi** — exactly
+KDP's ideal ebook cover spec (longest side 2560 >= the recommended 2500, well within
+the 1000-10000 px range, under 50 MB). No further cover work needed.
 
 ## Optional: KPF via epub2kpf (only if KDP's EPUB converter complains)
 
