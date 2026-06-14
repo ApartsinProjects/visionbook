@@ -130,6 +130,11 @@ torch_out = model(example).detach().numpy()
 print("max abs diff:", np.abs(ort_out - torch_out).max())   # max abs diff: ~1e-5</code></pre>
 <div class="code-caption"><strong>Code Fragment 1:</strong> Exporting a ResNet-18 to ONNX and validating it. The <code>dynamic_axes</code> entry marks the batch dimension as variable so the compiled engine is not locked to batch size 1. The roughly 1e-5 maximum difference between ONNX Runtime and eager PyTorch confirms the export preserved the computation; a large difference here is the first sign of an export bug, always check it before trusting the engine.</div>
 
+<div class="callout tip">
+<div class="callout-title">Try This: Feel the Difference Between Equivalent and Identical</div>
+<p>Run the validation above, then change the verification input from the single <code>example</code> the model was traced on to a fresh random batch, say <code>torch.randn(8, 3, 224, 224)</code>, and feed the same tensor to both the ONNX session and eager PyTorch. The maximum absolute difference stays around 1e-5, not exactly zero: the compiled graph computes the <em>same</em> mathematics but not the bit-identical floating-point order, which is why the right check is a small tolerance rather than equality. Now break it on purpose to see the alarm work: re-export with <code>opset_version=9</code> (an old operator set) or comment out the <code>.eval()</code> call so batch-norm runs in training mode, then re-run the diff and watch it jump by orders of magnitude. Seeing a clean export sit near 1e-5 and a broken one blow past 1e-2 is what turns the validation step from a ritual into a reflex.</p>
+</div>
+
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Always Validate the Export Numerically</div>
 <p>The single most common deployment bug is a model that exports without error but computes something subtly different from the original, because of an unsupported operator that got replaced, a tracing branch that took the wrong path, or a preprocessing step that lived in Python and never made it into the graph. The defense is cheap and non-negotiable: run the same input through both the original and the exported model and assert the outputs agree to within a small tolerance, as the code above does. An export that passes this check is trustworthy; one that skips it is a latent production incident. The accuracy you measured in <a href="section-28.1.html">Section 28.1</a> only transfers to deployment if the exported graph is the model you measured.</p>
@@ -138,7 +143,7 @@ print("max abs diff:", np.abs(ort_out - torch_out).max())   # max abs diff: ~1e-
 <h2>3. What a Compiler Actually Does <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
-A runtime does not just execute the ONNX graph node by node; it compiles it, and three optimizations do most of the speedup. Understanding them tells you why a compiled engine is faster and where the gains come from.
+Here is the part that surprises people the first time they measure it: the compiled engine computes the exact same numbers as your eager model, yet runs several times faster. Where does the speed come from if the arithmetic is identical? A runtime does not just execute the ONNX graph node by node; it compiles it, and three optimizations do most of the work. Understanding them tells you why a compiled engine is faster and, just as usefully, where to look when it is not.
 </p>
 
 <p>
