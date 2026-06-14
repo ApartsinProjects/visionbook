@@ -123,7 +123,7 @@ Part 3: Deep Learning for Computer Vision (part-3-deep-learning-for-vision/)
   Ch 22: Vision Transformers                        module-22-vision-transformers
   Ch 23: Object Detection                           module-23-object-detection
   Ch 24: Segmentation: Semantic, Instance & Promptable    module-24-segmentation
-  Ch 25: Self-Supervised Learning & Foundation Models     module-25-self-supervised-foundation-models
+  Ch 25: Self-Supervised Learning & Vision Foundation Models     module-25-self-supervised-foundation-models
   Ch 26: Video Understanding                        module-26-video-understanding
   Ch 27: Depth, 3D Vision & Neural Scene Representations  module-27-depth-3d-neural-scenes
   Ch 28: Efficient Vision & Edge Deployment         module-28-efficient-vision-deployment
