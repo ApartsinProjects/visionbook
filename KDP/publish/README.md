@@ -1,5 +1,13 @@
 # KDP Publish Folder — final upload artifacts only
 
+> **STATUS (2026-06-15):** `building-vision-ai.kpf` and `building-vision-ai.epub`
+> in this folder are the latest BUILT artifacts. They carry **First-Edition
+> content** (built before the Second-Edition expansion; footers read "First
+> Edition" and they lack the new graduate derivations / world-models depth).
+> They are usable for upload now. Re-run the rebuild chain below to refresh them
+> to the Second Edition before the final publish.
+
+
 This folder holds ONLY the files you upload to Amazon KDP. Everything else under
 `KDP/` (the `output/`, `_mathrast/`, `_diagrast/`, `*.log` directories) is build
 scratch and intermediate artifacts; do not upload from there.
