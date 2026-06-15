@@ -8,10 +8,18 @@ Structured metadata: `KDP/metadata/metadata.yaml`. Validated deliverables below.
 | File | What | Status |
 |---|---|---|
 | `KDP/output/building-vision-ai.epub` | Reflowable EPUB 3 manuscript (26.4 MB, 277 chapters, 244 illustrations, server-rendered KaTeX math) | **epubcheck 5.3.0: 0 fatals / 0 errors / 0 warnings** |
+| `KDP/output/building-vision-ai.kpf` | Kindle-native KPF (83 MB; math + diagrams rasterized to images, embedded text font) | **Kindle Previewer 3: Enhanced Typesetting Supported, 0 errors, 0 quality issues** |
 | `KDP/cover/cover_kdp.jpg` | Ebook cover, 1600x2560 baseline JPEG | OK (see cover note) |
+
+Either file can be uploaded to KDP. The EPUB is the lighter, source-faithful manuscript (crisp vector math/diagrams); the KPF is the Kindle-native package validated end-to-end by Kindle Previewer with Enhanced Typesetting on.
 
 Rebuild the EPUB any time: `HTML2EPUB_KATEX_OUTPUT=html python -m html2epub build .`
 Re-validate: run epubcheck 5.3.0 (Java) on the .epub.
+
+Rebuild the KPF: `python scripts/rasterize_math.py KDP/output/building-vision-ai.epub` then
+`python scripts/rasterize_diagrams.py KDP/output/building-vision-ai-mathimg.epub` then
+`python scripts/build_kindle.py`, then convert with
+`python <epub2kpf>/scripts/kpv_convert.py --epub KDP/output/building-vision-ai-kindle.epub --output KDP/output/kpf_out`.
 
 ## KDP "Kindle eBook Details" page — paste these
 

@@ -28,11 +28,25 @@ def px_to_em(m):
     return f"{m.group(1)}{float(m.group(2))/16:.3f}em"
 
 IB = re.compile(r"display\s*:\s*inline-block", re.I)
+# KFX E02208: font-size must be a positive em/rem. `font-size:0`, `font-size:0em`
+# and `font-size:inherit` are all rejected. 0/0em (used to hide badge text) ->
+# 0.75em (show the text, harmless on reflow), inherit -> 1em.
+FS_ZERO = re.compile(r"(font-size\s*:\s*)0(?:em)?(?=\s*[;}\"'!]|$)", re.I)
+FS_INHERIT = re.compile(r"(font-size\s*:\s*)inherit", re.I)
+# KFX E06424: system-ui / -apple-system resolve to a missing font file. These
+# appear as CSS values, SVG font-family="..." attrs, and `font:` shorthand, so
+# replace the bare tokens everywhere (they only ever name a font).
+SYSFONT = re.compile(r"-apple-system|system-ui|BlinkMacSystemFont", re.I)
+DUP_SANS = re.compile(r"(sans-serif)(\s*,\s*sans-serif)+", re.I)
 
 def sanitize(text):
     n_rem = len(REM.findall(text))
     text = REM.sub(lambda m: m.group(1) + "em", text)
     text, n_px = PXFONT.subn(px_to_em, text)
+    text = FS_ZERO.sub(lambda m: m.group(1) + "0.75em", text)
+    text = FS_INHERIT.sub(lambda m: m.group(1) + "1em", text)
+    text = SYSFONT.sub("sans-serif", text)
+    text = DUP_SANS.sub("sans-serif", text)
     # KFX E00204: inline-block unsupported inside tables. Kindle reflows, so
     # plain inline is a safe global substitute (badges/chips stay inline).
     text = IB.sub("display:inline", text)
