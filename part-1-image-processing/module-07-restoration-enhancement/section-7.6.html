@@ -141,6 +141,75 @@ print(f"radiance range: {hdr.min():.4f} .. {hdr.max():.1f}, "
 <p>
 Note what step 2 quietly does: it inverts a stage of the in-camera processing pipeline from <a href="../module-01-digital-image-fundamentals/index.html">Chapter 1</a> using nothing but the photographs themselves. If you shoot RAW, the response is already linear and calibration is unnecessary; the Debevec step exists because the world runs on JPEGs.
 </p>
+<h3>2.1 The Response-Curve Solve, Written Out <span class="level-badge advanced" title="Advanced">Advanced</span></h3>
+<p>
+Step 2 of Code 7.6.1 said "recover the response curve $g$" and handed the job to OpenCV. A graduate course should be able to derive what that call computes, because it is a clean, finite linear least-squares problem and assembling it cements every idea above. We have one observation equation per sampled pixel per exposure, $g(Z_{ij}) = \ln E_i + \ln \Delta t_j$. Treat $g$ as a lookup table of 256 unknown numbers $g(0), g(1), \dots, g(255)$, one per possible 8-bit value, and treat the $N$ sampled scene points' log irradiances $\ln E_1, \dots, \ln E_N$ as unknowns too. With $P$ exposures and $N$ pixels we have $N \cdot P$ equations in $256 + N$ unknowns, so a few dozen well-chosen pixels already over-determine the system. Debevec and Malik minimize the weighted objective
+</p>
+<div class="math-block">
+$$
+\mathcal{O} = \underbrace{\sum_{i=1}^{N}\sum_{j=1}^{P}
+\Bigl\{\, w(Z_{ij})\,\bigl[\, g(Z_{ij}) - \ln E_i - \ln \Delta t_j \,\bigr] \Bigr\}^2}_{\text{data fit, trust mid-tones}}
+\;+\;
+\underbrace{\lambda \sum_{z=1}^{254} \bigl[\, w(z)\, g''(z) \,\bigr]^2}_{\text{smoothness of the curve}},
+$$
+</div>
+<p>
+where the discrete second derivative is $g''(z) = g(z-1) - 2\,g(z) + g(z+1)$. The first sum is the fit: every equation is weighted by the hat function $w(Z)$ so clipped highlights and noise-drowned shadows barely vote. The second sum is the regularizer that the prose above promised, penalizing curvature so $g$ stays smooth between the discrete values it is actually pinned at; $\lambda$ trades fit against smoothness exactly as $\gamma$ did for deconvolution in <a href="section-7.3.html">Section 7.3</a>, the same data-plus-regularizer skeleton one level up the chapter. Because every term is linear in the unknowns, the whole objective is a single overdetermined linear system $A\mathbf{x} = \mathbf{b}$ solved in one shot by SVD. Two housekeeping details make it well-posed: the weights $w$ multiply the smoothness rows too (so curvature is policed only where the curve is trustworthy), and one extra equation $g(127) = 0$ fixes the otherwise-free additive constant (radiance is recovered up to scale, so we simply nail the mid-gray response to zero). Code 7.6.1a assembles and solves the system from scratch.
+</p>
+<pre><code class="language-python">import numpy as np
+
+def debevec_response(Z, ln_t, w, lam=20.0):
+    """Recover the log response curve g (256 values) by least squares.
+
+    Z      : (N, P) uint8 sampled pixel values, N points across P exposures
+    ln_t   : (P,)   natural-log exposure times ln(dt_j)
+    w      : (256,) hat weights, e.g. w[z] = min(z, 255 - z)
+    Returns g (256,) and the recovered log irradiances lnE (N,).
+    """
+    n_samples, n_exp = Z.shape
+    n_rows = n_samples * n_exp + 254 + 1        # data + curvature + anchor
+    n_cols = 256 + n_samples                    # g(0..255) then lnE(0..N-1)
+    A = np.zeros((n_rows, n_cols))
+    b = np.zeros(n_rows)
+
+    k = 0
+    for i in range(n_samples):                  # data-fit equations
+        for j in range(n_exp):
+            z = Z[i, j]
+            wij = w[z]
+            A[k, z] = wij                        #  +g(Z_ij)
+            A[k, 256 + i] = -wij                 #  -lnE_i
+            b[k] = wij * ln_t[j]                 #  = ln(dt_j)
+            k += 1
+
+    A[k, 127] = 1.0                              # anchor: g(127) = 0
+    k += 1
+
+    for z in range(1, 255):                      # smoothness: lam * w * g''
+        A[k, z - 1] =  lam * w[z]
+        A[k, z]     = -2 * lam * w[z]
+        A[k, z + 1] =  lam * w[z]
+        k += 1
+
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)    # one SVD solve
+    return x[:256], x[256:]
+
+# Hat weights: distrust values near 0 and 255 (clipped / noise-drowned).
+w = np.array([min(z, 255 - z) for z in range(256)], dtype=np.float64)
+</code></pre>
+<div class="code-caption"><strong>Code 7.6.1a:</strong> The Debevec-Malik response recovery as the linear least-squares system it is: one weighted data row per pixel-exposure pair, 254 weighted curvature rows for smoothness, and one anchor row to fix the scale. <code>cv2.createCalibrateDebevec</code> solves this exact system internally; here it is in thirty lines so the mechanism is reproducible, not opaque.</div>
+<p>
+With $g$ in hand, the merge of step 3 is a weighted average in the log domain: each exposure $j$ contributes its estimate $g(Z_{ij}) - \ln \Delta t_j$ of $\ln E_i$, weighted again by $w(Z_{ij})$ so each pixel is trusted in the frames where it was well exposed, giving
+</p>
+<div class="math-block">
+$$
+\ln E_i = \frac{\sum_{j} w(Z_{ij})\,\bigl[\, g(Z_{ij}) - \ln \Delta t_j \,\bigr]}
+{\sum_{j} w(Z_{ij})}.
+$$
+</div>
+<p>
+Exponentiate and you have the radiance map. This is the entire algorithm: a calibration solve to learn the camera once, then a per-pixel weighted vote to recover radiance everywhere.
+</p>
 <h2>3. Tone Mapping: Spending the Range <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <p>
 Now the second gap. Naively normalizing the radiance map to [0, 255] produces a nearly black image with a few bright speckles: radiance is so skewed that the window and the lamp own the entire linear range while the room's contents huddle in the bottom few codes. Tone mapping operators (TMOs) compress intelligently instead, and they split into two families. <strong>Global</strong> operators apply one monotone curve to every pixel. Reinhard's classic is barely more than one line,

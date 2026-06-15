@@ -204,11 +204,98 @@ PDE and marching methods share a fatal limitation: they synthesize the fill from
 The landmark formulation (Criminisi, Perez, and Toyama, 2004) realized that copy <em>order</em> decides everything. Fill the easy flat areas first and interrupted edges get walled off, never to reconnect; the fill looks patched. Their algorithm scores every patch on the hole's rim with a priority $P(p) = C(p) \cdot D(p)$: a confidence term $C$ measuring how much already-known content the patch contains, and a data term $D$ that spikes where a strong isophote hits the boundary head-on. The product makes the algorithm extend structure first, exactly like the transport methods, then flood texture into the remaining areas. One iteration runs four steps: pick the rim patch with the highest priority, search the known region for its best match (masked sum of squared differences over the known pixels only), copy the matching patch's pixels into the unknown ones, then update confidences and repeat until the hole is gone. Structure propagates, then texture; large holes in textured scenes come out looking startlingly intact.
 </p>
 <p>
-We will not build Criminisi from scratch: a faithful implementation is a few hundred lines of boundary bookkeeping, and the algorithmic ideas are all stated above. What turned the approach from paper to product was <strong>PatchMatch</strong> (Barnes et al., 2009), a randomized algorithm that finds approximate nearest-neighbor patches orders of magnitude faster than exhaustive search by exploiting the coherence of natural images: good matches for neighboring patches are themselves neighbors. PatchMatch became the engine of Photoshop's Content-Aware Fill in 2010, which is the form in which a billion users met exemplar inpainting without learning its name.
+The four steps are worth making precise, because each maps to a few lines of code. Write $\Omega$ for the hole, $\partial\Omega$ for its current boundary (the fill front), and let $C(p)$ be the confidence at a front pixel $p$, initialized to $0$ inside the hole and $1$ on known pixels. For a $w \times w$ patch $\Psi_p$ centered at $p$, the two priority factors are
+</p>
+<div class="math-block">
+$$
+C(p) = \frac{1}{|\Psi_p|}\!\!\sum_{q \in \Psi_p \cap \bar{\Omega}}\!\! C(q),
+\qquad
+D(p) = \frac{\bigl| \nabla^{\perp} I_p \cdot n_p \bigr|}{\alpha},
+\qquad
+P(p) = C(p)\,D(p),
+$$
+</div>
+<p>
+where $C(p)$ is the fraction of the patch that is already known (so the algorithm fills from the most-surrounded points first, and confidence decays as it pushes deeper into the hole, discouraging the fill from drifting), $\nabla^{\perp} I_p$ is the isophote direction (the level-curve tangent, perpendicular to the gradient), $n_p$ is the unit normal to the front, and $\alpha = 255$ normalizes for 8-bit data. The data term $D(p)$ spikes precisely where a strong edge runs <em>into</em> the front head-on, which is what makes structure propagate first. The source search then minimizes the masked sum of squared differences over the known pixels of the patch, $\Psi_{\hat q} = \arg\min_{\Psi_q \subset \bar\Omega} \sum_{m \in \Psi_p \cap \bar\Omega} \lVert \Psi_p(m) - \Psi_q(m)\rVert^2$, copies the source patch's pixels into the unknown positions of $\Psi_p$, and finally stamps the just-filled pixels with $C(p)$ so their newly-minted confidence flows into the next iteration's priorities. Code 7.4.5 is the whole algorithm; it is longer than the smoothness fillers because priority bookkeeping is the point, but every line traces directly to the four steps above.
+</p>
+<pre><code class="language-python">import numpy as np
+from scipy import ndimage as ndi
+
+def criminisi_inpaint(img, mask, patch=9, alpha=255.0):
+    """Exemplar-based inpainting (Criminisi-Perez-Toyama, 2004).
+
+    img : float image, HxW (grayscale) or HxWx3. mask: bool, True = hole.
+    Fills the hole by structure-first patch copying. Returns the filled image.
+    """
+    img = img.astype(np.float64).copy()
+    fill = mask.copy()                      # True where still unknown
+    conf = (~mask).astype(np.float64)       # confidence: 1 known, 0 hole
+    h, w = mask.shape
+    r = patch // 2
+    # Isophote = gradient rotated 90 deg, taken on a graylevel image.
+    gray = img.mean(2) if img.ndim == 3 else img
+
+    while fill.any():
+        # 1. Fill front: hole pixels with at least one known 4-neighbor.
+        front = fill &amp; (ndi.binary_dilation(~fill) )
+        ys, xs = np.nonzero(front)
+
+        # Front normal n_p from the gradient of the (smoothed) fill region.
+        ny, nx = np.gradient((~fill).astype(np.float64))
+        # Isophote direction = (-dI/dy, dI/dx), i.e. gradient rotated by 90 deg.
+        gy, gx = np.gradient(gray)
+        iso_y, iso_x = -gx, gy
+
+        # 2. Priorities P = C * D over the front; pick the maximum.
+        best_p, best_xy = -1.0, None
+        for y, x in zip(ys, xs):
+            y0, y1 = max(0, y - r), min(h, y + r + 1)
+            x0, x1 = max(0, x - r), min(w, x + r + 1)
+            known = ~fill[y0:y1, x0:x1]
+            C = conf[y0:y1, x0:x1][known].sum() / known.size
+            nlen = np.hypot(nx[y, x], ny[y, x]) + 1e-9
+            D = abs(iso_x[y, x] * nx[y, x] + iso_y[y, x] * ny[y, x]) / (nlen * alpha)
+            P = C * (D + 1e-3)              # tiny floor so flat fronts still fill
+            if P &gt; best_p:
+                best_p, best_xy, best_C = P, (y, x), C
+
+        # 3. Best-match search: masked SSD over all fully-known source patches.
+        y, x = best_xy
+        y0, y1 = max(0, y - r), min(h, y + r + 1)
+        x0, x1 = max(0, x - r), min(w, x + r + 1)
+        target = img[y0:y1, x0:x1]
+        tmask = ~fill[y0:y1, x0:x1]         # known pixels of the target patch
+        ph, pw = target.shape[:2]
+        best_ssd, best_src = np.inf, None
+        for sy in range(0, h - ph + 1):
+            for sx in range(0, w - pw + 1):
+                if fill[sy:sy + ph, sx:sx + pw].any():
+                    continue               # source must be entirely known
+                src = img[sy:sy + ph, sx:sx + pw]
+                ssd = ((src - target) ** 2)[tmask].sum()   # known pixels only
+                if ssd &lt; best_ssd:
+                    best_ssd, best_src = ssd, src
+
+        # 4. Copy source pixels into the unknown positions, then update state.
+        unknown = fill[y0:y1, x0:x1]
+        target[unknown] = best_src[unknown]
+        img[y0:y1, x0:x1] = target
+        gray = img.mean(2) if img.ndim == 3 else img
+        conf[y0:y1, x0:x1][unknown] = best_C
+        fill[y0:y1, x0:x1][unknown] = False
+    return img
+</code></pre>
+<div class="code-caption"><strong>Code 7.4.5:</strong> Exemplar-based inpainting from scratch: priority $P = C \cdot D$ selects the front patch where confidence and an incoming isophote coincide, a masked-SSD search finds its best match among fully-known patches, and the copy plus confidence update closes the loop. The exhaustive source search is the slow part (it is what PatchMatch replaces below); on a small hole it runs in seconds, and watching the fill order makes the structure-first behavior visible.</div>
+<div class="callout note">
+<div class="callout-title">Why the Priority Term Earns Its Keep</div>
+<p>Drop the data term $D$ (fill purely by confidence) and the front advances as a smooth, isotropic peel from the rim inward, exactly like the marching methods, so an edge that should cross the hole gets walled off and the seam shows. Keeping $D$ lets a patch sitting on an incoming isophote leap to the head of the queue and drag the edge across the gap <em>before</em> the surrounding flat texture is filled. This is the whole reason Criminisi beat earlier exemplar methods that filled in raster or onion-peel order: copy order, not patch matching, was the missing idea. Exercise 7.4.2 has you remove and restore $D$ to see the seam appear and vanish.</p>
+</div>
+<p>
+Code 7.4.5 is faithful but slow: its source search compares the target against every known patch in the image, an $O(\text{image size})$ scan per filled patch. What turned the approach from paper to product was <strong>PatchMatch</strong> (Barnes et al., 2009), a randomized algorithm that finds approximate nearest-neighbor patches orders of magnitude faster than exhaustive search by exploiting the coherence of natural images: good matches for neighboring patches are themselves neighbors, so after a few random guesses, matches propagate spatially and converge in a handful of passes rather than a full scan. PatchMatch became the engine of Photoshop's Content-Aware Fill in 2010, which is the form in which a billion users met exemplar inpainting without learning its name.
 </p>
 <div class="callout tip">
 <div class="callout-title">You Could Build This: A One-Click Object Remover</div>
-<p>With the mask discipline of Section 1 and the classical fillers of Codes 7.4.1 through 7.4.4, you can build a small portfolio tool that removes an unwanted object from a photo. The pipeline is short: let the user paint a rough mask (or threshold one from a distinctive color), dilate it by a ring of pixels, then route by hole geometry from Table 7.4.1, thin damage to <code>cv2.inpaint</code> with the Telea flag, wider textured holes to an exemplar fill. Wrap it in a tiny script or notebook that takes an image plus a mask and returns the cleaned result. This is a beginner-friendly build (about 30 to 60 minutes), it produces a before-and-after pair that reads instantly in a portfolio, and it is the honest, deterministic cousin of the generative erasers you will build in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>. Stretch goal: log which method each region was routed to, so the tool can explain its own decisions.</p>
+<p>With the mask discipline of Section 1 and the classical fillers of Codes 7.4.1 through 7.4.5, you can build a small portfolio tool that removes an unwanted object from a photo. The pipeline is short: let the user paint a rough mask (or threshold one from a distinctive color), dilate it by a ring of pixels, then route by hole geometry from Table 7.4.1, thin damage to <code>cv2.inpaint</code> with the Telea flag, wider textured holes to the exemplar fill of Code 7.4.5. Wrap it in a tiny script or notebook that takes an image plus a mask and returns the cleaned result. This is a beginner-friendly build (about 30 to 60 minutes), it produces a before-and-after pair that reads instantly in a portfolio, and it is the honest, deterministic cousin of the generative erasers you will build in <a href="../../part-4-generative-vision-models/module-35-controllable-generation-editing/index.html">Chapter 35</a>. Stretch goal: log which method each region was routed to, so the tool can explain its own decisions.</p>
 </div>
 <h2>5. Choosing by Hole Geometry <span class="level-badge basic" title="Beginner">Beginner</span></h2>
 <p>
@@ -255,7 +342,7 @@ Every method in this section is bounded by the same wall: the fill can only cont
 </div>
 <div class="callout exercise">
 <div class="callout-title">Exercise 7.4.2: Criminisi-Lite <span class="exercise-type coding">Coding</span></div>
-<p>Implement a simplified exemplar inpainter: at each step, take the rim patch with the highest <em>confidence</em> (skip the data term), find its best match over a coarse grid of candidate source patches using masked SSD, and copy the unknown pixels. Run it on a 9x9-pixel-patch scale against a texture image (try <code>skimage.data.grass()</code>) with a 60x60 hole, and compare visually against <code>cv2.inpaint</code> with the Telea flag. Then add the data term $D(p) = |\nabla^{\perp} I \cdot n_p|$ and show one example where the fill order visibly changes the result.</p>
+<p>Start from Code 7.4.5 and make one change: comment out the data term $D$ so the priority is confidence alone, $P(p) = C(p)$. Run both versions (with and without $D$) on a 9x9-patch scale against a texture image carrying a strong edge (try <code>skimage.data.grass()</code> with a dark bar painted across it) under a 60x60 hole, and compare visually against <code>cv2.inpaint</code> with the Telea flag. Identify the example where the fill order visibly changes the result: the confidence-only version should wall off the edge while the full priority carries it across, exactly as the "Why the Priority Term Earns Its Keep" note predicts. Then replace the exhaustive source search with a coarse candidate grid (every $k$-th pixel) and report the speed-versus-quality tradeoff, which is the gap PatchMatch closes.</p>
 </div>
 <div class="callout exercise">
 <div class="callout-title">Exercise 7.4.3: When the Metric Lies <span class="exercise-type analysis">Analysis</span></div>

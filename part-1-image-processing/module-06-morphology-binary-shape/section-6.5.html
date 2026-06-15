@@ -105,6 +105,47 @@ print(f"chamfer max = {chamfer_dt(disk).max():.2f}  (true inradius 40)")
 <p>The 25-line chamfer above is an approximation and, in pure Python, a slow one. <code>scipy.ndimage.distance_transform_edt(mask)</code> returns the <em>exact</em> Euclidean transform in one line, using the Felzenszwalb-Huttenlocher style linear-time algorithm (a lower-envelope-of-parabolas construction run separably per dimension, the same separability dividend as Chapter 3's filters). It also accepts <code>sampling=</code> for anisotropic pixels (a CT slice whose voxels are 0.5 mm in-plane and 2 mm between slices) and returns nearest-boundary indices on request. OpenCV's <code>cv2.distanceTransform(mask, cv2.DIST_L2, 5)</code> is the speed-optimized chamfer equivalent, with <code>cv2.DIST_MASK_PRECISE</code> for the exact version.</p>
 </div>
 
+<p>
+That "exact in one line" deserves more than a function name, because the algorithm behind it is one of the prettiest results in image processing and explains <em>why</em> the chamfer above can only approximate. The squared Euclidean distance transform is separable: the 2D distance to the nearest seed factors into independent 1D passes, first down each column, then across each resulting row. The trick is the second pass. After the column pass, cell $(y, x)$ holds $G(y, x)$, the squared vertical distance to the nearest seed in column $x$. The true squared distance is then
+</p>
+<div class="math-block">
+$$
+D(y, x) = \min_{x'} \bigl[\, (x - x')^2 + G(y, x') \,\bigr],
+$$
+</div>
+<p>
+a one-dimensional minimization over every other column $x'$ in the row. Read each candidate as a function of the query position $x$: the term $(x - x')^2 + G(y, x')$ is a parabola in $x$, with its vertex at horizontal position $x'$ and height $G(y, x')$. The distance transform of the whole row is therefore the <strong>lower envelope</strong> of one upward parabola per source column: at each $x$ you want whichever parabola sits lowest. Felzenszwalb and Huttenlocher (2004) compute that envelope in a single left-to-right sweep. Maintain a stack of the parabolas that currently win somewhere, together with the breakpoints where the winner changes; each new parabola either joins the envelope on the right (compute its intersection with the current rightmost winner) or, if it dips below the rightmost winner before that winner ever takes over, it dominates and pops it off the stack. Two parabolas of equal width intersect at exactly one point, computable in closed form, so each is pushed and popped at most once and the whole row resolves in time linear in its length.
+</p>
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Exact Squared-EDT of One Row (Lower Envelope of Parabolas)</div>
+<p>Given the post-column-pass array $G[0..n-1]$ for one row, compute $D[q] = \min_{x'} (q - x')^2 + G[x']$:</p>
+<pre><code class="language-python">def edt_1d(G):
+    """One-dimensional squared-distance transform: lower envelope of parabolas."""
+    n = len(G)
+    v = [0]                     # indices of the parabolas in the envelope
+    z = [-float('inf'), float('inf')]   # breakpoints between successive winners
+    k = 0                       # index of the rightmost parabola so far
+    for q in range(1, n):
+        # intersection abscissa of parabola q with the current rightmost one v[k]
+        s = ((G[q] + q*q) - (G[v[k]] + v[k]*v[k])) / (2*q - 2*v[k])
+        while s &lt;= z[k]:        # q dominates v[k] before v[k] ever wins: pop it
+            k -= 1
+            s = ((G[q] + q*q) - (G[v[k]] + v[k]*v[k])) / (2*q - 2*v[k])
+        k += 1
+        v[k:] = [q]             # push q as the new rightmost winner
+        z[k:k+2] = [s, float('inf')]
+    D = [0]*n
+    k = 0
+    for q in range(n):          # read off the envelope left to right
+        while z[k+1] &lt; q:
+            k += 1
+        D[q] = (q - v[k])**2 + G[v[k]]
+    return D
+</code></pre>
+<p class="code-caption"><strong>Code Fragment 1b:</strong> The Felzenszwalb-Huttenlocher one-dimensional lower-envelope sweep, computing the exact squared Euclidean distance transform of a row in linear time.</p>
+<p>Run this down every column (seeded with $0$ at object pixels and $+\infty$ at seeds' complements), then across every row of the result, and take the square root: the output is the <em>exact</em> Euclidean distance transform in $O(n)$ per row and $O(N)$ total for an $N$-pixel image, with no error term. This is what <code>distance_transform_edt</code> runs internally, and it is why the exact transform is both faster and more accurate than the chamfer sweeps it replaces.</p>
+</div>
+
 <h2>2. Reading the Map: Thickness, Inradius, Clearance <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
 
 <p>

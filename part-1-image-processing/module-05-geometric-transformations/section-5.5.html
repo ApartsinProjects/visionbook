@@ -102,6 +102,41 @@ aligned = cv2.warpAffine(moving, warp, fixed.shape[::-1],
 <p>
 Direct methods have a sharply defined personality. They use every pixel's gradient, so they achieve excellent subpixel accuracy and work on images with <em>no distinctive corners at all</em> (smooth terrain, medical slices, blurry frames). But the optimization is local: start it more than a few dozen pixels from the truth and it converges to the wrong valley. The standard remedy is coarse-to-fine: run ECC on the smallest level of a Gaussian pyramid from <a href="../module-04-frequency-domain-multiscale/index.html">Chapter 4</a>, where the basin of convergence is wide, and propagate the result down the levels as initialization. Phase correlation also makes an excellent initializer. When we reach optical flow in <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>, you will recognize Lucas-Kanade as exactly this machinery applied to small patches.
 </p>
+<h3>2.1 Mutual Information: Aligning Across Modalities <span class="level-badge advanced" title="Advanced">Advanced</span></h3>
+<p>
+ECC's brightness invariance handles a darker exposure of the same scene, but it assumes a single global gain and bias relate the two intensities. Cross-modality registration breaks that assumption outright: a CT slice and an MRI slice of the same anatomy, or a thermal and a visible-light frame of the same scene, share <em>edges and structure</em> but no monotone intensity map at all. Bone is bright in CT and dark in some MRI sequences; a sum-of-squared-differences or correlation objective sees those aligned pixels as maximally dissimilar and registers them apart. The fix is to stop comparing intensities and start comparing <em>statistical dependence</em>: when the two images are correctly aligned, knowing a pixel's value in one image tells you the most it ever can about its value in the other, whatever the (possibly non-monotone, many-to-one) relationship between the modalities happens to be. <strong>Mutual information</strong> (Viola and Wells, 1997; Maes et al., 1997) measures exactly that dependence and is the standard cross-modal objective.
+</p>
+<p>
+The construction reuses the joint histogram of <a href="../module-02-point-operations-histograms/index.html">Chapter 2</a> directly. Warp the moving image by $W_\mathbf{p}$, then bin the pairs of co-located intensities $(a, b)$ into a 2D histogram and normalize it to a joint probability $p_{AB}(a, b)$, with marginals $p_A(a) = \sum_b p_{AB}(a,b)$ and $p_B(b) = \sum_a p_{AB}(a,b)$. Mutual information is the Kullback-Leibler divergence between the joint distribution and the product of its marginals,
+</p>
+<div class="math-block">
+$$
+\mathrm{MI}(\mathbf{p}) = \sum_{a}\sum_{b} p_{AB}(a, b)\,
+\log \frac{p_{AB}(a, b)}{p_A(a)\, p_B(b)}
+= H(A) + H(B) - H(A, B),
+$$
+</div>
+<p>
+where $H(A) = -\sum_a p_A(a)\log p_A(a)$ is the Shannon entropy of one image's intensities and $H(A,B) = -\sum_{a,b} p_{AB}(a,b)\log p_{AB}(a,b)$ is the joint entropy. Read the second form as the payoff: the marginal entropies $H(A)$ and $H(B)$ are fixed by each image's own content and do not change as you slide the warp, so maximizing $\mathrm{MI}$ is the same as <em>minimizing the joint entropy</em> $H(A,B)$. A misregistered overlay smears each true tissue-pair across many histogram cells (a blurry, high-entropy cloud); the correct alignment collapses the cloud onto a few sharp ridges, one per genuine tissue correspondence, which is the lowest-entropy, most concentrated the joint histogram can be. Maximizing mutual information is, concretely, sharpening the joint histogram.
+</p>
+<pre><code class="language-python"># Mutual information from a joint histogram: the cross-modal alignment score.
+# Maximize this over the warp parameters (e.g. with Powell's method) to register
+# images whose intensities are related non-monotonically (CT/MRI, thermal/visible).
+import numpy as np
+
+def mutual_information(a, b, bins=64):
+    """MI in nats between two co-located, equal-shape uint8 images."""
+    joint, _, _ = np.histogram2d(a.ravel(), b.ravel(), bins=bins)
+    p_ab = joint / joint.sum()                  # normalize to a joint pmf
+    p_a = p_ab.sum(axis=1, keepdims=True)       # marginals
+    p_b = p_ab.sum(axis=0, keepdims=True)
+    nz = p_ab &gt; 0                               # 0 log 0 := 0
+    return float(np.sum(p_ab[nz] * np.log(p_ab[nz] / (p_a @ p_b)[nz])))
+</code></pre>
+<div class="code-caption"><strong>Code 5.5.2a:</strong> Mutual information from a joint histogram, the cross-modal similarity score. Wrap it in a maximizer over the warp parameters (a derivative-free optimizer such as <code>scipy.optimize.minimize</code> with <code>method='Powell'</code> on the negated MI, or the multi-resolution pyramid above) to register images no intensity-difference objective can. SimpleITK's <code>ImageRegistrationMethod</code> with <code>SetMetricAsMattesMutualInformation</code> ships the production version, with a smooth Parzen-window estimate of the histogram so the objective is differentiable.</div>
+<p>
+The one subtlety is that mutual information as written rewards <em>overlap area</em> as well as alignment: a warp that shoves most of the moving image off the canvas can raise the score by shrinking the histogram support. <em>Normalized</em> mutual information, $\mathrm{NMI} = (H(A) + H(B)) / H(A, B)$, divides that bias out and is the form used in practice. With this objective in hand, the ECC machinery of this subsection (and the coarse-to-fine pyramid) carries over unchanged; only the similarity score is swapped, which is why mutual information is described as a metric rather than a separate algorithm.
+</p>
 <h2>3. Feature-Based Registration and RANSAC <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 <p>
 The third family is the one inside every panorama app. Instead of comparing all pixels, find a few hundred <em>distinctive</em> points in each image, describe each by a compact signature of its neighborhood, match signatures across images, and fit a transform to the matched pairs. The detection and description machinery (ORB here; SIFT, AKAZE, and learned successors) gets a full treatment in <a href="../../part-2-classical-computer-vision/module-10-keypoints-descriptors-matching/index.html">Chapter 10</a>; today we use it as a black box that outputs correspondences, because the interesting part for this chapter is what happens next.
