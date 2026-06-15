@@ -195,6 +195,258 @@ print("probability-flow ODE: deterministic, ~50 steps instead of 200")</code></p
 <p>The continuous SDE and ODE framing (Song et al., 2021, arXiv:2011.13456) turned out to be the language in which nearly all subsequent progress was expressed. The EDM design space (Karras et al., 2022) is stated entirely in $\sigma$-space SDE/ODE terms. The flow-matching and rectified-flow methods of <a href="section-33.5.html">Section 33.5</a> (Lipman et al., 2023; Liu et al., 2023) are about choosing a better probability path and learning its ODE velocity field directly. Consistency models (Song et al., 2023) are defined as learning the solution map of the probability-flow ODE. Even diffusion-based solvers for inverse problems (deblurring, super-resolution, MRI reconstruction in 2023 to 2025) plug a measurement-consistency term into the reverse SDE. If you internalize one idea from this section, make it that the reverse-time SDE and its deterministic ODE twin are the substrate on which the modern field reasons.</p>
 </div>
 
+<h2>4. The Forward SDE in Full: VE and VP Kernels <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 2b named the two families; a graduate course needs their exact drift, diffusion, and transition kernels, because those closed forms are what you actually simulate and what the loss is computed against. Start again from the general forward SDE, now written with the Wiener increment as $dw$ to match the primary source (Song et al., 2021):
+</p>
+
+<div class="math-block">
+$$dx = f(x, t)\, dt + g(t)\, dw.$$
+</div>
+
+<p>
+A linear SDE of this form has a Gaussian transition kernel $p_{0t}(x_t \mid x_0) = \mathcal N(x_t; \mu_t(x_0), \Sigma_t)$, whose mean and covariance solve a pair of ordinary differential equations (the moment equations of the SDE). We solve those for each family.
+</p>
+
+<h3>4.1 Variance Exploding (VE)</h3>
+
+<p>
+The VE SDE is the continuous limit of the score-matching models (SMLD/NCSN), in which corruption is pure noise injection with no shrinkage of the signal. It sets the drift to zero and chooses the diffusion coefficient so that the running variance tracks a prescribed schedule $\sigma^2(t)$:
+</p>
+
+<div class="math-block">
+$$f = 0, \qquad g(t) = \sqrt{\frac{d}{dt}\,\sigma^2(t)}.$$
+</div>
+
+<p>
+With zero drift the mean does not move, so $\mu_t(x_0) = x_0$. The variance accumulates the squared diffusion coefficient: $\frac{d}{dt}\Sigma_t = g(t)^2 I = \frac{d}{dt}\sigma^2(t)\, I$, which integrates to $\Sigma_t = [\sigma^2(t) - \sigma^2(0)]\, I$. The transition kernel is therefore
+</p>
+
+<div class="math-block">
+$$p_{0t}(x_t \mid x_0) = \mathcal N\!\big(x_t;\, x_0,\, [\sigma^2(t) - \sigma^2(0)]\, I\big).$$
+</div>
+
+<p>
+The name is now literal: as $t$ grows, $\sigma(t)$ is driven to a very large value, so the variance explodes while the mean stays pinned at $x_0$. The signal is never attenuated; it is simply drowned. Sampling from this kernel is one line, $x_t = x_0 + \sqrt{\sigma^2(t) - \sigma^2(0)}\,\epsilon$ with $\epsilon \sim \mathcal N(0, I)$, which is exactly the multi-scale noise corruption of NCSN.
+</p>
+
+<h3>4.2 Variance Preserving (VP) and Recovering DDPM</h3>
+
+<p>
+The VP SDE is the continuous limit of DDPM. Here the drift actively shrinks the signal as noise is added so the total variance is held near one, which is what makes the inputs to the network stay on a fixed scale across all noise levels. With a noise-rate schedule $\beta(t) > 0$,
+</p>
+
+<div class="math-block">
+$$dx = -\tfrac{1}{2}\,\beta(t)\, x\, dt + \sqrt{\beta(t)}\, dw.$$
+</div>
+
+<p>
+This is a linear SDE with $f(x,t) = -\tfrac12 \beta(t) x$ and $g(t) = \sqrt{\beta(t)}$. The mean obeys $\frac{d}{dt}\mu_t = -\tfrac12 \beta(t)\mu_t$, a scalar linear ODE whose solution is an exponential decay, and the variance obeys $\frac{d}{dt}\Sigma_t = -\beta(t)\Sigma_t + \beta(t) I$, a linear ODE driven toward the identity. Solving both with $\mu_0 = x_0$ and $\Sigma_0 = 0$ gives the closed-form marginal
+</p>
+
+<div class="math-block">
+$$\mu_t = x_0\, e^{-\frac{1}{2}\int_0^t \beta(s)\, ds}, \qquad \Sigma_t = \Big(1 - e^{-\int_0^t \beta(s)\, ds}\Big) I.$$
+</div>
+
+<p>
+The mean decays toward zero and the variance rises toward one, so their squares always sum to one (in the per-coordinate, unit-data-variance sense): the variance is preserved. Deriving these two formulas from the SDE is Exercise 33.3.4. The intuition behind the $-\tfrac12 \beta x$ drift is precisely this balance: the exponent on the mean is half the exponent on the variance, which is what forces $\mu_t^2 + \Sigma_t = 1$.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Euler-Maruyama of the VP SDE Is Exactly DDPM</div>
+<p>
+Discretize the VP SDE with the Euler-Maruyama scheme on a unit time grid, replacing $\beta(t)\,dt$ with the per-step value $\beta_i$. The update becomes $x_i = x_{i-1} - \tfrac12 \beta_i x_{i-1} + \sqrt{\beta_i}\, z \approx \sqrt{1 - \beta_i}\, x_{i-1} + \sqrt{\beta_i}\, z$, using $\sqrt{1-\beta_i} \approx 1 - \tfrac12\beta_i$ for small $\beta_i$. This is the DDPM forward step of <a href="section-33.2.html">Section 33.2</a> verbatim, with $\alpha_i = 1 - \beta_i$ and $\bar\alpha_i = \prod_{j=1}^{i} \alpha_j$. The continuous marginal variance $1 - e^{-\int_0^t \beta(s)ds}$ is the continuous-time counterpart of the discrete $1 - \bar\alpha_i$, and the mean factor $e^{-\frac12\int_0^t \beta(s)ds}$ is the counterpart of $\sqrt{\bar\alpha_i}$. The continuous and discrete pictures are the same process viewed at two resolutions.
+</p>
+</div>
+
+<h2>5. Deriving the Reverse-Time SDE and Its Training Objective <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 2 stated Anderson's reverse-time SDE; here is what it says and how the single unknown becomes a tractable regression target. Anderson (1982) proved that if a process evolves forward by $dx = f(x,t)\,dt + g(t)\,dw$, then running time backward the same marginals $p_t$ are reproduced by another diffusion:
+</p>
+
+<div class="math-block">
+$$dx = \big[\, f(x, t) - g(t)^2\, \nabla_x \log p_t(x)\,\big]\, dt + g(t)\, d\bar w,$$
+</div>
+
+<p>
+where $d\bar w$ is a Wiener increment for time flowing in reverse (an infinitesimal Gaussian as $t$ decreases from $T$ to $0$), and $\nabla_x \log p_t(x)$ is the score of the noisy marginal. Read the drift term by term: $f(x,t)$ is the original forward push, which in reverse time still acts, and $-g(t)^2 \nabla_x \log p_t(x)$ is the correction that bends trajectories back uphill toward regions of high data density. The diffusion coefficient $g(t)$ is unchanged from the forward process; only the drift acquires the score.
+</p>
+
+<p>
+Every quantity here is known except the score $\nabla_x \log p_t(x)$, because $p_t$ is the marginal of the data pushed through the forward SDE and we have no closed form for it. We learn a network $s_\theta(x, t)$ to approximate it. The marginal score is intractable, but the per-sample conditional score $\nabla_{x_t} \log p_{0t}(x_t \mid x_0)$ is available in closed form (it is the Gaussian kernel of subsection 4), and a classical identity (Vincent, 2011) shows that regressing onto the conditional score also fits the marginal score in expectation. The training objective is weighted denoising score matching:
+</p>
+
+<div class="math-block">
+$$\mathcal L(\theta) = \mathbb E_{t}\Big\{\, \lambda(t)\; \mathbb E_{x_0}\, \mathbb E_{x_t \mid x_0}\, \big\| s_\theta(x_t, t) - \nabla_{x_t} \log p_{0t}(x_t \mid x_0) \big\|^2 \,\Big\}.$$
+</div>
+
+<p>
+The outer expectation samples a time $t$ (uniformly or from a chosen distribution), $\lambda(t) > 0$ is a positive weighting that balances the loss across noise levels, $x_0$ is drawn from data, and $x_t$ is drawn from the forward kernel given $x_0$. For the VP kernel the conditional score is $\nabla_{x_t}\log p_{0t}(x_t\mid x_0) = -(x_t - \mu_t)/\Sigma_t = -\,\epsilon/\sqrt{1-\bar\alpha_t}$, which is precisely the noise-prediction target of <a href="section-33.1.html">Section 33.1</a> up to the $1/\sqrt{1-\bar\alpha_t}$ rescaling of the Key Insight in subsection 2. Choosing $\lambda(t) = \Sigma_t$ (the kernel variance) turns this objective into the plain noise-prediction MSE that DDPM minimizes. The same loss, two weightings, two communities.
+</p>
+
+<h2>6. Deriving the Probability-Flow ODE from Fokker-Planck <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 3 wrote the probability-flow ODE down and described its consequences; the course needs the derivation, which is a short and elegant manipulation of the Fokker-Planck equation. The point to establish is that a deterministic flow can reproduce the exact same time-varying density $p_t$ as the noisy SDE, with no randomness at all.
+</p>
+
+<p>
+Any SDE $dx = f(x,t)\,dt + g(t)\,dw$ induces a partial differential equation for how its marginal density $p_t(x)$ evolves, the Fokker-Planck (forward Kolmogorov) equation. With a scalar diffusion coefficient $g(t)$ it reads
+</p>
+
+<div class="math-block">
+$$\frac{\partial p_t(x)}{\partial t} = -\nabla \cdot \big[\, f(x,t)\, p_t(x)\,\big] + \tfrac{1}{2}\, g(t)^2\, \nabla^2 p_t(x).$$
+</div>
+
+<p>
+The first term is transport by the drift and the second is diffusion (a Laplacian smoothing). The trick is to rewrite the diffusion term as the divergence of a flux so the whole right-hand side becomes a single divergence, which is the signature of a deterministic transport (continuity) equation. Use the identity $\nabla^2 p_t = \nabla\cdot(\nabla p_t)$ and the log-derivative identity $\nabla p_t = p_t\, \nabla \log p_t$:
+</p>
+
+<div class="math-block">
+$$\tfrac{1}{2}\, g(t)^2\, \nabla^2 p_t = \nabla \cdot \Big[\, \tfrac{1}{2}\, g(t)^2\, \nabla p_t \,\Big] = \nabla \cdot \Big[\, \tfrac{1}{2}\, g(t)^2\, p_t\, \nabla \log p_t \,\Big].$$
+</div>
+
+<p>
+Substituting back and pulling both terms under one divergence,
+</p>
+
+<div class="math-block">
+$$\frac{\partial p_t}{\partial t} = -\nabla \cdot \Big[\, \big( f(x,t) - \tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x) \big)\, p_t \,\Big] = -\nabla \cdot \big[\, \tilde f(x,t)\, p_t \,\big].$$
+</div>
+
+<p>
+This is exactly the continuity (Liouville) equation $\partial_t p_t + \nabla\cdot(\tilde f\, p_t) = 0$ for particles carried by the deterministic velocity field
+</p>
+
+<div class="math-block">
+$$\tilde f(x, t) = f(x, t) - \tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x).$$
+</div>
+
+<p>
+A continuity equation says: if you move every particle along the ODE $\frac{dx}{dt} = \tilde f(x,t)$, the population density they carry evolves by precisely this PDE. Since that PDE is identical to the Fokker-Planck equation of the original SDE, the deterministic flow and the stochastic process share the same marginals $p_t(x)$ at every time. That deterministic flow is the probability-flow ODE:
+</p>
+
+<div class="math-block">
+$$\frac{dx}{dt} = f(x, t) - \tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x).$$
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Common Error: The Factor on the Score Is One Half for the ODE, One for the SDE</div>
+<p>
+The single most common mistake when implementing these equations is using the wrong coefficient on the score term. The reverse-time SDE carries the full $g(t)^2\, \nabla_x \log p_t(x)$; the probability-flow ODE carries $\tfrac{1}{2}\, g(t)^2\, \nabla_x \log p_t(x)$, exactly half. The half is not a convention you may drop: it is what the Fokker-Planck derivation forces, because moving the diffusion term into the drift contributes only half of $g^2$ to the deterministic velocity (the other half is what the SDE realizes as injected noise). Use $g^2$ in an ODE solver and your samples drift off-distribution; use $\tfrac12 g^2$ in the SDE and you under-correct. When in doubt, check which equation has a $d\bar w$ noise term (then the score factor is $g^2$) and which does not (then it is $\tfrac12 g^2$).
+</p>
+</div>
+
+<h3>6.1 Exact Likelihoods via the Instantaneous Change of Variables</h3>
+
+<p>
+Because the probability-flow ODE is a deterministic, invertible map, it is a continuous normalizing flow, and continuous normalizing flows come with an exact likelihood. Along an ODE trajectory the log-density evolves by the instantaneous change-of-variables formula:
+</p>
+
+<div class="math-block">
+$$\frac{\partial}{\partial t}\,\log p_t(x_t) = -\,\nabla \cdot \tilde f(x_t, t).$$
+</div>
+
+<p>
+Integrating this from $t = 0$ to $t = T$ along the trajectory that starts at a data point $x_0$ gives $\log p_0(x_0)$ as the known Gaussian log-density at $x_T$ minus the accumulated divergence. The one obstacle is that the divergence $\nabla\cdot\tilde f$ is a trace of a $d\times d$ Jacobian, expensive for image-sized $d$. The Hutchinson trace estimator replaces it with a stochastic estimate $\nabla\cdot\tilde f = \mathbb E_{v}[\, v^\top \partial_x \tilde f\, v\,]$ for $v$ with identity covariance (for example Rademacher or standard Gaussian), and $v^\top \partial_x \tilde f$ is a single vector-Jacobian product cheaply obtained by automatic differentiation. This is how the SDE paper reports exact bits-per-dimension likelihoods for diffusion models, a number GANs cannot produce at all.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Probability-Flow ODE Likelihood</div>
+<p>
+Given a trained score network $s_\theta(x, t) \approx \nabla_x \log p_t(x)$, the drift $f$, the diffusion $g$, and a data point $x_0$:
+</p>
+<ol>
+<li>Form the ODE velocity $\tilde f_\theta(x, t) = f(x, t) - \tfrac{1}{2} g(t)^2\, s_\theta(x, t)$.</li>
+<li>Draw a fixed probe vector $v$ with $\mathbb E[v v^\top] = I$ (Rademacher or Gaussian) for the Hutchinson estimator.</li>
+<li>Define the augmented state $(x, \ell)$ with $\ell$ the running log-density change, and integrate from $t = 0$ to $t = T$ the coupled ODE: $\dfrac{dx}{dt} = \tilde f_\theta(x, t)$ and $\dfrac{d\ell}{dt} = -\,v^\top \big(\partial_x \tilde f_\theta(x,t)\big)\, v$, computing the second right-hand side as one vector-Jacobian product by autodiff.</li>
+<li>At $t = T$ evaluate the known prior log-density $\log p_T(x_T)$ (a Gaussian).</li>
+<li>Return $\log p_0(x_0) = \log p_T(x_T) + \ell(T)$, the exact (Hutchinson-estimated) log-likelihood. Average over several probes $v$ to reduce variance.</li>
+</ol>
+</div>
+
+<h2>7. Predictor-Corrector Sampling <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The reverse SDE and the probability-flow ODE both give samplers, but each leaves something on the table: a numerical SDE solver accumulates discretization error in the drift, and once the iterate has drifted off the true $p_t$ there is nothing to pull it back. Predictor-corrector (PC) sampling fixes this by interleaving two moves. The <strong>predictor</strong> takes one step of a reverse-time numerical solver (for instance an Euler-Maruyama step of the reverse SDE) to advance the noise level. The <strong>corrector</strong> then holds the time $t$ fixed and runs several steps of score-based MCMC to nudge the sample back onto $p_t$, using only the learned score. The natural corrector is annealed Langevin dynamics, the same sampler that powered NCSN in <a href="../module-30-generative-foundations/index.html">Chapter 30</a>:
+</p>
+
+<div class="math-block">
+$$x \leftarrow x + \epsilon\, s_\theta(x, t) + \sqrt{2\epsilon}\, z, \qquad z \sim \mathcal N(0, I).$$
+</div>
+
+<p>
+Each Langevin step takes a small ascent of size $\epsilon$ along the score (uphill toward higher density) and adds calibrated noise $\sqrt{2\epsilon}\, z$; the $\sqrt 2$ is exactly the amount that makes $p_t$ the stationary distribution of the chain, so iterating leaves the sample correctly distributed. Predictor and corrector use the very same network $s_\theta$, so the corrector is free in engineering terms; it just trades a few extra function evaluations for samples that sit more faithfully on the marginal. The result is the predictor-corrector sampler that gave the SDE framework its strongest sample quality.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Predictor-Corrector Sampling</div>
+<p>
+Given a trained score network $s_\theta(x, t)$, the reverse SDE drift and diffusion, a decreasing time grid $T = t_0 > t_1 > \cdots > t_N = 0$, a corrector step size $\epsilon$, and a corrector count $M$:
+</p>
+<ol>
+<li>Initialize $x \sim p_T$ from the prior (a Gaussian for VP, a wide Gaussian for VE).</li>
+<li>For $i = 0, 1, \dots, N-1$:
+<ol>
+<li><strong>Predictor.</strong> Take one reverse-SDE step from $t_i$ to $t_{i+1}$: with $\Delta t = t_{i+1} - t_i < 0$, set $x \leftarrow x - \big[f(x, t_i) - g(t_i)^2 s_\theta(x, t_i)\big]\,\Delta t + g(t_i)\sqrt{|\Delta t|}\, z,\ z \sim \mathcal N(0, I)$.</li>
+<li><strong>Corrector.</strong> Repeat $M$ times at fixed $t_{i+1}$: $x \leftarrow x + \epsilon\, s_\theta(x, t_{i+1}) + \sqrt{2\epsilon}\, z,\ z \sim \mathcal N(0, I)$.</li>
+</ol>
+</li>
+<li>Return $x$ as the generated sample.</li>
+</ol>
+<p>
+Setting $M = 0$ recovers a pure predictor (reverse-SDE) sampler; replacing the predictor with the deterministic $\tfrac12 g^2$ drift and $M = 0$ recovers the probability-flow ODE sampler.
+</p>
+</div>
+
+<h2>8. A From-Scratch Implementation <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The derivations above become concrete in a few lines of PyTorch. The snippet implements the VP-SDE forward marginal sampler of subsection 4.2 (drawing $x_t$ from its closed-form Gaussian given $x_0$) and a single Euler step of the probability-flow ODE of subsection 6 (with the correct $\tfrac12 g^2$ factor on the score), given any score network $s_\theta$.
+</p>
+
+<pre><code class="language-python">import torch
+
+def vp_alpha_bar(t, beta_min=0.1, beta_max=20.0):
+    # integral of beta(s) for the standard linear VP schedule, t in [0, 1]
+    integral = beta_min * t + 0.5 * (beta_max - beta_min) * t**2
+    return torch.exp(-integral)              # = exp(-int_0^t beta(s) ds)
+
+def vp_forward_sample(x0, t):
+    # closed-form VP marginal: mean x0 * sqrt(abar), var (1 - abar)
+    abar = vp_alpha_bar(t).view(-1, *([1] * (x0.dim() - 1)))
+    eps = torch.randn_like(x0)
+    xt = abar.sqrt() * x0 + (1 - abar).sqrt() * eps
+    return xt, eps
+
+def beta(t, beta_min=0.1, beta_max=20.0):
+    return beta_min + (beta_max - beta_min) * t
+
+def pf_ode_euler_step(score_net, x, t, dt):
+    # probability-flow ODE: dx/dt = f - 0.5 g^2 score,  f = -0.5 beta x,  g^2 = beta
+    b = beta(t).view(-1, *([1] * (x.dim() - 1)))
+    drift = -0.5 * b * x - 0.5 * b * score_net(x, t)   # note the 1/2 on the score
+    return x + drift * dt                               # Euler step (dt < 0 when sampling)
+</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The VP forward marginal sampler and one Euler step of the probability-flow ODE. The forward sampler draws $x_t$ directly from the closed-form Gaussian, never simulating the SDE step by step. The ODE step uses drift $f = -\tfrac12\beta x$ and $g^2 = \beta$, and crucially multiplies the score by $\tfrac12 g^2$, the half that subsection 6 derived. Sampling integrates this step from $t = 1$ down to $t = 0$ with $dt < 0$.</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.4: Derive the VP Marginal Mean and Variance <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Starting from the VP SDE $dx = -\tfrac12 \beta(t) x\, dt + \sqrt{\beta(t)}\, dw$, derive the closed-form marginal $\mu_t = x_0\, e^{-\frac12\int_0^t\beta(s)ds}$ and $\Sigma_t = \big(1 - e^{-\int_0^t\beta(s)ds}\big)I$ of subsection 4.2. Write the moment ODEs $\frac{d}{dt}\mu_t = -\tfrac12\beta(t)\mu_t$ and $\frac{d}{dt}\Sigma_t = -\beta(t)\Sigma_t + \beta(t)I$ from the SDE, solve each (the variance ODE is linear with an integrating factor), and confirm that $\mu_t^2 + \Sigma_t$ equals the constant implied by unit-variance data. State why this is what justifies the name "variance preserving."</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.5: PF-ODE and Reverse SDE Share Marginals <span class="exercise-type analysis">Analysis</span></div>
+<p>Show that the probability-flow ODE and the reverse-time SDE produce the same marginals $p_t(x)$. Write the Fokker-Planck equation for the forward SDE, use $\nabla^2 p_t = \nabla\cdot(p_t \nabla\log p_t)$ to fold the diffusion term into a divergence, and read off the deterministic velocity $\tilde f = f - \tfrac12 g^2\nabla\log p_t$ whose continuity equation matches the same PDE. Then explain, in two or three sentences, exactly where the factor $\tfrac12$ on the ODE score comes from and why the reverse SDE instead carries the full $g^2$.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.3.6: Numerically Match PF-ODE and Ancestral DDPM on 2D Toy Data <span class="exercise-type coding">Coding</span></div>
+<p>Train a small score network on a 2D toy distribution (the two-moons or a Gaussian mixture), then generate two sets of 5000 samples: one with ancestral DDPM sampling (Section 33.1) and one by Euler-integrating the probability-flow ODE using the <code>pf_ode_euler_step</code> above. Compare the two sample sets with a distribution-level statistic that stands in for FID on 2D data: for example the energy distance, the 2-Wasserstein distance, or the difference in per-mode means and covariances. Confirm the two samplers agree to within sampling noise, then study how the agreement degrades as you cut the ODE step count from 200 to 50 to 20 to 10, and report the step budget at which the gap becomes visible.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 33.3.1: Score and Noise Are the Same Network <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Starting from the closed form $x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon$ and the fact that for a Gaussian $\mathcal N(\mu, \sigma^2 I)$ the score is $-(x-\mu)/\sigma^2$, derive the relationship $\nabla_x \log p_t(x_t) = -\,\epsilon/\sqrt{1-\bar\alpha_t}$ stated in the Key Insight. Explain in one sentence what this means for someone who trained a noise-prediction model in <a href="section-33.1.html">Section 33.1</a> but now wants a score network.</p>
@@ -210,6 +462,18 @@ print("probability-flow ODE: deterministic, ~50 steps instead of 200")</code></p
 <p>Write a short note (one to two paragraphs) explaining the practical difference between the variance-exploding and variance-preserving formulations from subsection 2b. Address: what happens to the magnitude of $x_t$ in each as $t$ grows, why a network trained on VP-scaled inputs would behave poorly if fed VE-scaled inputs without rescaling, and why the EDM $\sigma$-parameterization (referenced in <a href="section-33.2.html">Section 33.2</a>) is a convenient unification. Tie your answer to the normalization-statistics discussion from <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/index.html">Chapter 21</a>.</p>
 </div>
 
+<section class="bibliography">
+<h2>Bibliography <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A., Ermon, S., Poole, B. "Score-Based Generative Modeling through Stochastic Differential Equations." ICLR (2021). <a href="https://arxiv.org/abs/2011.13456" target="_blank" rel="noopener">arXiv:2011.13456</a></div>
+<div class="bib-annotation">The source of this section's continuous-time framework. It unified DDPM and score matching as the VP and VE SDEs, gave the reverse-time SDE with the learned score, derived the probability-flow ODE and its exact likelihoods, and introduced predictor-corrector sampling.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Anderson, B. D. O. "Reverse-time diffusion equation models." Stochastic Processes and their Applications 12(3):313-326 (1982). <a href="https://doi.org/10.1016/0304-4149(82)90051-5" target="_blank" rel="noopener">doi:10.1016/0304-4149(82)90051-5</a></div>
+<div class="bib-annotation">The classical result behind the reverse-time SDE of subsection 5. Anderson showed that a forward diffusion has a time-reversed diffusion whose drift is the forward drift corrected by the score of the marginal density, the theorem the entire reverse-sampling construction rests on.</div>
+</div>
+</section>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-33.2.html">&#8592; Section 33.2: DDPM</a>
 <a href="index.html">Chapter 33</a>
@@ -217,7 +481,7 @@ print("probability-flow ODE: deterministic, ~50 steps instead of 200")</code></p
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

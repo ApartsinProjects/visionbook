@@ -192,6 +192,224 @@ The guidance scale $w$ is the most consequential single knob in conditional gene
 <p>Classifier-free guidance requires a conditional and an unconditional network evaluation at every sampling step, doubling the compute per step relative to unguided sampling. For a 20-step DDIM sampler from <a href="section-33.4.html">Section 33.4</a>, compute the total number of network evaluations with and without CFG. Then explain in one paragraph why this doubling is a serious problem for the one- to four-step models of <a href="section-33.5.html">Section 33.5</a>, and what guidance distillation does about it. Relate the trade-off to the two-tier deployment idea from <a href="section-33.4.html">Section 33.4</a>.</p>
 </div>
 
+<h2>4. Classifier Guidance, Derived Rigorously <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 2 stated the classifier-guidance formula and gave its intuition. Here we derive it carefully, because the derivation exposes exactly what the guidance scale $s$ does to the sampled distribution and why $s = 1$ is special. The setup is a deliberately reshaped target. Instead of sampling the true posterior $p(x \mid y)$ for a condition $y$, classifier guidance samples from a <em>tempered</em> posterior
+</p>
+
+<div class="math-block">
+$$p_s(x \mid y) \;\propto\; p(x)\, p(y \mid x)^{\,s},$$
+</div>
+
+<p>
+where the classifier likelihood $p(y \mid x)$ is raised to a power $s \ge 0$ before being combined with the unconditional prior $p(x)$. The exponent $s$ is the only free parameter. When $s = 1$ this is exactly Bayes' rule, $p(x)\,p(y \mid x) \propto p(x \mid y)$, so guidance with $s = 1$ samples the true Bayesian posterior and nothing more. When $s > 1$ the likelihood term is sharpened: regions where the classifier is confident about $y$ get their probability raised to a power greater than one and so dominate even more, which concentrates samples onto the most unambiguous exemplars of $y$ at the cost of diversity. When $s < 1$ the condition is softened toward the unconditional prior. The single scalar is therefore a temperature on the classifier, not a probability, which is the reason turning it up does not give "more correct" samples but rather "more stereotypical, less varied" ones.
+</p>
+
+<p>
+Take the log and the gradient with respect to $x$ of the tempered posterior. The normalizing constant does not depend on $x$ and drops, leaving the guided score in its cleanest form:
+</p>
+
+<div class="math-block">
+$$\nabla_x \log p_t(x \mid y) \;=\; \nabla_x \log p_t(x) \;+\; s\,\nabla_x \log p_t(y \mid x).$$
+</div>
+
+<p>
+Each term is now unambiguous. The first, $\nabla_x \log p_t(x)$, is the unconditional score the diffusion model already supplies. The second, $\nabla_x \log p_t(y \mid x)$, is the gradient of the log-likelihood of a classifier $p_\phi$ evaluated at the noisy sample $x_t$, and $s$ scales how hard that gradient pushes. Setting $s = 1$ recovers the plain Bayes posterior of subsection 2; the extra factor $s$ is precisely the exponent on the likelihood. This is the score-domain statement. To use it inside an $\epsilon$-prediction sampler we convert via the identity from <a href="section-33.3.html">Section 33.3</a>, $\nabla_x \log p_t(x) = -\,\epsilon_\theta(x_t, t)/\sqrt{1 - \bar\alpha_t}$, which says the predicted noise is the negative score scaled by $\sqrt{1 - \bar\alpha_t}$. Multiplying the whole guided score by $-\sqrt{1 - \bar\alpha_t}$ to express it as an effective noise prediction gives the form you implement:
+</p>
+
+<div class="math-block">
+$$\hat\epsilon(x_t, t) \;=\; \epsilon_\theta(x_t, t) \;-\; \sqrt{1 - \bar\alpha_t}\; s\; \nabla_{x_t} \log p_\phi(y \mid x_t).$$
+</div>
+
+<p>
+Read term by term: start from the network's noise prediction $\epsilon_\theta(x_t, t)$, then subtract the classifier gradient $\nabla_{x_t} \log p_\phi(y \mid x_t)$, weighted by the guidance scale $s$ and by $\sqrt{1 - \bar\alpha_t}$. The minus sign is the score-to-noise sign flip; the $\sqrt{1 - \bar\alpha_t}$ factor is the same conversion factor applied to the classifier term so that both pieces live in noise units and can be added. Plug $\hat\epsilon$ into any DDPM or DDIM update from <a href="section-33.4.html">Section 33.4</a> in place of $\epsilon_\theta$ and the sampler now walks toward the tempered posterior.
+</p>
+
+<div class="callout note">
+<div class="callout-title">Why the Classifier Must See Noisy Inputs</div>
+<p>
+The gradient $\nabla_{x_t} \log p_\phi(y \mid x_t)$ is evaluated at the <em>noisy</em> state $x_t$, not at a clean image. An off-the-shelf classifier trained on clean photographs produces meaningless gradients on a sample that is mostly noise at large $t$, which is why Dhariwal and Nichol train a dedicated classifier on inputs corrupted to every noise level $t$. This requirement, a separate model trained across the full noise schedule, is the practical friction that classifier-free guidance removes.
+</p>
+</div>
+
+<h2>5. Classifier-Free Guidance: Two Conventions and the Implicit Classifier <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 3 introduced classifier-free guidance (CFG) and gave one form of its update. There are two widely used algebraic forms of the same operation, and they assign different meanings to the guidance scalar. Confusing them is the single most common source of "my guidance scale of 7.5 behaves like someone else's 6.5" bugs, so we state both explicitly and pin down the conversion. Ho and Salimans train one network jointly on the conditional objective and, with some dropout probability, on the unconditional objective by replacing the condition with a null token $\varnothing$. The same network thus estimates both $\epsilon_\theta(x_t, c)$ and $\epsilon_\theta(x_t, \varnothing)$. Their sampling rule, in the paper's own notation, is
+</p>
+
+<div class="math-block">
+$$\tilde\epsilon_\theta(x_t, c) \;=\; (1 + w)\,\epsilon_\theta(x_t, c) \;-\; w\,\epsilon_\theta(x_t, \varnothing).$$
+</div>
+
+<p>
+Here $w = 0$ means no guidance (you get the plain conditional prediction), and $w > 0$ extrapolates. Most implementations, including the <code>diffusers</code> library and Stable Diffusion, instead expose a "guidance scale" $s$ and write the algebraically rearranged form
+</p>
+
+<div class="math-block">
+$$\tilde\epsilon_\theta(x_t, c) \;=\; \epsilon_\theta(x_t, \varnothing) \;+\; s\,\big(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing)\big).$$
+</div>
+
+<p>
+In this form $s = 1$ means no guidance (the unconditional plus one times the difference collapses to the plain conditional), and $s > 1$ extrapolates. The two are the same equation: expanding the second gives $(1)\epsilon_\varnothing + s\,\epsilon_c - s\,\epsilon_\varnothing = s\,\epsilon_c - (s-1)\epsilon_\varnothing$, which matches the first under the relation $s = 1 + w$. The familiar default $s = 7.5$ corresponds to $w = 6.5$.
+</p>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Two Guidance-Scale Conventions Differ by One</div>
+<p>
+The Ho and Salimans scalar $w$ and the implementation "guidance scale" $s$ are not the same number. They are related by $s = 1 + w$. No guidance is $w = 0$ in the paper's convention but $s = 1$ in code. The popular default $s = 7.5$ in <code>diffusers</code> is $w = 6.5$ in the paper. When you read a method that reports a guidance value, check which form it uses: the paper form $\tilde\epsilon = (1+w)\epsilon_c - w\,\epsilon_\varnothing$ or the implementation form $\tilde\epsilon = \epsilon_\varnothing + s(\epsilon_c - \epsilon_\varnothing)$. Reporting a bare number without the convention is ambiguous by exactly one unit.
+</p>
+</div>
+
+<p>
+Why does extrapolating between two noise predictions do anything coherent? Convert both to scores and read the result as a probability statement. Using $\epsilon \propto -\nabla \log p$, the implementation form becomes, in score terms,
+</p>
+
+<div class="math-block">
+$$\nabla_x \log \tilde p(x \mid c) \;=\; \nabla_x \log p(x \mid c) \;+\; w\,\big[\nabla_x \log p(x \mid c) - \nabla_x \log p(x)\big].$$
+</div>
+
+<p>
+The bracketed difference is the gradient of $\log p(x \mid c) - \log p(x) = \log\frac{p(x \mid c)}{p(x)} = \log p(c \mid x) + \text{const}$, by Bayes' rule. So the difference between the conditional and unconditional scores <em>is</em> the gradient of an implicit classifier $p(c \mid x) \propto p(x \mid c)/p(x)$, obtained without ever training one. CFG is therefore classifier guidance with the classifier replaced by the difference of the two predictions the single network already makes, and the scale $w$ sharpens that implicit classifier exactly as $s$ sharpened the explicit one in subsection 4. This is the precise sense in which CFG "needs no separate classifier."
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Classifier-Free Guidance Sampling</div>
+<p>
+Given a network $\epsilon_\theta$ trained jointly on the condition $c$ and the null token $\varnothing$, a guidance scale $s$ (implementation convention, $s = 1$ is off), a decreasing time grid $t_N > t_{N-1} > \cdots > t_0$, and a base sampler update (DDPM or DDIM) from <a href="section-33.4.html">Section 33.4</a>:
+</p>
+<ol>
+<li>Initialize $x_{t_N} \sim \mathcal N(0, I)$.</li>
+<li>For $i = N, N-1, \dots, 1$:
+<ol>
+<li>Compute the unconditional prediction $\epsilon_\varnothing = \epsilon_\theta(x_{t_i}, t_i, \varnothing)$ and the conditional prediction $\epsilon_c = \epsilon_\theta(x_{t_i}, t_i, c)$, ideally in one batched forward pass.</li>
+<li>Combine: $\hat\epsilon = \epsilon_\varnothing + s\,(\epsilon_c - \epsilon_\varnothing)$.</li>
+<li>Take one sampler step using $\hat\epsilon$ in place of the plain noise prediction to produce $x_{t_{i-1}}$.</li>
+</ol>
+</li>
+<li>Return $x_{t_0}$.</li>
+</ol>
+<p>
+Cost: two network evaluations per step instead of one. The batched pass in step 2a keeps the wall-clock overhead near a single larger forward rather than two sequential ones.
+</p>
+</div>
+
+<h2>6. Diffusion for Inverse Problems <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Guidance steers generation toward a label or a prompt. A closely related and practically enormous problem is steering generation to be consistent with a <em>measurement</em>: given a blurred, masked, downsampled, or otherwise degraded observation, reconstruct a plausible clean image. This is an inverse problem, and a pretrained unconditional diffusion model is a powerful image prior for it, no retraining required. Model the measurement as
+</p>
+
+<div class="math-block">
+$$y \;=\; \mathcal A(x_0) \;+\; n, \qquad n \sim \mathcal N(0, \sigma_y^2 I),$$
+</div>
+
+<p>
+where $x_0$ is the unknown clean image, $\mathcal A$ is a known forward operator (a blur kernel, a masking operator for inpainting, a downsampling operator for super-resolution), and $n$ is measurement noise of variance $\sigma_y^2$. We want to sample the posterior $p(x_0 \mid y)$. As in classifier guidance, the posterior score splits by Bayes' rule into the prior score the diffusion model gives us plus a measurement-likelihood term:
+</p>
+
+<div class="math-block">
+$$\nabla_{x_t} \log p_t(x_t \mid y) \;=\; \nabla_{x_t} \log p_t(x_t) \;+\; \nabla_{x_t} \log p_t(y \mid x_t).$$
+</div>
+
+<p>
+The first term is supplied by the unconditional model. The hard term is the second, the likelihood of the measurement given the <em>noisy intermediate</em> $x_t$, because $y$ is a function of the clean $x_0$, not of $x_t$. There is no closed form for $p_t(y \mid x_t)$, since it requires marginalizing over all clean images consistent with $x_t$. Diffusion Posterior Sampling (DPS) makes this tractable with one well-chosen approximation.
+</p>
+
+<p>
+The key tool is Tweedie's formula, which gives the posterior mean of the clean image given the noisy one directly from the score. For the variance-preserving forward process, the minimum-mean-square estimate of $x_0$ given $x_t$ is
+</p>
+
+<div class="math-block">
+$$\hat x_0(x_t) \;=\; \frac{1}{\sqrt{\bar\alpha_t}}\,\Big(x_t + (1 - \bar\alpha_t)\,s_\theta(x_t, t)\Big),$$
+</div>
+
+<p>
+where $s_\theta(x_t, t) \approx \nabla_{x_t} \log p_t(x_t)$ is the learned score. Intuitively, $\hat x_0$ is the model's single best guess at the clean image hidden inside $x_t$: it takes the noisy sample, nudges it along the score toward higher density, and rescales by $1/\sqrt{\bar\alpha_t}$ to undo the forward shrinkage. DPS now approximates the intractable $p_t(y \mid x_t)$ by collapsing the distribution over clean images to this point estimate, $p_t(y \mid x_t) \approx p(y \mid \hat x_0(x_t))$. Under the Gaussian measurement model that likelihood is $p(y \mid \hat x_0) \propto \exp\!\big(-\frac{1}{2\sigma_y^2}\|y - \mathcal A(\hat x_0)\|^2\big)$, so its log-gradient is
+</p>
+
+<div class="math-block">
+$$\nabla_{x_t} \log p_t(y \mid x_t) \;\approx\; -\,\frac{1}{\sigma_y^2}\,\nabla_{x_t}\big\|y - \mathcal A(\hat x_0(x_t))\big\|^2 \cdot \tfrac{1}{2}.$$
+</div>
+
+<p>
+Note that $\hat x_0$ itself depends on $x_t$ through the network, so this gradient is taken through the score network by automatic differentiation, a vector-Jacobian product, not a gradient of a fixed quantity. In practice DPS folds the $1/(2\sigma_y^2)$ and the inevitable approximation error into a single tunable step size $\zeta_i$ and applies the correction as an extra term after each ordinary reverse step. If $x_{i-1}'$ is the sample produced by one unconditional reverse-diffusion update, the DPS update is
+</p>
+
+<div class="math-block">
+$$x_{i-1} \;\leftarrow\; x_{i-1}' \;-\; \zeta_i\,\nabla_{x_i}\big\|y - \mathcal A(\hat x_0(x_i))\big\|^2.$$
+</div>
+
+<p>
+This is remarkably general: any forward operator $\mathcal A$ you can differentiate, linear or nonlinear, plugs in directly, which is why DPS handles inpainting, deblurring, super-resolution, and phase retrieval with the same code and a single pretrained prior.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Diffusion Posterior Sampling (DPS)</div>
+<p>
+Given a pretrained score network $s_\theta(x_t, t)$, a differentiable forward operator $\mathcal A$, a measurement $y$ with noise level $\sigma_y$, step sizes $\{\zeta_i\}$, and a decreasing time grid $t_N > \cdots > t_0$:
+</p>
+<ol>
+<li>Initialize $x_N \sim \mathcal N(0, I)$.</li>
+<li>For $i = N, N-1, \dots, 1$:
+<ol>
+<li>Estimate the noise / score at $x_i$ and form the Tweedie posterior mean $\hat x_0 = \tfrac{1}{\sqrt{\bar\alpha_i}}\big(x_i + (1 - \bar\alpha_i)\,s_\theta(x_i, t_i)\big)$.</li>
+<li>Take one ordinary unconditional reverse step (DDPM or DDIM from <a href="section-33.4.html">Section 33.4</a>) to get the prior-only proposal $x_{i-1}'$.</li>
+<li>Compute the measurement residual $\|y - \mathcal A(\hat x_0)\|^2$ and its gradient with respect to $x_i$ by backpropagating through $s_\theta$.</li>
+<li>Apply the likelihood correction: $x_{i-1} \leftarrow x_{i-1}' - \zeta_i\,\nabla_{x_i}\|y - \mathcal A(\hat x_0)\|^2$.</li>
+</ol>
+</li>
+<li>Return $x_0$.</li>
+</ol>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Prior, Every Inverse Problem</div>
+<p>
+The same unconditional diffusion model, trained once, solves inpainting, deblurring, super-resolution, and more, because the only thing that changes between tasks is the forward operator $\mathcal A$ in the data-fidelity term. The diffusion model supplies a generic image prior; the measurement supplies the constraint; DPS glues them by adding the gradient of the measurement residual, evaluated at the Tweedie estimate of the clean image, to each reverse step. This decoupling is the reason a single foundation diffusion model can serve as a universal plug-and-play prior for restoration tasks it was never trained on.
+</p>
+</div>
+
+<p>
+DPS's point-estimate approximation, replacing the full clean-image posterior by its mean $\hat x_0$, is its main weakness, and it ignores how measurement noise interacts with the operator. The follow-up $\Pi$GDM (pseudoinverse-guided diffusion models) sharpens the likelihood for <em>linear</em> operators $H$ by accounting for both the diffusion uncertainty at time $t$ (a variance $r_t^2$) and the measurement noise $\sigma_y^2$, replacing the isotropic $1/\sigma_y^2$ weighting with the noise-aware matrix $(r_t^2 H H^\top + \sigma_y^2 I)^{-1}$. This weights each measurement direction by how much of its uncertainty comes from the prior versus the sensor, which improves reconstruction quality on linear problems at the cost of needing the operator's structure $H$ explicitly rather than just a black-box $\mathcal A$.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.4: Derive the Classifier-Guided Score from Bayes <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Start from the tempered posterior $p_s(x \mid y) \propto p(x)\,p(y \mid x)^s$ of subsection 4. Take the logarithm and the gradient with respect to $x$ to derive the guided score $\nabla_x \log p_t(x \mid y) = \nabla_x \log p_t(x) + s\,\nabla_x \log p_t(y \mid x)$, stating clearly why the normalizing constant drops out. Then explain what is special about $s = 1$ (it recovers the exact Bayesian posterior) and describe, in one or two sentences each, what happens to the sampled distribution as $s$ grows beyond 1 and as $s$ falls below 1. Finally, convert your score to the $\epsilon$-prediction form using the score-noise identity from <a href="section-33.3.html">Section 33.3</a> and confirm the $-\sqrt{1 - \bar\alpha_t}$ factor on the classifier term.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.5: Show CFG Needs No Separate Classifier <span class="exercise-type analysis">Analysis</span></div>
+<p>Using the score identity $\epsilon \propto -\nabla \log p$, rewrite the implementation-form CFG update $\tilde\epsilon = \epsilon_\varnothing + s(\epsilon_c - \epsilon_\varnothing)$ as a statement about scores, and show that the difference $\nabla_x \log p(x \mid c) - \nabla_x \log p(x)$ equals $\nabla_x \log p(c \mid x)$ up to an additive constant by applying Bayes' rule. Conclude that classifier-free guidance is classifier guidance with the explicit classifier gradient replaced by the difference of the conditional and unconditional predictions the single network already produces, so no separate classifier is ever trained. As a check, verify algebraically that $s = 1 + w$ converts the implementation form to the Ho and Salimans form $\tilde\epsilon = (1+w)\epsilon_c - w\,\epsilon_\varnothing$.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.6.6: Implement DPS for Linear Inpainting on Toy Data <span class="exercise-type coding">Coding</span></div>
+<p>Take a small pretrained (or quickly trained) unconditional diffusion model on toy data, for example the 2D points or small images from earlier sections. Define a linear inpainting operator $\mathcal A$ as a binary mask that keeps a subset of coordinates or pixels and zeros the rest, and synthesize a measurement $y = \mathcal A(x_0) + n$ with small $\sigma_y$. Implement the DPS algorithm of subsection 6: at each reverse step form the Tweedie estimate $\hat x_0$ from the network output, take one ordinary reverse step, then backpropagate $\|y - \mathcal A(\hat x_0)\|^2$ through the network and apply the correction $x_{i-1} \leftarrow x_{i-1}' - \zeta_i\,\nabla_{x_i}\|y - \mathcal A(\hat x_0)\|^2$. Compare the reconstruction against the masked input and against an unconditional sample, sweep the step size $\zeta_i$, and report how reconstruction fidelity to the observed coordinates trades off against plausibility of the inpainted ones.</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="bib-entry-card">
+<div class="bib-ref">Dhariwal, P., Nichol, A. "Diffusion Models Beat GANs on Image Synthesis." NeurIPS (2021). <a href="https://arxiv.org/abs/2105.05233" target="_blank" rel="noopener">arXiv:2105.05233</a></div>
+<div class="bib-annotation">The origin of classifier guidance derived in subsection 4. It trained a noise-aware classifier and added a scaled multiple of its gradient to the diffusion score, sharpening the conditional distribution and letting diffusion models surpass GANs on conditional ImageNet for the first time.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Ho, J., Salimans, T. "Classifier-Free Diffusion Guidance." NeurIPS 2021 Workshop on Deep Generative Models (2022). <a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noopener">arXiv:2207.12598</a></div>
+<div class="bib-annotation">The source of the classifier-free method of subsections 3 and 5. By jointly training one network on the conditional and (with dropout) unconditional objectives, it replaced the external classifier gradient with the difference of the network's own two predictions, the form every modern text-to-image system uses.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Chung, H., Kim, J., Mccann, M. T., Klasky, M. L., Ye, J. C. "Diffusion Posterior Sampling for General Noisy Inverse Problems." ICLR (2023). <a href="https://arxiv.org/abs/2209.14687" target="_blank" rel="noopener">arXiv:2209.14687</a></div>
+<div class="bib-annotation">The DPS method of subsection 6. It approximated the intractable measurement likelihood $p_t(y \mid x_t)$ by evaluating it at the Tweedie posterior mean $\hat x_0(x_t)$, turning any pretrained unconditional diffusion model into a plug-and-play prior for general noisy inverse problems with a differentiable forward operator.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, J., Vahdat, A., Mardani, M., Kautz, J. "Pseudoinverse-Guided Diffusion Models for Inverse Problems." ICLR (2023). <a href="https://arxiv.org/abs/2210.06164" target="_blank" rel="noopener">arXiv:2210.06164</a></div>
+<div class="bib-annotation">The $\Pi$GDM refinement noted at the end of subsection 6. For linear forward operators $H$ it replaces the isotropic likelihood weighting with the measurement-noise-aware matrix $(r_t^2 H H^\top + \sigma_y^2 I)^{-1}$, accounting for both diffusion-time and sensor uncertainty to improve reconstruction on linear inverse problems.</div>
+</div>
+</section>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-33.5.html">&#8592; Section 33.5: Flow Matching &amp; Consistency Models</a>
 <a href="index.html">Chapter 33</a>
@@ -199,7 +417,7 @@ The guidance scale $w$ is the most consequential single knob in conditional gene
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

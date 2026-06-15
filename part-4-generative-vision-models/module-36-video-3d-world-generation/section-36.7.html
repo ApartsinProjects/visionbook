@@ -228,6 +228,142 @@ JEPA is the centerpiece of an explicit research program (LeCun's "path toward au
 <p><span class="exercise-type">Analysis.</span> A robot must plan 50 candidate action sequences of 20 steps each to pick the best grasp. Estimate the relative cost of evaluating these plans with (a) a generative world model that renders a future video per candidate versus (b) a JEPA that predicts a goal-distance in embedding space per candidate. Beyond speed, argue which approach is more robust to visually distracting but task-irrelevant scene changes (a moving shadow, a reflection) and why.</p>
 </div>
 
+<h2>5. JEPA as an Energy-Based Model: LeCun's Position <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The previous sections presented JEPA mechanically, as an encoder-predictor trained with an L2 loss in feature space. But where does the idea come from, and why was it proposed as something more ambitious than another self-supervised pretext task? The answer is a 2022 position paper by Yann LeCun, "A Path Towards Autonomous Machine Intelligence," posted on OpenReview as an argument rather than a peer-reviewed result. Its claim is that the dominant generative recipe (predict the data, in pixel or token space, by maximizing likelihood) is the wrong scaffold for building agents that understand and plan. The proposed replacement is an <strong>energy-based model (EBM)</strong> whose energy is exactly the prediction error in an abstract representation space.
+</p>
+
+<p>
+The energy-based framing is worth taking seriously because it reframes what the model is for. An EBM does not output a probability or a sample; it assigns a scalar <em>energy</em> $E(x, y)$ to a pair, low energy for compatible pairs and high energy for incompatible ones. JEPA instantiates this with the energy being the distance between the predicted and observed representations:
+</p>
+
+<div class="math-block">
+$$ E_\theta(x, y) \;=\; \min_{z}\;\big\lVert\, P_\phi\!\big(E_\theta(x),\, z\big) \;-\; \operatorname{sg}\!\big[\bar E(y)\big] \,\big\rVert^2, $$
+</div>
+
+<p>
+where $x$ is the context, $y$ the target, $E_\theta$ the online (context) encoder, $\bar E$ the stop-gradient EMA target encoder, $P_\phi$ the predictor, and $z$ a latent that captures the part of $y$ that the context genuinely cannot determine (the residual uncertainty). The energy is low when the context, after encoding and prediction, explains the target's representation, and the minimization over $z$ lets the model account for legitimately unpredictable variation without paying for it in the loss. Crucially, this energy is a function of the dependency between $x$ and $y$, and it never requires generating $y$ in pixel space. The hierarchical extension, <strong>H-JEPA</strong>, stacks these predictors so that higher levels predict over longer horizons in coarser, more abstract representations, which is the architecture LeCun argues an agent needs to plan at multiple timescales.
+</p>
+
+<div class="callout note">
+<div class="callout-title">A Position Paper, Not a Result</div>
+<p>
+LeCun's "A Path Towards Autonomous Machine Intelligence" (2022) is a position paper hosted on OpenReview; it was not peer-reviewed and reports no experiments. It sets the research agenda (energy-based, decoder-free, hierarchical prediction) that the I-JEPA, V-JEPA, and V-JEPA 2 papers then test empirically. Read it as a manifesto whose claims the later papers turn into measurements, not as evidence on its own.
+</p>
+</div>
+
+<h2>6. I-JEPA: The Objective Made Concrete <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+A manifesto needs a working demonstration, and I-JEPA (Assran et al., 2023, "Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture," arXiv:2301.08243) is the first one for images. The problem it solves is specific. Masked autoencoders (MAE, Chapter 25) reconstruct masked pixels, so they spend capacity on low-level detail; contrastive methods (SimCLR, MoCo) need carefully hand-engineered augmentations (crops, color jitter) to define what counts as the same image. I-JEPA discards both. It predicts the <em>representations</em> of several target blocks from a single context block, in latent space, with no pixel decoder and no hand-crafted augmentations. The masking does the work that augmentation did: a large, informative context block must predict several spatially distant target blocks, a task hard enough to force semantic features rather than texture shortcuts.
+</p>
+
+<p>
+Concretely, sample a context block from the image and $M$ target blocks. Encode the context with the online encoder $E_\theta$, encode the full image with the EMA target encoder $\bar E$ and read off the representations $s_{y_i}$ of each target block, then predict each target representation with the predictor $P_\phi$ conditioned on positional mask tokens $z_i$. The loss is the average squared $L2$ distance over the masked target blocks:
+</p>
+
+<div class="math-block">
+$$ \mathcal{L}_{\text{I-JEPA}} \;=\; \frac{1}{M}\sum_{i=1}^{M} \big\lVert\, P_\phi\!\big(E_\theta(x),\, z_i\big) \;-\; \operatorname{sg}\!\big[\bar E(y_i)\big] \,\big\rVert_2^2. $$
+</div>
+
+<p>
+Every term has a concrete reading. $P_\phi(E_\theta(x), z_i)$ is the predictor's guess for the $i$-th target block's representation, made from the context embedding and the positional token $z_i$ that says <em>which</em> block to predict. $\operatorname{sg}[\bar E(y_i)]$ is the EMA target encoder's representation of that block, frozen as a label by the stop-gradient. The $\tfrac{1}{M}\sum_i$ averages the error over the several target blocks, which is the multi-block structure that keeps the representation from degenerating. The payoff is efficiency as much as quality: I-JEPA trains a ViT-H/14 in under 72 hours on 16 A100 GPUs, and its frozen features rival contrastive and masked-autoencoder methods without any augmentation engineering.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: One I-JEPA Training Step</div>
+<p>
+Given an image $x_{\text{img}}$, the online encoder $E_\theta$, the EMA target encoder $\bar E$, the predictor $P_\phi$, and EMA rate $\tau$:
+</p>
+<ol>
+<li>Sample one context block and $M$ target blocks (large, possibly overlapping spatial regions) from $x_{\text{img}}$; record each target block's position as a mask token $z_i$.</li>
+<li>Encode the context: $h_x = E_\theta(x_{\text{context}})$, with gradients enabled.</li>
+<li>Encode the targets with the EMA encoder under no-grad: $s_{y_i} = \operatorname{sg}\big[\bar E(x_{\text{img}})\big]_{\text{block } i}$ for $i = 1, \dots, M$.</li>
+<li>Predict each target representation: $\hat s_{y_i} = P_\phi(h_x, z_i)$.</li>
+<li>Compute the loss $\mathcal{L} = \tfrac{1}{M}\sum_i \lVert \hat s_{y_i} - s_{y_i}\rVert_2^2$ and backpropagate into $E_\theta$ and $P_\phi$ only (never into $\bar E$).</li>
+<li>EMA update the target encoder: $\bar\theta \leftarrow \tau\,\bar\theta + (1-\tau)\,\theta$. This step, not the loss, is what trains the target encoder, and it is what makes the constant solution unreachable.</li>
+</ol>
+</div>
+
+<p>
+The code below condenses the loss and the EMA update to their essentials, the two lines that carry the whole anti-collapse argument. It is the same skeleton as Code Fragment 1 written at the level of a single step, with the stop-gradient made explicit via <code>.detach()</code> and the EMA update written out.
+</p>
+
+<pre><code class="language-python"># I-JEPA loss + EMA target update, the two ideas that prevent collapse.
+# online_enc, predictor are trained by grad; target_enc is an EMA copy (no grad).
+import torch
+import torch.nn.functional as F
+
+def ijepa_step(x_img, context_block, target_blocks, mask_tokens,
+               online_enc, target_enc, predictor, tau=0.996):
+    h_ctx = online_enc(context_block)                  # context embedding (grad ON)
+    with torch.no_grad():                              # target branch: no gradients
+        s_tgt = target_enc(x_img)                      # EMA encoder over full image
+        s_tgt = [s_tgt[b] for b in target_blocks]      # read off target-block reps
+    loss = 0.0
+    for s_i, z_i in zip(s_tgt, mask_tokens):
+        s_hat = predictor(h_ctx, z_i)                  # predict target representation
+        loss = loss + F.mse_loss(s_hat, s_i.detach())  # stop-gradient on the target
+    loss = loss / len(target_blocks)                   # average over M target blocks
+    loss.backward()                                    # grads flow ONLY to online_enc + predictor
+    # EMA update: target encoder slowly tracks the online encoder. This, not the
+    # loss, is what "trains" target_enc, and it forbids the lazy constant solution.
+    with torch.no_grad():
+        for tp, op in zip(target_enc.parameters(), online_enc.parameters()):
+            tp.mul_(tau).add_(op, alpha=1 - tau)
+    return loss
+</code></pre>
+<div class="code-caption"><strong>Code Fragment 3:</strong> One I-JEPA step. The <code>s_i.detach()</code> is the stop-gradient that turns the target representation into a fixed label, and the final EMA loop is what advances the target encoder; together they make the trivial constant solution unreachable. V-JEPA swaps the <code>mse_loss</code> for an L1 (<code>smooth_l1</code>) loss and samples spatiotemporal rather than spatial blocks; nothing else changes.</div>
+
+<h2>7. From Images to Video to Action: V-JEPA and V-JEPA 2 <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Images establish the objective; video is where a predictive world model earns its name, because video is where the future, dynamics, and consequences actually live. V-JEPA (Bardes et al., 2024, "Revisiting Feature Prediction for Learning Visual Representations from Video," arXiv:2404.08471) carries the I-JEPA recipe to video with one principled change: feature prediction over masked spatiotemporal regions, with an L1 loss in place of the L2 used for images, an EMA target encoder, and no negatives, no text, and no decoder. The result is a pure feature-prediction model, and its frozen-feature numbers are strong precisely because the features are about predictable structure: 81.9% on Kinetics-400 and 72.2% on Something-Something-v2 (two action-recognition benchmarks of <a href="../../part-3-deep-learning-for-vision/module-26-video-understanding/index.html">Chapter 26</a>), and 77.9% on ImageNet-1K despite never being trained on a single still-image classification label. That a video feature-predictor transfers to image classification is the clearest evidence that it learned semantics, not motion texture.
+</p>
+
+<p>
+V-JEPA 2 (Assran et al., 2025, "V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning," arXiv:2506.09985) is the step that closes the loop from perception to control, the loop LeCun's position paper drew but could not yet walk. It scales action-free pretraining to over one million hours of video, learning a world model from passive observation alone, with no actions and no rewards. Then, in a separate post-training stage, <strong>V-JEPA 2-AC</strong> (action-conditioned) is trained on under 62 hours of unlabeled robot video from the DROID dataset to predict how the latent state evolves given an action. With that latent action-conditioned model, the robot plans by searching over action sequences entirely in representation space and picking the sequence whose predicted latent reaches the goal, achieving zero-shot pick-and-place on a real robot without task-specific reward engineering. The model never renders a single frame of the future it is planning over.
+</p>
+
+<p>
+This is the concrete realization of the contrast that opened the section, and it connects directly to the decoder-free control of <a href="section-36.5.html">Section 36.5</a>. TD-MPC2 there plans in a learned latent without a pixel decoder, optimizing a latent reward; V-JEPA 2-AC plans in a learned latent without a pixel decoder, optimizing latent goal-distance. Both refuse to render the imagined rollouts they evaluate, for the same reason: rendering would spend the agent's planning budget on pixels no controller reads. The generative simulators of <a href="section-36.6.html">Section 36.6</a> render every candidate future; the predictive-embedding models of this section and the latent planner of 36.5 predict the part of the future a decision actually depends on, and discard the rest.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Decoder Is Where Generative and Predictive World Models Part</div>
+<p>
+A generative world model (Section 36.6) and a predictive-embedding world model can share an encoder and even a latent dynamics model; the single design choice that separates them is whether a decoder is trained alongside. Keep the decoder and you can watch the future, at the cost of a loss dominated by pixel detail no agent consumes. Drop the decoder, as JEPA and TD-MPC2 do, and every gradient goes into predicting the structure a controller or a classifier actually reads. The decoder is not a neutral add-on for visualization; it is a claim about where the model should spend its capacity, and JEPA's wager is that for understanding and planning, that claim is wrong.
+</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography &amp; Further Reading <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="bib-entry-card">
+<p class="bib-ref">LeCun, Y. "A Path Towards Autonomous Machine Intelligence." OpenReview position paper (2022), version 0.9.2. <a href="https://openreview.net/forum?id=BZ5a1r-kVsf" target="_blank" rel="noopener">openreview.net/forum?id=BZ5a1r-kVsf</a></p>
+<p class="bib-annotation"><strong>Position paper, not peer-reviewed, no experiments.</strong> Proposes JEPA and the hierarchical H-JEPA as energy-based models whose energy is prediction error in an abstract representation space, predicting the dependency between $x$ and $y$ without generating $y$ in pixel space. The manifesto that sets the agenda the I-JEPA, V-JEPA, and V-JEPA 2 papers then test.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Assran, M. et al. "Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture (I-JEPA)." CVPR (2023). <a href="https://arxiv.org/abs/2301.08243" target="_blank" rel="noopener">arXiv:2301.08243</a></p>
+<p class="bib-annotation">The first working JEPA: predict the representations of several target blocks from one context block, in latent space, with no pixel decoder and no hand-crafted augmentations. Trains a ViT-H/14 in under 72 hours on 16 A100s, with frozen features rivaling contrastive and masked-autoencoder methods.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Bardes, A. et al. "Revisiting Feature Prediction for Learning Visual Representations from Video (V-JEPA)." (2024). <a href="https://arxiv.org/abs/2404.08471" target="_blank" rel="noopener">arXiv:2404.08471</a></p>
+<p class="bib-annotation">Feature prediction on video with an EMA target encoder and an L1 loss, no negatives, no text, and no decoder. Frozen-feature results of 81.9% on Kinetics-400, 72.2% on Something-Something-v2, and 77.9% on ImageNet-1K demonstrate that a video feature-predictor learns transferable semantics.</p>
+</div>
+<div class="bib-entry-card">
+<p class="bib-ref">Assran, M. et al. "V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning." (2025). <a href="https://arxiv.org/abs/2506.09985" target="_blank" rel="noopener">arXiv:2506.09985</a></p>
+<p class="bib-annotation">Action-free pretraining on over one million hours of video, then V-JEPA 2-AC: a latent action-conditioned world model post-trained on under 62 hours of unlabeled DROID robot video for zero-shot pick-and-place planning, all in representation space with no frame ever rendered.</p>
+</div>
+</section>
+
+<div class="callout exercise">
+<div class="callout-title">More Exercises</div>
+<p><span class="exercise-type conceptual">Conceptual.</span> Exercise 36.7.4: Walk through why the stop-gradient EMA target encoder prevents the constant-vector collapse. Start from the loss $\tfrac{1}{M}\sum_i \lVert P_\phi(E_\theta(x), z_i) - \operatorname{sg}[\bar E(y_i)]\rVert_2^2$ and explain what would happen if the target encoder were trained by this loss with no stop-gradient (where does the gradient push both encoders?). Then explain why making the target encoder an EMA of the online encoder, updated only by $\bar\theta \leftarrow \tau\bar\theta + (1-\tau)\theta$, removes that incentive while still letting the target track useful representations.</p>
+<p><span class="exercise-type analysis">Analysis.</span> Exercise 36.7.5: Compare three self-supervised objectives on the same axes: I-JEPA (predict target representations in latent space), MAE (reconstruct masked pixels), and a contrastive method such as SimCLR (pull augmented views together, push negatives apart). For each, state (a) what space the loss is computed in, (b) what mechanism prevents trivial solutions (collapse for JEPA, none needed for MAE, negatives for contrastive), and (c) what kind of detail the objective forces the model to spend capacity on. Conclude with one scenario where each would be the preferred choice.</p>
+<p><span class="exercise-type discussion">Discussion.</span> Exercise 36.7.6: An agent must choose between a generative world model that renders candidate futures (Section 36.6) and a decoder-free predictive world model that scores candidates in latent space (V-JEPA 2-AC, TD-MPC2). Argue when the decoder-free model is preferable. Consider planning compute over many candidate action sequences, robustness to task-irrelevant visual distractors (shadows, reflections), the cost of curating labeled or action-annotated data, and the cases where a human or a downstream pixel-consumer genuinely needs to <em>see</em> the predicted future. State explicitly when you would keep the decoder despite its cost.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-36.6.html">&#8592; Section 36.6: Generative World Simulators</a>
 <a href="index.html">Chapter 36</a>
@@ -235,7 +371,7 @@ JEPA is the centerpiece of an explicit research program (LeCun's "path toward au
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

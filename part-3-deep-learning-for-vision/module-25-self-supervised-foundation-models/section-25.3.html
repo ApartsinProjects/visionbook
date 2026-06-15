@@ -281,6 +281,134 @@ DINO and MAE are not interchangeable, and knowing which to reach for matters in 
 <p>MAE reconstructs raw pixels, which the Fun Fact above noted wastes capacity on imperceptible detail. The 2023 to 2024 JEPA line from Meta (I-JEPA for images, V-JEPA for video) argues the prediction should happen in <em>representation space</em>: predict the encoded features of the masked region, not its pixels, so the model is never penalized for failing to hallucinate exact texture. This removes the decoder's pull toward low-level detail and, the authors argue, learns more abstract, more semantic features at lower cost. iBOT and the data-curated DINOv2 (which fuses masked modeling with self-distillation) are the other strands of this convergence. Whether pixel reconstruction, feature prediction, or joint distillation wins is an open question of 2025 and 2026, and the JEPA direction connects directly to the predictive world models you will meet in <a href="../module-26-video-understanding/index.html">Chapter 26</a>; we return to all of this in <a href="section-25.6.html">Section 25.6</a>.</p>
 </div>
 
+<h2>4. The Objectives, Formally <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The intuition above is enough to use both methods, but the precise objectives reward a careful read: every design choice in DINO and MAE is visible in a single line of math, and the anti-collapse equilibrium in particular only becomes unambiguous once it is written down. This subsection states both objectives in full, then ties them to the broader family of self-supervised recipes.
+</p>
+
+<h3>The DINO objective</h3>
+
+<p>
+DINO (Caron et al., 2021) couples a student network $g_{\theta_s}$ and a teacher network $g_{\theta_t}$ that share the same architecture but not the same weights. Each maps an input view to a $K$-dimensional vector, which a temperature-scaled softmax turns into a distribution over $K$ "prototype" coordinates. The training signal is the cross-entropy of the teacher distribution into the student distribution, summed over matched views $x$ (teacher) and $x'$ (student) of the same image,
+</p>
+
+<div class="math-block">
+$$\min_{\theta_s} \; -\sum P_t(x) \log P_s(x').$$
+</div>
+
+<p>
+Here $P_t$ is the teacher's target distribution and $P_s$ the student's prediction; minimizing this cross-entropy pulls the student's distribution onto the teacher's. The student distribution is an ordinary softmax at student temperature $\tau_s$,
+</p>
+
+<div class="math-block">
+$$P_s(x)^{(i)} = \frac{\exp\!\big(g_{\theta_s}(x)^{(i)} / \tau_s\big)}{\sum_{k} \exp\!\big(g_{\theta_s}(x)^{(k)} / \tau_s\big)},$$
+</div>
+
+<p>
+where $g_{\theta_s}(x)^{(i)}$ is the $i$-th of the $K$ output coordinates and $\tau_s$ controls how peaked the student's distribution is. The teacher distribution is the same softmax with two extra operations baked in: a subtracted center $c$ and a smaller temperature $\tau_t$,
+</p>
+
+<div class="math-block">
+$$P_t(x)^{(i)} = \frac{\exp\!\big((g_{\theta_t}(x)^{(i)} - c) / \tau_t\big)}{\sum_{k} \exp\!\big((g_{\theta_t}(x)^{(k)} - c) / \tau_t\big)}, \qquad c \leftarrow m\,c + (1 - m)\,\frac{1}{B}\sum_{b=1}^{B} g_{\theta_t}(x_b).$$
+</div>
+
+<p>
+The center $c$ is a running mean of the teacher's raw outputs over the batch (batch size $B$), updated as an exponential moving average with rate $m$, and subtracted from every teacher logit before the softmax. The teacher temperature $\tau_t < \tau_s$ is what sharpens: a smaller temperature divides the logits by a smaller number, exaggerating their differences and driving the teacher's distribution toward a single peak.
+</p>
+
+<p>
+These two operations are the entire anti-collapse mechanism, and they act in direct opposition. Sharpening (small $\tau_t$) pushes the teacher toward a one-hot distribution; if it acted alone the network would collapse onto a single output coordinate for every image, the peaked-output collapse. Centering subtracts whatever coordinate the teacher currently favors on average, which pushes the distribution back toward uniform; if it acted alone the network would collapse to the constant uniform distribution, learning nothing. Because one force pulls toward a peak and the other toward uniform, they cancel at an interior equilibrium where the only way to keep the loss low is for the teacher to assign genuinely different distributions to genuinely different images. The teacher itself is never trained by gradients; its weights track the student as an exponential moving average,
+</p>
+
+<div class="math-block">
+$$\theta_t \leftarrow \lambda\,\theta_t + (1 - \lambda)\,\theta_s,$$
+</div>
+
+<p>
+with momentum $\lambda$ close to one, so the teacher is the slow, smoothed echo of the student described in this section's epigraph. No negative pairs appear anywhere: unlike the contrastive objectives of <a href="section-25.2.html">Section 25.2</a>, DINO never contrasts an image against others in the batch, which is why the centering-plus-sharpening equilibrium has to do the anti-collapse work that negatives did before.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: DINO Student-Teacher Step (with Centering and Sharpening)</div>
+<p>
+Given an image, augmentations producing views $x$ (for the teacher) and $x'$ (for the student), networks $g_{\theta_s}$ and $g_{\theta_t}$, temperatures $\tau_s$ and $\tau_t < \tau_s$, center $c$, center rate $m$, and teacher momentum $\lambda$:
+</p>
+<ol>
+<li><strong>Forward both branches.</strong> Compute student logits $g_{\theta_s}(x')$ and teacher logits $g_{\theta_t}(x)$. (In practice multiple global and local crops are used; each student crop is matched to each teacher crop.)</li>
+<li><strong>Student distribution.</strong> Form $P_s(x') = \mathrm{softmax}\big(g_{\theta_s}(x') / \tau_s\big)$.</li>
+<li><strong>Teacher distribution (center then sharpen).</strong> Subtract the center and divide by the small temperature: $P_t(x) = \mathrm{softmax}\big((g_{\theta_t}(x) - c) / \tau_t\big)$. Apply a stop-gradient so no gradient flows into the teacher.</li>
+<li><strong>Loss.</strong> Compute the cross-entropy $-\sum P_t(x) \log P_s(x')$ and back-propagate into $\theta_s$ only.</li>
+<li><strong>Update the center.</strong> $c \leftarrow m\,c + (1 - m)\,\frac{1}{B}\sum_b g_{\theta_t}(x_b)$, the EMA of this batch's raw teacher logits.</li>
+<li><strong>Update the teacher.</strong> $\theta_t \leftarrow \lambda\,\theta_t + (1 - \lambda)\,\theta_s$. The teacher never sees a gradient; it only tracks the student.</li>
+</ol>
+</div>
+
+<h3>The MAE objective</h3>
+
+<p>
+MAE (He et al., 2022) replaces the matching game with reconstruction, and its design is built around one efficiency observation. After patchifying the image into tokens, MAE masks a random subset at a high ratio (seventy-five percent), then makes the encoder and decoder deliberately asymmetric: the encoder, a full ViT, processes only the visible quarter of patches and never sees a mask token, while a lightweight decoder reconstructs the image from the encoded visible tokens together with shared, learnable mask tokens inserted at the hidden positions. The reconstruction loss is mean squared error in pixel space, computed on the masked patches only,
+</p>
+
+<div class="math-block">
+$$\mathcal{L} = \frac{1}{|\mathcal{M}|} \sum_{p \in \mathcal{M}} \big\| \hat{x}_p - x_p \big\|_2^2,$$
+</div>
+
+<p>
+where $\mathcal{M}$ is the set of masked patch indices, $x_p$ the ground-truth patch and $\hat{x}_p$ the decoder's prediction; in practice the per-patch targets are normalized (each patch standardized by its own mean and variance), which sharpens the local contrast the loss rewards. The two ideas compound into the headline efficiency win: a high mask ratio shortens every sequence, and because the heavy encoder skips the masked patches entirely it runs on only a quarter of the tokens, giving roughly a threefold speedup over encoding the full image while still learning a strong representation.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: MAE Forward Pass</div>
+<p>
+Given an image, patch size, mask ratio $r = 0.75$, a ViT encoder, and a shallow decoder with a shared learnable mask token:
+</p>
+<ol>
+<li><strong>Patchify.</strong> Split the image into $N$ non-overlapping patches and embed each as a token (add positional embeddings).</li>
+<li><strong>Random masking.</strong> Sample a random permutation of the $N$ tokens and keep the first $\lceil N(1-r) \rceil$ as visible; the remaining $\lfloor N r \rfloor$ are masked. Record which positions were masked.</li>
+<li><strong>Encode visible only.</strong> Pass just the visible tokens through the full ViT encoder. No mask tokens enter the encoder, so it operates on roughly a quarter of the sequence.</li>
+<li><strong>Re-insert mask tokens.</strong> Build the full-length sequence: place each encoded visible token at its original position and fill every masked position with the shared learnable mask token, then add positional embeddings so the decoder knows where each token belongs.</li>
+<li><strong>Decode.</strong> Pass the full sequence through the shallow decoder, which predicts pixel values for every patch.</li>
+<li><strong>Loss.</strong> Compute the MSE $\frac{1}{|\mathcal{M}|}\sum_{p \in \mathcal{M}} \|\hat{x}_p - x_p\|_2^2$ on the masked patches only (with per-patch normalized targets), and back-propagate. After pretraining the decoder is discarded and only the encoder is kept.</li>
+</ol>
+</div>
+
+<p>
+The PyTorch fragment below isolates the DINO anti-collapse machinery from the formal objective: the centering-then-sharpening of the teacher, the stop-gradient, the cross-entropy, and the two exponential moving averages (the center $c$ and the teacher weights $\theta_t$). It is the precise counterpart of the equations above.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def update_teacher(student, teacher, lam=0.996):
+    # Teacher weights track the student as an EMA: theta_t <- lam*theta_t + (1-lam)*theta_s.
+    for ps, pt in zip(student.parameters(), teacher.parameters()):
+        pt.mul_(lam).add_(ps.detach(), alpha=1 - lam)
+
+def dino_step(s_logits, t_logits, center, tau_s=0.1, tau_t=0.04, m=0.9):
+    # Student: ordinary softmax at the higher temperature tau_s.
+    p_s = F.log_softmax(s_logits / tau_s, dim=-1)
+    # Teacher: CENTER (anti-collapse toward uniform) then SHARPEN (low tau_t -> peaked),
+    # with a stop-gradient so no gradient reaches the teacher.
+    p_t = F.softmax((t_logits - center) / tau_t, dim=-1).detach()
+    loss = -(p_t * p_s).sum(dim=-1).mean()            # cross-entropy of teacher into student
+    # Update the center as an EMA of this batch's raw teacher logits (opposes sharpening).
+    center = m * center + (1 - m) * t_logits.mean(dim=0, keepdim=True)
+    return loss, center</code></pre>
+<div class="code-caption"><strong>Code Fragment 4:</strong> The DINO centering-plus-sharpening loss and the two exponential moving averages. <code>dino_step</code> centers and sharpens the teacher before the cross-entropy (the <code>detach()</code> is the stop-gradient), and returns the updated center; <code>update_teacher</code> is the EMA on the weights $\theta_t \leftarrow \lambda\theta_t + (1-\lambda)\theta_s$. Remove the centering term and the teacher peaks onto one coordinate; remove the sharpening (set $\tau_t = \tau_s$) and the target drifts toward uniform.</div>
+
+<h3>Three families, and the predictive successor</h3>
+
+<p>
+DINO and MAE are two of the three families of self-supervised vision learning, alongside the contrastive methods of <a href="section-25.2.html">Section 25.2</a>. Contrastive learning pulls together views of the same image and pushes apart views of different images, using negatives; self-distillation (DINO) matches a student to a smoothed teacher with no negatives, relying on centering and sharpening to avoid collapse; masked reconstruction (MAE) predicts hidden pixels and needs neither negatives nor a teacher. The predictive-embedding successor that unifies the strengths of these lines is JEPA (Chapter 36), the Joint-Embedding Predictive Architecture. Like DINO and BYOL, JEPA learns against a stop-gradient EMA target rather than against negatives; unlike MAE, it does not predict in pixel space but in latent space, predicting the encoded representation of a masked region instead of its raw pixels, which spares the model from hallucinating imperceptible texture. We develop JEPA in full in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/section-36.7.html">Section 36.7</a>; for now it is enough to see it as masked modeling moved out of pixel space and onto a stable EMA target, the same target mechanism that makes DINO work.
+</p>
+
+<div class="callout note">
+<div class="callout-title">Note: One Target Mechanism, Many Methods</div>
+<p>The exponential-moving-average target is the connective thread across negative-free self-supervision. BYOL and DINO match a student to an EMA teacher of itself; MAE drops the teacher entirely and uses pixel reconstruction as its signal; JEPA keeps the EMA teacher of BYOL and DINO but, like MAE, predicts masked content, doing so in the teacher's latent space rather than in pixels. Reading the four together, the design axes are clear: negatives or not, teacher or not, and (given a teacher) predict pixels or predict embeddings. DINOv2 in <a href="section-25.6.html">Section 25.6</a> fuses the self-distillation and masked-modeling axes into one backbone.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 25.3.1: Why Both Centering and Sharpening <span class="exercise-type conceptual">Conceptual</span></div>
 <p>DINO uses both centering and sharpening on the teacher output. Describe the specific collapse that occurs if you remove centering (sharpening only), and the different collapse that occurs if you remove sharpening (centering only). Then explain, in terms of the two opposing forces, why applying both yields a stable non-collapsed solution. Why must these operations be applied to the teacher rather than the student?</p>
@@ -296,6 +424,29 @@ DINO and MAE are not interchangeable, and knowing which to reach for matters in 
 <p>The section claims DINO features win under a frozen linear probe while MAE features win under fine-tuning. Design an experiment using two pretrained backbones (one DINO, one MAE) from the library shortcut that would test this claim on a single downstream dataset. Specify exactly what you would measure for each backbone under each protocol (probe and fine-tune), what pattern of four numbers would confirm the claim, and what pattern would refute it. Then explain why the objective each method optimizes predicts the pattern you expect.</p>
 </div>
 
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.4: Centering and Sharpening as Opposing Forces <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Write the DINO teacher distribution $P_t(x)^{(i)} = \mathrm{softmax}\big((g_{\theta_t}(x)^{(i)} - c)/\tau_t\big)$ and explain, term by term, how centering and sharpening jointly prevent collapse. Argue what happens to $P_t$ in the limit $\tau_t \to 0$ with $c$ held fixed (sharpening dominant), and what happens as the center $c$ perfectly tracks the teacher's mean output with $\tau_t$ left large (centering dominant). Identify the collapsed distribution in each limit (one-hot peak versus uniform) and explain why an intermediate $\tau_t$ together with the EMA center update $c \leftarrow m\,c + (1-m)\,\frac1B\sum_b g_{\theta_t}(x_b)$ leaves the network at an equilibrium where it must assign different distributions to different images. Why does applying both operations to the teacher rather than the student matter for the stability of that equilibrium?</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.3.5: Pixel Reconstruction Versus Latent Prediction <span class="exercise-type analysis">Analysis</span></div>
+<p>MAE minimizes pixel-space MSE on masked patches, $\mathcal{L} = \frac{1}{|\mathcal{M}|}\sum_{p\in\mathcal{M}}\|\hat{x}_p - x_p\|_2^2$, while JEPA (<a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/section-36.7.html">Section 36.7</a>) predicts the encoded representation of the masked region against a stop-gradient EMA target. Contrast the two objectives along three axes: (a) what each is penalized for getting wrong (raw texture versus abstract content), and how that explains MAE's blurry, low-frequency reconstructions; (b) why JEPA needs the EMA target and a stop-gradient (the same anti-collapse concern as DINO) whereas MAE needs neither; and (c) what each keeps and discards after pretraining (MAE keeps the encoder and discards the decoder; JEPA has no pixel decoder at all). Conclude with the conditions under which you would expect latent prediction to learn more semantic features at lower cost than pixel reconstruction, and one case where pixel reconstruction is still the right objective.</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="bib-entry-card">
+<div class="bib-ref">Caron, M., Touvron, H., Misra, I., Jégou, H., Mairal, J., Bojanowski, P., Joulin, A. "Emerging Properties in Self-Supervised Vision Transformers." ICCV (2021). <a href="https://arxiv.org/abs/2104.14294" target="_blank" rel="noopener">arXiv:2104.14294</a></div>
+<div class="bib-annotation">The DINO paper, source of this section's self-distillation objective. It introduced the negative-free student-teacher cross-entropy $-\sum P_t(x)\log P_s(x')$, the centering-plus-sharpening anti-collapse equilibrium, and the EMA teacher $\theta_t \leftarrow \lambda\theta_t + (1-\lambda)\theta_s$, and reported the emergent object segmentation in the ViT class-token attention that needs no segmentation labels.</div>
+</div>
+
+<div class="bib-entry-card">
+<div class="bib-ref">He, K., Chen, X., Xie, S., Li, Y., Dollár, P., Girshick, R. "Masked Autoencoders Are Scalable Vision Learners." CVPR (2022). <a href="https://arxiv.org/abs/2111.06377" target="_blank" rel="noopener">arXiv:2111.06377</a></div>
+<div class="bib-annotation">The MAE paper, source of this section's masked-reconstruction objective. It established the seventy-five-percent mask ratio, the asymmetric design in which a full ViT encoder processes only the visible patches while a lightweight decoder reconstructs from encoded tokens plus learnable mask tokens, and the pixel-space MSE on masked patches with per-patch normalized targets, together giving roughly a threefold pretraining speedup.</div>
+</div>
+</section>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-25.2.html">&#8592; Section 25.2: Contrastive Learning: SimCLR &amp; MoCo</a>
 <a href="index.html">Chapter 25</a>
@@ -303,7 +454,7 @@ DINO and MAE are not interchangeable, and knowing which to reach for matters in 
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

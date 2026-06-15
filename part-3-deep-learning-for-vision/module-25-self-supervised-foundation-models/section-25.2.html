@@ -295,6 +295,131 @@ criterion = NTXentLoss(temperature=0.1, memory_bank_size=(65536, 128))  # queue 
 <p>The negatives that drove this entire section turned out to be optional. BYOL (Grill et al., 2020) and SimSiam (Chen and He, 2021) showed that a network can learn strong representations with positive pairs only, no negatives at all, as long as a momentum target encoder and a stop-gradient (blocking the gradient from flowing back through the target branch, so it acts as a fixed reference within the step) prevent the trivial collapse to a constant output. This reframed the field: the momentum encoder MoCo introduced for consistency turned out to be the key ingredient for a whole family of negative-free methods, and DINO in <a href="section-25.3.html">Section 25.3</a> takes this to its conclusion. As of 2024 to 2026 the dominant self-supervised backbones (DINOv2) combine this negative-free self-distillation with masked modeling rather than classical contrastive learning, though contrastive learning remains the heart of the language-supervised CLIP of <a href="section-25.4.html">Section 25.4</a>, where the negatives are other captions and come naturally.</p>
 </div>
 
+<h2>4. The Formal Objectives: NT-Xent and InfoNCE Written Out <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Sections 1 through 3 built the intuition and the working code, but a graduate reader needs the objectives stated in the exact form the original papers optimize, because the bookkeeping (which indices are summed, what counts as a negative, how positive pairs are averaged) is where contrastive methods quietly differ from one another. This subsection writes both losses out fully, names every term, and connects the temperature and the indicator to the geometry they control. The notation matches Chen et al. (2020) for SimCLR and He et al. (2020) for MoCo so the formulas below can be read directly against the papers.
+</p>
+
+<h3>4.1 SimCLR's NT-Xent, Indexed Over the Full Batch</h3>
+
+<p>
+SimCLR draws a minibatch of $N$ images and applies two independent augmentations to each, producing $2N$ views. Let $z_k$ be the L2-normalized projection-head output for view $k$, and let $\text{sim}(u,v) = u^\top v / (\|u\|\,\|v\|)$ be cosine similarity. For a positive pair $(i,j)$, meaning $i$ and $j$ are the two augmentations of one image, the per-pair loss is
+</p>
+
+<div class="math-block">
+$$\ell_{i,j} = -\log \frac{\exp\!\big(\text{sim}(z_i, z_j)/\tau\big)}{\sum_{k=1}^{2N} \mathbb{1}_{[k \neq i]}\,\exp\!\big(\text{sim}(z_i, z_k)/\tau\big)}.$$
+</div>
+
+<p>
+The indicator $\mathbb{1}_{[k \neq i]}$ excludes exactly one term from the denominator: the comparison of $z_i$ with itself. It does <strong>not</strong> exclude the positive partner $z_j$. This is the single subtle point of the formula. The denominator runs over all $2N - 1$ other views, which is the positive $z_j$ plus the $2N - 2$ negatives (the other $N-1$ images, each in two views). Dropping the self-term $k=i$ is mandatory because $\text{sim}(z_i, z_i)/\tau = 1/\tau$ is large and constant, and leaving it in would let the model satisfy the objective by matching itself, which carries no learning signal. Keeping $z_j$ in the denominator is what makes the expression a genuine softmax classification: the numerator is one entry of the denominator, so $\ell_{i,j}$ is the negative log-probability assigned to the correct partner among all $2N-1$ candidates.
+</p>
+
+<p>
+The full <strong>NT-Xent</strong> loss (normalized temperature-scaled cross-entropy) is the average of $\ell_{i,j}$ over all positive pairs, counting both directions, because $\ell_{i,j} \neq \ell_{j,i}$ in general (each fixes a different anchor and therefore a different denominator):
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{NT-Xent}} = \frac{1}{2N} \sum_{k=1}^{N} \big[\ell_{2k-1,\,2k} + \ell_{2k,\,2k-1}\big],$$
+</div>
+
+<p>
+where the pair $(2k-1, 2k)$ indexes the two views of the $k$-th image. The two directions $\ell_{i,j}$ and $\ell_{j,i}$ are both included, giving $2N$ positive-pair terms over $N$ images, hence the $1/2N$ normalization. This is exactly what the <code>F.cross_entropy(sim, targets)</code> call in Code Fragment 1 computes: cross-entropy over a row already averages over all $2N$ rows, and the <code>(targets + N) % N2</code> mapping supplies each row's positive partner in the other direction automatically.
+</p>
+
+<div class="callout note">
+<div class="callout-title">The Role of Temperature, Precisely</div>
+<p>Temperature $\tau$ rescales every similarity before the softmax, so it controls how sharply the loss distinguishes the positive from the negatives. Write the gradient intuition: the softmax assigns probability $p_k \propto \exp(\text{sim}(z_i,z_k)/\tau)$ to candidate $k$, and the gradient pushes hardest on the negatives with the largest $p_k$. A small $\tau$ (SimCLR uses $\tau \approx 0.1$, sometimes $0.07$) sharpens the distribution so that only the few hardest negatives, the ones already close to $z_i$ in feature space, receive significant gradient; the model spends its capacity separating near-collisions. A large $\tau$ flattens the distribution toward uniform, treating all negatives as equally important and producing weaker, less discriminative features. Temperature is therefore not a minor hyperparameter: it sets the effective hardness of the negative mining that happens implicitly inside the softmax.</p>
+</div>
+
+<h3>4.2 MoCo's InfoNCE Over a Queue</h3>
+
+<p>
+MoCo (He et al., 2020) writes the same softmax but reorganizes which embeddings supply the positive and the negatives. A query $q$ has exactly one positive key $k_+$ (the matching view of the same image, encoded by the momentum encoder) and a queue of $K$ negative keys $\{k_0, k_1, \ldots, k_K\}$ accumulated from previous batches. With dot-product similarity on normalized embeddings and temperature $\tau$, the InfoNCE loss for the query is
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_q = -\log \frac{\exp\!\big(q^\top k_+ / \tau\big)}{\sum_{i=0}^{K} \exp\!\big(q^\top k_i / \tau\big)},$$
+</div>
+
+<p>
+where the sum in the denominator runs over the positive $k_+$ together with all $K$ queued negatives (in MoCo's indexing $k_0$ denotes the positive, so the $K+1$ denominator terms are one positive plus $K$ negatives). This is a $(K+1)$-way softmax classification: identify the positive key among $K+1$ candidates. The structural difference from NT-Xent is only the <em>source</em> of the candidates. SimCLR's denominator is the current batch, which couples the number of negatives to batch size; MoCo's denominator is a FIFO queue, which decouples the number of negatives ($K$, often $65{,}536$) from the batch size entirely. The query encoder is updated by SGD on $\mathcal{L}_q$, while the key (momentum) encoder is never differentiated and instead tracks the query encoder by the exponential moving average of Section 3,
+</p>
+
+<div class="math-block">
+$$\theta_k \leftarrow m\,\theta_k + (1 - m)\,\theta_q, \qquad m = 0.999.$$
+</div>
+
+<p>
+The large $m$ is what makes the queue valid: keys enqueued many steps ago were produced by a key encoder that has barely moved since, so comparing a fresh query against old keys is meaningful. The FIFO queue then buys a large, consistent negative set without a large batch, which is the entire engineering payoff of MoCo over SimCLR.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: One SimCLR Training Step</div>
+<p><strong>Input:</strong> minibatch of $N$ images $\{x_1, \ldots, x_N\}$; augmentation distribution $\mathcal{T}$; encoder $f$; projection head $g$; temperature $\tau$.</p>
+<ol>
+<li>For each image $x_n$, sample two augmentations $t, t' \sim \mathcal{T}$ and form views $\tilde{x}_{2n-1} = t(x_n)$ and $\tilde{x}_{2n} = t'(x_n)$, giving $2N$ views.</li>
+<li>Encode and project: $h_k = f(\tilde{x}_k)$, then $z_k = g(h_k)$, for $k = 1, \ldots, 2N$.</li>
+<li>L2-normalize: $z_k \leftarrow z_k / \|z_k\|$.</li>
+<li>Compute the $2N \times 2N$ similarity matrix $S_{ik} = \text{sim}(z_i, z_k)/\tau$ and set the diagonal $S_{ii} = -\infty$ (mask self-comparisons).</li>
+<li>For each row $i$, the target column is its positive partner; accumulate $\ell_{i,j} = -\log \text{softmax}(S_{i,:})_j$.</li>
+<li>Average over all $2N$ rows to get $\mathcal{L}_{\text{NT-Xent}}$.</li>
+<li>Backpropagate and update $f$ and $g$ by one optimizer step. The features $h$ (before $g$) are kept for downstream use; $g$ is discarded after pretraining.</li>
+</ol>
+</div>
+
+<p>
+The PyTorch block below implements the NT-Xent numerator-and-denominator bookkeeping explicitly, rather than relying on <code>F.cross_entropy</code> as Code Fragment 1 did, so the correspondence to $\ell_{i,j}$ is line for line. It is the same loss, written to expose every term of the formula.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def nt_xent(z, temperature=0.1):
+    """z: (2N, d), stacked as [view_a(0..N-1), view_b(0..N-1)]. Returns NT-Xent loss."""
+    N2 = z.size(0)
+    N = N2 // 2
+    z = F.normalize(z, dim=1)                         # unit vectors -> dot = cosine sim
+    sim = (z @ z.t()) / temperature                  # (2N, 2N): S_ik = sim(z_i, z_k)/tau
+
+    # Denominator: sum over k != i  (exclude only the self-term, keep the positive).
+    self_mask = torch.eye(N2, dtype=torch.bool, device=z.device)
+    sim = sim.masked_fill(self_mask, float("-inf"))  # 1_{k != i}: drop k = i only
+    log_denom = torch.logsumexp(sim, dim=1)          # log sum_{k!=i} exp(S_ik)
+
+    # Numerator: each row i pairs with its other view (i <-> i+N).
+    pos_idx = (torch.arange(N2, device=z.device) + N) % N2
+    log_num = sim[torch.arange(N2), pos_idx]         # S_{i, j} = sim(z_i, z_j)/tau
+
+    per_pair = -(log_num - log_denom)                # l_{i,j} = -log( exp(num) / denom )
+    return per_pair.mean()                           # average over all 2N positive pairs
+
+torch.manual_seed(0)
+z = torch.randn(8, 128)                              # 4 images x 2 views, 128-d
+print("NT-Xent loss:", round(nt_xent(z).item(), 4)) # ~2.08, near log(2N-1)=log 7 at chance</code></pre>
+<div class="code-caption"><strong>Code Fragment 4:</strong> NT-Xent written term by term. <code>masked_fill</code> with the identity mask implements the indicator $\mathbb{1}_{[k \neq i]}$ (only the self-term is removed, the positive stays in the denominator); <code>logsumexp</code> is the log-denominator; the <code>(arange + N) % N2</code> index picks the positive partner $z_j$ for the numerator. The result matches the <code>F.cross_entropy</code> form of Code Fragment 1 because cross-entropy is exactly this log-softmax-and-gather.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Softmax, Two Sources of Negatives</div>
+<p>NT-Xent and MoCo's InfoNCE are the <em>same</em> objective, a temperature-scaled softmax that assigns high probability to the positive among many candidates. They differ in one design axis only: where the candidates come from. SimCLR reads them from the current batch (so more negatives means a bigger batch); MoCo reads them from a momentum-maintained queue (so more negatives is just a longer queue). Once you see the shared softmax skeleton, the entire contrastive family, including CLIP's image-text version in <a href="section-25.4.html">Section 25.4</a>, reduces to choosing the encoder, the positive, and the negative pool.</p>
+</div>
+
+<p>
+These contrastive objectives are one branch of self-supervision, the branch that learns by explicit comparison against negatives. They are not the only way to avoid labels. <a href="section-25.3.html">Section 25.3</a> develops two alternatives that need no negatives at all: DINO learns by <strong>self-distillation</strong>, matching a student network's output distribution to a momentum teacher's on different views, and MAE learns by <strong>masked reconstruction</strong>, predicting hidden image patches from visible ones. Both replace the push-against-negatives mechanism with a different anti-collapse device. Looking further ahead, the JEPA family of <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a> predicts in <em>latent</em> space rather than pixel or probability space, and it does so against an EMA target encoder that is exactly MoCo's momentum encoder repurposed: the same $\theta_k \leftarrow m\theta_k + (1-m)\theta_q$ update, now providing a stable prediction target instead of consistent negatives. The momentum encoder introduced here for one reason, keeping a queue consistent, turns out to be a load-bearing component across self-supervised learning.
+</p>
+
+<div class="callout bib-entry-card">
+<div class="callout-title">Foundational Paper: SimCLR</div>
+<p><strong>Chen, T., Kornblith, S., Norouzi, M., &amp; Hinton, G. (2020).</strong> A Simple Framework for Contrastive Learning of Visual Representations. <em>Proceedings of the 37th International Conference on Machine Learning (ICML)</em>. arXiv:2002.05709.</p>
+<p>Introduces SimCLR and the NT-Xent loss, and establishes that the composition of data augmentations (random crop plus color distortion), a learnable nonlinear projection head, large batch sizes, and many training steps are the levers that make simple contrastive learning match supervised pretraining on a linear probe. The paper's systematic ablation of augmentations is the source of the crop-plus-color finding used throughout this section.</p>
+</div>
+
+<div class="callout bib-entry-card">
+<div class="callout-title">Foundational Paper: MoCo</div>
+<p><strong>He, K., Fan, H., Wu, Y., Xie, S., &amp; Girshick, R. (2020).</strong> Momentum Contrast for Unsupervised Visual Representation Learning. <em>Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)</em>. arXiv:1911.05722.</p>
+<p>Reframes contrastive learning as dynamic dictionary lookup and introduces the two ideas that decouple negative-set size from batch size: a FIFO queue of $K$ negative keys and a momentum (EMA-updated) key encoder $\theta_k \leftarrow m\theta_k + (1-m)\theta_q$ with $m = 0.999$ that keeps queued keys mutually consistent. This made strong contrastive pretraining feasible on commodity hardware without SimCLR's 4096-image batches.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 25.2.1: Why Crop-Plus-Color, Not Either Alone <span class="exercise-type conceptual">Conceptual</span></div>
 <p>SimCLR found that random cropping alone, or color distortion alone, gives much weaker features than the two combined. Explain the shortcut the network can exploit when only cropping is used, and the different shortcut available when only color distortion is used. Then argue why composing the two removes both shortcuts simultaneously, and connect this to the pretext-task shortcut failure from <a href="section-25.1.html">Section 25.1</a>.</p>
@@ -310,6 +435,16 @@ criterion = NTXentLoss(temperature=0.1, memory_bank_size=(65536, 128))  # queue 
 <p>The momentum coefficient $m$ controls how fast the key encoder tracks the query encoder. Derive what happens at the two extremes: $m = 0$ (key encoder equals query encoder every step) and $m = 1$ (key encoder never updates). Explain why $m = 0$ reintroduces the consistency problem the momentum encoder was meant to fix, and why $m = 1$ makes the keys useless over time. Given that MoCo uses $m \approx 0.999$, estimate roughly how many steps it takes for the key encoder to reflect a given query-encoder update, and relate this to the queue length.</p>
 </div>
 
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.4: Why Large Batches or a Memory Queue <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The denominator of NT-Xent sums over the other views in the current batch, while MoCo's InfoNCE sums over a queue of $K$ keys. Using the Key Insight that contrastive quality scales with the number of negatives, explain in your own words why a small batch (say $N = 64$) starves SimCLR of negatives, and quantify exactly how many negatives a batch of $N$ supplies for one anchor. Then explain how MoCo's queue provides the same number of negatives with $N = 64$ that SimCLR would need a batch of thousands to match, and state the one new component MoCo must add (and why) to make those queued negatives usable. Conclude with the one-line mental model from Section 3 in your own words.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 25.2.5: InfoNCE as a Mutual-Information Lower Bound <span class="exercise-type analysis">Analysis</span></div>
+<p>The name InfoNCE comes from its connection to mutual information. Consider an anchor $z_i$ and a candidate set of one positive $z_j$ drawn from the joint distribution $p(z_i, z_j)$ and $K$ negatives drawn from the marginal $p(z)$. Show that the optimal critic for the NT-Xent softmax is proportional to the density ratio $p(z_j \mid z_i)/p(z_j)$, and use this to argue that the expected NT-Xent loss is bounded below by $-\log(K+1) + I(z_i; z_j)$, so that minimizing the loss maximizes a lower bound on the mutual information $I(z_i; z_j)$ between the two views. Then explain why this bound is loose when $K$ is small (the $\log(K+1)$ cap limits how much mutual information the objective can certify), giving a second, information-theoretic reason that more negatives help, complementing the geometric pull-and-push picture of Section 1. (Hint: follow the variational argument of van den Oord et al., 2018, Representation Learning with Contrastive Predictive Coding, arXiv:1807.03748.)</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-25.1.html">&#8592; Section 25.1: Pretext Tasks: Learning Without Labels</a>
 <a href="index.html">Chapter 25</a>
@@ -317,7 +452,7 @@ criterion = NTXentLoss(temperature=0.1, memory_bank_size=(65536, 128))  # queue 
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

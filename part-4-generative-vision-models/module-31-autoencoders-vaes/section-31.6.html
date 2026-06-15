@@ -140,7 +140,7 @@ $$\mathcal{L}_{\text{VQ}} = \underbrace{\lVert x - \hat{x} \rVert^2}_{\text{reco
 </div>
 
 <p>
-Notice there is no KL term and no fixed prior during this stage. Unlike the continuous VAE, a VQ-VAE is trained purely as a reconstruction autoencoder with codebook upkeep; the generative prior over tokens is learned separately afterward (subsection 3). The next block implements the whole quantizer, including the straight-through estimator and both losses.
+Notice there is no KL term and no fixed prior during this stage. Unlike the continuous VAE, a VQ-VAE is trained purely as a reconstruction autoencoder with codebook upkeep; the generative prior over tokens is learned separately afterward (subsection 4). The next block implements the whole quantizer, including the straight-through estimator and both losses.
 </p>
 
 <pre><code class="language-python"># The full vector quantizer: snap each encoder vector to its nearest
@@ -195,7 +195,110 @@ print("token grid:", tokens.shape)         # token grid: torch.Size([4, 8, 8])</
 <p>Two numbers in this section are easy to confuse, and the confusion is damaging. The first is the spatial grid (say $32 \times 32$), the number of <em>locations</em>; the second is the codebook size $K$ (say 8192), the number of <em>distinct vectors each location may choose from</em>. Students often collapse them, picturing the $32 \times 32$ token grid as a $32 \times 32$ pixel image and concluding VQ-VAE just shrinks the picture, or imagining that raising $K$ raises the resolution. Neither holds. Each grid cell is a token summarizing a whole patch of the $256 \times 256$ input (here a $8 \times 8$ pixel region), not a single pixel, and the decoder upsamples the grid back to full resolution; the grid is a coarse spatial layout, not a thumbnail. The codebook size controls how many different things a patch can <em>say</em> (the richness of the vocabulary), not how many patches there are. Raising $K$ buys finer distinctions per location and risks the codebook collapse that Exercise 31.6.2 diagnoses; raising the grid size buys finer spatial detail and a longer token sequence for the prior to model. They are independent knobs.</p>
 </div>
 
-<h2>3. Learning a Prior Over Tokens <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<h2>3. The Training Math in Full <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 2 stated the objective and the straight-through trick informally. Here we write the training mathematics out completely, in the notation of van den Oord, Vinyals, and Kavukcuoglu (2017), the paper that introduced the VQ-VAE, so that every gradient that flows during training is accounted for. The setup is the one already in play: the encoder produces $z_e(x)$ at each spatial location; the codebook is a set of $K$ vectors $\{e_k\}_{k=1}^{K}$; and quantization replaces $z_e(x)$ with its nearest entry,
+</p>
+
+<div class="math-block">
+$$z_q(x) = e_k, \quad k = \arg\min_j \lVert z_e(x) - e_j \rVert_2.$$
+</div>
+
+<p>
+To make the backward pass precise we introduce the <strong>stop-gradient operator</strong> $\text{sg}[\,\cdot\,]$. It is the identity on the forward pass, $\text{sg}[u] = u$, and has zero partial derivatives on the backward pass, $\nabla\,\text{sg}[u] = 0$; it is exactly PyTorch's <code>.detach()</code>. With it the full per-example loss is the sum of three terms,
+</p>
+
+<div class="math-block">
+$$\mathcal{L} = \underbrace{\lVert x - \hat{x} \rVert_2^2}_{\text{reconstruction}} + \underbrace{\lVert \text{sg}[z_e(x)] - e \rVert_2^2}_{\text{codebook (VQ) loss}} + \beta \underbrace{\lVert z_e(x) - \text{sg}[e] \rVert_2^2}_{\text{commitment}}.$$
+</div>
+
+<p>
+Read the three terms by asking, for each one, which parameters can move because of it. The reconstruction term $\lVert x - \hat{x} \rVert_2^2$ trains the decoder directly, and trains the encoder through the straight-through estimator described next. The codebook term $\lVert \text{sg}[z_e(x)] - e \rVert_2^2$ has the stop-gradient on $z_e$, so only $e$ can move: it pulls the chosen code <em>toward</em> the encoder output, with the encoder held fixed. The commitment term $\lVert z_e(x) - \text{sg}[e] \rVert_2^2$ has the stop-gradient on $e$, so only $z_e$ can move: it pulls the encoder output <em>toward</em> its chosen code, with the code held fixed. The codebook and commitment terms are the <em>same squared distance</em>, $\lVert z_e(x) - e \rVert_2^2$, written twice with the stop-gradient on opposite arguments; that single device splits one distance into two one-directional pulls whose relative strength is set by $\beta$.
+</p>
+
+<h3>The straight-through estimator, exactly</h3>
+
+<p>
+The $\arg\min$ is piecewise constant, so $\partial z_q / \partial z_e = 0$ almost everywhere and the reconstruction gradient cannot reach the encoder through the quantizer. The <strong>straight-through estimator</strong> repairs this by defining the forward map $z_e \to z_q$ but declaring the backward map $\nabla_{z_q} \to \nabla_{z_e}$ to be the identity: whatever gradient the decoder sends to its input $z_q$ is copied unchanged to $z_e$, as though quantization were not in the path. Formally the decoder receives $z_q(x)$ on the forward pass, while during backpropagation we set
+</p>
+
+<div class="math-block">
+$$\nabla_{z_e(x)} \mathcal{L}_{\text{recon}} \;\approx\; \nabla_{z_q(x)} \mathcal{L}_{\text{recon}},$$
+</div>
+
+<p>
+the approximation being the deliberate "lie" that $z_q = z_e$ for gradient purposes. This is exactly the identity <code>z_q = z_e + (z_q - z_e).detach()</code>: the forward value equals $z_q$, while the only term with a live gradient is the leading $z_e$, so $\nabla_{z_q}$ lands on $z_e$ unchanged. The commitment term is what keeps this approximation honest. By holding $z_e$ close to its chosen $e$, it keeps $z_q \approx z_e$, so copying the gradient across the gap introduces little error. The original paper sets $\beta = 0.25$ and reports the result is robust for $\beta$ anywhere in roughly $[0.1, 2.0]$, because $\beta$ only sets how hard the encoder commits, not what it represents; most implementations leave it at the default.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: VQ-VAE Forward and Backward (with Straight-Through)</div>
+<p><strong>Inputs:</strong> image $x$; encoder $E$, decoder $D$; codebook $\{e_k\}_{k=1}^{K}$; commitment weight $\beta$.</p>
+<p><strong>Forward pass.</strong></p>
+<ol>
+<li>Encode: $z_e \leftarrow E(x)$, a grid of $D$-dimensional vectors.</li>
+<li>Quantize each location: $k \leftarrow \arg\min_j \lVert z_e - e_j \rVert_2$, then $z_q \leftarrow e_k$.</li>
+<li>Straight-through wire: $\tilde{z}_q \leftarrow z_e + \text{sg}[\,z_q - z_e\,]$ (forward value is $z_q$).</li>
+<li>Decode: $\hat{x} \leftarrow D(\tilde{z}_q)$.</li>
+<li>Loss: $\mathcal{L} \leftarrow \lVert x - \hat{x} \rVert_2^2 + \lVert \text{sg}[z_e] - e_k \rVert_2^2 + \beta \lVert z_e - \text{sg}[e_k] \rVert_2^2$.</li>
+</ol>
+<p><strong>Backward pass.</strong></p>
+<ol>
+<li>Reconstruction gradient reaches $\tilde{z}_q$; because of the straight-through wire it lands on $z_e$ unchanged (the $\text{sg}[\cdot]$ bracket contributes zero), then flows into $E$.</li>
+<li>Codebook term sends gradient only to $e_k$ (its $z_e$ is stopped).</li>
+<li>Commitment term sends gradient only to $z_e$, hence into $E$ (its $e_k$ is stopped).</li>
+<li>Update $E$, $D$, and the codebook by the optimizer; or, with the EMA variant, drop the codebook term and update $\{e_k\}$ by the moving averages of the EMA scheme below.</li>
+</ol>
+</div>
+
+<pre><code class="language-python"># The quantizer with the straight-through estimator and both loss terms,
+# written to match the three-term objective term by term.
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class STQuantizer(nn.Module):
+    def __init__(self, num_codes=512, dim=64, beta=0.25):
+        super().__init__()
+        self.codebook = nn.Embedding(num_codes, dim)
+        self.codebook.weight.data.uniform_(-1 / num_codes, 1 / num_codes)
+        self.beta = beta
+
+    def forward(self, z_e):                          # z_e: (B, dim, H, W)
+        B, D, H, W = z_e.shape
+        flat = z_e.permute(0, 2, 3, 1).reshape(-1, D)
+        dist = (flat.pow(2).sum(1, keepdim=True)
+                - 2 * flat @ self.codebook.weight.t()
+                + self.codebook.weight.pow(2).sum(1))
+        idx = dist.argmin(1)                          # k = argmin_j ||z_e - e_j||
+        z_q = self.codebook(idx).view(B, H, W, D).permute(0, 3, 1, 2)
+        codebook_loss = F.mse_loss(z_q, z_e.detach())          # ||sg[z_e] - e||^2
+        commit_loss   = F.mse_loss(z_e, z_q.detach())          # ||z_e - sg[e]||^2
+        loss = codebook_loss + self.beta * commit_loss
+        z_q = z_e + (z_q - z_e).detach()             # straight-through estimator
+        return z_q, loss, idx.view(B, H, W)</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The quantizer written to mirror the three-term loss exactly. <code>codebook_loss</code> implements $\lVert \text{sg}[z_e] - e \rVert^2$ via <code>z_e.detach()</code>, <code>commit_loss</code> implements $\lVert z_e - \text{sg}[e] \rVert^2$ via <code>z_q.detach()</code>, and the final line is the straight-through wire that routes the reconstruction gradient past the non-differentiable <code>argmin</code> into the encoder.</div>
+
+<h3>The EMA codebook update</h3>
+
+<p>
+The appendix of the original paper offers an alternative to the codebook loss term that often trains more stably. Instead of moving each code toward the encoder outputs by gradient descent on $\lVert \text{sg}[z_e] - e \rVert^2$, set each code to the running average of the encoder vectors assigned to it. Maintain, per code $k$, a count $N_k$ and an accumulated sum $m_k$, updated each batch with an exponential moving average of decay $\gamma$,
+</p>
+
+<div class="math-block">
+$$N_k \leftarrow \gamma N_k + (1-\gamma)\, n_k, \qquad m_k \leftarrow \gamma m_k + (1-\gamma)\!\!\sum_{i:\, z_e(x_i)\to k}\!\! z_e(x_i), \qquad e_k = \frac{m_k}{N_k},$$
+</div>
+
+<p>
+where $n_k$ is the number of encoder vectors assigned to code $k$ in the current batch and the sum runs over exactly those vectors. The code $e_k$ is then the count-normalized running mean of everything that has ever quantized to it, decayed so that recent batches matter more; the paper uses $\gamma \approx 0.99$. This is just an online k-means update on the codebook, which is why it tends to be smoother than the gradient version: it replaces the codebook loss term entirely. The commitment term stays exactly as before, still trained by gradient, because the encoder still needs to be pulled toward its codes; only the codebook's own learning signal changes. Production libraries default to this EMA scheme together with dead-code reinitialization, which is the combination that most reliably avoids codebook collapse.
+</p>
+
+<div class="callout note">
+<div class="callout-title">Where these tokens go next</div>
+<p>The discrete latents trained here are not the end of the story; they are an alphabet that the rest of Part IV writes in. The same VQ tokenizer becomes the front end of latent diffusion (<a href="../module-33-diffusion-models/index.html">Chapter 33</a>), the vocabulary of autoregressive image models, and the discrete world-state codes of world models (<a href="../module-36-video-3d-world-generation/index.html">Chapter 36</a>). In every case the recipe is the two-stage one of subsection 4: freeze this tokenizer, then train a powerful sequence or diffusion model over its token grids. The straight-through estimator and commitment loss derived above are the conceptual core that all of those downstream systems inherit.</p>
+</div>
+
+<h2>4. Learning a Prior Over Tokens <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
 <p>
 A trained VQ-VAE is only an autoencoder; it cannot generate yet, because nothing tells you which token grids are plausible. The second stage fixes this by training a generative model over the token grids the encoder produces on the training set. Originally this was a PixelCNN-style autoregressive model predicting each token from those above and to the left; modern systems use a transformer, predicting tokens in raster order (autoregressive) or filling masked tokens (masked, BERT-style). To sample a new image you generate a fresh token grid from this prior, look up each token in the codebook to get the quantized grid, and decode. The two-stage structure, learn a tokenizer, then learn a prior over tokens, is the template for an enormous family of generative models. The next block shows the sampling procedure.
@@ -218,9 +321,9 @@ def sample_image(prior, vqvae, grid_hw=(8, 8), start_token=0):
     return vqvae.decoder(quantized)              # decode the token grid to an image
 # The transformer prior does the generating; the VQ-VAE decoder only renders.
 # This is the same recipe behind token-based text-to-image models.</code></pre>
-<div class="code-caption"><strong>Code Fragment 2:</strong> Two-stage generation with a VQ-VAE. The <code>sample_image</code> function lets a transformer prior generate the token grid one index at a time, then looks each index up in the codebook and decodes the quantized grid into an image. The tokenizer and the prior are trained separately, the template for autoregressive image generation.</div>
+<div class="code-caption"><strong>Code Fragment 3:</strong> Two-stage generation with a VQ-VAE. The <code>sample_image</code> function lets a transformer prior generate the token grid one index at a time, then looks each index up in the codebook and decodes the quantized grid into an image. The tokenizer and the prior are trained separately, the template for autoregressive image generation.</div>
 
-<h2>4. VQ-VAE-2, VQGAN, and the Road to Diffusion <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+<h2>5. VQ-VAE-2, VQGAN, and the Road to Diffusion <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
 
 <p>
 Two refinements turned the VQ-VAE from a clever idea into production infrastructure. VQ-VAE-2 (2019) stacked the codebooks into a hierarchy, a top codebook for global structure and a bottom codebook for detail, the discrete cousin of the hierarchical VAE in <a href="section-31.5.html">Section 31.5</a>, and paired it with a powerful autoregressive prior to produce sharp, large, diverse images, proving discrete latents scale. VQGAN (2021) made the autoencoder itself much better by adding a <a href="../../part-3-deep-learning-for-vision/module-25-self-supervised-foundation-models/index.html">perceptual loss</a> and an adversarial discriminator (the <a href="../module-32-gans/index.html">GAN</a> idea of <a href="../module-32-gans/index.html">Chapter 32</a>, used here only to sharpen the decoder) so that a small token grid could be decoded into a crisp high-resolution image. That compact, crisp tokenizer is exactly what made transformer-based image generation efficient, since the transformer only has to model a short sequence.
@@ -258,6 +361,16 @@ The line from here to the rest of Part IV is direct. VQGAN's autoencoder is the 
 <div class="callout exercise">
 <div class="callout-title">Exercise 31.6.3: Continuous vs Discrete Latent Trade-offs <span class="exercise-type analysis">Analysis</span></div>
 <p>Write a one-page comparison of the continuous VAE latent of <a href="section-31.3.html">Section 31.3</a> against the discrete VQ-VAE latent of this section, organized around four axes: (1) how you generate (sample a Gaussian and decode, versus learn and sample a prior over tokens), (2) interpolation behavior (smooth versus discrete jumps), (3) what generative model the latent invites (custom continuous model versus borrowed sequence transformer), and (4) the failure modes (posterior collapse versus codebook collapse). Conclude with a recommendation: for a system that wants to reuse a powerful pretrained sequence model and one that wants smooth latent-space editing, which latent would you choose and why? Connect your answer to the continuous-versus-discrete choice that <a href="../module-33-diffusion-models/index.html">Chapter 33</a>'s latent diffusion faces.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.6.4: Why Both the Codebook and Commitment Terms Are Needed <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The two squared-distance terms in the VQ-VAE loss are the same distance $\lVert z_e(x) - e \rVert^2$ with the stop-gradient on opposite arguments. Explain, in four or five sentences, why training needs <em>both</em> rather than either alone. Specifically: (a) suppose you keep only the codebook term $\lVert \text{sg}[z_e] - e \rVert^2$; describe what the encoder is now free to do and why that makes the straight-through gradient unreliable. (b) Suppose instead you keep only the commitment term $\beta \lVert z_e - \text{sg}[e] \rVert^2$; describe what happens to the codebook entries and why reconstruction suffers. Conclude by stating, in terms of which partner each term moves, why splitting one distance into two one-directional pulls (codebook moves $e$ toward $z_e$; commitment moves $z_e$ toward $e$) is exactly what lets the encoder and codebook converge to a consistent quantization.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 31.6.5: Implement EMA Codebook Updates and Compare <span class="exercise-type coding">Coding</span></div>
+<p>Starting from the <code>STQuantizer</code> of subsection 3, build an EMA variant. Register non-trainable buffers <code>cluster_size</code> ($N_k$) and <code>ema_w</code> ($m_k$) of the codebook shape, and on each forward pass (under <code>torch.no_grad()</code>) update them with decay $\gamma = 0.99$ using $N_k \leftarrow \gamma N_k + (1-\gamma)\,n_k$ and $m_k \leftarrow \gamma m_k + (1-\gamma)\sum_{i:\,z_e(x_i)\to k} z_e(x_i)$, then set $e_k = m_k / N_k$ (add a small epsilon to $N_k$ to avoid division by zero). Drop the codebook loss term from the objective but keep the commitment term trained by gradient. Train this EMA version and the loss-based version of Exercise 31.6.2 on the same dataset with the same seed, and compare on three axes: final reconstruction error, codebook utilization (how many of the entries stay alive), and training stability across the first few epochs. State which variant collapses less and explain why the running-mean update is effectively an online k-means step on the codebook.</p>
 </div>
 
 <p>The chapter has now built three latents from the same skeleton: the plain code of <a href="section-31.1.html">Section 31.1</a>, the samplable Gaussian code of <a href="section-31.3.html">Section 31.3</a>, and the discrete codebook of this section. The Hands-On Lab below pulls all three into one runnable experiment so you can see, in a single figure, exactly how the constraint decides what the code becomes.</p>
@@ -635,6 +748,15 @@ print("saved latent_showdown.png")</code></pre>
 </details>
 </div>
 
+<h2>6. Further Reading <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<div class="bib-entry-card">
+<div class="bib-entry-title">Neural Discrete Representation Learning</div>
+<div class="bib-entry-authors">A. van den Oord, O. Vinyals, K. Kavukcuoglu</div>
+<div class="bib-entry-venue">Advances in Neural Information Processing Systems (NeurIPS), 2017. arXiv:1711.00937. <a href="https://arxiv.org/abs/1711.00937" target="_blank" rel="noopener">arXiv:1711.00937</a></div>
+<p class="bib-entry-note">The paper that introduced the VQ-VAE. It defines the nearest-neighbor quantization $z_q(x) = e_k$, the three-term objective $\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \lVert \text{sg}[z_e] - e \rVert_2^2 + \beta \lVert z_e - \text{sg}[e] \rVert_2^2$, the straight-through estimator that copies the decoder gradient past the $\arg\min$ into the encoder, and the commitment weight $\beta = 0.25$ (robust over roughly $[0.1, 2.0]$). Its appendix gives the EMA codebook update, $N_k \leftarrow \gamma N_k + (1-\gamma) n_k$, $m_k \leftarrow \gamma m_k + (1-\gamma)\sum z_e$, $e_k = m_k / N_k$ with $\gamma \approx 0.99$, the alternative to the codebook loss term used in subsection 3 and by most production libraries.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-31.5.html">&#8592; Section 31.5: Hierarchical VAEs: From Ladder Networks to NVAE</a>
 <a href="index.html">Chapter 31</a>
@@ -642,7 +764,7 @@ print("saved latent_showdown.png")</code></pre>
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

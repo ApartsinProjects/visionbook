@@ -175,6 +175,154 @@ Better solvers reduce steps without retraining, but they hit a floor around 10 t
 <p>The race to few-step generation defined diffusion engineering from 2023 to 2025. Latent Consistency Models (LCM; Luo et al., 2023) brought consistency distillation to Stable Diffusion latents for four-step generation. Adversarial distillation, SDXL-Turbo and SD3-Turbo (Sauer et al., 2023 to 2024), added a GAN-style discriminator from <a href="../module-32-gans/index.html">Chapter 32</a> to the distillation loss, reaching convincing single-step samples. Distribution-matching distillation (DMD, 2024, arXiv:2311.18828, and DMD2, arXiv:2405.14867) matched the student's output distribution to the teacher's score and closed much of the remaining quality gap to multi-step sampling. By 2025 to 2026 the practical state of the art was that a well-distilled model gives roughly 90 percent or more of multi-step quality in one to four steps, which is why real-time, type-and-see image and video tools became feasible, and why few-step diffusion is increasingly a candidate for the <a href="../../part-3-deep-learning-for-vision/module-28-efficient-vision-deployment/index.html">on-device and edge deployment of Chapter 28</a> rather than a server-only workload. The newest open-weight families ship a few-step distilled variant alongside the full model (for example Stable Diffusion 3.5 Large Turbo, a four-step distilled model) so the speed tier is a first-class deliverable, not an afterthought. The open question is whether one-step models can fully match the best multi-step quality or whether a small residual gap is inherent.</p>
 </div>
 
+<h2>4. The EDM Design Space: One Framework for All the Knobs <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The solvers above all assume the noise schedule, the network parameterization, and the loss weighting are fixed; they only change how you walk the trajectory. But these design choices interact, and a sampler tuned for one parameterization can be mediocre for another. The practical pain is concrete: a team porting a VP-trained checkpoint to a VE schedule, or swapping $\epsilon$-prediction for $x_0$-prediction, often finds the carefully tuned step count no longer produces clean samples, and there is no principled way to know which knob to turn. Karras et al. (2022), in "Elucidating the Design Space of Diffusion-Based Generative Models," untangle these coupled choices into independent, separately tunable components. The reframing is so clean that the resulting recipe, known as <strong>EDM</strong>, became a default starting point for new diffusion models.
+</p>
+
+<p>
+The first simplification is to treat the noise level $\sigma$ itself as time. EDM uses a variance-exploding forward process in which a clean sample is simply corrupted by additive Gaussian noise of standard deviation $\sigma$:
+</p>
+
+<div class="math-block">
+$$x = x_0 + \sigma\,\epsilon, \qquad \epsilon \sim \mathcal{N}(0, I).$$
+</div>
+
+<p>
+There is no shrinking $\sqrt{\bar\alpha_t}$ factor on the signal here, which is what makes the algebra below so much simpler than the VP bookkeeping of <a href="section-33.2.html">Section 33.2</a>. The marginal at noise level $\sigma$ is the data distribution blurred by a Gaussian of width $\sigma$, written $p(x; \sigma)$. The probability-flow ODE that transports samples from high noise to low noise is
+</p>
+
+<div class="math-block">
+$$dx = -\dot\sigma(t)\,\sigma(t)\,\nabla_x \log p(x; \sigma(t))\,dt,$$
+</div>
+
+<p>
+where $\nabla_x \log p(x; \sigma)$ is the score (the gradient of the log-density at noise level $\sigma$) and $\dot\sigma(t)$ is the time-derivative of the noise schedule. EDM then makes the cleanest possible choice of schedule, $\sigma(t) = t$, so that noise level and time are literally the same variable and $\dot\sigma = 1$. The ODE collapses to $dx = -\sigma\,\nabla_x \log p(x;\sigma)\,dt$, and because the score relates to a denoiser by $\nabla_x \log p(x;\sigma) = (D_\theta(x;\sigma) - x)/\sigma^2$, the drift is just $(x - D_\theta(x;\sigma))/\sigma$. That single quantity, the normalized difference between the current point and the denoised estimate, is the slope the sampler follows; everything in the Heun algorithm below is built from it.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Separate the Network from the Scaling</div>
+<p>
+The conceptual core of EDM is to stop asking the neural network to predict noise or clean images directly at every noise level, and instead wrap it in noise-level-dependent scaling so that the network always sees a well-conditioned, unit-variance input and produces a well-conditioned target. The network $F_\theta$ does the learning; a set of closed-form coefficients $c_{\text{skip}}, c_{\text{out}}, c_{\text{in}}, c_{\text{noise}}$ do the bookkeeping. Because the coefficients are derived from first principles (the requirement that inputs and training targets have unit variance) rather than chosen by trial, the same network behaves consistently from $\sigma_{\min} \approx 0.002$ to $\sigma_{\max} \approx 80$, a range spanning more than four orders of magnitude.
+</p>
+</div>
+
+<p>
+Concretely, EDM never uses the raw network output as the denoiser. It defines a <em>preconditioned denoiser</em> that combines a skip connection from the noisy input with a scaled network evaluation:
+</p>
+
+<div class="math-block">
+$$D_\theta(x; \sigma) = c_{\text{skip}}(\sigma)\,x + c_{\text{out}}(\sigma)\,F_\theta\big(c_{\text{in}}(\sigma)\,x;\ c_{\text{noise}}(\sigma)\big).$$
+</div>
+
+<p>
+Read this left to right. The term $c_{\text{skip}}(\sigma)\,x$ passes the noisy input through directly, so at low noise the denoiser can be nearly the identity (the input is already almost clean) and the network only has to predict a small correction. The term $c_{\text{in}}(\sigma)\,x$ rescales the input so the network always sees unit variance regardless of $\sigma$. The factor $c_{\text{out}}(\sigma)$ rescales the network's output to the magnitude actually needed, and $c_{\text{noise}}(\sigma)$ maps the noise level to a conditioning input that varies gently rather than over four orders of magnitude. The four coefficients have closed forms,
+</p>
+
+<div class="math-block">
+$$c_{\text{in}}(\sigma) = \frac{1}{\sqrt{\sigma^2 + \sigma_{\text{data}}^2}}, \quad
+c_{\text{skip}}(\sigma) = \frac{\sigma_{\text{data}}^2}{\sigma^2 + \sigma_{\text{data}}^2}, \quad
+c_{\text{out}}(\sigma) = \frac{\sigma\,\sigma_{\text{data}}}{\sqrt{\sigma^2 + \sigma_{\text{data}}^2}}, \quad
+c_{\text{noise}}(\sigma) = \tfrac{1}{4}\ln\sigma,$$
+</div>
+
+<p>
+where $\sigma_{\text{data}}$ is the standard deviation of the data (EDM uses $\sigma_{\text{data}} = 0.5$ for images normalized to roughly unit range). These are not tuned constants; they are the unique choices that make both the network's input and its regression target have unit variance at every $\sigma$, which is exactly the well-conditioning that makes training stable across the whole noise range. Deriving them is the subject of Exercise 33.4.4. Sanity-check the limits: as $\sigma \to 0$, $c_{\text{skip}} \to 1$ and $c_{\text{out}} \to 0$, so the denoiser returns the input essentially unchanged (correct, since a nearly clean image needs no denoising); as $\sigma \to \infty$, $c_{\text{skip}} \to 0$ and the denoiser leans entirely on the network output, since the input is almost pure noise and carries no usable signal.
+</p>
+
+<p>
+The loss weighting and the noise distribution used during training follow the same conditioning logic. The per-sample loss is weighted by
+</p>
+
+<div class="math-block">
+$$\lambda(\sigma) = \frac{1}{c_{\text{out}}(\sigma)^2},$$
+</div>
+
+<p>
+which exactly cancels the $c_{\text{out}}$ scaling so that every noise level contributes a loss of comparable magnitude, and no single $\sigma$ band dominates the gradient. The noise levels seen during training are drawn so that $\ln\sigma$ is Gaussian,
+</p>
+
+<div class="math-block">
+$$\ln\sigma \sim \mathcal{N}(P_{\text{mean}}, P_{\text{std}}^2), \qquad P_{\text{mean}} = -1.2,\quad P_{\text{std}} = 1.2,$$
+</div>
+
+<p>
+which concentrates training on the intermediate noise levels that matter most for sample quality while still covering the tails. Plugging in, $P_{\text{mean}} = -1.2$ places the median noise level at $\sigma = e^{-1.2} \approx 0.30$, comfortably near $\sigma_{\text{data}} = 0.5$ where the denoising problem is hardest and most informative.
+</p>
+
+<h2>5. The EDM Sampling Schedule and Heun's Method <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Choosing how to place the discrete noise levels between $\sigma_{\max}$ and $\sigma_{\min}$ is a sampling decision, fully decoupled from training in the EDM framework. A uniform spacing wastes steps: the trajectory bends most sharply at low noise, so EDM warps the spacing to put more steps there. The schedule for $N$ steps is
+</p>
+
+<div class="math-block">
+$$\sigma_i = \left(\sigma_{\max}^{1/\rho} + \frac{i}{N-1}\left(\sigma_{\min}^{1/\rho} - \sigma_{\max}^{1/\rho}\right)\right)^{\rho}, \qquad i = 0, \dots, N-1,$$
+</div>
+
+<p>
+with $\rho = 7$, $\sigma_{\min} \approx 0.002$, and $\sigma_{\max} \approx 80$, and a final step to $\sigma_N = 0$. The exponent $\rho$ controls the warp: $\rho = 1$ recovers uniform spacing in $\sigma$, and larger $\rho$ packs more levels near $\sigma_{\min}$. The value $\rho = 7$ was found to minimize the discretization error of the sampler across datasets. Linear interpolation happens in $\sigma^{1/\rho}$ space, then the result is raised back to the $\rho$ power, which is why low-noise levels (small $\sigma^{1/\rho}$) end up densely sampled.
+</p>
+
+<p>
+With the schedule fixed, EDM solves the ODE with <strong>Heun's method</strong>, the second-order solver foreshadowed in subsection 2. Heun takes a provisional Euler step, evaluates the slope again at the landing point, then re-steps using the average of the two slopes. This trapezoidal correction halves the per-step error compared to Euler at the cost of one extra network evaluation per step, and it is the dominant reason EDM reaches high quality in roughly 30 to 60 network evaluations where DDIM needs many more.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: EDM Heun (2nd-Order) Deterministic Sampler</div>
+<p><strong>Input:</strong> denoiser $D_\theta$, schedule $\sigma_0 = \sigma_{\max} > \sigma_1 > \dots > \sigma_{N-1} > \sigma_N = 0$.</p>
+<p><strong>1.</strong> Sample initial point $x_0 \sim \mathcal{N}(0,\ \sigma_0^2 I)$.</p>
+<p><strong>2.</strong> For $i = 0, \dots, N-1$:</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;<strong>(a)</strong> Evaluate the slope: $d_i = \dfrac{x_i - D_\theta(x_i; \sigma_i)}{\sigma_i}$.</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;<strong>(b)</strong> Euler step: $x_{i+1} = x_i + (\sigma_{i+1} - \sigma_i)\,d_i$.</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;<strong>(c)</strong> If $\sigma_{i+1} \ne 0$, apply the second-order correction:</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$d_i' = \dfrac{x_{i+1} - D_\theta(x_{i+1}; \sigma_{i+1})}{\sigma_{i+1}}$, then $x_{i+1} = x_i + (\sigma_{i+1} - \sigma_i)\,\tfrac{1}{2}(d_i + d_i')$.</p>
+<p><strong>Output:</strong> $x_N$, the generated sample at $\sigma = 0$.</p>
+</div>
+
+<p>
+The conditional in step (c) matters: at the last step the target noise level is exactly zero, so $d_i'$ would divide by $\sigma_{i+1} = 0$. EDM therefore skips the correction on that final Euler step and lands directly on the clean manifold. Heun's method is purely deterministic here, but EDM also offers an optional <em>stochastic churn</em>: at each step you may add a small amount of fresh noise to nudge $\sigma$ slightly upward before the deterministic step, which can correct accumulated error and improve sample quality for some models, at the cost of reintroducing the randomness that pure ODE sampling removed. Churn is a tunable extra, off by default; the deterministic Heun sampler is the workhorse.
+</p>
+
+<p>
+The code below implements the EDM preconditioning and a single Heun step from scratch, so the closed-form coefficients and the two-slope correction are visible side by side rather than hidden inside a scheduler.
+</p>
+
+<pre><code class="language-python"># EDM preconditioning (Karras et al. 2022) and one deterministic Heun step.
+import torch
+
+SIGMA_DATA = 0.5
+
+def edm_denoise(net, x, sigma):
+    """Preconditioned denoiser D(x; sigma) wrapping a raw network F_theta."""
+    s = sigma.view(-1, 1, 1, 1)                          # broadcast over images
+    c_in   = 1.0 / (s**2 + SIGMA_DATA**2).sqrt()
+    c_skip = SIGMA_DATA**2 / (s**2 + SIGMA_DATA**2)
+    c_out  = s * SIGMA_DATA / (s**2 + SIGMA_DATA**2).sqrt()
+    c_noise = 0.25 * sigma.log()                         # gentle conditioning input
+    F = net(c_in * x, c_noise)                           # the only network call
+    return c_skip * x + c_out * F                        # D(x; sigma)
+
+@torch.no_grad()
+def heun_step(net, x, sigma_cur, sigma_next):
+    """One 2nd-order Heun step from sigma_cur down to sigma_next."""
+    d = (x - edm_denoise(net, x, sigma_cur)) / sigma_cur          # slope at start
+    x_euler = x + (sigma_next - sigma_cur) * d                    # provisional Euler
+    if sigma_next == 0:                                           # final step: no correction
+        return x_euler
+    d_next = (x_euler - edm_denoise(net, x_euler, sigma_next)) / sigma_next
+    return x + (sigma_next - sigma_cur) * 0.5 * (d + d_next)      # averaged slope
+</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> EDM preconditioning and one Heun step. The <code>edm_denoise</code> function applies the four closed-form coefficients so the raw network <code>net</code> always sees a unit-variance input, and <code>heun_step</code> evaluates the slope twice (once at the start, once at the provisional Euler landing point) and steps with their average, skipping the correction only on the final step into $\sigma = 0$.</div>
+
+<div class="callout note">
+<div class="callout-title">Note: How the EDM Knobs Map to Earlier Sections</div>
+<p>
+EDM does not contradict the DDPM and DDIM formulations of Sections 33.1 to 33.3; it re-expresses them. The preconditioning coefficients reduce, for particular choices, to the familiar $\epsilon$-prediction and VP schedules, so an EDM denoiser can be converted to the $\epsilon_\theta$ form the <code>diffusers</code> schedulers expect. The payoff of the reframing is that each design choice (the schedule $\sigma_i$, the parameterization via the $c$-coefficients, the loss weighting $\lambda$, the sampler) is now an independent dial you can tune in isolation rather than a tangled bundle, which is exactly why EDM became a strong default baseline for training new diffusion models from scratch.
+</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 33.4.1: Why DDIM Can Skip Steps <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Explain in a short paragraph why the deterministic DDIM update can take a large jump from step $t$ to a much smaller step $t'$ with little error, while the stochastic ancestral update of <a href="section-33.1.html">Section 33.1</a> cannot. Reference the smoothness of the probability-flow ODE from <a href="section-33.3.html">Section 33.3</a> and the role of the injected noise term. Then state what quantity a higher-order solver estimates that Euler/DDIM ignores.</p>
@@ -190,6 +338,23 @@ Better solvers reduce steps without retraining, but they hit a floor around 10 t
 <p>Compare the three speedup strategies of this section along several axes: extra training cost, achievable minimum steps, and whether the original checkpoint is reusable. Summarize in a small table (DDIM, DPM-Solver, progressive/consistency distillation) and write one paragraph advising a team that needs sub-second generation but cannot afford a long distillation run. Connect your recommendation to the two-tier deployment in the practical example, and to the consistency models you will study in <a href="section-33.5.html">Section 33.5</a>.</p>
 </div>
 
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.4.4: Derive the EDM Coefficients <span class="exercise-type conceptual">Conceptual</span></div>
+<p>The EDM coefficients are not tuned; they follow from a unit-variance requirement. Assume the clean data has variance $\sigma_{\text{data}}^2$ and the added noise has variance $\sigma^2$, independent of the data, so the noisy input $x = x_0 + \sigma\epsilon$ has variance $\sigma^2 + \sigma_{\text{data}}^2$. (a) Derive $c_{\text{in}}(\sigma) = 1/\sqrt{\sigma^2 + \sigma_{\text{data}}^2}$ from the requirement that the network input $c_{\text{in}}(\sigma)\,x$ has unit variance. (b) The network is asked to predict the target $\big(x_0 - c_{\text{skip}}(\sigma)\,x\big)/c_{\text{out}}(\sigma)$. Require this target to have unit variance and require $c_{\text{skip}}$ to be chosen so that the coefficient of the noise $\epsilon$ in the effective error is minimized; show that these two conditions yield $c_{\text{skip}}(\sigma) = \sigma_{\text{data}}^2/(\sigma^2 + \sigma_{\text{data}}^2)$ and $c_{\text{out}}(\sigma) = \sigma\,\sigma_{\text{data}}/\sqrt{\sigma^2 + \sigma_{\text{data}}^2}$. (c) Verify the $\sigma \to 0$ and $\sigma \to \infty$ limits and explain in one sentence each why they are the behavior you want.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.4.5: Euler vs Heun per Function Evaluation <span class="exercise-type coding">Coding</span></div>
+<p>Using the <code>edm_denoise</code> and <code>heun_step</code> code of subsection 5 (or the EDM reference implementation), build two samplers from the same trained checkpoint: a plain Euler sampler (drop the correction in step (c)) and the full Heun sampler. Generate samples at matched <em>numbers of function evaluations</em> (NFE), recalling that one Heun step costs two network calls and one Euler step costs one, so an $N$-step Heun run and a $2N$-step Euler run use the same NFE. Sweep NFE over roughly 10, 20, 40, and 80, compute FID against a reference set at each point, and plot FID versus NFE for both samplers on one axis. Confirm that Heun reaches a given FID at fewer function evaluations, and identify the NFE region where the second-order solver's advantage is largest.</p>
+</div>
+
+<div class="bib-entry-card">
+<div class="bib-entry-title">Elucidating the Design Space of Diffusion-Based Generative Models</div>
+<div class="bib-entry-authors">T. Karras, M. Aittala, T. Aila, S. Laine</div>
+<div class="bib-entry-venue">Advances in Neural Information Processing Systems (NeurIPS) 35, 2022. arXiv:2206.00364.</div>
+<p class="bib-entry-note">Disentangles the noise schedule, network preconditioning, loss weighting, and sampler into independently tunable components, introduces the $c_{\text{skip}}/c_{\text{out}}/c_{\text{in}}/c_{\text{noise}}$ denoiser, the $\rho = 7$ noise schedule, and the second-order Heun sampler. The EDM recipe is a common default starting point for training new diffusion models.</p>
+</div>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-33.3.html">&#8592; Section 33.3: The Score-Based View</a>
 <a href="index.html">Chapter 33</a>
@@ -197,7 +362,7 @@ Better solvers reduce steps without retraining, but they hit a floor around 10 t
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

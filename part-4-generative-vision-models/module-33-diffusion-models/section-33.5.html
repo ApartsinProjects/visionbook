@@ -177,6 +177,197 @@ Flow matching and rectified flow make the path straight; consistency models atta
 <p>Between 2023 and 2026, flow matching went from an alternative formulation to the default training recipe for frontier generators. Stable Diffusion 3 (Esser et al., 2024, arXiv:2403.03206) is a rectified-flow transformer, as are its Stable Diffusion 3.5 successors (October 2024, on the multimodal MMDiT backbone); the FLUX family from Black Forest Labs is flow-matching-based and set open-weight quality records, and its FLUX.2 release (November 2025) scaled the recipe to a roughly 32-billion-parameter flow-matching transformer. Meta's Movie Gen and several 2024 to 2026 <a href="../module-36-video-3d-world-generation/index.html">video models (Chapter 36)</a> use flow matching for its few-step sampling and clean scaling. On the consistency side, the improved consistency-training recipes of Song and Dhariwal (2024, arXiv:2310.14189) and consistency trajectory models narrowed the one-step quality gap, and latent consistency adapters made any Stable Diffusion checkpoint four-step-capable with a small <a href="../../part-3-deep-learning-for-vision/module-21-training-recipes/section-21.3.html">LoRA</a> (the low-rank adapter from Chapter 21 that fine-tunes a frozen network by adding a few trainable low-rank weight matrices). The newest unification, flow maps, learns a map between any two noise levels in one network call and so generalizes both flow matching and consistency models while staying effective across all step counts; the Align Your Flow work (Sabour, Fidler, and Kreis, 2025, arXiv:2506.14603) is the clearest statement of that direction. The throughline is that the straight-path and direct-endpoint ideas of this section are now the engine of real-time generation; if you build a new generator today, flow matching is the recipe you reach for first.</p>
 </div>
 
+<h2>4. The Continuity Equation and Why Conditional Flow Matching Works <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 1 asserted that regressing on the easy conditional velocity also learns the correct marginal field. That claim is the engine of the whole method, and it deserves a proof rather than a promise. The starting point is the object we actually want. We want a velocity field $v_t(x)$ whose flow carries the noise distribution at $t=0$ into the data distribution at $t=1$. "Carries one distribution into another" has a precise meaning: as we push the points of a density along the field, the density must evolve consistently, with no probability mass created or destroyed. That conservation law is the <strong>continuity equation</strong>,
+</p>
+
+<div class="math-block">
+$$\partial_t p_t(x) + \nabla \cdot \big(p_t(x)\, v_t(x)\big) = 0,$$
+</div>
+
+<p>
+read as: the rate at which density piles up at a point ($\partial_t p_t$) equals the net inflow of the probability current $p_t v_t$ (the negative divergence). A field $v_t$ is said to <em>generate</em> the path $p_t$ exactly when this equation holds. The flow itself is the trajectory of an individual particle under that field, the ODE
+</p>
+
+<div class="math-block">
+$$\frac{d}{dt}\phi_t(x) = v_t\big(\phi_t(x)\big), \qquad \phi_0(x) = x,$$
+</div>
+
+<p>
+so $\phi_t$ is the map that slides each starting point along the velocity field up to time $t$, and the marginal $p_t$ is the law of $\phi_t(x_0)$ when $x_0$ is drawn from the prior. If we knew the true generating field $u_t$, the obvious objective would be the <strong>marginal flow matching loss</strong>
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{FM}}(\theta) = \mathbb{E}_{t \sim U[0,1],\; x \sim p_t}\big\| v_\theta(x, t) - u_t(x) \big\|^2.$$
+</div>
+
+<p>
+This is intractable: we have no closed form for the marginal target $u_t(x)$, because $p_t$ is a mixture over every possible data point and computing $u_t$ at a single $x$ would require integrating against the whole data distribution. The Lipman et al. (2023) construction sidesteps the marginal entirely. Build the marginal path as a mixture of simple <em>conditional</em> paths, one per data point $x_1$:
+</p>
+
+<div class="math-block">
+$$p_t(x) = \int p_t(x \mid x_1)\, q(x_1)\, dx_1,$$
+</div>
+
+<p>
+where each conditional path $p_t(\cdot \mid x_1)$ is something we design to be trivial, a Gaussian that starts as the prior at $t=0$ and concentrates on $x_1$ at $t=1$, with a known conditional velocity $u_t(x \mid x_1)$ that generates it. The key lemma is that the marginal field generating $p_t$ is the conditional-velocity average weighted by the posterior over which data point produced $x$:
+</p>
+
+<div class="math-block">
+$$u_t(x) = \mathbb{E}_{x_1 \sim p(x_1 \mid x,\, t)}\big[\, u_t(x \mid x_1)\,\big] = \int u_t(x \mid x_1)\, \frac{p_t(x \mid x_1)\, q(x_1)}{p_t(x)}\, dx_1.$$
+</div>
+
+<p>
+This is verified by substituting the mixture into the continuity equation: the marginal current $p_t(x) u_t(x)$ equals $\int p_t(x\mid x_1) u_t(x\mid x_1)\, q(x_1)\, dx_1$, the mixture of conditional currents, and since each conditional pair $(p_t(\cdot\mid x_1), u_t(\cdot\mid x_1))$ satisfies its own continuity equation, the integral satisfies the marginal one by linearity. So $u_t$ is a conditional expectation of $u_t(x\mid x_1)$ over the posterior.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Conditional Expectation Makes the Gradients Identical</div>
+<p>
+The reason the tractable loss can stand in for the intractable one is a single fact about least squares: the function that minimizes $\mathbb{E}\,\|v_\theta(x,t) - Y\|^2$ over a random target $Y$ is the conditional mean $\mathbb{E}[Y \mid x, t]$. In the marginal loss the target is $u_t(x)$; in the <strong>conditional flow matching</strong> loss
+</p>
+<div class="math-block">
+$$\mathcal{L}_{\text{CFM}}(\theta) = \mathbb{E}_{t \sim U[0,1],\; x_1 \sim q,\; x \sim p_t(\cdot \mid x_1)}\big\| v_\theta(x, t) - u_t(x \mid x_1) \big\|^2$$
+</div>
+<p>
+the target is the random $u_t(x \mid x_1)$. But by the lemma above, $\mathbb{E}[u_t(x \mid x_1) \mid x, t] = u_t(x)$, so both losses have the <em>same</em> minimizer and, expanding the squares, differ only by a term $\mathbb{E}\|u_t(x\mid x_1)\|^2 - \mathbb{E}\|u_t(x)\|^2$ that does not contain $\theta$. A constant in $\theta$ has zero gradient, hence $\nabla_\theta \mathcal{L}_{\text{CFM}} = \nabla_\theta \mathcal{L}_{\text{FM}}$ exactly. You never have to evaluate the intractable marginal target; regressing on the easy per-sample target descends the loss you actually care about. This is the same conditional-expectation trick that lets denoising score matching of <a href="../module-30-generative-foundations/index.html">Chapter 30</a> regress on a per-sample noise direction yet recover the marginal score.</p>
+</div>
+
+<h2>5. Gaussian Conditional Paths and the OT Target <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The lemma works for any family of conditional paths, so we get to choose the most convenient one. Pick a Gaussian conditional path that interpolates between the prior and a point mass on the data:
+</p>
+
+<div class="math-block">
+$$p_t(x \mid x_1) = \mathcal{N}\big(x \,;\, \mu_t(x_1),\, \sigma_t(x_1)^2 I\big),$$
+</div>
+
+<p>
+with the mean $\mu_t$ and standard deviation $\sigma_t$ chosen so that at $t=0$ the Gaussian is the standard prior and at $t=1$ it concentrates on $x_1$. We need the conditional velocity $u_t(x\mid x_1)$ that generates this Gaussian. A point on the path can be written as the reparameterization $x = \mu_t(x_1) + \sigma_t(x_1)\,\epsilon$ for a fixed standard-normal $\epsilon$; differentiating in time at fixed $\epsilon$ gives the velocity of that particle, $\dot x = \mu_t'(x_1) + \sigma_t'(x_1)\,\epsilon$. Eliminating $\epsilon = (x - \mu_t)/\sigma_t$ yields the closed-form conditional target
+</p>
+
+<div class="math-block">
+$$u_t(x \mid x_1) = \frac{\sigma_t'(x_1)}{\sigma_t(x_1)}\big(x - \mu_t(x_1)\big) + \mu_t'(x_1).$$
+</div>
+
+<p>
+Each term is interpretable: the first scales the offset from the mean by the relative rate at which the Gaussian's width is changing (it contracts the cloud as $\sigma_t$ shrinks), and the second is simply the velocity of the mean itself. This single formula reproduces the targets of several known models depending on the schedule. The choice that yields the straightest individual trajectories, the <strong>optimal-transport (OT) path</strong>, takes the mean and width to be linear in time:
+</p>
+
+<div class="math-block">
+$$\mu_t(x_1) = t\, x_1, \qquad \sigma_t(x_1) = 1 - (1 - \sigma_{\min})\, t.$$
+</div>
+
+<p>
+At $t=0$ this is $\mathcal{N}(0, I)$, the prior, and at $t=1$ it is $\mathcal{N}(x_1, \sigma_{\min}^2 I)$, a tight blob on the data point with a small floor $\sigma_{\min}$ that keeps the density well defined. Substituting $\mu_t' = x_1$ and $\sigma_t' = -(1-\sigma_{\min})$ into the general target gives
+</p>
+
+<div class="math-block">
+$$u_t(x \mid x_1) = \frac{x_1 - (1 - \sigma_{\min})\, x}{1 - (1 - \sigma_{\min})\, t}.$$
+</div>
+
+<p>
+In the limit $\sigma_{\min} \to 0$ this collapses to $u_t(x\mid x_1) = (x_1 - x)/(1 - t)$, and along the path $x = (1-t)x_0 + t x_1$ the numerator $x_1 - x = (1-t)(x_1 - x_0)$ and denominator $1-t$ cancel to leave the constant $x_1 - x_0$. That recovers exactly the straight-line target of subsection 1: the linear interpolation and its constant velocity are the $\sigma_{\min}\to 0$ OT special case of the general Gaussian construction, now derived rather than asserted. The name "optimal transport" is earned because these straight, constant-speed conditional paths are the displacement-optimal interpolation between the two Gaussians under squared-Euclidean cost.
+</p>
+
+<div class="callout note">
+<div class="callout-title">A Numeric Trace of the OT Target</div>
+<p>Take scalars $x_0 = 2$, $x_1 = -1$, and $\sigma_{\min} = 0$, and sample the midpoint $t = 0.5$. The path point is $x = (1-0.5)(2) + 0.5(-1) = 0.5$. The general formula gives $u_t(x\mid x_1) = (x_1 - x)/(1-t) = (-1 - 0.5)/0.5 = -3$, and the constant-velocity form gives $x_1 - x_0 = -1 - 2 = -3$. They agree, as the cancellation above guarantees, and the sign is correct: the particle at $x=0.5$ is moving left toward the data point at $-1$ at speed $3$, which over the remaining half-unit of time covers exactly the remaining distance $3 \times 0.5 = 1.5$ to land on $-1$.</p>
+</div>
+
+<h2>6. Rectified Flow as the Linear Special Case <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Rectified flow (Liu et al., 2022) arrives at the same straight-line objective from a transport-first viewpoint rather than a probability-path one, and the equivalence is worth making explicit. Given any coupling of a noise sample $x_0$ and a data sample $x_1$, define the linear interpolation and regress the network on its (constant) time derivative:
+</p>
+
+<div class="math-block">
+$$x_t = (1 - t)\, x_0 + t\, x_1, \qquad \min_\theta\ \mathbb{E}_{t \sim U[0,1],\,(x_0, x_1)}\big\| (x_1 - x_0) - v_\theta(x_t, t) \big\|^2.$$
+</div>
+
+<p>
+This is identical to the CFM loss with the OT path at $\sigma_{\min}=0$; the constant target $x_1 - x_0$ is the conditional velocity of the straight segment, and the conditional-expectation argument of subsection 4 again guarantees the learned marginal field transports the noise marginal to the data marginal. The distinctive contribution of rectified flow is what it does <em>after</em> this first fit. The marginal field learned from an arbitrary (typically independent) coupling is straight for each pair but curved on average, because a single noise point is regressed toward many different data points and learns their average direction, which bends. <strong>Reflow</strong> repairs this: simulate the trained ODE from many noise samples to obtain the data points it actually produces, forming a new <em>deterministic</em> coupling $(x_0, \Phi(x_0))$, then refit the linear objective on these self-generated pairs. The new coupling never sends two trajectories through the same point in different directions, so its marginal interpolant has lower transport cost and is provably straighter; iterating drives the trajectories toward genuinely straight lines that a single Euler step solves exactly. One reflow round is usually enough to make few-step sampling work, and the procedure is the reason the title of the paper is "Flow Straight and Fast."
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Consistency-Model Sampling (One-Step and Multi-Step)</div>
+<p>
+Given a trained consistency model $f_\theta(x, t)$ with boundary time $\epsilon$, a prior scale $T$, and (for multi-step) a decreasing sequence of times $T = \tau_1 > \tau_2 > \cdots > \tau_{K-1} > \epsilon$:
+</p>
+<ol>
+<li><strong>One-step.</strong> Draw $\hat x_T \sim \mathcal{N}(0, T^2 I)$ from the prior and return $x \leftarrow f_\theta(\hat x_T, T)$. A single network call maps the noise straight to the trajectory endpoint.</li>
+<li><strong>Multi-step (alternate denoise and re-noise).</strong> Draw $\hat x_T \sim \mathcal{N}(0, T^2 I)$ and set $x \leftarrow f_\theta(\hat x_T, T)$.</li>
+<li>For $k = 1, 2, \dots, K-1$:
+<ol>
+<li>Re-noise the current estimate back onto the path at level $\tau_k$: draw $z \sim \mathcal{N}(0, I)$ and form $\hat x_{\tau_k} \leftarrow x + \sqrt{\tau_k^2 - \epsilon^2}\; z$.</li>
+<li>Project to the endpoint again: $x \leftarrow f_\theta(\hat x_{\tau_k}, \tau_k)$.</li>
+</ol>
+</li>
+<li>Return $x$. Each extra round trades one network call for refinement; two to four steps typically close most of the quality gap to the teacher while remaining far cheaper than diffusion.</li>
+</ol>
+</div>
+
+<h2>7. Consistency Models: Parameterization and the Distillation Loss <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 3 described self-consistency in words; here is the construction that makes it trainable. A consistency model must satisfy two requirements simultaneously, and naive networks satisfy neither for free. First, the <strong>boundary condition</strong>: at the smallest time $\epsilon$ the map must be the identity, $f_\theta(x, \epsilon) = x$, because a point already at the trajectory's clean end has nothing left to denoise. Second, <strong>self-consistency</strong> across the trajectory, $f_\theta(x_t, t) = f_\theta(x_{t'}, t')$ for any two times on the same probability-flow ODE path of <a href="section-33.3.html">Section 33.3</a>. The boundary condition is enforced by construction through the parameterization
+</p>
+
+<div class="math-block">
+$$f_\theta(x, t) = c_{\text{skip}}(t)\, x + c_{\text{out}}(t)\, F_\theta(x, t), \qquad c_{\text{skip}}(\epsilon) = 1,\ \ c_{\text{out}}(\epsilon) = 0,$$
+</div>
+
+<p>
+where $F_\theta$ is the raw network. The skip coefficient $c_{\text{skip}}$ carries the input straight through and the output coefficient $c_{\text{out}}$ scales the network's correction; at $t=\epsilon$ the constraints force $f_\theta(x,\epsilon) = 1\cdot x + 0\cdot F_\theta = x$ automatically, no matter what $F_\theta$ outputs. Away from the boundary $c_{\text{skip}}$ falls and $c_{\text{out}}$ rises so the network does the work. This is the same skip-plus-output design used by the EDM preconditioning of <a href="section-33.4.html">Section 33.4</a>, reused here to bake in the identity at $\epsilon$ rather than to normalize the loss scale.
+</p>
+
+<p>
+Self-consistency is then trained, not constructed, by a loss that ties the model's outputs at two adjacent points on the <em>same</em> trajectory. Take a fine time grid $\epsilon = t_1 < t_2 < \cdots < t_N = T$. Draw a data point, noise it to level $t_{n+1}$ to get $x_{t_{n+1}}$, and take one ODE solver step backward to the adjacent level $t_n$ using the probability-flow field (the teacher's score in distillation), producing $\hat x_{t_n}$. The <strong>consistency distillation</strong> loss asks the model at $t_{n+1}$ to match a frozen copy of itself at the neighboring $t_n$:
+</p>
+
+<div class="math-block">
+$$\mathcal{L}_{\text{CD}}(\theta) = \mathbb{E}\Big[\, \lambda(t_n)\; d\big(f_\theta(x_{t_{n+1}}, t_{n+1}),\ f_{\theta^-}(\hat x_{t_n}, t_n)\big) \Big],$$
+</div>
+
+<p>
+where $d(\cdot, \cdot)$ is a distance (squared $\ell_2$, $\ell_1$, or LPIPS), $\lambda(t_n)$ is a positive per-step weight, and $\theta^- = \text{stopgrad}\big(\text{EMA}(\theta)\big)$ is a target network that is the exponential moving average of $\theta$ with the gradient detached. Three design choices make this work. The target $\hat x_{t_n}$ is produced by one ODE step from $x_{t_{n+1}}$, so the two arguments lie on a common trajectory and self-consistency is exactly what the loss measures. The stop-gradient prevents the trivial collapse in which the model drives both sides to a constant. The EMA target supplies a slowly moving, stable regression goal, the same stabilization idea as the target networks of value-based reinforcement learning. Because the boundary condition pins $f_\theta(\cdot,\epsilon)$ to the identity and the data point is the true endpoint at $t_1=\epsilon$, the chain of pairwise agreements propagates the correct endpoint all the way up the trajectory: minimizing $\mathcal{L}_{\text{CD}}$ to zero makes $f_\theta(x_t, t)$ return the trajectory's clean endpoint from any $t$, which is precisely the one-step generator. Consistency <em>training</em> replaces the teacher's ODE step with an unbiased single-sample estimate of the score, removing the need for a pretrained model at the cost of a noisier target.
+</p>
+
+<pre><code class="language-python"># Rectified-flow training step and Euler ODE sampling, with the explicit
+# constant target x1 - x0. Convention: t=0 is noise, t=1 is data.
+import torch
+
+def rectified_flow_step(model, x1, opt):
+    """One optimization step of the rectified-flow / CFM-OT objective."""
+    x0 = torch.randn_like(x1)                          # noise endpoint x0 ~ N(0, I)
+    t  = torch.rand(x1.size(0), *[1] * (x1.dim() - 1)) # uniform t in [0, 1)
+    xt = (1 - t) * x0 + t * x1                          # linear interpolation point
+    target = x1 - x0                                    # constant velocity of the segment
+    pred = model(xt, t.view(x1.size(0)))               # network predicts the velocity
+    loss = ((pred - target) ** 2).mean()               # least-squares -> learns marginal field
+    opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+@torch.no_grad()
+def euler_sample(model, shape, steps=4):
+    """Sample by Euler-integrating dx/dt = v_theta(x, t) from t=0 to t=1."""
+    x = torch.randn(shape)                              # start at noise
+    dt = 1.0 / steps
+    for i in range(steps):
+        t = torch.full((shape[0],), i * dt)
+        x = x + model(x, t) * dt                        # straight Euler step
+    return x                                            # lands near the data manifold</code></pre>
+<div class="code-caption"><strong>Code Fragment 2:</strong> The rectified-flow training step and Euler sampler made explicit. <code>rectified_flow_step</code> regresses the network onto the constant velocity $x_1 - x_0$ of the straight interpolation; <code>euler_sample</code> integrates the learned field with as few as four steps. After one reflow round (refitting on self-generated pairs), even <code>steps=1</code> produces usable samples because the trajectory is then nearly straight.</div>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: SD3 and the Logit-Normal Timestep</div>
+<p>
+Stable Diffusion 3 (Esser et al., 2024, arXiv:2403.03206) is the clearest demonstration that flow matching is the dominant 2024-plus recipe. Its latent path is the rectified-flow interpolation $z_t = (1 - t)\, x_0 + t\, \epsilon$ between a data latent $x_0$ and noise $\epsilon$, trained with the constant-velocity objective of subsections 1 and 6. (Note SD3 uses the opposite endpoint convention to this section, with $t=0$ data and $t=1$ noise; only the labels differ.) Two engineering choices made it scale. First, instead of sampling the training time $t$ uniformly, SD3 draws it logit-normally, $t = \text{sigmoid}(u)$ with $u \sim \mathcal{N}(m, s^2)$, which concentrates training on the middle timesteps where the velocity is hardest to predict and the interpolation is most ambiguous, while spending fewer samples on the near-noise and near-data ends that are nearly trivial. Second, the backbone is MM-DiT, a multimodal diffusion transformer that gives text and image tokens <em>separate</em> weight streams and lets them interact only through joint attention, so each modality keeps its own representation while still conditioning on the other. The same flow-matching core powers the FLUX family and the SD3.5 successors, confirming that the straight-path objective developed in this section, not the diffusion variational bound, is the foundation of current frontier image generators.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 33.5.1: Why a Straight Path Needs One Step <span class="exercise-type conceptual">Conceptual</span></div>
 <p>The Euler ODE step is $x_{t+\Delta t} = x_t + v_\theta(x_t, t)\,\Delta t$. Explain in two or three sentences why, if the trajectory from noise to data is exactly a straight line with constant velocity, a single Euler step with $\Delta t = 1$ reaches the endpoint with zero error, whereas a curved trajectory accumulates error. Connect this to the reflow procedure of subsection 2 and to the step-skipping failure of <a href="section-33.4.html">Section 33.4</a>.</p>
@@ -192,6 +383,41 @@ Flow matching and rectified flow make the path straight; consistency models atta
 <p>Consistency models can be obtained by consistency <em>training</em> from scratch or by consistency <em>distillation</em> from a diffusion teacher, and the progressive distillation of <a href="section-33.4.html">Section 33.4</a> is a third route to few-step models. Write a short comparison (one to two paragraphs) of when each is preferable, addressing whether a pretrained teacher exists, total compute, and the quality ceiling. Conclude with which approach you would pick if you already had a strong 50-step latent diffusion model and wanted 4-step generation, and justify the choice.</p>
 </div>
 
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.4: Show the CFM and Marginal-FM Gradients Match <span class="exercise-type conceptual">Conceptual</span></div>
+<p>Let $u_t(x) = \mathbb{E}_{x_1 \sim p(x_1 \mid x, t)}[\, u_t(x \mid x_1)\,]$ be the marginal velocity, as derived in subsection 4. Starting from the conditional flow matching loss $\mathcal{L}_{\text{CFM}} = \mathbb{E}_{t, x_1, x}\| v_\theta(x,t) - u_t(x\mid x_1)\|^2$, expand the square and use the tower property of conditional expectation to show that $\mathcal{L}_{\text{CFM}} = \mathcal{L}_{\text{FM}} + C$, where $\mathcal{L}_{\text{FM}} = \mathbb{E}_{t, x}\| v_\theta(x,t) - u_t(x)\|^2$ and $C = \mathbb{E}\,\|u_t(x\mid x_1)\|^2 - \mathbb{E}\,\|u_t(x)\|^2$ does not depend on $\theta$. Conclude that $\nabla_\theta \mathcal{L}_{\text{CFM}} = \nabla_\theta \mathcal{L}_{\text{FM}}$, and state in one sentence why this is exactly the least-squares "the minimizer is the conditional mean" fact.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.5: The OT Flow-Matching Target as a Diffusion Score <span class="exercise-type analysis">Analysis</span></div>
+<p>For the OT Gaussian path with $\mu_t(x_1) = t x_1$ and $\sigma_t(x_1) = 1 - (1-\sigma_{\min})t$, the conditional density is $p_t(x\mid x_1) = \mathcal{N}(x; \mu_t, \sigma_t^2 I)$. Compute the conditional score $\nabla_x \log p_t(x\mid x_1) = -(x - \mu_t)/\sigma_t^2$ and the conditional velocity $u_t(x\mid x_1) = (\sigma_t'/\sigma_t)(x - \mu_t) + \mu_t'$ from subsection 5. Show algebraically that they are an affine reparameterization of each other, $u_t(x\mid x_1) = a(t)\,\nabla_x \log p_t(x\mid x_1) + b(t)\, x + c_t(x_1)$, and identify $a(t)$, $b(t)$, and $c_t(x_1)$. Explain in two or three sentences why this equivalence means a flow-matching model and a score model are two parameterizations of the same probability-flow ODE field of <a href="section-33.3.html">Section 33.3</a>, so either can be converted to the other after training.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 33.5.6: Train Rectified Flow on 2D Toy Data and Straighten the Trajectories <span class="exercise-type coding">Coding</span></div>
+<p>Sample $x_1$ from a 2D target (two Gaussian blobs or the crescent moons of <a href="section-33.1.html">Section 33.1</a>) and train a small MLP velocity field with the <code>rectified_flow_step</code> of Code Fragment 2. (1) After the first fit, sample 30 noise points and plot their full ODE trajectories from <code>euler_sample</code> with many steps; observe that the paths are visibly curved and some cross. (2) Run one reflow round: generate deterministic $(x_0, \Phi(x_0))$ pairs by simulating the trained model, then refit the same objective on those pairs. (3) Re-plot the trajectories and confirm they are now nearly straight and non-crossing. (4) Compare sample quality at <code>steps = 50, 4, 1</code> before and after reflow, and report how much the 1-step result improves. State the measured straightness gain (for example, mean trajectory length divided by straight-line endpoint distance, which should approach 1 after reflow).</p>
+</div>
+
+<section class="bibliography">
+<h2>Bibliography <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+<div class="bib-entry-card">
+<div class="bib-ref">Lipman, Y., Chen, R. T. Q., Ben-Hamu, H., Nickel, M., Le, M. "Flow Matching for Generative Modeling." ICLR (2023). <a href="https://arxiv.org/abs/2210.02747" target="_blank" rel="noopener">arXiv:2210.02747</a></div>
+<div class="bib-annotation">The source of this section's flow-matching framework. It introduced the continuity-equation view of generation, proved that the tractable conditional flow matching loss shares its gradient with the intractable marginal objective, and singled out the optimal-transport Gaussian path whose straight conditional trajectories give the constant velocity target $x_1 - x_0$.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Liu, X., Gong, C., Liu, Q. "Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow." (2022). <a href="https://arxiv.org/abs/2209.03003" target="_blank" rel="noopener">arXiv:2209.03003</a></div>
+<div class="bib-annotation">Introduced rectified flow: regress a velocity field on the constant interpolation velocity, then apply the reflow procedure that refits on self-generated noise-data pairs to straighten the marginal trajectories toward one-step transport. The transport-first derivation that subsection 6 connects to conditional flow matching.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Song, Y., Dhariwal, P., Chen, M., Sutskever, I. "Consistency Models." ICML (2023). <a href="https://arxiv.org/abs/2303.01469" target="_blank" rel="noopener">arXiv:2303.01469</a></div>
+<div class="bib-annotation">Defined consistency models through the self-consistency property, the skip-plus-output parameterization that bakes in the boundary condition $f_\theta(x,\epsilon)=x$, and the EMA-target consistency distillation loss of subsection 7. Established one-step and multi-step sampling from a probability-flow ODE.</div>
+</div>
+<div class="bib-entry-card">
+<div class="bib-ref">Esser, P., Kulal, S., Blattmann, A., Entezari, R., Müller, J., Saini, H., Levi, Y., Lorenz, D., Sauer, A., Boesel, F., Podell, D., Dockhorn, T., English, Z., Lacey, K., Goodwin, A., Marek, Y., Rombach, R. "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis." ICML (2024). <a href="https://arxiv.org/abs/2403.03206" target="_blank" rel="noopener">arXiv:2403.03206</a></div>
+<div class="bib-annotation">The Stable Diffusion 3 paper. It trains a rectified-flow path $z_t = (1-t)x_0 + t\epsilon$ with logit-normal timestep sampling and the MM-DiT backbone that gives text and image tokens separate streams joined by attention, and is the reference point of subsection 7's research-frontier note that flow matching is the dominant 2024-plus recipe.</div>
+</div>
+</section>
+
 <nav class="chapter-nav">
 <a class="prev" href="section-33.4.html">&#8592; Section 33.4: Fast Sampling</a>
 <a href="index.html">Chapter 33</a>
@@ -199,7 +425,7 @@ Flow matching and rectified flow make the path straight; consistency models atta
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

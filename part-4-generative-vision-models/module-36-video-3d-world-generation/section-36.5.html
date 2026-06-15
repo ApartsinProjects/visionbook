@@ -233,11 +233,266 @@ DreamerV3 (2023) showed one configuration mastering 150-plus tasks, settling the
 </p>
 </div>
 
+<h2>5. The Original World Model: V, M, C <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Before the RSSM unified everything into one trained objective, Ha and Schmidhuber (2018) proposed a deliberately modular agent with three pieces, each trained almost independently, that already contained every idea this section builds on. The decomposition is worth studying precisely because the parts are visible. A <strong>Vision module (V)</strong> is a variational autoencoder that compresses each frame $o_t$ into a low-dimensional latent code $z_t$ (the same VAE you built in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a>). A <strong>Memory module (M)</strong> is a recurrent network that predicts the next latent given the current latent and action. A <strong>Controller (C)</strong> is a tiny linear policy. Compression, prediction, and control are cleanly separated, which makes the agent easy to reason about and, as we will see, easy to train the controller inside the dream.
+</p>
+
+<p>
+The Memory module is the conceptual ancestor of the RSSM transition. The next-frame latent is genuinely uncertain (the same action in the same place can lead to different futures), so M does not predict a single $z_{t+1}$; it predicts a full probability distribution. Ha and Schmidhuber use a <strong>mixture density network</strong> on top of an LSTM, so the next latent is modeled as a mixture of $K$ Gaussians whose mixing weights, means, and variances are all functions of the recurrent hidden state $h_t$:
+</p>
+
+<div class="math-block">$$p(z_{t+1} \mid a_t, z_t, h_t) = \sum_{k=1}^{K} \pi_k(h_t)\, \mathcal{N}\!\big(z_{t+1};\, \mu_k(h_t),\, \sigma_k^2(h_t)\big).$$</div>
+
+<p>
+Each term is one mode of the predicted future. The mixing weights $\pi_k(h_t)$ (a softmax over the $K$ components, so $\sum_k \pi_k = 1$) say how probable each mode is; $\mu_k(h_t)$ is where that mode sits in latent space and $\sigma_k^2(h_t)$ how spread out it is. A single Gaussian would be forced to average over forking futures and would predict the blurry midpoint of two outcomes that never actually occurs; the mixture instead keeps the modes apart. This is the mixture-density-network idea (Bishop, 1994) applied to dynamics, and it is exactly the role the stochastic latent $s_t$ later plays inside the RSSM: a learned representation of irreducible branching in the world.
+</p>
+
+<p>
+The Controller is deliberately minuscule. It is a single linear map from the concatenated latent and memory state to an action,
+</p>
+
+<div class="math-block">$$a_t = W_c\,[\,z_t,\, h_t\,] + b_c,$$</div>
+
+<p>
+where $[z_t, h_t]$ stacks the VAE latent and the LSTM hidden state into one vector and $(W_c, b_c)$ are the only parameters the controller has. Because V and M already did the hard representational work, C has so few parameters that it can be optimized by a black-box evolution strategy rather than by backpropagation. Ha and Schmidhuber use <strong>CMA-ES</strong> (covariance matrix adaptation evolution strategy), which maintains a Gaussian distribution over controller parameter vectors, samples a population, scores each by the return of a rollout, and shifts the distribution toward the high-scoring samples. The decisive move, the one that names this whole section, is that those scoring rollouts are run <em>inside M</em>: the controller never touches the real environment during its own optimization. It learns to drive by driving in the dream that M generates, which is why Ha and Schmidhuber titled the relevant experiment "training inside the dream." If the dream is faithful, a controller good in M is good in reality; if M has exploitable flaws, the controller learns to exploit them, the model-exploitation failure flagged in the Fun Note above.
+</p>
+
+<h2>6. PlaNet and the RSSM Objective <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Ha and Schmidhuber's three modules are trained separately, which means M never gets a gradient signal about what V should encode, and the controller cannot send any pressure back through the model. PlaNet (Hafner et al., 2019) fuses the pieces into a single latent-dynamics model trained end-to-end by one variational objective, and in doing so introduces the precise split that defines the RSSM. The state at time $t$ is a pair: a deterministic recurrent state $h_t$ that is a deterministic function of the past, and a stochastic state $s_t$ sampled from a learned distribution. The deterministic part is a GRU update,
+</p>
+
+<div class="math-block">$$h_t = f(h_{t-1},\, s_{t-1},\, a_{t-1}),$$</div>
+
+<p>
+which folds the previous stochastic state and action into memory. Conditioned on $h_t$, the model defines four learned distributions: the <strong>prior</strong> (transition) $p(s_t \mid h_t)$ that predicts the stochastic state from memory alone, the <strong>posterior</strong> (representation) $q(s_t \mid h_t, o_t)$ that corrects that prediction using the observation, the <strong>decoder</strong> $p(o_t \mid h_t, s_t)$ that reconstructs pixels, and the <strong>reward head</strong> $p(r_t \mid h_t, s_t)$ that predicts the scalar reward. Only the prior is needed to imagine; the posterior exists only during training, to supply a target the prior must learn to match.
+</p>
+
+<p>
+Training maximizes a variational lower bound on the log-likelihood of the observed sequence, the same ELBO logic as the VAE in <a href="../module-31-autoencoders-vaes/index.html">Chapter 31</a> but now summed over time and carrying a reward term:
+</p>
+
+<div class="math-block">$$\mathcal{J} = \sum_t \mathbb{E}_q\!\Big[\log p(o_t \mid h_t, s_t) + \log p(r_t \mid h_t, s_t) - D_{KL}\big(q(s_t \mid h_t, o_t)\,\|\,p(s_t \mid h_t)\big)\Big].$$</div>
+
+<p>
+Read term by term, the objective is intuitive. The first term, $\log p(o_t \mid h_t, s_t)$, is reconstruction: the state must contain enough information to redraw the frame. The second, $\log p(r_t \mid h_t, s_t)$, forces the state to be reward-relevant, so the model does not waste capacity on visually salient but task-irrelevant detail. The third, the KL divergence, is the term that makes imagination possible: it pulls the observation-informed posterior $q$ toward the observation-free prior $p$, so that at imagination time the prior alone produces stochastic states statistically indistinguishable from the ones the posterior would have produced had it seen the frame. Without that KL, the prior would never learn to dream; with it, the model can roll forward with no input.
+</p>
+
+<p>
+A single-step ELBO trains the prior only to predict one step ahead, but planning needs accurate predictions many steps out, where one-step errors compound. PlaNet adds <strong>latent overshooting</strong>: it also requires the prior, run $d$ steps without observations, to match the posterior at the destination, averaged over multiple distances $d$:
+</p>
+
+<div class="math-block">$$\mathcal{J}_{LO} = \sum_t \frac{1}{D}\sum_{d=1}^{D} \mathbb{E}\!\Big[-D_{KL}\big(q(s_t \mid o_{\le t})\,\|\,p(s_t \mid s_{t-d})\big)\Big].$$</div>
+
+<p>
+Here $p(s_t \mid s_{t-d})$ is the prior advanced $d$ steps forward from the state at $t-d$ using no observations, and the KL drives that multi-step prediction toward the true posterior at $t$. Summing over $d$ from $1$ to $D$ trains the model to be self-consistent over many horizons at once, which is exactly the regime a planner exercises when it imagines long rollouts. The intuition is direct: if you intend to plan twenty steps ahead, train the model to predict twenty steps ahead, not just one.
+</p>
+
+<p>
+PlaNet has no learned policy at all. It plans online with <strong>CEM</strong> (the cross-entropy method) as model-predictive control. At each real step it samples many candidate action sequences from a diagonal Gaussian, imagines each one through the latent dynamics, scores each by the sum of predicted rewards, keeps the top-K highest-scoring sequences (the elites), refits the Gaussian to those elites, and repeats for a few iterations. It then executes only the first action of the best sequence and replans at the next step (receding horizon). Planning replaces the policy entirely; the model is the plan.
+</p>
+
+<h2>7. Dreamer: Actor-Critic in Imagination <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Replanning from scratch at every step, as PlaNet does, is expensive, and it throws away everything the agent learned on the previous step. Dreamer (Hafner et al., 2020) keeps PlaNet's RSSM but replaces online planning with a learned <strong>actor-critic</strong> trained entirely on imagined trajectories. The critic $v_\psi(s_t)$ estimates the expected long-horizon return from a latent state; the actor $\pi_\theta(a_t \mid s_t)$ is the policy. Both are trained on rollouts the RSSM dreams from real replayed start states, so no environment interaction is spent on behavior learning.
+</p>
+
+<p>
+The training target is the <strong>$\lambda$-return</strong>, a geometric average of $n$-step returns that trades off the bias of the critic's bootstrap against the variance of long imagined rollouts. It is defined recursively over the imagination horizon $H$:
+</p>
+
+<div class="math-block">$$V^\lambda_t = r_t + \gamma\Big[(1-\lambda)\,v_\psi(s_{t+1}) + \lambda\, V^\lambda_{t+1}\Big], \qquad V^\lambda_H = v_\psi(s_H).$$</div>
+
+<p>
+The recursion is the heart of the method, so unpack it. At horizon $H$ the return is just the critic's estimate $v_\psi(s_H)$, the boundary condition. Working backward, each step earns the immediate reward $r_t$ plus the discounted future, and that future is a blend: with weight $(1-\lambda)$ it trusts the critic's one-step bootstrap $v_\psi(s_{t+1})$, and with weight $\lambda$ it trusts the deeper return $V^\lambda_{t+1}$ assembled from the rest of the imagined rollout. Setting $\lambda = 0$ recovers the pure one-step TD target (low variance, high bias if the critic is wrong); $\lambda = 1$ recovers the full Monte-Carlo imagined return (unbiased given the model, high variance). Intermediate $\lambda$ interpolates. The discount $\gamma$ down-weights distant rewards as usual.
+</p>
+
+<p>
+The critic regresses onto this target with a squared loss, treating the $\lambda$-return as a fixed value via the stop-gradient $\text{sg}(\cdot)$ so the regression target does not chase the parameters being optimized:
+</p>
+
+<div class="math-block">$$\mathcal{L}(\psi) = \mathbb{E}_\pi\!\Big[\sum_t \tfrac{1}{2}\big(v_\psi(s_t) - \text{sg}(V^\lambda_t)\big)^2\Big].$$</div>
+
+<p>
+The actor maximizes the same $\lambda$-return, plus an entropy bonus $\mathcal{H}(\pi_\theta(a_t \mid s_t))$ scaled by $\eta$ that keeps the policy exploratory and prevents premature collapse onto a single action:
+</p>
+
+<div class="math-block">$$\mathcal{L}(\theta) = -\,\mathbb{E}_\pi\!\Big[\sum_t V^\lambda_t + \eta\,\mathcal{H}\big(\pi_\theta(a_t \mid s_t)\big)\Big].$$</div>
+
+<p>
+The decisive advantage over model-free actor-critics lives in how this gradient is computed. Because the entire imagined rollout, the RSSM transitions, the reward head, and the reparameterized stochastic states, is differentiable, the gradient of $V^\lambda_t$ with respect to the actor parameters $\theta$ can flow backward through the imagined dynamics analytically. The actor receives a direct, low-variance signal of how nudging each action changes the predicted future return, rather than the high-variance score-function (REINFORCE) estimate a model-free agent is stuck with. This analytic policy gradient through a learned model is the single most important reason Dreamer is sample-efficient.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: Dreamer Imagination Training</div>
+<p>Given a trained RSSM (recurrent model, prior, decoder, reward head), actor $\pi_\theta$, critic $v_\psi$, replay buffer of real experience, horizon $H$, discount $\gamma$, return mixing $\lambda$:</p>
+<ol>
+<li>Sample a batch of real sequences from the replay buffer and run the RSSM <em>posterior</em> over them to obtain start states $\{(h_t, s_t)\}$.</li>
+<li>From each start state, imagine $H$ steps forward using the <em>prior</em> only: at each step draw $a \sim \pi_\theta(a \mid s)$, advance $h \leftarrow f(h, s, a)$, sample $s \sim p(s \mid h)$ (reparameterized), and predict reward $r$ and continuation. Store the imagined trajectory.</li>
+<li>Compute the $\lambda$-returns $V^\lambda_t$ along each imagined trajectory by the backward recursion, with $V^\lambda_H = v_\psi(s_H)$.</li>
+<li>Update the critic by descending $\mathcal{L}(\psi) = \mathbb{E}\big[\sum_t \tfrac12 (v_\psi(s_t) - \text{sg}(V^\lambda_t))^2\big]$.</li>
+<li>Update the actor by ascending $\mathbb{E}\big[\sum_t V^\lambda_t + \eta\,\mathcal{H}(\pi_\theta(a_t\mid s_t))\big]$, with gradients flowing analytically back through the imagined dynamics.</li>
+<li>Periodically act in the real environment with $\pi_\theta$, add the experience to the replay buffer, and continue training the RSSM on it.</li>
+</ol>
+</div>
+
+<h2>8. DreamerV2 and V3: Stabilizing the Recipe <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The original Dreamer worked on continuous control but was fragile on the discrete, visually diverse Atari suite, and it needed per-domain tuning. The V2 and V3 revisions are a sequence of stabilization changes that culminate in one fixed hyperparameter set working across more than 150 tasks. Each change is small and well-motivated, and together they are why DreamerV3 (Hafner et al., 2023; Nature, 2025) is the default modern recipe.
+</p>
+
+<p>
+<strong>DreamerV2</strong> (Hafner et al., 2021) replaced the Gaussian stochastic latent with a vector of <strong>categorical</strong> variables. Discrete latents are a better fit for the sharp, multi-modal transitions of games (a screen either changes or it does not), but sampling from a categorical is not differentiable. DreamerV2 uses the <strong>straight-through estimator</strong>: the forward pass samples a hard one-hot category, while the backward pass pretends the sample was the continuous softmax probability, so gradients still flow into the prior and posterior. It also introduced <strong>KL balancing</strong>, which recognizes that the prior-posterior KL is doing two jobs at once and should not weight them equally. Training the prior toward the posterior (the dream learning to match reality) matters more than regularizing the posterior toward the prior, so the two directions get different weights:
+</p>
+
+<div class="math-block">$$\mathcal{L}_{KL} = \alpha\, D_{KL}\big(\text{sg}(q)\,\|\,p\big) + (1-\alpha)\, D_{KL}\big(q\,\|\,\text{sg}(p)\big), \qquad \alpha = 0.8.$$</div>
+
+<p>
+The first term, with the posterior held fixed by $\text{sg}$, trains the prior to predict; the second, with the prior held fixed, gently regularizes the posterior. The asymmetry $\alpha = 0.8$ puts most of the pressure on improving the prior (the predictor that drives imagination), which is the quantity that determines dream quality.
+</p>
+
+<p>
+<strong>DreamerV3</strong> (Hafner et al., 2023) adds the changes that finally removed per-task tuning. Rewards and returns in different environments span wildly different magnitudes, from fractions to thousands, which destabilizes regression losses; V3 squashes them with the <strong>symlog</strong> transform, a signed logarithm that compresses large magnitudes while staying linear near zero and handling negatives:
+</p>
+
+<div class="math-block">$$\text{symlog}(x) = \text{sign}(x)\,\ln\!\big(1 + |x|\big).$$</div>
+
+<p>
+The reward and value heads no longer regress a scalar at all. They predict a distribution over a fixed grid of symlog-spaced bins using a <strong>two-hot</strong> encoding (a target value falls between two grid points and is represented as the two-point interpolation that recovers it in expectation), trained with cross-entropy. This turns an unbounded regression into a stable classification problem that copes with heavy-tailed and sparse rewards without tuning.
+</p>
+
+<p>
+V3 also reshapes the world-model loss into three explicitly weighted terms and clips each KL with <strong>free bits</strong> so the model never wastes effort driving an already-small KL toward zero (which would otherwise collapse the latent to the prior and starve reconstruction):
+</p>
+
+<div class="math-block">$$\mathcal{L} = \beta_{pred}\,\mathcal{L}_{pred} + \beta_{dyn}\,\mathcal{L}_{dyn} + \beta_{rep}\,\mathcal{L}_{rep},$$</div>
+
+<div class="math-block">$$\mathcal{L}_{dyn} = \max\!\big(1,\; D_{KL}(\text{sg}(q)\,\|\,p)\big), \qquad \mathcal{L}_{rep} = \max\!\big(1,\; D_{KL}(q\,\|\,\text{sg}(p))\big),$$</div>
+
+<p>
+with $\beta_{pred} = 1$, $\beta_{dyn} = 1$, and $\beta_{rep} = 0.1$. The prediction loss $\mathcal{L}_{pred}$ collects the decoder, reward, and continuation log-likelihoods; the dynamics loss $\mathcal{L}_{dyn}$ (the KL-balanced prior-toward-posterior term) and the representation loss $\mathcal{L}_{rep}$ (posterior-toward-prior) carry over V2's KL balancing, now each floored at $1$ nat by the $\max(1, \cdot)$ free-bits clip. The down-weighting $\beta_{rep} = 0.1$ keeps the representation free to encode useful detail. Two further details complete the recipe: a <strong>1% uniform mixture</strong> ("unimix") is blended into every categorical distribution so no class probability is ever exactly zero (which would give infinite KL and dead gradients), and returns are normalized by a running estimate of their <strong>percentile range</strong> rather than their variance, which is robust to the reward outliers that variance normalization mishandles. The payoff of this stack of small fixes is the headline result: one configuration, no per-task tuning, strong performance from Atari to continuous control to collecting diamonds in Minecraft from scratch.
+</p>
+
+<h2>9. TD-MPC2: Decoder-Free Latent Planning <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Every model so far reconstructs pixels, and that decoder is expensive and arguably wasteful: to choose good actions you do not need to redraw the scene, only to predict reward and value. TD-MPC2 (Hansen et al., 2024) takes this to its conclusion with a <strong>decoder-free</strong> latent world model that never reconstructs an observation. An encoder maps the observation to a latent, $z = h_\theta(o)$; a latent dynamics model predicts the next latent, $z_{t+1} = d_\theta(z_t, a_t)$; a reward head $R_\theta$, a value head $Q_\theta$, and a policy prior $\pi_\theta$ read out of the latent. The crucial difference is what holds the latent together. With no reconstruction term, the latent is shaped purely by a <strong>self-consistency</strong> loss that forces the predicted next latent to match the encoder's actual encoding of the next observation:
+</p>
+
+<div class="math-block">$$\mathcal{L}_{\text{cons}} = \big\| d_\theta(z_t, a_t) - \text{sg}\big(h_\theta(o_{t+1})\big) \big\|^2.$$</div>
+
+<p>
+The stop-gradient on the target $h_\theta(o_{t+1})$ prevents the trivial collapse where the encoder maps everything to a constant (which would make any prediction perfect). The full objective adds the reward loss and a temporal-difference value loss, both as two-hot cross-entropy as in DreamerV3, and crucially contains <em>no</em> reconstruction term. The latent is therefore free to discard everything about the observation that does not help predict reward and value, which is precisely the task-relevant compression a planner wants.
+</p>
+
+<p>
+At decision time TD-MPC2 plans with <strong>MPPI</strong> (model-predictive path integral control), a sampling-based planner closely related to PlaNet's CEM but with a softer, reward-weighted update. It samples action trajectories (seeded partly from the policy prior $\pi_\theta$ to start from sensible behavior), rolls each through the latent dynamics, and scores each by the discounted sum of predicted rewards plus a terminal value bootstrap, $\sum_t \gamma^t \hat{r}_t + \gamma^H \hat{Q}$. Rather than keeping a hard top-K set of elites as CEM does, MPPI updates the sampling distribution by a reward-weighted softmax over all trajectories, so better trajectories pull the distribution proportionally to how good they are. The terminal $\gamma^H \hat{Q}$ is what lets a short planning horizon see past its own edge: the learned value summarizes everything beyond step $H$, so the planner need not imagine to the end of the episode.
+</p>
+
+<div class="callout algorithm">
+<div class="callout-title">Algorithm: TD-MPC2 MPPI Planning</div>
+<p>Given encoder $h_\theta$, latent dynamics $d_\theta$, reward $R_\theta$, value $Q_\theta$, policy prior $\pi_\theta$, current observation $o$, horizon $H$, $N$ sampled trajectories, temperature $\tau$, iterations $M$:</p>
+<ol>
+<li>Encode the current observation, $z_0 = h_\theta(o)$. Initialize a per-step action Gaussian (mean $\mu$, std $\sigma$).</li>
+<li>Draw a fraction of the $N$ action sequences by rolling the policy prior $\pi_\theta$ through the latent dynamics, and the rest from the current Gaussian, to seed the search with sensible behavior.</li>
+<li>For each candidate sequence, roll $z_{t+1} = d_\theta(z_t, a_t)$ and score it $G = \sum_{t=0}^{H-1} \gamma^t R_\theta(z_t, a_t) + \gamma^H Q_\theta(z_H, a_H)$.</li>
+<li>Update the Gaussian by a reward-weighted softmax: weight each sequence by $\exp(G / \tau)$ (normalized), set $\mu$ to the weighted mean of the action sequences and $\sigma$ to their weighted std.</li>
+<li>Repeat steps 2 to 4 for $M$ iterations, then execute the first action of $\mu$ and replan at the next observation (receding horizon).</li>
+</ol>
+</div>
+
+<h2>10. Comparing the World-Model Family <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The six systems above are variations on one template, latent state plus learned transition, that differ along a few decisive axes: whether the stochastic latent exists and what form it takes, whether the policy gradient flows analytically through the model, how the prior-posterior KL is handled, whether the model reconstructs observations, and how an action is finally chosen. Reading the table row by row traces the field's trajectory from modular and hand-tuned toward unified, stable, and decoder-free.
+</p>
+
+<table>
+<thead>
+<tr><th>System</th><th>Stochastic latent</th><th>Action gradient</th><th>KL handling</th><th>Reconstruction</th><th>Action selection</th></tr>
+</thead>
+<tbody>
+<tr><td>World Models (2018)</td><td>VAE latent; MDN-RNN mixture for next-step</td><td>None (CMA-ES on controller)</td><td>None (modules trained separately)</td><td>Yes (VAE pixels)</td><td>Linear controller, evolved in the dream</td></tr>
+<tr><td>PlaNet (2019)</td><td>Gaussian $s_t$, RSSM split</td><td>None (no policy)</td><td>Standard ELBO KL + latent overshooting</td><td>Yes (pixels + reward)</td><td>CEM model-predictive control</td></tr>
+<tr><td>Dreamer (2020)</td><td>Gaussian $s_t$, RSSM split</td><td>Analytic through imagined rollout</td><td>Standard ELBO KL</td><td>Yes (pixels + reward)</td><td>Learned actor, $\lambda$-return critic</td></tr>
+<tr><td>DreamerV2 (2021)</td><td>Categorical (straight-through)</td><td>Analytic through imagined rollout</td><td>KL balancing ($\alpha = 0.8$)</td><td>Yes (pixels + reward)</td><td>Learned actor, $\lambda$-return critic</td></tr>
+<tr><td>DreamerV3 (2023)</td><td>Categorical + 1% unimix</td><td>Analytic through imagined rollout</td><td>KL balancing + free bits ($\max(1,\cdot)$)</td><td>Yes (symlog, two-hot heads)</td><td>Learned actor, percentile-normalized $\lambda$-return</td></tr>
+<tr><td>TD-MPC2 (2024)</td><td>Deterministic latent (consistency-shaped)</td><td>Through dynamics for value/policy</td><td>None (no prior-posterior KL)</td><td>No (decoder-free)</td><td>MPPI planning seeded by policy prior</td></tr>
+</tbody>
+</table>
+
+<p>
+Two trends jump out. The KL column moves from "none" through ever more carefully balanced and floored divergences and then back to "none" once the decoder is dropped, because the prior-posterior KL exists to keep a generative latent honest and a consistency-shaped latent does not need it. The reconstruction column stays "yes" for five systems and then turns "no," marking the decoder-free turn that <a href="section-36.7.html">Section 36.7</a> pushes further with the JEPA philosophy. The action-selection column tells the other story: planning (CEM, MPPI) and learned policies (Dreamer's actor-critic) are two answers to the same question, and TD-MPC2's seeding of MPPI from a learned policy prior shows the two answers converging.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: Where the Family Is Heading (2024-2026)</div>
+<p>
+The decoder-free turn of TD-MPC2 and the categorical, fixed-hyperparameter robustness of DreamerV3 are converging with the transformer and diffusion world models noted earlier (IRIS, Diamond). The live questions are sharp: can a single self-consistency objective, with no reconstruction at all, scale to high-dimensional visual control the way reconstruction-based RSSMs have; does the analytic policy gradient through a learned model keep its sample-efficiency edge as horizons lengthen and models grow; and is the right stochastic latent a small categorical (DreamerV3) or no explicit stochasticity at all (TD-MPC2) once the latent is shaped by consistency rather than generation. These are accessible to a motivated reader: both the DreamerV3 and TD-MPC2 reference implementations are open source and run on a single GPU, so an ablation that swaps one axis of the comparison table above is a genuine, publishable experiment.
+</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercises</div>
 <p><span class="exercise-type">Conceptual.</span> The RSSM splits its latent into a deterministic state $h$ and a stochastic state $z$. Give a concrete environment in which a purely deterministic latent would fail, and one in which a purely stochastic latent would fail, and explain how the split resolves both. Relate $h$ and the transition function to the Kalman filter's state and motion model from <a href="../../part-2-classical-computer-vision/module-15-motion-flow-tracking/index.html">Chapter 15</a>.</p>
 <p><span class="exercise-type">Coding.</span> Using the <code>RSSMCell</code>, write an imagination rollout: from a zero initial state, repeatedly call the cell with <code>obs_feat=None</code> and a fixed action, collecting the deterministic states over 20 steps. Plot the norm of $h_t$ over time for a randomly initialized (untrained) cell, and explain why the trajectory is meaningless until the prior and GRU are trained. Then describe what the KL(posterior, prior) loss would change about this rollout once training converges.</p>
 <p><span class="exercise-type">Analysis.</span> A model-free agent needs 10 million real environment steps; each real step costs one second of robot time. A Dreamer agent needs 1 million real steps plus 1 billion imagined steps; each imagined step costs one millisecond of GPU time. Compute the wall-clock for each and identify the dominant cost in the Dreamer case. Then argue the failure mode: what happens to the policy if the world model is systematically wrong about one rare but high-stakes transition (an obstacle the decoder never learned to render)?</p>
+<p><span class="exercise-type">Conceptual.</span> Exercise 36.5.4: Derive the RSSM variational objective. Starting from the log-likelihood $\log p(o_{1:T}, r_{1:T})$ of an observed trajectory under the generative model (recurrent $h_t = f(h_{t-1}, s_{t-1}, a_{t-1})$, prior $p(s_t \mid h_t)$, decoder $p(o_t \mid h_t, s_t)$, reward $p(r_t \mid h_t, s_t)$), introduce the variational posterior $q(s_t \mid h_t, o_t)$ and apply Jensen's inequality to obtain the lower bound $\mathcal{J}$ given in Section 6. Identify which term is the VAE reconstruction term, which is new to the dynamics setting, and explain precisely where the KL divergence $D_{KL}(q\,\|\,p)$ comes from in the derivation.</p>
+<p><span class="exercise-type">Analysis.</span> Exercise 36.5.5: Why split the state into a deterministic $h_t$ and a stochastic $s_t$ at all, rather than making the whole state stochastic? Argue two points. First, explain why a fully stochastic state makes multi-step prediction harder by injecting sampling noise at every step, so that prediction variance grows with horizon, and how the deterministic GRU path provides a low-variance "backbone" that carries long-range information faithfully. Second, explain why a fully deterministic state cannot represent a genuinely branching future (give the die-roll or opponent-move example) and would be forced to predict a blurry average. Conclude by relating the split to the mixture-density-network of Section 5: both are mechanisms for representing multi-modal futures.</p>
+<p><span class="exercise-type">Coding.</span> Exercise 36.5.6: Implement $\lambda$-returns and verify them against Monte-Carlo returns. Write a function <code>lambda_return(rewards, values, gamma, lam)</code> that applies the backward recursion $V^\lambda_t = r_t + \gamma[(1-\lambda)v_{t+1} + \lambda V^\lambda_{t+1}]$ with $V^\lambda_H = v_H$. Then verify two limiting cases on a random trajectory: with $\lambda = 1$ the output must equal the discounted Monte-Carlo return $\sum_{k \ge t} \gamma^{k-t} r_k$ ignoring the bootstrap (up to the terminal value), and with $\lambda = 0$ it must equal the one-step TD target $r_t + \gamma v_{t+1}$. Confirm both numerically with an assertion, then plot how the variance of $V^\lambda_t$ (over many random value-function perturbations) changes as $\lambda$ sweeps from $0$ to $1$.</p>
+</div>
+
+<h2>11. Foundational Papers <span class="level-badge intermediate" title="Intermediate">Intermediate</span></h2>
+
+<p>
+The six systems traced above are documented in a tight sequence of papers; the cards below give the primary sources, each with the single idea it contributed to the lineage.
+</p>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Ha, D., &amp; Schmidhuber, J. (2018).</p>
+<p class="bib-title">World Models.</p>
+<p class="bib-venue">Advances in Neural Information Processing Systems (NeurIPS) 31. arXiv:1803.10122.</p>
+<p class="bib-note">Introduced the V (VAE) + M (MDN-RNN) + C (controller) decomposition and trained a tiny linear controller with CMA-ES entirely inside the model's learned dream.</p>
+</div>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Hafner, D., Lillicrap, T., Fischer, I., Villegas, R., Ha, D., Lee, H., &amp; Davidson, J. (2019).</p>
+<p class="bib-title">Learning Latent Dynamics for Planning from Pixels (PlaNet).</p>
+<p class="bib-venue">International Conference on Machine Learning (ICML). arXiv:1811.04551.</p>
+<p class="bib-note">Introduced the RSSM (deterministic GRU plus stochastic latent), the variational training objective, latent overshooting, and CEM planning in latent space.</p>
+</div>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Hafner, D., Lillicrap, T., Ba, J., &amp; Norouzi, M. (2020).</p>
+<p class="bib-title">Dream to Control: Learning Behaviors by Latent Imagination (Dreamer).</p>
+<p class="bib-venue">International Conference on Learning Representations (ICLR). arXiv:1912.01603.</p>
+<p class="bib-note">Replaced online planning with an actor-critic trained on imagined rollouts, propagating analytic value gradients through the learned dynamics via $\lambda$-returns.</p>
+</div>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Hafner, D., Lillicrap, T., Norouzi, M., &amp; Ba, J. (2021).</p>
+<p class="bib-title">Mastering Atari with Discrete World Models (DreamerV2).</p>
+<p class="bib-venue">International Conference on Learning Representations (ICLR). arXiv:2010.02193.</p>
+<p class="bib-note">Switched to categorical latents with straight-through gradients and introduced KL balancing ($\alpha = 0.8$) to weight the prior-toward-posterior direction more heavily.</p>
+</div>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Hafner, D., Pasukonis, J., Ba, J., &amp; Lillicrap, T. (2023).</p>
+<p class="bib-title">Mastering Diverse Domains through World Models (DreamerV3).</p>
+<p class="bib-venue">arXiv:2301.04104. Published in Nature (2025).</p>
+<p class="bib-note">Added symlog transforms, two-hot reward and value heads, free-bits KL, unimix, and percentile return normalization, yielding one fixed hyperparameter set across 150-plus tasks.</p>
+</div>
+
+<div class="bib-entry-card">
+<p class="bib-authors">Hansen, N., Su, H., &amp; Wang, X. (2024).</p>
+<p class="bib-title">TD-MPC2: Scalable, Robust World Models for Continuous Control.</p>
+<p class="bib-venue">International Conference on Learning Representations (ICLR). arXiv:2310.16828.</p>
+<p class="bib-note">A decoder-free latent world model trained by self-consistency, reward, and TD value losses with no reconstruction, planned with MPPI seeded by a learned policy prior.</p>
 </div>
 
 <nav class="chapter-nav">
@@ -247,7 +502,7 @@ DreamerV3 (2023) showed one configuration mastering 150-plus tasks, settling the
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>

@@ -287,10 +287,233 @@ Every metric in this section is useful and every one is flawed, and a competent 
 <p>This frontier is unusually open to a motivated student because the tooling is public. The <code>dgm-eval</code> library released with Stein et al. (2023), at <a href="https://github.com/layer6ai-labs/dgm-eval" target="_blank" rel="noopener">github.com/layer6ai-labs/dgm-eval</a>, computes 15 generative-evaluation metrics across 8 different feature encoders (Inception, DINOv2, CLIP, MAE, and more) from one interface. Take a handful of pretrained generators, score them once with Inception-FID and once with DINOv2-FID, and check whether the ranking changes. When two encoders disagree about which generator is best, you have reproduced the paper's central claim that the metric, not only the model, decides the leaderboard, and you can ask which ranking your own eye agrees with. It is a self-contained weekend project that lands you directly on the question Chapter 37 takes up in full.</p>
 </div>
 
-<h2>6. Closing the Foundations <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+<h2>6. Unified View: One Family of Generative Models <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
 
 <p>
-This section completes the foundations of the part. You can now define what it means to model $p(\mathbf{x})$, name and place the five families that do it, work in a latent space, reason about energies and scores, judge any generator on the quality-diversity-speed triangle, and measure two of those three axes with feature-space metrics while knowing exactly where those metrics lie to you. Every remaining chapter of Part IV is the detailed construction of one box on the map, and you now carry the vocabulary and the warnings to read each one critically. The next chapter takes the very first box, the latent-variable model of <a href="section-30.3.html">Section 30.3</a>, and turns it into a working, trainable system: the autoencoder and the variational autoencoder.
+We have spent this chapter naming five families, VAEs, energy-based models, score-based models, diffusion models, and normalizing flows, plus GANs and autoregressive models, and treating them as separate boxes on a map. That separation is how the field is taught and how the rest of Part IV is organized, but it hides something a graduate student should see plainly: most of these families are the same idea wearing different clothes. They all solve one problem, and the deep derivations that the next three chapters give you (the VAE evidence lower bound in <a href="../module-31-autoencoders-vaes/section-31.3.html">Section 31.3</a>, energy and score matching in <a href="section-30.4.html">Section 30.4</a>, the diffusion training bound in <a href="../module-33-diffusion-models/section-33.2.html">Section 33.2</a>, the score SDEs and probability-flow ODE in <a href="../module-33-diffusion-models/section-33.3.html">Section 33.3</a>, and flow matching in <a href="../module-33-diffusion-models/section-33.5.html">Section 33.5</a>) turn out to be three views of one object. This section is the synthesis. It will not introduce new machinery; it will show that the machinery you are about to learn, chapter by chapter, all fits in one frame. Once you see the frame, choosing a family for a real application stops being memorization and becomes reasoning.
+</p>
+
+<h3>6.1 The Common Goal: Transport Noise to Data</h3>
+
+<p>
+Strip away the names and every family in this chapter is trying to do the same thing: take a simple distribution you can sample trivially, a unit Gaussian $p_0 = \mathcal{N}(\mathbf{0}, \mathbf{I})$, and transport it onto the complicated data distribution $p_{\text{data}}(\mathbf{x})$ you cannot write down. Sampling is always the same ritual: draw cheap noise $\mathbf{z} \sim p_0$, then push it through some learned map until it lands on the data manifold. The families differ in exactly one place: <em>how they represent that map and how they train it.</em>
+</p>
+
+<ul>
+<li>A <strong>VAE</strong> represents the transport as a single learned jump: a decoder $p_\theta(\mathbf{x} \mid \mathbf{z})$ that turns one latent draw into a sample in one step.</li>
+<li>A <strong>normalizing flow</strong> represents it as an invertible deterministic map $\mathbf{x} = f_\theta(\mathbf{z})$ whose Jacobian you can track, so the change-of-variables formula gives an exact density.</li>
+<li>A <strong>diffusion or score-based model</strong> represents it as a many-step trajectory: start at noise and follow a learned vector field through time until $t=0$, integrating an SDE or ODE.</li>
+<li>A <strong>flow-matching model</strong> represents it as a learned velocity field $v_t(\mathbf{x})$ that you integrate along a (usually straight) path from noise to data.</li>
+<li>A <strong>GAN</strong> represents it as a single generator jump like a VAE, but trains it by a game rather than by likelihood.</li>
+</ul>
+
+<p>
+Hold that sentence fixed, "everyone transports noise to data, they differ in how the transport is represented and trained," and the rest of this section is just two lenses that make the differences precise.
+</p>
+
+<h3>6.2 Shared Lens 1: The Variational / ELBO View</h3>
+
+<p>
+The first lens is the evidence lower bound (ELBO). A VAE cannot maximize the data likelihood $\log p_\theta(\mathbf{x})$ directly because the integral over the latent is intractable, so it introduces an inference distribution $q_\phi(\mathbf{z} \mid \mathbf{x})$ and maximizes a tractable lower bound instead (the full derivation is <a href="../module-31-autoencoders-vaes/section-31.3.html">Section 31.3</a>):
+</p>
+
+<div class="math-block">
+$$\log p_\theta(\mathbf{x}) \;\ge\; \mathbb{E}_{q_\phi(\mathbf{z}\mid\mathbf{x})}\big[\log p_\theta(\mathbf{x}\mid\mathbf{z})\big] \;-\; D_{\mathrm{KL}}\!\big(q_\phi(\mathbf{z}\mid\mathbf{x}) \,\|\, p(\mathbf{z})\big).$$
+</div>
+
+<p>
+The first term rewards reconstruction; the second pulls the inference posterior toward the prior. Here is the synthesis that surprises most students the first time they see it: <strong>a diffusion model is a deeply hierarchical VAE with a fixed inference chain.</strong> Take the single latent $\mathbf{z}$ and replace it with a long ladder of latents $\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_T$, one per noise level. The "encoder" is no longer learned: it is the fixed Gaussian forward process $q(\mathbf{x}_t \mid \mathbf{x}_{t-1}) = \mathcal{N}(\sqrt{1-\beta_t}\,\mathbf{x}_{t-1}, \beta_t \mathbf{I})$ that simply adds a little noise at each step. The "decoder" is the learned reverse process $p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t)$. Maximizing the diffusion likelihood gives exactly the same kind of bound, now summed over all $T$ levels (derived in <a href="../module-33-diffusion-models/section-33.2.html">Section 33.2</a>):
+</p>
+
+<div class="math-block">
+$$\log p_\theta(\mathbf{x}_0) \;\ge\; \mathbb{E}_q\Big[\log p_\theta(\mathbf{x}_0 \mid \mathbf{x}_1)\Big] \;-\; \sum_{t=2}^{T} \mathbb{E}_q\Big[D_{\mathrm{KL}}\!\big(q(\mathbf{x}_{t-1}\mid\mathbf{x}_t,\mathbf{x}_0)\,\|\,p_\theta(\mathbf{x}_{t-1}\mid\mathbf{x}_t)\big)\Big] - D_{\mathrm{KL}}\!\big(q(\mathbf{x}_T\mid\mathbf{x}_0)\,\|\,p(\mathbf{x}_T)\big).$$
+</div>
+
+<p>
+Term by term this is the VAE ELBO unrolled $T$ times: one reconstruction term at the bottom, a stack of KL terms (one per noise level) in the middle, and a prior-matching term at the top that vanishes because the forward process is designed so $\mathbf{x}_T$ is pure noise. The single architectural difference, learned encoder versus fixed Gaussian encoder, is what makes diffusion training so stable: there is no posterior to learn and no posterior collapse to fear, because the inference path is frozen by construction. A VAE and a diffusion model are not cousins; they are the same variational object at two extremes of latent depth.
+</p>
+
+<h3>6.3 Shared Lens 2: The Score / Vector-Field View</h3>
+
+<p>
+The second lens looks at the transport not as a likelihood bound but as a <em>vector field that flows noise to data over time.</em> Define a family of distributions $p_t(\mathbf{x})$ that interpolates from data at $t=0$ to noise at $t=1$ (the forward diffusion does exactly this). Three families all learn a time-indexed vector field over this interpolation; they just learn different fields.
+</p>
+
+<p>
+<strong>Score-based and diffusion models learn the score</strong>, the gradient of the log density of the noised data, $\mathbf{s}_\theta(\mathbf{x}, t) \approx \nabla_{\mathbf{x}} \log p_t(\mathbf{x})$. The score points "uphill" toward higher-density regions, so following it (with the right noise schedule) walks a noise sample back onto the data manifold. Denoising score matching, introduced in <a href="section-30.4.html">Section 30.4</a>, shows that learning this score is equivalent to learning to denoise: the optimal denoiser and the score are the same object up to a known scale. That is the bridge to the diffusion loss. DDPM trains a network $\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$ to predict the Gaussian noise that was added, and noise prediction and score prediction are related by one exact equation:
+</p>
+
+<div class="math-block">
+$$\mathbf{s}_\theta(\mathbf{x}_t, t) \;=\; \nabla_{\mathbf{x}_t} \log p_t(\mathbf{x}_t) \;=\; -\,\frac{\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)}{\sqrt{1 - \bar\alpha_t}}.$$
+</div>
+
+<p>
+The intuition for the minus sign and the scale: on a Gaussian noising path $\mathbf{x}_t = \sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon}$, the score of a Gaussian is the negative of the standardized displacement from its mean, and that standardized displacement is exactly $\boldsymbol{\epsilon}/\sqrt{1-\bar\alpha_t}$. So predicting the noise <em>is</em> predicting the (scaled, negated) score; the two training targets in the literature are one target in disguise. This is why a DDPM and a score-based SDE model, derived by completely different routes in <a href="../module-33-diffusion-models/section-33.2.html">Section 33.2</a> and <a href="../module-33-diffusion-models/section-33.3.html">Section 33.3</a>, produce interchangeable networks.
+</p>
+
+<p>
+<strong>The probability-flow ODE closes the loop with flows.</strong> Section 33.3 shows that the stochastic reverse diffusion has a deterministic twin, an ordinary differential equation whose marginal distributions $p_t$ match the SDE's at every time:
+</p>
+
+<div class="math-block">
+$$\frac{d\mathbf{x}}{dt} \;=\; \mathbf{f}(\mathbf{x}, t) \;-\; \tfrac{1}{2}\,g(t)^2\,\nabla_{\mathbf{x}} \log p_t(\mathbf{x}).$$
+</div>
+
+<p>
+This is a deterministic, invertible map from noise to data driven entirely by the learned score, which is the exact definition of a continuous normalizing flow. <strong>So diffusion, viewed through the probability-flow ODE, literally is a continuous normalizing flow</strong>, and that is why diffusion models can report exact likelihoods (by integrating the instantaneous change of variables along the ODE) even though they were trained as denoisers. The flow family and the diffusion family meet here.
+</p>
+
+<p>
+<strong>Flow matching learns a velocity instead of a score</strong>, but on Gaussian paths the two are the same information. Flow matching (<a href="../module-33-diffusion-models/section-33.5.html">Section 33.5</a>) trains a velocity field $v_\theta(\mathbf{x}, t)$ to regress the velocity of a chosen probability path, typically the straight-line interpolation $\mathbf{x}_t = (1-t)\,\mathbf{x}_0 + t\,\boldsymbol{\epsilon}$. For Gaussian probability paths the marginal velocity is an affine function of the score, so a flow-matching velocity and a diffusion score carry the same content and can be converted into each other; the practical difference is that the straight-line path is easier to integrate, which is why flow matching often samples in fewer steps. Score, noise, and velocity are three coordinates for the same vector field.
+</p>
+
+<h3>6.4 Energy-Based Models: The Root of the Score View</h3>
+
+<p>
+Why does the score, a gradient of a log density, sit at the center of so many families? Because it is what you get when you refuse to compute the one quantity that makes explicit densities intractable. An energy-based model (<a href="section-30.4.html">Section 30.4</a>) writes the density as a Boltzmann distribution over a learned energy $E_\theta$:
+</p>
+
+<div class="math-block">
+$$p_\theta(\mathbf{x}) \;=\; \frac{e^{-E_\theta(\mathbf{x})}}{Z_\theta}, \qquad Z_\theta = \int e^{-E_\theta(\mathbf{x})}\, d\mathbf{x}.$$
+</div>
+
+<p>
+The partition function $Z_\theta$ is an integral over the entire data space, hopelessly intractable for images, and it is the reason you cannot just maximize $\log p_\theta$. But take the gradient of the log density with respect to $\mathbf{x}$ and the obstacle disappears:
+</p>
+
+<div class="math-block">
+$$\nabla_{\mathbf{x}} \log p_\theta(\mathbf{x}) \;=\; -\,\nabla_{\mathbf{x}} E_\theta(\mathbf{x}),$$
+</div>
+
+<p>
+because $Z_\theta$ does not depend on $\mathbf{x}$, so its gradient is zero and the partition function vanishes. <strong>The score is the energy gradient with the intractable constant removed.</strong> This is the conceptual root of the entire score view: score matching learns $-\nabla E$ without ever computing $Z$, and Langevin dynamics samples by descending the energy (climbing the score) with injected noise. Every score-based and diffusion model is, in this sense, an energy-based model that learns the gradient field directly instead of the energy itself, dodging the partition function the same way. The EBM is the root; the score is its tractable shadow.
+</p>
+
+<h3>6.5 GANs: The Odd One Out</h3>
+
+<p>
+Every family above is organized around a density: a likelihood bound, an exact change of variables, or a score that is the gradient of a log density. GANs (<a href="../module-32-gans/index.html">Module 32</a>) abandon density entirely. A GAN never writes down, bounds, or differentiates $p_\theta(\mathbf{x})$. Instead it trains a generator against a learned discriminator in a minimax game, and at the optimum the generator's implicit distribution matches the data because the discriminator can no longer tell them apart. There is no ELBO, no score, no tractable likelihood, and no way to ask "what is the probability of this image" under a GAN. That is the trade: by replacing the explicit density with an adversarial signal, GANs sidestep every intractability above and can produce extremely sharp samples in a single forward pass, but they give up likelihood, they offer no built-in coverage guarantee (hence mode collapse), and the game can be unstable to train. The GAN is the one family that buys sample quality and speed by walking away from the probabilistic frame the others share.
+</p>
+
+<h3>6.6 The Comparison, In One Table</h3>
+
+<p>
+The table below places the families side by side along the axes that actually drive a design choice: what objective trains them, what object they learn, whether they give an exact likelihood, how sampling works, and where each shines.
+</p>
+
+<table>
+<thead>
+<tr>
+<th>Family</th>
+<th>Training objective</th>
+<th>What is learned</th>
+<th>Exact likelihood?</th>
+<th>Sampling</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>VAE</strong></td>
+<td>ELBO (variational lower bound)</td>
+<td>Encoder $q_\phi$ + decoder $p_\theta$ over a latent</td>
+<td>No (lower bound only)</td>
+<td>One latent draw, one decoder pass (fast)</td>
+<td>Structured latent space, representation learning, fast rough samples</td>
+</tr>
+<tr>
+<td><strong>Normalizing flow</strong></td>
+<td>Exact log-likelihood (change of variables)</td>
+<td>Invertible map $f_\theta$ with tractable Jacobian</td>
+<td>Yes (exact)</td>
+<td>One pass through the inverse map (fast)</td>
+<td>Density estimation, exact likelihood, invertible encodings</td>
+</tr>
+<tr>
+<td><strong>Energy-based model</strong></td>
+<td>Score matching / contrastive divergence</td>
+<td>Energy $E_\theta$ (score $=-\nabla E$)</td>
+<td>No (unknown $Z_\theta$)</td>
+<td>Iterative MCMC / Langevin (slow)</td>
+<td>Flexible unnormalized densities, composing constraints</td>
+</tr>
+<tr>
+<td><strong>Score-based / diffusion</strong></td>
+<td>Denoising score matching / ELBO on noise levels</td>
+<td>Score $\mathbf{s}_\theta$ (equiv. noise $\boldsymbol{\epsilon}_\theta$) at every $t$</td>
+<td>Yes via probability-flow ODE</td>
+<td>Many denoising steps (slow, fewer with solvers)</td>
+<td>State-of-the-art fidelity and coverage; text-to-image</td>
+</tr>
+<tr>
+<td><strong>Flow matching</strong></td>
+<td>Regress a probability-path velocity</td>
+<td>Velocity field $v_\theta$ on a (straight) path</td>
+<td>Yes via the ODE</td>
+<td>Integrate an ODE (few steps)</td>
+<td>High quality with faster sampling than DDPM</td>
+</tr>
+<tr>
+<td><strong>GAN</strong></td>
+<td>Adversarial minimax game</td>
+<td>Generator + discriminator (no density)</td>
+<td>No (implicit density)</td>
+<td>One generator pass (very fast)</td>
+<td>Sharp single-step samples; real-time generation</td>
+</tr>
+<tr>
+<td><strong>Autoregressive</strong></td>
+<td>Exact log-likelihood (factorized)</td>
+<td>Conditionals $p_\theta(x_i \mid x_{&lt;i})$</td>
+<td>Yes (exact)</td>
+<td>Sequential, one element at a time (slow)</td>
+<td>Discrete data, exact likelihood, strong text-to-image with tokens</td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Score, ELBO, and Flow Are Three Views of One Transport</div>
+<p>Do not memorize seven unrelated algorithms. Memorize one transport problem, move noise to data, and three lenses on it. The <strong>ELBO lens</strong> sees the transport as a likelihood bound, and through it a diffusion model is just a deeply hierarchical VAE with a fixed Gaussian inference chain. The <strong>score lens</strong> sees the transport as a vector field $\nabla_{\mathbf{x}} \log p_t$, and through it diffusion, score matching, and (on Gaussian paths) flow matching are learning the same field, with noise prediction $\boldsymbol{\epsilon}_\theta$, score $\mathbf{s}_\theta = -\boldsymbol{\epsilon}_\theta/\sqrt{1-\bar\alpha_t}$, and velocity $v_\theta$ as three coordinates for it. The <strong>flow lens</strong> sees the transport as a deterministic ODE, and through the probability-flow ODE diffusion literally is a continuous normalizing flow, which is why a model trained as a denoiser can still report an exact likelihood. Underneath all three sits the energy-based model: the score is just $-\nabla E$ with the partition function removed. GANs are the lone exception, the one family that drops the density and learns the transport through a game instead.</p>
+</div>
+
+<h3>6.7 Choosing a Family: A Selection Guide</h3>
+
+<p>
+The unified view is not only elegant; it tells you how to choose. The decision reduces to four questions, each tracing back to the quality-diversity-speed trilemma of <a href="section-30.5.html">Section 30.5</a> plus one new axis, do you need the likelihood number itself?
+</p>
+
+<ul>
+<li><strong>Do you need an exact likelihood</strong> (anomaly detection, compression, scientific density estimation, lossless coding)? Choose a <strong>normalizing flow</strong> or an <strong>autoregressive model</strong>; both give the number directly. A diffusion model can also report a likelihood via the probability-flow ODE, but at the cost of integrating the ODE.</li>
+<li><strong>Do you need the highest sample fidelity and full coverage</strong>, and can you afford many sampling steps (offline generation, text-to-image, where seconds per image are fine)? Choose a <strong>diffusion model</strong>: it currently leads on the fidelity and diversity axes of the trilemma, at the cost of the speed axis.</li>
+<li><strong>Do you need diffusion-class quality but faster sampling</strong> (interactive tools, tighter latency budgets)? Choose <strong>flow matching</strong>: the straight-line path integrates in far fewer steps than a DDPM while keeping most of the quality, a deliberate trade of a little fidelity for a lot of speed.</li>
+<li><strong>Do you need real-time, single-pass generation</strong> and can tolerate weaker coverage and trickier training (live video filters, on-device generation, GAN-based super-resolution)? Choose a <strong>GAN</strong>: one forward pass, sharpest-per-millisecond samples, but watch for mode collapse and instability.</li>
+<li><strong>Do you need a structured, smooth latent space</strong> for representation learning, interpolation, or downstream control, and are rough samples acceptable? Choose a <strong>VAE</strong>: fast single-step sampling and a usable latent, at the cost of blurrier samples than diffusion or GANs.</li>
+</ul>
+
+<p>
+Read against the trilemma, the pattern is clean: flows and autoregressive models buy <em>likelihood</em>; diffusion buys <em>fidelity and coverage</em> by spending <em>speed</em>; flow matching rebalances that spend toward speed; GANs buy <em>speed and sharpness</em> by spending <em>coverage and training stability</em>; VAEs buy a <em>latent space and speed</em> by spending <em>fidelity</em>. No family wins on every axis, which is exactly the trilemma's promise, and the unified view tells you which axis each family chose to sacrifice and why.
+</p>
+
+<div class="callout note">
+<div class="callout-title">Note: The Map Has Borders, Not Walls</div>
+<p>The boundaries in the table are softer than they look, which is itself a consequence of the unified view. Latent diffusion runs a diffusion model inside a VAE's latent space, combining a VAE encoder with a diffusion transport. Consistency models distill a multi-step diffusion ODE into a one-step generator, importing GAN-like speed into the diffusion family. Diffusion-GAN hybrids add an adversarial term to a diffusion loss. Because the families share one transport problem and a small set of lenses, they recombine freely; the modern frontier of <a href="../module-33-diffusion-models/index.html">Chapter 33</a> and beyond is mostly built from these recombinations rather than from brand-new families.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.6.4: DDPM Loss as Weighted Denoising Score Matching <span class="exercise-type analysis">Analysis</span></div>
+<p>The DDPM training objective minimizes $\mathbb{E}_{\mathbf{x}_0, \boldsymbol{\epsilon}, t}\big[\|\boldsymbol{\epsilon} - \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)\|^2\big]$ where $\mathbf{x}_t = \sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon}$. Using the relation $\mathbf{s}_\theta(\mathbf{x}_t, t) = -\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)/\sqrt{1-\bar\alpha_t}$ from Section 6.3, show that this loss is, up to a per-timestep weight, a denoising-score-matching objective $\mathbb{E}\big[\lambda(t)\,\|\mathbf{s}_\theta(\mathbf{x}_t,t) - \nabla_{\mathbf{x}_t}\log q(\mathbf{x}_t\mid\mathbf{x}_0)\|^2\big]$. Two steps suffice: (a) write the score of the Gaussian transition $q(\mathbf{x}_t \mid \mathbf{x}_0)$ in terms of $\boldsymbol{\epsilon}$ and show it equals $-\boldsymbol{\epsilon}/\sqrt{1-\bar\alpha_t}$; (b) substitute both scores in the score-matching loss and read off the weight $\lambda(t)$ that turns it back into the noise-prediction loss. State what value of $\lambda(t)$ DDPM implicitly uses by setting all weights to one, and one sentence on why a different $\lambda(t)$ corresponds to a different (likelihood-weighted) objective.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 30.6.5: Pick a Family, Justify the Choice <span class="exercise-type conceptual">Conceptual</span></div>
+<p>For each of the three applications below, choose one generative family from the table in Section 6.6 and justify it in two or three sentences, naming the axes of the trilemma (<a href="section-30.5.html">Section 30.5</a>) and the likelihood axis you are trading. (1) An <strong>on-device photo filter</strong> that must stylize a live camera feed at 30 frames per second on a phone. (2) A <strong>scientific anomaly detector</strong> for telescope images that must flag inputs with unusually low probability under the learned distribution. (3) A <strong>text-to-image system</strong> for a design tool where users wait a few seconds per image but demand the sharpest, most varied results. For each, also name one family you would <em>not</em> choose and state the specific axis on which it would fail the requirement.</p>
+</div>
+
+<h2>7. Closing the Foundations <span class="level-badge beginner" title="Beginner">Beginner</span></h2>
+
+<p>
+This section completes the foundations of the part. You can now define what it means to model $p(\mathbf{x})$, name and place the five families that do it, work in a latent space, reason about energies and scores, judge any generator on the quality-diversity-speed triangle, and measure two of those three axes with feature-space metrics while knowing exactly where those metrics lie to you. The unified view of the previous section gave you the deeper payoff: those families are not seven disconnected algorithms but one transport problem seen through the ELBO, score, and flow lenses, with the energy-based model at the root and the GAN as the lone density-free exception. Every remaining chapter of Part IV is the detailed construction of one box on the map, and you now carry the vocabulary, the warnings, and the unifying frame to read each one critically. The next chapter takes the very first box, the latent-variable model of <a href="section-30.3.html">Section 30.3</a>, and turns it into a working, trainable system: the autoencoder and the variational autoencoder.
 </p>
 
 <div class="callout exercise">
@@ -315,7 +538,7 @@ This section completes the foundations of the part. You can now define what it m
 </nav>
 
 <footer>
-<p class="footer-title">Building Vision AI: From Pixels to Generative Models, First Edition</p>
+<p class="footer-title">Building Vision AI: From Pixels to Generative Models, Second Edition</p>
 <p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
 <p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
 </footer>
