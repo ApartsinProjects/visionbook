@@ -191,6 +191,40 @@ The training objective is a blend of an L1 pixel loss and a structural-similarit
 <p>Gaussian splatting moved faster than almost any recent vision idea. <strong>Dynamic splatting</strong> (4D Gaussian Splatting, Deformable 3DGS, 2024) adds a time dimension so the Gaussians move, capturing video and moving scenes, the spatiotemporal analogue of <a href="../module-26-video-understanding/index.html">Chapter 26</a>. <strong>Compression</strong> is active because a raw splat can be hundreds of megabytes; methods like Scaffold-GS, Compact-3DGS, and the 2024-2025 vector-quantized variants shrink scenes by 10 to 30 times for streaming. <strong>Mesh extraction</strong> (SuGaR, 2D Gaussian Splatting, 2024) recovers a clean triangle mesh from the splat, bridging back to the explicit surface of <a href="section-27.2.html">Section 27.2</a> for use in standard graphics pipelines. And <strong>generative splatting</strong> closes the loop with Part IV: models such as DreamGaussian and feed-forward large Gaussian reconstruction models like <strong>LGM</strong> (ECCV 2024 Oral, arXiv:2402.05054) predict a full splat from text or a single image in seconds, the representation behind much of the 3D generation in <a href="../../part-4-generative-vision-models/module-36-video-3d-world-generation/index.html">Chapter 36</a>.</p>
 </div>
 
+<h2>4. The EWA Screen-Space Projection <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+Subsection 2 asserted that each 3D Gaussian "becomes a 2D Gaussian footprint" on the screen. That claim deserves a derivation, because it is not obvious: a Gaussian stays Gaussian under a linear map, but the camera projection that takes a world point to a pixel is <em>perspective</em>, and perspective is nonlinear (it divides by depth). The elliptical weighted average (EWA) framework of Zwicker and colleagues (2002), which Kerbl and colleagues (2023) adopt for splatting, resolves this by linearizing the projection once per Gaussian. The result is the projected covariance the renderer uses to compute every splat's footprint and its per-pixel opacity.
+</p>
+<p>
+Start with the linear half of the pipeline. The <strong>viewing transform</strong> $W$ takes a point from world space to camera (eye) space; it is the rotation-translation of the camera pose, so it is affine, and a Gaussian transformed by it stays exactly Gaussian. Under any linear map $M$ a Gaussian with covariance $\Sigma$ maps to a Gaussian with covariance $M \Sigma M^\top$, because the covariance of $Mx$ is $\mathbb{E}[(Mx)(Mx)^\top] = M\,\mathbb{E}[xx^\top]\,M^\top$. The trouble is the second half: the projective map from camera space to the image plane divides the $x$ and $y$ coordinates by the depth $z$, and that division is not linear, so it does not preserve the Gaussian form.
+</p>
+<p>
+EWA's fix is a first-order (affine) approximation of the projective map, taken at the Gaussian's own center. Let $m = \phi(t)$ be the projection $\phi$ evaluated at the camera-space center $t$ of the Gaussian, and let
+</p>
+<div class="math-block">
+$$J = \frac{\partial \phi}{\partial t}\bigg|_{t}$$
+</div>
+<p>
+be its Jacobian there: the best local linear stand-in for the perspective division, valid in the small neighborhood the Gaussian actually occupies. Replacing $\phi$ by this local linear map makes the whole world-to-screen pipeline linear, so the projected covariance follows from the same $M \Sigma M^\top$ rule applied twice, first by $W$, then by $J$:
+</p>
+<div class="math-block">
+$$\Sigma' = J\, W\, \Sigma\, W^\top J^\top.$$
+</div>
+<p>
+This $\Sigma'$ is a $3 \times 3$ covariance in ray (camera-aligned) coordinates. The image plane is two-dimensional, so the renderer simply <strong>drops the third row and column</strong> of $\Sigma'$, leaving the upper-left $2 \times 2$ block. That $2 \times 2$ covariance defines the 2D elliptical Gaussian, the conic, that is the splat's screen-space footprint; evaluating it at a pixel offset from the projected center $m$ gives the footprint value that, multiplied by the stored opacity $\alpha$, becomes the per-pixel $\alpha_i$ fed to the alpha-blending sum of subsection 2. Because $J$, $W$, and the covariance factorization $\Sigma = R S S^\top R^\top$ of subsection 1 are all differentiable, gradients of the photometric loss flow back through the projection into every Gaussian's position, rotation, and scale.
+</p>
+
+<div class="callout note">
+<div class="callout-title">Note: The Affine Approximation and Where It Frays</div>
+<p>The projected footprint is Gaussian only because EWA replaces the true perspective projection with its first-order Taylor expansion at each Gaussian's center. The approximation is excellent for a small Gaussian near the optical axis, where the perspective division is nearly linear across the blob's extent, and it degrades for large Gaussians far in the periphery, where the true projection curves noticeably within the footprint and the elliptical splat no longer matches the exact projected shape. This is a deliberate accuracy-for-speed trade: keeping every footprint a 2D Gaussian is exactly what lets the GPU rasterize and alpha-blend splats in closed form, so the localized error at the periphery is the price paid for real-time rendering, not a bug.</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 27.5.4: Why a Gaussian Survives an Affine Map but Not Perspective <span class="exercise-type analysis">Analysis</span></div>
+<p>(a) Let $x \sim \mathcal{N}(\mu, \Sigma)$ and let $M$ be any invertible matrix and $b$ a vector. Show that $y = Mx + b$ is Gaussian with mean $M\mu + b$ and covariance $M \Sigma M^\top$, either by transforming the density with the change-of-variables Jacobian $|\det M|^{-1}$ or by computing the covariance of $Mx + b$ directly; conclude that a Gaussian footprint maps to a Gaussian footprint under the viewing transform $W$ and under any linear approximation $J$, which is why $\Sigma' = J W \Sigma W^\top J^\top$ is again a covariance. (b) The true perspective projection sends camera-space $(x, y, z)$ to image coordinates $(x/z, y/z)$. Argue that this map is nonlinear in $z$ and therefore does not preserve the Gaussian form in general, so an exact projection would turn a 3D Gaussian into a non-Gaussian footprint. Explain in one or two sentences why EWA's per-Gaussian Jacobian $J$ recovers a Gaussian footprint anyway, and state the regime (Gaussian size and field-of-view position) in which the approximation is tightest.</p>
+</div>
+
 <p>
 We now have two production-grade ways to turn photographs into a renderable 3D scene: the implicit radiance field of <a href="section-27.4.html">Section 27.4</a> and the explicit Gaussian splat of this section. Both, crucially, depend on camera poses, sensible captures, and careful cleanup, and both fail in ways that no paper figure shows. The final section steps back from the methods to the workflow that ties them together in practice. That is <a href="section-27.6.html">Section 27.6</a>.
 </p>
@@ -208,6 +242,19 @@ We now have two production-grade ways to turn photographs into a renderable 3D s
 <div class="callout exercise">
 <div class="callout-title">Exercise 27.5.3: Memory and Speed Trade-offs <span class="exercise-type analysis">Analysis</span></div>
 <p>A splat stores per Gaussian: position (3 floats), scale (3), rotation quaternion (4), opacity (1), and color as spherical harmonics of degree 3 (48 floats for RGB). Compute the memory for a 2-million-Gaussian scene at 4 bytes per float. Compare this to a NeRF MLP of roughly 1 million parameters. Then explain the apparent paradox: splatting uses far more memory yet renders far faster than NeRF. Connect your answer to the per-ray network query of <a href="section-27.4.html">Section 27.4</a> and to the deployment trade-off in the AR furniture story, and note one situation where NeRF's smaller footprint would still be preferable.</p>
+</div>
+
+<div class="bib-entry-card">
+<div class="bib-entry-title">3D Gaussian Splatting for Real-Time Radiance Field Rendering</div>
+<div class="bib-entry-authors">B. Kerbl, G. Kopanas, T. Leimkuehler, G. Drettakis</div>
+<div class="bib-entry-venue">ACM Transactions on Graphics (SIGGRAPH) 42(4), 2023. <a href="https://arxiv.org/abs/2308.04079" target="_blank" rel="noopener">arXiv:2308.04079</a></div>
+<p class="bib-entry-note">The paper that made splatting practical: explicit anisotropic 3D Gaussians, the factored covariance $\Sigma = R S S^\top R^\top$, the EWA screen-space projection $\Sigma' = J W \Sigma W^\top J^\top$, adaptive densification, and a tile-based differentiable rasterizer that matches NeRF quality while rendering in real time.</p>
+</div>
+<div class="bib-entry-card">
+<div class="bib-entry-title">EWA Splatting</div>
+<div class="bib-entry-authors">M. Zwicker, H. Pfister, J. van Baar, M. Gross</div>
+<div class="bib-entry-venue">IEEE Transactions on Visualization and Computer Graphics (TVCG) 8(3):223-238, 2002. <a href="https://doi.org/10.1109/TVCG.2002.1021576" target="_blank" rel="noopener">doi:10.1109/TVCG.2002.1021576</a></div>
+<p class="bib-entry-note">Derives the elliptical weighted average resampling filter that splatting inherits: projecting a 3D Gaussian to a 2D screen-space conic via the affine (local-linear) approximation of the perspective projection, the source of the Jacobian $J$ in $\Sigma' = J W \Sigma W^\top J^\top$.</p>
 </div>
 
 <nav class="chapter-nav">

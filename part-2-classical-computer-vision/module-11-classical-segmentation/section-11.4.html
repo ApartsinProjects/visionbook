@@ -249,6 +249,56 @@ The energy framework itself, however, is one of the most durable ideas in the ch
 <p>The graph-cut energy did not lose to deep learning so much as get absorbed by it. DeepLab (Chen et al., the v1 and v2 lines, with the CRF-as-RNN formulation of Zheng et al., ICCV 2015) appended a dense CRF, the very energy of this section, to a CNN's logits, and the contrast-sensitive pairwise term sharpened blurry network boundaries enough to win benchmarks for years. Modern promptable models took the interactive thread instead: SAM (Kirillov et al., ICCV 2023) and SAM 2 (Ravi et al., ICLR 2025) replace GrabCut's box and scribbles with learned prompt encoders, so a click yields a mask without any per-image GMM or max-flow, but the user-in-the-loop spirit of GrabCut is unmistakable. On the unsupervised side, normalized cuts came back as a deep tool: CutLER (Wang et al., CVPR 2023) runs normalized cuts on self-supervised features to discover object masks with no labels, exactly Shi and Malik's criterion with the affinity matrix now built from learned embeddings. Across all three, the classical structure, an energy or a cut, persists; the weights it operates on became learned.</p>
 </div>
 
+<h2>6. Normalized Cuts: Removing the Small-Cut Bias <span class="level-badge advanced" title="Advanced">Advanced</span></h2>
+
+<p>
+The min-cut of Section 2 has a quiet flaw that the two-terminal foreground/background setup hides. When there is no source and sink to anchor the partition, and we simply ask for the cheapest cut that splits the graph into two parts $A$ and $B$, the cost
+</p>
+<div class="math-block">
+$$\operatorname{cut}(A, B) = \sum_{u \in A,\; v \in B} w(u, v)$$
+</div>
+<p>
+is the sum of the affinity weights $w(u,v)$ on every edge crossing the partition. Minimizing this raw cut is biased toward slicing off a tiny, isolated group of nodes: a single node weakly connected to the rest is cut by severing just its few thin edges, and that is almost always cheaper than splitting the graph into two substantial halves. The cut criterion rewards small partitions for the wrong reason, namely that a small set simply has fewer edges to cut, not that it is a more natural grouping. This is precisely why min-cut, so well behaved with terminals, misbehaves as a generic clustering objective.
+</p>
+<p>
+Shi and Malik (2000) fix the bias by <em>normalizing</em> the cut against the total connection each part has to the whole graph. Define the association of a set $A$ with all vertices $V$ as
+</p>
+<div class="math-block">
+$$\operatorname{assoc}(A, V) = \sum_{u \in A,\; t \in V} w(u, t),$$
+</div>
+<p>
+the total weight from $A$ to every vertex (itself included). The <strong>normalized cut</strong> of a partition $(A, B)$ is then
+</p>
+<div class="math-block">
+$$\operatorname{Ncut}(A, B) = \frac{\operatorname{cut}(A, B)}{\operatorname{assoc}(A, V)} + \frac{\operatorname{cut}(A, B)}{\operatorname{assoc}(B, V)}.$$
+</div>
+<p>
+Read each term as the fraction of $A$'s total connectivity that is spent on the cut, plus the same fraction for $B$. A tiny group $A$ now pays dearly: its association $\operatorname{assoc}(A, V)$ is small, so even a small numerator makes the first ratio large, and the criterion stops preferring to peel off singletons. The minimum of $\operatorname{Ncut}$ falls where both parts are substantial and the edges between them are genuinely weak, which is the balanced partition we wanted all along. The same normalization, written as $\operatorname{Nassoc}(A,B) = \operatorname{assoc}(A,A)/\operatorname{assoc}(A,V) + \operatorname{assoc}(B,B)/\operatorname{assoc}(B,V)$, measures within-group tightness, and one can show $\operatorname{Ncut}(A,B) = 2 - \operatorname{Nassoc}(A,B)$, so minimizing the cut between groups is identical to maximizing the association within them.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Normalization Trades Absolute Cost for Relative Cost</div>
+<p>The min-cut asks an absolute question, "how much edge weight must I sever?", and a small isolated group always answers it cheaply, because a small group simply has few edges to begin with. Normalized cuts asks a relative question, "what fraction of each group's own connectivity does this cut destroy?", and a small group can no longer hide behind its small edge count: severing a singleton destroys nearly all of that singleton's connectivity, so the ratio is near its maximum, not its minimum. Dividing by the association is exactly the operation that converts "few edges" from a reward into a neutral fact, which is why a criterion built from the very same cut weights produces balanced segments instead of slivers.</p>
+</div>
+
+<p>
+Minimizing $\operatorname{Ncut}$ over all partitions is NP-hard, but Shi and Malik show it admits a clean continuous relaxation. Collect the affinities into the symmetric weight matrix $W$ with $W_{ij} = w(i,j)$, and form the diagonal degree matrix $D$ with $D_{ii} = \sum_j W_{ij}$, the total weight incident on node $i$. Encode the partition by an indicator vector $x \in \{1, -b\}^n$ (positive on $A$, a fixed negative constant on $B$). Substituting this indicator into $\operatorname{Ncut}$ and rearranging turns the combinatorial objective into a Rayleigh quotient in a real-valued vector $y$, and minimizing that quotient is exactly the generalized eigenvalue problem
+</p>
+<div class="math-block">
+$$(D - W)\, y = \lambda\, D\, y.$$
+</div>
+<p>
+The matrix $L = D - W$ is the graph Laplacian. Its smallest eigenvalue is $\lambda_0 = 0$ with the trivial eigenvector $y_0 = \mathbf{1}$ (the all-ones vector), which assigns every node to the same side and so encodes no cut at all. The informative solution is the eigenvector of the <em>second</em>-smallest eigenvalue, the <strong>Fiedler vector</strong>: its real-valued entries give a soft assignment of nodes to the two parts, and thresholding them (at zero, the median, or the split that yields the lowest $\operatorname{Ncut}$) produces the discrete segmentation. Subsequent eigenvectors, those of the third- and fourth-smallest eigenvalues, carry progressively finer partitioning information and can be used to subdivide the image into more than two regions.
+</p>
+<p>
+This construction is the prototype of <strong>spectral clustering</strong>: represent data as an affinity graph, build its Laplacian, and read the cluster structure off the lowest nontrivial eigenvectors. Normalized cuts is the segmentation-flavored instance of that general recipe, and the same affinity-plus-Laplacian machinery reappears whenever a grouping problem is posed as a balanced graph partition, including the learned-affinity revival noted in the research-frontier callout above.
+</p>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 11.4.4: From Ncut to the Generalized Eigenproblem <span class="exercise-type analysis">Analysis</span></div>
+<p>Let $W$ be the symmetric affinity matrix and $D$ the diagonal degree matrix with $D_{ii} = \sum_j W_{ij}$. (a) Show that $y = \mathbf{1}$ (the all-ones vector) satisfies $(D - W)\,y = 0$, so it is an eigenvector of the generalized problem $(D - W)y = \lambda D y$ with eigenvalue $\lambda = 0$, and explain why this trivial solution corresponds to "cut nothing" and must therefore be discarded. (b) Using the partition indicator $x_i = 1$ for $i \in A$ and $x_i = -1$ for $i \in B$, verify that $\operatorname{cut}(A,B) = \tfrac{1}{4}\sum_{i,j} W_{ij}(x_i - x_j)^2 = \tfrac{1}{4}\, x^\top (D - W)\, x$, which is the numerator that the Laplacian quadratic form measures. (c) Argue from these two facts that minimizing the normalized cut relaxes to minimizing the Rayleigh quotient $y^\top (D - W) y / (y^\top D y)$ subject to $y^\top D \mathbf{1} = 0$ (orthogonality to the trivial solution), whose minimizer is the Fiedler vector, the eigenvector of the second-smallest eigenvalue.</p>
+</div>
+
 <div class="callout exercise">
 <div class="callout-title">Exercise 11.4.1: Reading the Energy <span class="exercise-type conceptual">Conceptual</span></div>
 <p>Consider the energy $E(\ell) = \sum_p D_p(\ell_p) + \lambda \sum_{(p,q)} V_{pq}(\ell_p, \ell_q)$. Describe qualitatively what the optimal segmentation looks like in three regimes: (a) $\lambda = 0$, (b) $\lambda \to \infty$, and (c) a moderate $\lambda$. For each, explain whether the result is dominated by the data term, the smoothness term, or a balance, and relate $\lambda = 0$ back to the speckle problem of <a href="section-11.1.html">Section 11.1</a>'s clustering.</p>
@@ -262,6 +312,13 @@ The energy framework itself, however, is one of the most durable ideas in the ch
 <div class="callout exercise">
 <div class="callout-title">Exercise 11.4.3: Felzenszwalb Scale Sweep <span class="exercise-type analysis">Analysis</span></div>
 <p>Run <code>skimage.segmentation.felzenszwalb</code> on one image across a range of <code>scale</code> values while holding <code>sigma</code> and <code>min_size</code> fixed. Plot region count versus <code>scale</code> and, for three representative scales, overlay the region boundaries on the image. Identify a textured region and a smooth region in the photo, and explain how the adaptive boundary predicate produces large regions in the textured area and small ones in the smooth area at the <em>same</em> scale setting. Contrast this adaptivity with the single global threshold of region growing in <a href="section-11.2.html">Section 11.2</a>.</p>
+</div>
+
+<div class="bib-entry-card">
+<div class="bib-entry-title">Normalized Cuts and Image Segmentation</div>
+<div class="bib-entry-authors">J. Shi, J. Malik</div>
+<div class="bib-entry-venue">IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI) 22(8):888-905, 2000. <a href="https://doi.org/10.1109/34.868688" target="_blank" rel="noopener">doi:10.1109/34.868688</a></div>
+<p class="bib-entry-note">Introduces the normalized-cut criterion that removes min-cut's bias toward small isolated groups by dividing the cut cost by each part's total association, and shows that minimizing it relaxes to the generalized eigenproblem $(D - W)y = \lambda D y$ solved by the second-smallest (Fiedler) eigenvector. The founding paper of spectral segmentation, and the criterion CutLER revives on self-supervised features.</p>
 </div>
 
 <nav class="chapter-nav">
