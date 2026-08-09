@@ -8,7 +8,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = "https://visionbook.apartsin.com/"
+BASE = "https://visionbook.icsgen-ai.org/"
 LASTMOD = "2026-06-15"
 SKIP_DIRS = ("KDP", "vendor", "pagefind", "node_modules", "_diagnostics",
              ".git", ".html2epub_cache", "templates", "scripts")
